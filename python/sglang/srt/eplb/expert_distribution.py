@@ -84,6 +84,9 @@ class ExpertDistributionRecorder(ABC):
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
 
+    def record_topk_ids(self, topk_ids: torch.Tensor):
+        pass
+
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: List[int],
@@ -192,6 +195,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
+    def record_topk_ids(self, topk_ids: torch.Tensor):
+        self._on_hook("record_topk_ids", topk_ids=topk_ids)
+
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: List[int],
@@ -285,6 +291,8 @@ def set_global_expert_distribution_recorder(value):
 
 
 class _SinglePassGatherer(ABC):
+    _TOP_K_NUM = 8
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,
@@ -326,6 +334,9 @@ class _SinglePassGatherer(ABC):
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         pass
 
+    def record_topk_ids(self, layer_idx:int, topk_ids: torch.Tensor):
+        pass
+
     def on_deepep_dispatch_normal(
         self,
         layer_idx: int,
@@ -350,7 +361,7 @@ class _SinglePassGatherer(ABC):
 
 class _DetailSinglePassGatherer(_SinglePassGatherer):
     # DeepSeek V3 has this value; should generalize later
-    _TOP_K_NUM = 8
+    # _TOP_K_NUM = 8
 
     def __init__(
         self,
@@ -365,7 +376,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
                 expert_location_metadata.num_layers,
                 # TODO determine the max number
                 server_args.chunked_prefill_size * 8,
-                self._TOP_K_NUM,
+                super()._TOP_K_NUM,
             ),
             dtype=torch.int32,
             device=server_args.device,
@@ -472,9 +483,18 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
             dtype=torch.int,
             device=device,
         )
+        self._topk_ids_data = torch.zeros(
+            (
+                self._expert_location_metadata.num_layers,
+                super()._TOP_K_NUM,
+            ),
+            dtype=torch.int,
+            device=device,
+        )
 
     def reset(self):
         self._data[...] = 0
+        self._topk_ids_data[...] = -1
 
     def collect(self) -> Dict:
         if self._enable_global_physical_experts:
@@ -488,7 +508,7 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
                 num_physical_experts=self._expert_location_metadata.num_physical_experts,
             )
 
-        return dict(global_physical_count=global_physical_count)
+        return dict(global_physical_count=global_physical_count, topk_ids=self._topk_ids_data.clone().cpu())
 
 
 class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
@@ -546,6 +566,15 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     ):
         # Most naive implementation, can optimize later
         self._data[layer_idx, :] += local_physical_count_of_layer
+
+    def record_topk_ids(self, layer_idx: int, topk_ids: torch.Tensor):
+        topk_ids = topk_ids.flatten()
+        if (topk_ids.shape[0] == super()._TOP_K_NUM):
+            self._topk_ids_data[layer_idx] = topk_ids
+        else:
+            logger.info(f"Expected shape: {super()._TOP_K_NUM}, got {topk_ids.shape[0]}")
+            # TODO should record full topk result for batch inference
+            self._topk_ids_data[layer_idx] = topk_ids[:super()._TOP_K_NUM]
 
 
 def _convert_local_to_global_physical_count(
@@ -622,6 +651,7 @@ class _Accumulator(ABC):
 
 
 class _UtilizationRateAccumulatorMixin(_Accumulator):
+    _TOP_K_NUM = 8
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -764,6 +794,15 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             dtype=torch.int32,
             device=self._server_args.device,
         )
+        self._topk_ids_of_buffered_step = _Buffer.init_new(
+            item_shape=(
+                self._expert_location_metadata.num_layers,
+                super()._TOP_K_NUM,
+            ),
+            buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
+            dtype=torch.int32,
+            device=self._server_args.device,
+        )
         self._first_dump = True
 
     def append(
@@ -777,10 +816,14 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         self._global_physical_count_of_buffered_step.append(
             single_pass_data["global_physical_count"]
         )
+        self._topk_ids_of_buffered_step.append(
+            single_pass_data["topk_ids"]
+        )
 
     def reset(self):
         super().reset()
         self._global_physical_count_of_buffered_step.reset()
+        self._topk_ids_of_buffered_step.reset()
 
     def dump(self, output_mode: _OutputMode):
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
@@ -802,6 +845,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             rank=self._rank,
             logical_count=logical_count_of_buffered_step,
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
+            topk_ids=self._topk_ids_of_buffered_step.get_all().clone().cpu(),
         )
 
         if output_mode == "file":

@@ -3,7 +3,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.eplb.eplb_algorithms import deepseek, deepseek_vec
+from sglang.srt.eplb.eplb_algorithms import deepseek, deepseek_vec, deepseek_commun
 
 
 class EplbAlgorithm(Enum):
@@ -11,6 +11,7 @@ class EplbAlgorithm(Enum):
     deepseek_hierarchical = auto()
     deepseek_vec = auto()
     deepseek_vec_hierarchical = auto()
+    deepseek_commun = auto()
     # TODO may have more algorithm later
 
 
@@ -21,6 +22,7 @@ def rebalance_experts(
     num_groups: Optional[int],
     num_nodes: int,
     algorithm: EplbAlgorithm,
+    comm_matrix: Optional[torch.Tensor],
 ):
     if algorithm in [EplbAlgorithm.deepseek, EplbAlgorithm.deepseek_hierarchical]:
         return deepseek.rebalance_experts(
@@ -43,6 +45,17 @@ def rebalance_experts(
             num_groups=num_groups,
             num_nodes=num_nodes,
             enable_hierarchical=algorithm == EplbAlgorithm.deepseek_vec_hierarchical,
+        )
+
+    if algorithm == EplbAlgorithm.deepseek_commun:
+        """Using DeepSeek-Commun algorithm for expert rebalancing."""
+        return deepseek_commun.rebalance_experts(
+            weight=tokens_per_expert.sum(dim=0),
+            num_replicas=num_physical_experts,
+            num_groups=num_groups,
+            num_nodes=num_nodes,
+            num_gpus=num_physical_experts // num_local_physical_experts,
+            comm_matrix=comm_matrix,
         )
 
     raise NotImplementedError
