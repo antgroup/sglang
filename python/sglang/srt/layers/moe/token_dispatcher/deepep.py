@@ -510,6 +510,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_idx = topk_idx.to(torch.int64)
+
+        if topk_idx.numel() > 0:
+            get_global_expert_distribution_recorder().record_topk_ids(
+                topk_idx
+            )
+        else:
+            logger.warning("topk_idx is empty in DeepEP low latency dispatch.")
+
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
             + self.num_experts

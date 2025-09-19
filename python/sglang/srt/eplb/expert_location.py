@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from sglang.srt.eplb import eplb_algorithms
 from sglang.srt.model_loader import get_model_architecture
+from sglang.srt.eplb.utils.comm_matrix_process import generate_comm_matrix
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -138,13 +139,23 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_by_eplb(
-        server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor
+        server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor, topk_history_data: torch.Tensor
     ):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
         if len(logical_count.shape) == 2:
             logical_count = logical_count.unsqueeze(0)
         logical_count = logical_count.to(server_args.device)
+
+        if topk_history_data is None or topk_history_data.numel() == 0:
+            logger.info("No topk_history_data provided, skipping communication matrix computation.")
+            comm_matrix = None
+        else:
+            if not isinstance(topk_history_data, torch.Tensor):
+                topk_history_data = torch.tensor(topk_history_data)
+            topk_history_data = topk_history_data.to(server_args.device)
+            comm_matrix = generate_comm_matrix(topk_history_data, num_experts=256)
+
 
         common = ExpertLocationMetadata._init_common(server_args, model_config)
 
@@ -168,6 +179,7 @@ class ExpertLocationMetadata:
                     num_groups=num_groups,
                     num_nodes=num_nodes,
                 ),
+                comm_matrix=comm_matrix,
             )
         )
 
@@ -456,12 +468,19 @@ def compute_initial_expert_location_metadata(
             server_args, model_config, **data_dict
         )
     elif "logical_count" in data_dict:
-        logger.info(
-            "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
-        )
-        return ExpertLocationMetadata.init_by_eplb(
-            server_args, model_config, logical_count=data_dict["logical_count"]
-        )
+        if "topk_ids" in data_dict:
+            logger.info("init_expert_location with topk_history_data")
+            return ExpertLocationMetadata.init_by_eplb(
+                server_args,
+                model_config,
+                logical_count=data_dict["logical_count"],
+                topk_history_data=data_dict["topk_ids"],
+            )
+        else:
+            logger.info("init_expert_location without topk_history_data")
+            return ExpertLocationMetadata.init_by_eplb(
+                server_args, model_config, logical_count=data_dict["logical_count"], topk_history_data=None
+            )
     else:
         raise NotImplementedError(
             f"Unknown init_expert_location format ({list(data_dict.keys())=})"
