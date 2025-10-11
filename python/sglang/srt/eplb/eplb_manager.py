@@ -65,13 +65,14 @@ class EPLBManager:
         average_utilization_rate_over_window = dump_record_output[
             "average_utilization_rate_over_window"
         ]
+        topk_history_data = dump_record_output["topk_history_data"]
 
         # Check whether rebalancing is needed
         if not self._check_rebalance_needed(average_utilization_rate_over_window):
             return
 
         expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
-            self._server_args, self._model_runner.model_config, logical_count
+            self._server_args, self._model_runner.model_config, logical_count, topk_history_data
         )
 
         update_layer_ids_chunks = self._compute_update_layer_ids_chunks()
