@@ -852,12 +852,14 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
     from decord import VideoReader, cpu, gpu
 
     try:
-        from decord.bridge import decord_bridge
+        import decord
 
-        ctx = gpu(0)
-        _ = decord_bridge.get_ctx_device(ctx)
+        try:
+            decord.bridge.set_bridge("torch")
+        except Exception:
+            decord.bridge.set_bridge("native")
     except Exception:
-        ctx = cpu(0)
+        pass
 
     tmp_file = None
     vr = None
@@ -866,7 +868,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
             tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
             tmp_file.write(video_file)
             tmp_file.close()
-            vr = VideoReader(tmp_file.name, ctx=ctx)
+            src_path = tmp_file.name
         elif isinstance(video_file, str):
             if video_file.startswith(("http://", "https://")):
                 timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
@@ -876,25 +878,36 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 for chunk in response.iter_content(chunk_size=8192):
                     tmp_file.write(chunk)
                 tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
+                src_path = tmp_file.name
             elif video_file.startswith("data:"):
                 _, encoded = video_file.split(",", 1)
                 video_bytes = pybase64.b64decode(encoded)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
+                src_path = tmp_file.name
             elif os.path.isfile(video_file):
-                vr = VideoReader(video_file, ctx=ctx)
+                src_path = video_file
             else:
                 video_bytes = pybase64.b64decode(video_file)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
+                src_path = tmp_file.name
         else:
             raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
+        ctx = cpu(0)
+        if use_gpu:
+            try:
+                ctx = gpu(0)
+                vr = VideoReader(src_path, ctx=ctx)
+            except Exception:
+                vr = None
+
+        if vr is None:
+            # Enable FFmpeg use multi-thread
+            vr = VideoReader(src_path, ctx=cpu(0), num_threads=8)
         return vr
 
     finally:

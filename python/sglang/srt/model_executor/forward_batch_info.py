@@ -595,7 +595,7 @@ class ForwardBatch:
                 mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
-            [pos.to(device=model_runner.device) for pos in mrope_positions_list],
+            mrope_positions_list,
             dim=1,
         ).to(dtype=torch.int64, device=model_runner.device)
 

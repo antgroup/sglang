@@ -4,7 +4,10 @@ import os
 import re
 from typing import List, Union
 
+import decord
+import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
@@ -170,14 +173,34 @@ async def preprocess_video(
     ele = {}
     total_frames, video_fps = len(vr), vr.get_avg_fps()
     nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
-    idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
-    video = vr.get_batch(idx).asnumpy()
-    video = torch.tensor(video).permute(0, 3, 1, 2)  # Convert to TCHW format
+    idx = np.linspace(0, max(total_frames - 1, 0), num=nframes, dtype=np.int64)
+
+    batch = vr.get_batch(idx)
+
+    # zero copy for decord gpu/cpu
+    if hasattr(batch, "to_dlpack"):
+        from torch.utils import dlpack as _dlpack
+
+        video_nhwc = _dlpack.from_dlpack(batch.to_dlpack())
+    elif hasattr(batch, "asnumpy"):
+        video_nhwc = torch.from_numpy(batch.asnumpy())
+    else:
+        video_nhwc = torch.from_numpy(np.asarray(batch))
+
+    want_cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if want_cuda else "cpu")
+    if video_nhwc.device.type != device.type:
+        video_nhwc = video_nhwc.to(device, non_blocking=True)
+
+    # [T,H,W,C] -> [T,C,H,W]
+    video = video_nhwc.permute(0, 3, 1, 2).contiguous()
     nframes, _, height, width = video.shape
+
+    ele = {}
     min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
     total_pixels = ele.get("total_pixels", VIDEO_TOTAL_PIXELS)
     max_pixels = max(
-        min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR),
+        min(VIDEO_MAX_PIXELS, total_pixels / max(nframes, 1) * FRAME_FACTOR),
         int(min_pixels * 1.05),
     )
     max_pixels_supposed = ele.get("max_pixels", max_pixels)
@@ -186,6 +209,7 @@ async def preprocess_video(
             f"The given max_pixels[{max_pixels_supposed}] exceeds limit[{max_pixels}]."
         )
     max_pixels = min(max_pixels_supposed, max_pixels)
+
     if "resized_height" in ele and "resized_width" in ele:
         resized_height, resized_width = smart_resize(
             ele["resized_height"],
@@ -200,12 +224,16 @@ async def preprocess_video(
             min_pixels=min_pixels,
             max_pixels=max_pixels,
         )
-    video = torchvision.transforms.functional.resize(
+
+    video = video.to(dtype=torch.float32, copy=False)
+    video = F.interpolate(
         video,
-        [resized_height, resized_width],
-        interpolation=InterpolationMode.BICUBIC,
+        size=(resized_height, resized_width),
+        mode="bicubic",
+        align_corners=False,
         antialias=True,
-    ).float()
+    )
+
     return video
 
 
