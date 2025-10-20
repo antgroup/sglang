@@ -296,6 +296,7 @@ from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,
     fp8_blockwise_scaled_grouped_mm,
+    fused_qk_norm_rope,
     moe_align_block_size,
     moe_fused_gate,
     moe_sum,

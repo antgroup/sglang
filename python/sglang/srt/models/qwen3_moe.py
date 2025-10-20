@@ -71,6 +71,12 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
 )
 
+if _is_cuda:
+    from sgl_kernel import fused_qk_norm_rope
+elif _is_cpu and _is_cpu_amx_available:
+    pass
+
+
 Qwen3MoeConfig = None
 
 _is_flashinfer_available = is_flashinfer_available()
@@ -344,6 +350,9 @@ class Qwen3MoeAttention(nn.Module):
         self.compatible_with_fused_kv_buffer = (
             False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
         )
+        self.compatible_with_fused_qk_norm_rope = (
+            False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
+        )
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -371,6 +380,9 @@ class Qwen3MoeAttention(nn.Module):
                 k_by_head = k.reshape(-1, self.head_dim)
                 k_by_head = self.k_norm(k_by_head)
             current_stream.wait_stream(self.alt_stream)
+            q = q_by_head.view(q.shape)
+            k = k_by_head.view(k.shape)
+            return q, k
         else:
             q_by_head = q.reshape(-1, self.head_dim)
             q_by_head = self.q_norm(q_by_head)
@@ -392,6 +404,43 @@ class Qwen3MoeAttention(nn.Module):
             state.pop("attn_intermediate_state")
         )
 
+    def apply_qk_norm_rope(self, qkv, positions, forward_batch):
+        if self.use_fused_qk_norm_rope:
+            fused_qk_norm_rope(
+                qkv,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                self.rotary_emb.is_neox_style,
+                positions.view(-1),
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            # Fallback to non-fused QK Norm & RoPE implementation
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self._apply_qk_norm(q, k)
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                fused_set_kv_buffer_arg=(
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if enable_fused_set_kv_buffer(forward_batch)
+                    and self.compatible_with_fused_kv_buffer
+                    else None
+                ),
+            )
+        return q, k, v
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -401,23 +450,9 @@ class Qwen3MoeAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=(
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
-                )
-                if enable_fused_set_kv_buffer(forward_batch)
-                and self.compatible_with_fused_kv_buffer
-                else None
-            ),
-        )
+
+        q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
+
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
