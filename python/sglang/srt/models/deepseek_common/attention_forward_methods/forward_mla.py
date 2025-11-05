@@ -5,8 +5,13 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.distributed import (
+    get_dcp_group,
+    get_dcp_world_size,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
+from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -305,6 +310,15 @@ class DeepseekMLAForwardMixin:
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
+        # TODO(augusto.yjh) 这里要all_gather q_pe 和 q_node_out,以 tp8为例， [1, 8, 64] [1, 8, 512] 经过all gather后为 [1, 64, 64] [1, 64, 512], k_pe 为 [1, 1, 64], k_nope 为 [1, 1, 512], 从 local heads到all heads
+        if get_dcp_world_size() > 1:
+            q_pe = q_pe.contiguous()
+            q_nope_out = q_nope_out.contiguous()
+            gathered_q_pe = get_dcp_group().all_gather(q_pe, dim=-2)
+            gathered_q_nope_out = get_dcp_group().all_gather(q_nope_out, dim=-2)
+            q_pe = gathered_q_pe
+            q_nope_out = gathered_q_nope_out
+
         return (
             q_pe,
             k_pe,
@@ -340,7 +354,7 @@ class DeepseekMLAForwardMixin:
                     "llama_4_scaling": llama_4_scaling,
                 }
 
-            attn_output = self.attn_mqa(
+            attn_output, lse = self.attn_mqa(
                 q_nope_out,
                 k_nope,
                 k_nope,
@@ -393,6 +407,14 @@ class DeepseekMLAForwardMixin:
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+        # TODO(augusto.yjh) all gather lse，订正attn_output
+        # TODO(augusto.yjh) 执行reduce scatter, 先reduce拿到正确的 attn_output, 再按local_num_heads scatter attn_output
+        if get_dcp_world_size() > 1:
+            attn_output = attn_output.view(
+                -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
+            )
+            attn_output = attn_output.contiguous()
+            attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
