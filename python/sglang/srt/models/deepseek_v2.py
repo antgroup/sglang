@@ -41,6 +41,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import (
     divide,
+    get_dcp_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -1226,8 +1227,9 @@ class DeepseekV2AttentionMLA(
             self.rotary_emb = None
         self.use_deepseek_yarn_rope = rope_scaling is not None
 
+        # TODO(augusto.yjh) 这里要改逻辑， local_heads是all heads, 而且还要返回lse，用来修正attn_out
         self.attn_mqa = RadixAttention(
-            self.num_local_heads,
+            self.num_local_heads * get_dcp_world_size(),
             self.kv_lora_rank + self.qk_rope_head_dim,
             self.scaling,
             num_kv_heads=1,
