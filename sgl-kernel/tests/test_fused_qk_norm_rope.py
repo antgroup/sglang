@@ -1,10 +1,31 @@
 import pytest
 import torch
 from sgl_kernel import fused_qk_norm_rope as sgl_fused_qk_norm_rope
-from tensorrt_llm._torch.attention_backend.interface import RopeParams
 
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.rotary_embedding import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.server_args import (
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args_for_scheduler,
+)
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_npu = is_npu()
+_is_xpu = is_xpu()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 @torch.inference_mode()
@@ -62,34 +83,32 @@ def torch_ref_rms_norm_rope(
     k = qkv[:, q_size : q_size + k_size]
     v = qkv[:, q_size + k_size :]
 
+    rotary_emb = get_rope(
+        head_dim,
+        rotary_dim=head_dim,
+        max_position=8192,
+        base=10000,
+        rope_scaling=None,
+        dual_chunk_attention_config=None,
+    )
+
     # Create and apply RMSNorm modules with custom weights
     q_norm = RMSNorm(hidden_size=head_dim, eps=eps).to(qkv.device).to(qkv.dtype)
     k_norm = RMSNorm(hidden_size=head_dim, eps=eps).to(qkv.device).to(qkv.dtype)
 
-    # Set the weights to the provided weights
-    q_norm.weight.data.copy_(q_weight)
-    k_norm.weight.data.copy_(k_weight)
+    q_by_head = q.reshape(-1, head_dim)
+    q_by_head = q_norm(q_by_head)
+    k_by_head = k.reshape(-1, head_dim)
+    k_by_head = k_norm(k_by_head)
+    q = q_by_head.view(q.shape)
+    k = k_by_head.view(k.shape)
 
-    # Apply RMSNorm to Q and K
-    q_normalized = q_norm(q.reshape(num_tokens * num_heads_q, head_dim)).reshape(
-        num_tokens, q_size
+    [q_rope, k_rope] = rotary_emb(
+        position_ids,
+        q,
+        k,
+        fused_set_kv_buffer_arg=None,
     )
-    k_normalized = k_norm(k.reshape(num_tokens * num_heads_k, head_dim)).reshape(
-        num_tokens, k_size
-    )
-
-    # Create and apply RotaryEmbedding module
-    rope_params = RopeParams(
-        dim=head_dim,  # Set the rotary dimension to match the head dimension
-        theta=base,  # Base value for RoPE calculations
-        max_positions=8192,  # Large enough for any reasonable hidden size
-    )
-    rotary_emb = RotaryEmbedding(
-        rope_params=rope_params, head_dim=head_dim, is_neox=is_neox
-    ).to(qkv.device)
-
-    # Apply RoPE to the normalized Q and K
-    [q_rope, k_rope] = rotary_emb(position_ids, [q_normalized, k_normalized])
 
     # Combine Q, K, V back together
     result = torch.cat([q_rope, k_rope, v], dim=1)
@@ -107,9 +126,10 @@ num_heads_groups = [
 ]
 num_tokens_list = [1, 3, 8, 32, 256]
 is_neox_list = [False, True]
-dtypes = [torch.bfloat16]  # TODO: support float16
+dtypes = [torch.bfloat16]
 
 
+@pytest.mark.skipif(not _is_cuda, reason="Skipping CUDA/ROCm only tests.")
 @pytest.mark.parametrize("head_dim", head_dims)
 @pytest.mark.parametrize("num_heads_group", num_heads_groups)
 @pytest.mark.parametrize("num_tokens", num_tokens_list)
@@ -130,6 +150,7 @@ def test_fused_qk_norm_rope(head_dim, num_heads_group, num_tokens, is_neox, dtyp
         num_tokens: Number of tokens to process
         dtype: Data type (float16 or bfloat16)
     """
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
     device = "cuda"
     torch_dtype = dtype
 

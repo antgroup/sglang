@@ -22,7 +22,6 @@ import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
-import transformers
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -75,17 +74,18 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
 )
 
-TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import fused_qk_norm_rope
+
+TConfig = TypeVar("TConfig", bound=PretrainedConfig)
 
 Qwen3MoeConfig = None
 
 _is_flashinfer_available = is_flashinfer_available()
 
 logger = logging.getLogger(__name__)
-_is_cuda = is_cuda()
-
-if _is_cuda:
-    from sgl_kernel import fused_qk_norm_rope
 
 
 def compute_yarn_parameters(
@@ -410,6 +410,7 @@ class Qwen3MoeAttention(nn.Module):
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
 
+        self.config = config
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -468,6 +469,9 @@ class Qwen3MoeAttention(nn.Module):
         self.compatible_with_fused_qk_norm_rope = (
             False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
         )
+        # TODO(yuan-luo): Add feature server_args
+        self.use_fused_qk_norm_rope = self.compatible_with_fused_qk_norm_rope
+        self._used_fused_qk_norm_rope_last_call = False
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -521,6 +525,10 @@ class Qwen3MoeAttention(nn.Module):
 
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
         if self.use_fused_qk_norm_rope:
+            theta = getattr(self.config, "rope_theta", 10000.0)
+            positions = (
+                positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
+            )
             factor, low, high, attention_factor = compute_yarn_parameters(self.config)
             fused_qk_norm_rope(
                 qkv,
@@ -531,15 +539,16 @@ class Qwen3MoeAttention(nn.Module):
                 self.q_norm.variance_epsilon,
                 self.q_norm.weight,
                 self.k_norm.weight,
-                self.rotary_emb.cos_sin_cache,
+                theta,
                 self.rotary_emb.is_neox_style,
-                positions.view(-1),
+                positions,
                 factor,
                 low,
                 high,
                 attention_factor,
             )
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            self._used_fused_qk_norm_rope_last_call = True
         else:
             # Fallback to non-fused QK Norm & RoPE implementation
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -559,6 +568,7 @@ class Qwen3MoeAttention(nn.Module):
                     else None
                 ),
             )
+            self._used_fused_qk_norm_rope_last_call = False
         return q, k, v
 
     def forward_prepare(
@@ -580,13 +590,12 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-        attn_output = self.attn(
-            *inner_state,
-            save_kv_cache=not (
-                enable_fused_set_kv_buffer(forward_batch)
-                and self.compatible_with_fused_kv_buffer
-            ),
+        must_save_kv = self._used_fused_qk_norm_rope_last_call
+        save_kv_cache = must_save_kv or not (
+            enable_fused_set_kv_buffer(forward_batch)
+            and self.compatible_with_fused_kv_buffer
         )
+        attn_output = self.attn(*inner_state, save_kv_cache=save_kv_cache)
         output, _ = self.o_proj(attn_output)
         return output
 
