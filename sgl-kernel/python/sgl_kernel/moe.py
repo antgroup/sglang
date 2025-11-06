@@ -199,11 +199,15 @@ def fused_qk_norm_rope(
     eps: float,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
+    base: float,
     is_neox: bool,
     position_ids: torch.Tensor,
+    factor: float,
+    low: float,
+    high: float,
+    attention_factor: float,
 ) -> None:
-    torch.ops._C.fused_qk_norm_rope(
+    torch.ops.sgl_kernel.fused_qk_norm_rope(
         qkv,
         num_heads_q,
         num_heads_k,
@@ -212,9 +216,13 @@ def fused_qk_norm_rope(
         eps,
         q_weight,
         k_weight,
-        cos_sin_cache,
+        base,
         is_neox,
         position_ids,
+        factor,
+        low,
+        high,
+        attention_factor,
     )
 
 
