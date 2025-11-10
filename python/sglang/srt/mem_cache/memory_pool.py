@@ -1404,6 +1404,128 @@ class NSATokenToKVPool(MLATokenToKVPool):
         return kv_size_bytes
 
 
+class DCPAwareMLATokenToKVPool(MLATokenToKVPool):
+    def __init__(
+        self, 
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        dcp_rank: int,
+        dcp_world_size: int,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None
+    ):
+        self.dcp_rank = dcp_rank
+        self.dcp_world_size = dcp_world_size
+
+        super().__init__(
+            size = ceil(size / dcp_world_size),
+            page_size = page_size,
+            dtype = dtype,
+            kv_lora_rank = kv_lora_rank,
+            qk_rope_head_dim = qk_rope_head_dim,
+            layer_num = layer_num,
+            device = device,
+            enable_memory_saver = enable_memory_saver,
+            start_layer = start_layer,
+            end_layer = end_layer,
+        )
+
+        logger.info(
+            f"DCPAwareMLATokenToKVPool initialized: "
+            f"dcp_rank={dcp_rank}/{dcp_world_size}, "
+            f"page_size={page_size}, size={ceil(size / dcp_world_size)}."
+        )
+
+    def get_physical_loc(
+        self,
+        virtual_loc: torch.Tensor
+    ):
+        if self.dcp_world_size == 1:
+            return virtual_loc, torch.ones_like(virtual_loc, dtype=torch.bool)
+        # DCP mapping rule:
+        #   own: token belongs to this rank iff (virtual_loc % d) == r
+        #   phys: local compact index = virtual_loc // d
+        d = int(self.dcp_world_size)
+        r = int(self.dcp_rank)
+        # Ensure integer tensor on device
+        vloc = virtual_loc.to(dtype=torch.int64, device=self.device)
+        own_mask = (vloc % d) == r
+        phys_loc = torch.div(vloc, d, rounding_mode="floor").to(torch.int32)
+        return phys_loc, own_mask
+
+
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        # Map virtual locations to local physical locations and mask out tokens of other ranks
+        phys_loc, mask = self.get_physical_loc(loc)
+        if mask.numel() == 0 or not torch.any(mask):
+            return
+        sel_loc = phys_loc[mask]
+        sel_k_nope = cache_k_nope[mask]
+        sel_k_rope = cache_k_rope[mask]
+
+        # Match base class dtype behavior
+        if sel_k_nope.dtype != self.dtype:
+            sel_k_nope = sel_k_nope.to(self.dtype)
+            sel_k_rope = sel_k_rope.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            sel_k_nope = sel_k_nope.view(self.store_dtype)
+            sel_k_rope = sel_k_rope.view(self.store_dtype)
+
+        set_mla_kv_buffer_triton(
+            self.kv_buffer[layer_id - self.start_layer],
+            sel_loc,
+            sel_k_nope,
+            sel_k_rope,
+        )
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        # This overrides MLATokenToKVPool.set_kv_buffer to apply DCP mapping.
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+
+        phys_loc, mask = self.get_physical_loc(loc)
+        if mask.numel() == 0 or not torch.any(mask):
+            return
+        sel_loc = phys_loc[mask]
+        sel_k = cache_k[mask]
+
+        # Match base class dtype behavior
+        if sel_k.dtype != self.dtype:
+            if k_scale is not None:
+                sel_k = sel_k.div(k_scale)
+            sel_k = sel_k.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            sel_k = sel_k.view(self.store_dtype)
+
+        self.kv_buffer[layer_id - self.start_layer][sel_loc] = sel_k
+
+
+
 class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
     def __init__(
         self,

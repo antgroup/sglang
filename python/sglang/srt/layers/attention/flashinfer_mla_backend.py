@@ -453,7 +453,22 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     ):
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
-            kv_len_arr_cpu = seq_lens_cpu[:bs]
+            # Build per-sequence filtered lengths for DCP (if enabled)
+            if get_dcp_world_size() > 1:
+                d = get_dcp_world_size()
+                r = get_dcp_rank()
+                kv_len_arr_cpu = torch.empty(bs, dtype=torch.int32)
+                # Compute from req_to_token to get exact residues
+                for i in range(bs):
+                    rid = int(req_pool_indices[i].item())
+                    L = int(seq_lens_cpu[i].item())
+                    if L == 0:
+                        kv_len_arr_cpu[i] = 0
+                        continue
+                    toks = self.req_to_token[rid, :L].to("cpu", non_blocking=True)
+                    kv_len_arr_cpu[i] = int(((toks % d) == r).sum().item())
+            else:
+                kv_len_arr_cpu = seq_lens_cpu[:bs]
             self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
                 kv_len_arr_cpu, dim=0
             )
@@ -651,7 +666,7 @@ class FlashInferMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size() * get_dcp_world_size()
+            model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -722,22 +737,24 @@ class FlashInferMLAIndicesUpdaterDecode:
                 self.req_to_token.shape[1],
             )
 
-            # TODO(augusto.yjh) 更新kv_indices
-            def filter_seq_indices(paged_kernel_lens, paged_kernel_lens_cumsum, dcp_rank:int, dpc_world_size:int):
-                paged_kernel_lens_split = ((paged_kernel_lens - dcp_rank - 1) // dpc_world_size) + 1
-                all_filered_indice = []
-                for i in range(len(paged_kernel_lens_split)):
-                    indice = torch.arange(paged_kernel_lens_split[i], device=paged_kernel_lens.device) * dpc_world_size + dcp_rank + paged_kernel_lens_cumsum[i]
-                    all_filered_indice.append(indice)
-                filterd_kv_indices = torch.cat(all_filered_indice, dim=0).to(device="cuda")
-                return paged_kernel_lens_split, filterd_kv_indices
-
+            # DCP: filter tokens for this rank and remap virtual -> physical indices
             if get_dcp_world_size() > 1:
-                filtered_paged_kernel_lens, filterd_kv_indices = filter_seq_indices(paged_kernel_lens, kv_indptr, get_dcp_rank(), get_dcp_world_size())
-                kv_indices = kv_indices[filterd_kv_indices]
-                kv_lens = filtered_paged_kernel_lens.to(torch.int32)
-                kv_indptr[1:bs+1] = torch.cumsum(filtered_paged_kernel_lens, dim=0)
-                kv_indptr = kv_indptr[:bs+1]
+                d = get_dcp_world_size()
+                r = get_dcp_rank()
+                # mask and remap
+                mask = (kv_indices % d) == r
+                kv_indices = torch.div(kv_indices[mask], d, rounding_mode="floor").to(torch.int32)
+                # recompute kv_lens and kv_indptr based on filtered mask per sequence
+                lens_filtered = torch.empty((bs,), dtype=torch.int32, device=kv_indptr.device)
+                # iterate sequences and count per-seq mask
+                for i in range(bs):
+                    st = kv_indptr[i].item()
+                    ed = kv_indptr[i + 1].item()
+                    lens_filtered[i] = mask[st:ed].sum()
+                kv_lens = lens_filtered
+                kv_indptr[0] = 0
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
@@ -889,7 +906,26 @@ class FlashInferMLAIndicesUpdaterPrefill:
             )
         else:
             # mla paged prefill
-            kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
+            # If DCP is enabled, filter kv_indices to this rank and remap to local physical indices
+            if get_dcp_world_size() > 1:
+                d = get_dcp_world_size()
+                r = get_dcp_rank()
+                # Build per-rank filtered indices and length array
+                mask = (kv_indices % d) == r
+                kv_indices = torch.div(kv_indices[mask], d, rounding_mode="floor").to(torch.int32)
+                # recompute kv_indptr and kv_len_arr
+                bs = len(paged_kernel_lens)
+                lens_filtered = torch.empty((bs,), dtype=torch.int32, device=kv_indptr.device)
+                for i in range(bs):
+                    st = kv_indptr[i].item()
+                    ed = kv_indptr[i + 1].item()
+                    lens_filtered[i] = mask[st:ed].sum()
+                kv_indptr[0] = 0
+                kv_indptr[1 : bs + 1] = torch.cumsum(lens_filtered, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_len_arr = lens_filtered
+            else:
+                kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
             wrapper_paged.plan(
                 qo_indptr,
                 kv_indptr,
