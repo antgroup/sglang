@@ -1617,21 +1617,21 @@ class ModelRunner:
                 get_dcp_rank,
                 get_dcp_world_size
             )
-
+            dcp_size = get_dcp_world_size()
             # When DCP is enabled, each rank only stores ~1/dcp_size of tokens physically.
             # Expand logical capacity by dcp_size to utilize freed memory.
-            if self.server_args.dcp_size > 1:
-                expanded = self.max_total_num_tokens * self.server_args.dcp_size
+            if dcp_size > 1:
+                expanded = self.max_total_num_tokens * dcp_size
                 # keep page alignment
                 expanded = expanded // self.server_args.page_size * self.server_args.page_size
                 if expanded != self.max_total_num_tokens:
                     logger.info(
                         f"Expand max_total_num_tokens for DCP: {self.max_total_num_tokens} -> {expanded} "
-                        f"(dcp_size={self.server_args.dcp_size})"
+                        f"(dcp_size={dcp_size})"
                     )
                 self.max_total_num_tokens = expanded
 
-            if self.server_args.dcp_size > 1:
+            if dcp_size > 1:
                 self.token_to_kv_pool = DCPAwareMLATokenToKVPool(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -1642,7 +1642,7 @@ class ModelRunner:
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     dcp_rank=get_dcp_rank(),
-                    dcp_world_size=get_dcp_world_size(),
+                    dcp_world_size=dcp_size,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
