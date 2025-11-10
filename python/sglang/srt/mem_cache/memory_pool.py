@@ -37,6 +37,7 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import math
 import torch
 import triton
 import triton.language as tl
@@ -1424,7 +1425,7 @@ class DCPAwareMLATokenToKVPool(MLATokenToKVPool):
         self.dcp_world_size = dcp_world_size
 
         super().__init__(
-            size = ceil(size / dcp_world_size),
+            size = math.ceil(size / dcp_world_size),
             page_size = page_size,
             dtype = dtype,
             kv_lora_rank = kv_lora_rank,
@@ -1439,7 +1440,7 @@ class DCPAwareMLATokenToKVPool(MLATokenToKVPool):
         logger.info(
             f"DCPAwareMLATokenToKVPool initialized: "
             f"dcp_rank={dcp_rank}/{dcp_world_size}, "
-            f"page_size={page_size}, size={ceil(size / dcp_world_size)}."
+            f"page_size={page_size}, size={math.ceil(size / dcp_world_size)}."
         )
 
     def get_physical_loc(
