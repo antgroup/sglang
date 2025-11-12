@@ -32,19 +32,7 @@ from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
-# Try to import DCP functions, fallback if not available
-try:
-    from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
-
-    _DCP_AVAILABLE = True
-except (ImportError, AttributeError):
-    _DCP_AVAILABLE = False
-
-    def get_dcp_world_size():
-        return 1
-
-    def get_dcp_rank():
-        return 0
+from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -168,17 +156,11 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 which rank stores the token.
         """
         # Filter tokens based on DCP interleaved storage if enabled
-        if token_positions is not None and _DCP_AVAILABLE:
-            dcp_world_size = get_dcp_world_size()
-            dcp_rank = get_dcp_rank()
-            if dcp_world_size > 1:
-                # Create mask for tokens that belong to this rank
-                token_rank_mask = (token_positions % dcp_world_size) == dcp_rank
-                # Calculate how many tokens belong to this rank
-                local_need_size = token_rank_mask.sum().item()
-            else:
-                token_rank_mask = None
-                local_need_size = need_size
+        if token_positions is not None and get_dcp_world_size() > 1:
+            # Create mask for tokens that belong to this rank
+            token_rank_mask = (token_positions % get_dcp_world_size()) == get_dcp_rank()
+            # Calculate how many tokens belong to this rank
+            local_need_size = token_rank_mask.sum().item()
         else:
             token_rank_mask = None
             local_need_size = need_size
@@ -551,17 +533,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         bs = len(prefix_lens)
 
         # Filter tokens based on DCP interleaved storage if enabled
-        if token_positions is not None and _DCP_AVAILABLE:
-            dcp_world_size = get_dcp_world_size()
-            dcp_rank = get_dcp_rank()
-            if dcp_world_size > 1:
-                # Create mask for tokens that belong to this rank
-                token_rank_mask = (token_positions % dcp_world_size) == dcp_rank
-                # Calculate how many tokens belong to this rank
-                local_extend_num_tokens = token_rank_mask.sum().item()
-            else:
-                token_rank_mask = None
-                local_extend_num_tokens = extend_num_tokens
+        if token_positions is not None and get_dcp_world_size() > 1:
+            # Create mask for tokens that belong to this rank
+            token_rank_mask = (token_positions % get_dcp_world_size()) == get_dcp_rank()
+            # Calculate how many tokens belong to this rank
+            local_extend_num_tokens = token_rank_mask.sum().item()
         else:
             token_rank_mask = None
             local_extend_num_tokens = extend_num_tokens
@@ -655,14 +631,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         bs = len(seq_lens)
 
         # Filter tokens based on DCP interleaved storage if enabled
-        if token_positions is not None and _DCP_AVAILABLE:
-            dcp_world_size = get_dcp_world_size()
-            dcp_rank = get_dcp_rank()
-            if dcp_world_size > 1:
-                # Create mask for tokens that belong to this rank
-                token_rank_mask = (token_positions % dcp_world_size) == dcp_rank
-            else:
-                token_rank_mask = None
+        if token_positions is not None and get_dcp_world_size() > 1:
+            # Create mask for tokens that belong to this rank
+            token_rank_mask = (token_positions % get_dcp_world_size()) == get_dcp_rank()
         else:
             token_rank_mask = None
 
