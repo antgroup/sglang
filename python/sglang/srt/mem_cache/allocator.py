@@ -180,8 +180,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # Save unused indices before setting placeholder
             unused_indices = select_index[~token_rank_mask].clone()
 
-            # Set placeholder (0) for tokens not on this rank
-            select_index[~token_rank_mask] = 0
+            # Set placeholder (-1) for tokens not on this rank
+            select_index[~token_rank_mask] = -1
 
             # Return unused indices to free pool
             if unused_indices.numel() > 0:
@@ -585,8 +585,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             else:
                 actual_pages_needed = 0
 
-            # Set placeholder (0) for tokens not on this rank
-            out_indices[~token_rank_mask] = 0
+            # Set placeholder (-1) for tokens not on this rank
+            out_indices[~token_rank_mask] = -1
 
             # Free pages that were allocated for tokens not on this rank
             if unused_indices.numel() > 0:
@@ -672,8 +672,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             else:
                 actual_pages_needed = 0
 
-            # Set placeholder (0) for tokens not on this rank
-            out_indices[~token_rank_mask] = 0
+            # Set placeholder (-1) for tokens not on this rank
+            out_indices[~token_rank_mask] = -1
 
             # Free pages that were allocated for tokens not on this rank
             if unused_indices.numel() > 0:
