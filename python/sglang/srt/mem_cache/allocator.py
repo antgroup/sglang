@@ -32,7 +32,15 @@ from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
-from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
+import logging
+
+from sglang.srt.distributed.parallel_state import (
+    get_dcp_rank,
+    get_dcp_world_size,
+    get_tensor_model_parallel_rank,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -196,6 +204,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                     else:
                         self.free_pages = torch.cat((self.free_pages, unused_indices))
 
+        logger.info(
+            f"tp_rank={get_tensor_model_parallel_rank()}, select_index={select_index}, token_rank_mask={token_rank_mask}"
+        )
         return select_index
 
     def free(self, free_index: torch.Tensor):
