@@ -1227,9 +1227,8 @@ class DeepseekV2AttentionMLA(
             self.rotary_emb = None
         self.use_deepseek_yarn_rope = rope_scaling is not None
 
-        # TODO(augusto.yjh) 这里要改逻辑， local_heads是all heads, 而且还要返回lse，用来修正attn_out
         self.attn_mqa = RadixAttention(
-            self.num_local_heads * get_dcp_world_size(),
+            self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
             self.scaling,
             num_kv_heads=1,
@@ -1238,6 +1237,18 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
+        # TODO(augusto.yjh) 这里要改逻辑， local_heads是all heads, 而且还要返回lse，用来修正attn_out
+        if get_dcp_world_size() > 1:
+            self.attn_mqa_for_dcp_decode = RadixAttention(
+                self.num_local_heads * get_dcp_world_size(),
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                v_head_dim=self.kv_lora_rank,
+                quant_config=quant_config,
+                prefix=add_prefix("attn_mqa", prefix),
+            )
 
         self.attn_mha = RadixAttention(
             self.num_local_heads,

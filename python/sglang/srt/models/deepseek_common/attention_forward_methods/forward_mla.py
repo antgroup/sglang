@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -7,7 +8,11 @@ import torch
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed import (
     get_dcp_group,
+    get_dcp_rank,
     get_dcp_world_size,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
@@ -31,6 +36,8 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -312,12 +319,39 @@ class DeepseekMLAForwardMixin:
 
         # TODO(augusto.yjh) 这里要all_gather q_pe 和 q_node_out,以 tp8为例， [1, 8, 64] [1, 8, 512] 经过all gather后为 [1, 64, 64] [1, 64, 512], k_pe 为 [1, 1, 64], k_nope 为 [1, 1, 512], 从 local heads到all heads
         if get_dcp_world_size() > 1:
-            q_pe = q_pe.contiguous()
-            q_nope_out = q_nope_out.contiguous()
-            gathered_q_pe = get_dcp_group().all_gather(q_pe, dim=-2)
-            gathered_q_nope_out = get_dcp_group().all_gather(q_nope_out, dim=-2)
-            q_pe = gathered_q_pe
-            q_nope_out = gathered_q_nope_out
+            if forward_batch.forward_mode.is_decode():
+                # if forward_batch.forward_mode is decode, gather q
+                with use_symmetric_memory(get_dcp_group()):
+                    combined = torch.cat([q_pe, q_nope_out], dim=-1)
+                gathered = get_dcp_group().all_gather(combined, dim=-2)
+                d_pe = q_pe.size(-1)
+                d_nope = q_nope_out.size(-1)
+                q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
+            elif forward_batch.forward_mode.is_extend():
+                # for extend, gather kv
+                cache_k_nope, cache_k_rope = (
+                    forward_batch.token_to_kv_pool.get_mla_kv_buffer(
+                        self.attn_mqa, forward_batch.dcp_local_prefix_kv_indices
+                    )
+                )
+                # all gather kv cache into forward_batch.dcp_kv_buffer
+                local_cache_kv = torch.cat((cache_k_nope, cache_k_rope), dim=-1)
+                get_dcp_group().all_gather_into_tensor(
+                    forward_batch.dcp_kv_buffer[
+                        : forward_batch.dcp_extend_prefix_lens_sum
+                    ],
+                    local_cache_kv,
+                )
+
+                # copy local kv cache into forward_batch.dcp_kv_buffer
+                forward_batch.dcp_kv_buffer[
+                    forward_batch.dcp_extend_prefix_lens_sum :, ..., : self.kv_lora_rank
+                ] = k_nope
+                forward_batch.dcp_kv_buffer[
+                    forward_batch.dcp_extend_prefix_lens_sum :, ..., self.kv_lora_rank :
+                ] = k_pe
+            else:
+                logger.warn(f"not supported forward_mode {forward_batch.forward_mode}")
 
         return (
             q_pe,
@@ -354,16 +388,37 @@ class DeepseekMLAForwardMixin:
                     "llama_4_scaling": llama_4_scaling,
                 }
 
-            attn_output, lse = self.attn_mqa(
-                q_nope_out,
-                k_nope,
-                k_nope,
-                forward_batch,
-                q_rope=q_pe,
-                k_rope=k_pe,
-                **extra_args,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
+            # TODO(augusto.yjh) 返回lse, correct attn_output
+            if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
+                attn_output, lse = self.attn_mqa_for_dcp_decode(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **extra_args,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+            else:
+                attn_output = self.attn_mqa(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **extra_args,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
         else:
             if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache
@@ -409,11 +464,13 @@ class DeepseekMLAForwardMixin:
             )
         # TODO(augusto.yjh) all gather lse，订正attn_output
         # TODO(augusto.yjh) 执行reduce scatter, 先reduce拿到正确的 attn_output, 再按local_num_heads scatter attn_output
-        if get_dcp_world_size() > 1:
-            attn_output = attn_output.view(
-                -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
-            )
-            attn_output = attn_output.contiguous()
+        if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
+            # Note(wh): make sure input tensors use nccl allocator
+            with use_symmetric_memory(get_dcp_group()):
+                attn_output = attn_output.view(
+                    -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
+                ).clone(memory_format=torch.contiguous_format)
+                lse = lse.clone(memory_format=torch.contiguous_format)
             attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
@@ -533,6 +590,20 @@ class DeepseekMLAForwardMixin:
         output, _ = self.o_proj(attn_bmm_output)
 
         return output
+
+    def _all_gather_dcp_kv_cache(self, kv_a):
+        dcp_world_size = get_dcp_world_size()
+        dcp_rank = get_dcp_rank()
+        with use_symmetric_memory(get_dcp_group()):
+            gathered_kv_a = torch.zeros(
+                (kv_a.shape[0] * get_dcp_world_size(), *kv_a.shape[1:]),
+                dtype=kv_a.dtype,
+                device=kv_a.device,
+            )
+        idxs = torch.arange(kv_a.shape[0] * dcp_world_size)
+        mask = idxs % dcp_world_size == dcp_rank
+        gathered_kv_a[mask] = kv_a
+        return get_dcp_group().all_reduce(gathered_kv_a)
 
     def _fuse_rope_for_trtllm_mla(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
