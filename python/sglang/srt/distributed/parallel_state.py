@@ -69,6 +69,9 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
+# check whether only enable symmetric_memory for dcp group
+_DCP_ENABLE_SYMM_ONLY = get_bool_env_var("SGLANG_DCP_SYMM_ONLY", "false")
+
 
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
@@ -344,7 +347,12 @@ class GroupCoordinator:
         )
         from sglang.srt.layers.dp_attention import is_allocation_symmetric
 
-        self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
+        if _DCP_ENABLE_SYMM_ONLY:
+            self.is_symmetric_memory_enabled = (
+                lambda: group_name == "dcp" and is_symmetric_memory_enabled()
+            )
+        else:
+            self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
         self.use_symmetric_memory = use_symmetric_memory
         self.is_allocation_symmetric = is_allocation_symmetric
         if is_hip():
@@ -752,25 +760,26 @@ class GroupCoordinator:
             # Convert negative dim to positive.
             dim += input_.dim()
 
-        # Note: This will produce an incorrect answer if we don't make
-        # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-        input_tensor = input_.movedim(0, dim).contiguous()
+        with self.use_symmetric_memory(self):
+            # Note: This will produce an incorrect answer if we don't make
+            # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
+            input_tensor = input_.movedim(0, dim).contiguous()
 
         assert input_tensor.shape[0] % world_size == 0
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
-        output_tensor = torch.empty(
-            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-        )
+        with self.use_symmetric_memory(self):
+            output_tensor = torch.empty(
+                output_shape,
+                dtype=input_tensor.dtype,
+                device=input_tensor.device,
+            )
 
-        # Perform reduce-scatter operation
-        torch.distributed.reduce_scatter_tensor(
-            output_tensor, input_tensor, group=self.device_group
-        )
+        self.reduce_scatter_tensor(output_tensor, input_tensor)
 
         # Reshape before returning
-        return output_tensor.movedim(0, dim).contiguous()
+        return output_tensor.movedim(0, dim)
 
     def _reduce_scatter_tensor(
         self,
@@ -1622,9 +1631,11 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    with get_tp_group().graph_capture(
-        stream=stream
-    ) as context, get_pp_group().graph_capture(context):
+    with (
+        get_tp_group().graph_capture(stream=stream) as context,
+        get_pp_group().graph_capture(context),
+        get_dcp_group().graph_capture(context),
+    ):
         moe_ep = _MOE_EP
         if moe_ep is not None and moe_ep is not _TP:
             with moe_ep.graph_capture(context):
@@ -1977,6 +1988,16 @@ def initialize_model_parallel(
         )
     # build decode context parallel groups
     decode_context_model_parallel_size = get_dcp_size_from_env()
+    if decode_context_model_parallel_size > 1:
+        if get_tensor_model_parallel_rank() == 0:
+            logger.info(
+                f"DCP enabled, dcp_size={decode_context_model_parallel_size}, tp_size={tensor_model_parallel_size}"
+            )
+    else:
+        if get_tensor_model_parallel_rank() == 0:
+            logger.info(
+                f"DCP disabled, dcp_size={decode_context_model_parallel_size}, tp_size={tensor_model_parallel_size}"
+            )
     assert (
         tensor_model_parallel_size % decode_context_model_parallel_size == 0
     ), f"{tensor_model_parallel_size} must be divisible by decode_context_model_parallel_size"
