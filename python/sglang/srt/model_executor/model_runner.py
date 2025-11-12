@@ -63,7 +63,11 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import (
+    get_dcp_rank,
+    get_dcp_world_size,
+    monkey_patch_vllm_parallel_state,
+)
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
@@ -101,6 +105,7 @@ from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
+    DcpTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -2016,8 +2021,44 @@ class ModelRunner:
                             need_sort=need_sort,
                         )
                     else:
-                        self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                        if get_dcp_world_size() > 1:
+                            self.max_total_num_tokens *= get_dcp_world_size()
+                            self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
+                                self.max_total_num_tokens,
+                                1,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=self.token_to_kv_pool,
+                                need_sort=need_sort,
+                                dcp_rank=get_dcp_rank(),
+                                dcp_world_size=get_dcp_world_size(),
+                            )
+                        else:
+                            self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                                self.max_total_num_tokens,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=self.token_to_kv_pool,
+                                need_sort=need_sort,
+                            )
+                else:
+                    assert not self.is_hybrid
+                    if get_dcp_world_size() > 1:
+                        self.max_total_num_tokens *= get_dcp_world_size()
+                        self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
                             self.max_total_num_tokens,
+                            self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                            dcp_rank=get_dcp_rank(),
+                            dcp_world_size=get_dcp_world_size(),
+                        )
+                    else:
+                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,

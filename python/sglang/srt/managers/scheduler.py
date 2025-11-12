@@ -59,7 +59,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     prepare_abort,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import get_dcp_world_size, get_pp_group, get_world_group
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -728,6 +728,8 @@ class Scheduler(
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
 
+        if get_dcp_world_size() > 1:
+            params.page_size = params.page_size * get_dcp_world_size()
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
