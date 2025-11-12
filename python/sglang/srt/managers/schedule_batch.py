@@ -1174,6 +1174,113 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_empty(self):
         return len(self.reqs) == 0
 
+    def alloc_token_slots(
+        self,
+        num_tokens: int,
+        backup_state: bool = False,
+        token_positions: Optional[torch.Tensor] = None,
+    ):
+        self._evict_tree_cache_if_needed(num_tokens)
+
+        if backup_state:
+            state = self.token_to_kv_pool_allocator.backup_state()
+
+        out_cache_loc = self.token_to_kv_pool_allocator.alloc(
+            num_tokens, token_positions=token_positions
+        )
+        if out_cache_loc is None:
+            phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
+            error_msg = (
+                f"{phase_str} out of memory. Try to lower your batch size.\n"
+                f"Try to allocate {num_tokens} tokens.\n"
+                f"{self._available_and_evictable_str()}"
+            )
+            logger.error(error_msg)
+            if self.tree_cache is not None:
+                self.tree_cache.pretty_print()
+            raise RuntimeError(error_msg)
+
+        if backup_state:
+            return out_cache_loc, state
+        else:
+            return out_cache_loc
+
+    def alloc_paged_token_slots_extend(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        backup_state: bool = False,
+        token_positions: Optional[torch.Tensor] = None,
+    ):
+        # Over estimate the number of tokens: assume each request needs a new page.
+        num_tokens = (
+            extend_num_tokens
+            + len(seq_lens_cpu) * self.token_to_kv_pool_allocator.page_size
+        )
+        self._evict_tree_cache_if_needed(num_tokens)
+
+        if backup_state:
+            state = self.token_to_kv_pool_allocator.backup_state()
+
+        out_cache_loc = self.token_to_kv_pool_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            token_positions=token_positions,
+        )
+        if out_cache_loc is None:
+            error_msg = (
+                f"Prefill out of memory. Try to lower your batch size.\n"
+                f"Try to allocate {extend_num_tokens} tokens.\n"
+                f"{self._available_and_evictable_str()}"
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
+        if backup_state:
+            return out_cache_loc, state
+        else:
+            return out_cache_loc
+
+    def alloc_paged_token_slots_decode(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        backup_state: bool = False,
+        token_positions: Optional[torch.Tensor] = None,
+    ):
+        # Over estimate the number of tokens: assume each request needs a new page.
+        num_tokens = len(seq_lens) * self.token_to_kv_pool_allocator.page_size
+        self._evict_tree_cache_if_needed(num_tokens)
+
+        if backup_state:
+            state = self.token_to_kv_pool_allocator.backup_state()
+
+        out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(
+            seq_lens, seq_lens_cpu, last_loc, token_positions=token_positions
+        )
+        if out_cache_loc is None:
+            error_msg = (
+                f"Decode out of memory. Try to lower your batch size.\n"
+                f"Try to allocate {len(seq_lens)} tokens.\n"
+                f"{self._available_and_evictable_str()}"
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
+        if backup_state:
+            return out_cache_loc, state
+        else:
+            return out_cache_loc
+
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
         self.encoder_cached = []
