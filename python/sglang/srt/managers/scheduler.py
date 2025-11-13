@@ -1588,6 +1588,136 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
+    def self_check_during_idle(self):
+        self.check_memory()
+        self.check_tree_cache()
+        self.new_token_ratio = self.init_new_token_ratio
+        self.maybe_sleep_on_idle()
+
+    def check_memory(self):
+        if self.is_hybrid:
+            (
+                full_num_used,
+                swa_num_used,
+                _,
+                _,
+                full_available_size,
+                full_evictable_size,
+                swa_available_size,
+                swa_evictable_size,
+            ) = self._get_swa_token_info()
+            memory_leak = full_num_used != 0 or swa_num_used != 0
+            token_msg = (
+                f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {self.tree_cache.full_protected_size()=}\n"
+                f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {self.tree_cache.swa_protected_size()=}\n"
+            )
+        else:
+            _, _, available_size, evictable_size = self._get_token_info()
+            protected_size = self.tree_cache.protected_size()
+            memory_leak = (available_size + evictable_size) != (
+                # self.max_total_num_tokens
+                # if not self.enable_hierarchical_cache
+                # else self.max_total_num_tokens - protected_size
+                self.max_total_num_tokens
+                - protected_size
+            )
+            token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+
+        if memory_leak:
+            msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
+            # raise ValueError(msg)
+
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            req_total_size = (
+                self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
+            )
+        else:
+            req_total_size = self.req_to_token_pool.size
+
+        if len(self.req_to_token_pool.free_slots) != req_total_size:
+            msg = (
+                "req_to_token_pool memory leak detected!"
+                f"available_size={len(self.req_to_token_pool.free_slots)}, "
+                f"total_size={self.req_to_token_pool.size}\n"
+            )
+            raise ValueError(msg)
+
+        if (
+            self.enable_metrics
+            and self.current_scheduler_metrics_enabled()
+            and time.perf_counter() > self.metrics_collector.last_log_time + 30
+        ):
+            # During idle time, also collect metrics every 30 seconds.
+            if self.is_hybrid:
+                (
+                    full_num_used,
+                    swa_num_used,
+                    full_token_usage,
+                    swa_token_usage,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = self._get_swa_token_info()
+                num_used = max(full_num_used, swa_num_used)
+                token_usage = max(full_token_usage, swa_token_usage)
+            else:
+                num_used, token_usage, _, _ = self._get_token_info()
+            num_running_reqs = len(self.running_batch.reqs)
+            self.stats.num_running_reqs = num_running_reqs
+            self.stats.num_used_tokens = num_used
+            self.stats.token_usage = round(token_usage, 2)
+            self.stats.gen_throughput = 0
+            self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.stats.num_prefill_prealloc_queue_reqs = len(
+                    self.disagg_prefill_bootstrap_queue.queue
+                )
+                self.stats.num_prefill_inflight_queue_reqs = len(
+                    self.disagg_prefill_inflight_queue
+                )
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                self.stats.num_decode_prealloc_queue_reqs = len(
+                    self.disagg_decode_prealloc_queue.queue
+                )
+                self.stats.num_decode_transfer_queue_reqs = len(
+                    self.disagg_decode_transfer_queue.queue
+                )
+            self.metrics_collector.log_stats(self.stats)
+        self._publish_kv_events()
+
+    def _get_token_info(self):
+        available_size = self.token_to_kv_pool_allocator.available_size()
+        evictable_size = self.tree_cache.evictable_size()
+        num_used = self.max_total_num_tokens - (available_size + evictable_size)
+        token_usage = num_used / self.max_total_num_tokens
+        return num_used, token_usage, available_size, evictable_size
+
+    def _get_swa_token_info(self):
+        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        full_evictable_size = self.tree_cache.full_evictable_size()
+        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+        swa_evictable_size = self.tree_cache.swa_evictable_size()
+        full_num_used = self.full_tokens_per_layer - (
+            full_available_size + full_evictable_size
+        )
+        swa_num_used = self.swa_tokens_per_layer - (
+            swa_available_size + swa_evictable_size
+        )
+        full_token_usage = full_num_used / self.full_tokens_per_layer
+        swa_token_usage = swa_num_used / self.swa_tokens_per_layer
+        return (
+            full_num_used,
+            swa_num_used,
+            full_token_usage,
+            swa_token_usage,
+            full_available_size,
+            full_evictable_size,
+            swa_available_size,
+            swa_evictable_size,
+        )
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
