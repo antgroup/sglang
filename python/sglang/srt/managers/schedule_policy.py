@@ -29,6 +29,11 @@ from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.distributed.parallel_state import get_dcp_world_size
+
+def compute_dcp_local_max_new_tokens(tokens: int):
+    return (tokens + get_dcp_world_size() -1) // get_dcp_world_size()
+
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -365,7 +370,7 @@ class PrefillAdder:
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
             min(
-                (req.sampling_params.max_new_tokens - len(req.output_ids)),
+                compute_dcp_local_max_new_tokens(req.sampling_params.max_new_tokens - len(req.output_ids)),
                 CLIP_MAX_NEW_TOKENS,
             )
             * self.new_token_ratio
@@ -444,7 +449,7 @@ class PrefillAdder:
             0,
             req.extend_input_len,
             (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                min(compute_dcp_local_max_new_tokens(req.sampling_params.max_new_tokens), CLIP_MAX_NEW_TOKENS)
                 if not truncated
                 else 0
             ),
@@ -479,7 +484,7 @@ class PrefillAdder:
             new_token_ratio = (
                 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
             )
-            tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
+            tokens_left = compute_dcp_local_max_new_tokens(r.sampling_params.max_new_tokens) * new_token_ratio - len(
                 r.output_ids
             )
             tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
@@ -533,7 +538,7 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_input_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                min(compute_dcp_local_max_new_tokens(req.sampling_params.max_new_tokens), CLIP_MAX_NEW_TOKENS),
             )
         else:
             if self.rem_chunk_tokens == 0:
@@ -557,7 +562,7 @@ class PrefillAdder:
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+            compute_dcp_local_max_new_tokens(req.sampling_params.max_new_tokens), CLIP_MAX_NEW_TOKENS
         )
 
         # adjusting the input_tokens based on host_hit_length and page_size
@@ -602,7 +607,7 @@ class PrefillAdder:
                     prefix_len,
                     input_tokens,
                     min(
-                        req.sampling_params.max_new_tokens,
+                        compute_dcp_local_max_new_tokens(req.sampling_params.max_new_tokens),
                         CLIP_MAX_NEW_TOKENS,
                     ),
                 )
@@ -657,7 +662,7 @@ class PrefillAdder:
         preemptible_reqs = []
         min_tokens_to_remove = (
             req.extend_input_len
-            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            + min(compute_dcp_local_max_new_tokens(req.sampling_params.max_new_tokens), CLIP_MAX_NEW_TOKENS)
             - self.rem_total_tokens
         )
         for running_req in sorted_running_reqs:
