@@ -183,6 +183,7 @@ def concat_and_cast_mha_k_triton(
     )
 
 
+@triton.jit
 def _correct_attn_cp_out_kernel(
     outputs_ptr,
     new_output_ptr,
