@@ -1821,6 +1821,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
@@ -1915,6 +1916,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch=forward_batch,
                 layer_id=self.layer_id,
             )
+
         # TODO(augusto.yjh) 这里要all_gather q_pe 和 q_node_out,以 tp8为例， [1, 8, 64] [1, 8, 512] 经过all gather后为 [1, 64, 64] [1, 64, 512], k_pe 为 [1, 1, 64], k_nope 为 [1, 1, 512], 从 local heads到all heads
         if get_dcp_world_size() > 1:
             q_pe = q_pe.contiguous()
@@ -1952,6 +1954,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     "cos_sin_cache": self.rotary_emb.cos_sin_cache,
                     "is_neox": self.rotary_emb.is_neox_style,
                 }
+
             # TODO(augusto.yjh) 返回lse, correct attn_output
             attn_output, lse = self.attn_mqa(
                 q_nope_out,
