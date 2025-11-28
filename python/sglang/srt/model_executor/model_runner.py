@@ -1980,6 +1980,7 @@ class ModelRunner:
                         )
                     else:
                         if get_dcp_world_size() > 1:
+                            self.max_total_num_tokens *= get_dcp_world_size()
                             self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
                                 self.max_total_num_tokens,
                                 1,
@@ -2001,6 +2002,7 @@ class ModelRunner:
                 else:
                     assert not self.is_hybrid
                     if get_dcp_world_size() > 1:
+                        self.max_total_num_tokens *= get_dcp_world_size()
                         self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
                             self.max_total_num_tokens,
                             self.page_size,

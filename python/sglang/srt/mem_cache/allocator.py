@@ -581,6 +581,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 
 # expand page-size to page-size * dcp_world_size
+# size is actual kv pool size * dcp_world_size
 class DcpTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def __init__(
@@ -594,13 +595,11 @@ class DcpTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         dcp_rank: int = 0,
         dcp_world_size: int = 1,
     ):
-        super().__init__(
-            size * dcp_world_size, page_size, dtype, device, kvcache, need_sort
-        )
+        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.dcp_rank = dcp_rank
         self.dcp_world_size = dcp_world_size
         self.real_allocator = PagedTokenToKVPoolAllocator(
-            size * dcp_world_size,
+            size,
             dcp_world_size * page_size,
             dtype,
             device,
