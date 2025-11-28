@@ -769,6 +769,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 filtered_paged_kernel_lens, filterd_kv_indices = filter_seq_indices(
                     paged_kernel_lens, kv_indptr, get_dcp_rank(), get_dcp_world_size()
                 )
+                kv_indices = kv_indices // get_dcp_world_size()
                 if init_metadata_replay:
                     # For cuda graph replay, we must pack the DCP-filtered indices
                     # back into the shared kv_indices buffer so that the FlashInfer

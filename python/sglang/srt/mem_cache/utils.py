@@ -49,6 +49,7 @@ def set_mla_kv_buffer_kernel(
     loc = tl.load(loc_ptr + pid_loc)
     is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
     safe_loc = tl.where(is_valid, loc, 0)
+    safe_loc = safe_loc // DCP_WORLD_SIZE
     dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
 
     if base + BLOCK <= nope_dim:
