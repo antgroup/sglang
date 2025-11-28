@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 import triton
@@ -200,7 +200,6 @@ def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
     backup_state: bool = False,
-    token_positions: Optional[torch.Tensor] = None,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -209,7 +208,7 @@ def alloc_token_slots(
     if backup_state:
         state = allocator.backup_state()
 
-    out_cache_loc = allocator.alloc(num_tokens, token_positions=token_positions)
+    out_cache_loc = allocator.alloc(num_tokens)
 
     if out_cache_loc is None:
         error_msg = (
@@ -259,7 +258,6 @@ def alloc_paged_token_slots_extend(
     last_loc: torch.Tensor,
     extend_num_tokens: int,
     backup_state: bool = False,
-    token_positions: Optional[torch.Tensor] = None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -277,7 +275,6 @@ def alloc_paged_token_slots_extend(
         seq_lens_cpu,
         last_loc,
         extend_num_tokens,
-        token_positions=token_positions,
     )
 
     if out_cache_loc is None:
@@ -355,29 +352,9 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
-    # Build token positions for DCP interleaved storage
-    token_positions = None
-    try:
-        from sglang.srt.distributed.parallel_state import get_dcp_world_size
-
-        if get_dcp_world_size() > 1:
-            # Build token positions: each token's position in its sequence (0-indexed)
-            token_positions_list = []
-            for req in batch.reqs:
-                seq_len = len(req.fill_ids)
-                # Positions for extend tokens (after prefix)
-                pre_len = len(req.prefix_indices)
-                extend_positions = torch.arange(pre_len, seq_len, dtype=torch.int64)
-                token_positions_list.append(extend_positions)
-            if token_positions_list:
-                token_positions = torch.cat(token_positions_list).to(batch.device)
-    except (ImportError, AttributeError):
-        pass
     # Allocate KV cache (throws exception on failure)
     if batch.tree_cache.page_size == 1:
-        out_cache_loc = alloc_token_slots(
-            batch.tree_cache, batch.extend_num_tokens, token_positions=token_positions
-        )
+        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Since tree_cache.page_size is (page_size * get_dcp_world_size), for dcp, always use alloc_paged_token_slots_extend
         # Paged allocation - build last_loc
@@ -393,7 +370,6 @@ def alloc_for_extend(
             seq_lens_cpu=batch.seq_lens_cpu,
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
-            token_positions=token_positions,
         )
 
     # Write to req_to_token_pool
@@ -420,7 +396,6 @@ def alloc_paged_token_slots_decode(
     seq_lens_cpu: torch.Tensor,
     last_loc: torch.Tensor,
     token_per_req: int = 1,
-    token_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -428,9 +403,7 @@ def alloc_paged_token_slots_decode(
     num_tokens = len(seq_lens) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
-    out_cache_loc = allocator.alloc_decode(
-        seq_lens, seq_lens_cpu, last_loc, token_positions=token_positions
-    )
+    out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
 
     if out_cache_loc is None:
         error_msg = (
@@ -460,21 +433,10 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             )
 
     bs = batch.seq_lens.shape[0]
-    # Build token positions for DCP interleaved storage
-    token_positions = None
-    try:
-        from sglang.srt.distributed.parallel_state import get_dcp_world_size
 
-        if get_dcp_world_size() > 1:
-            # For decode, token position is seq_len (the last token position)
-            token_positions = (batch.seq_lens).to(torch.int64)
-    except (ImportError, AttributeError):
-        pass
     if batch.tree_cache.page_size == 1:
         # Non-paged allocation
-        out_cache_loc = alloc_token_slots(
-            batch.tree_cache, bs * token_per_req, token_positions=token_positions
-        )
+        out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
         # Paged allocation
         last_loc = batch.req_to_token_pool.req_to_token[
@@ -487,7 +449,6 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
             last_loc=last_loc,
             token_per_req=token_per_req,
-            token_positions=token_positions,
         )
 
     # Write to req_to_token_pool
