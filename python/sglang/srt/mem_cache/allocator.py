@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from python.sglang.srt.mem_cache.memory_pool import KVCache
-
 """
 Copyright 2025 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,10 +31,6 @@ from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
-
-import logging
-
-logger = logging.getLogger(__name__)
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
