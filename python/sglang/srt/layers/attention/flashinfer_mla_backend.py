@@ -769,16 +769,17 @@ class FlashInferMLAIndicesUpdaterDecode:
                 filtered_paged_kernel_lens, filterd_kv_indices = filter_seq_indices(
                     paged_kernel_lens, kv_indptr, get_dcp_rank(), get_dcp_world_size()
                 )
-                kv_indices = kv_indices // get_dcp_world_size()
                 if init_metadata_replay:
                     # For cuda graph replay, we must pack the DCP-filtered indices
                     # back into the shared kv_indices buffer so that the FlashInfer
                     # kernel reads a contiguous prefix of valid entries.
-                    local_kv_indices = kv_indices[filterd_kv_indices]
+                    local_kv_indices = (
+                        kv_indices[filterd_kv_indices] // get_dcp_world_size()
+                    )
                     kv_indices[: local_kv_indices.numel()] = local_kv_indices
                 else:
                     # Non-replay path can keep using a shrunk tensor.
-                    kv_indices = kv_indices[filterd_kv_indices]
+                    kv_indices = kv_indices[filterd_kv_indices] // get_dcp_world_size()
                 kv_lens = filtered_paged_kernel_lens.to(torch.int32)
                 kv_indptr[1 : bs + 1] = torch.cumsum(filtered_paged_kernel_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
