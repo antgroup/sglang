@@ -2665,7 +2665,7 @@ class ModelRunner:
                 )
 
                 dcp_prefix_kv_indices = torch.empty(
-                    forward_batch.extend_prefix_lens_cpu.sum().item(),
+                    sum(forward_batch.extend_prefix_lens_cpu),
                     dtype=torch.int32,
                     device=get_global_server_args().device,
                 )
