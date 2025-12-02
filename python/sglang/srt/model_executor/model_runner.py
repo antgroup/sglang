@@ -2661,7 +2661,7 @@ class ModelRunner:
                 )
                 extend_cu_prefix_lens = extend_cu_prefix_lens[:-1]
                 extend_prefix_lens_sum = sum(
-                    [i for i in forward_batch.extend_seq_lens_cpu]
+                    [i for i in forward_batch.extend_prefix_lens_cpu]
                 )
 
                 dcp_prefix_kv_indices = torch.empty(
