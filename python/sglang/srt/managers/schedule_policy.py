@@ -485,7 +485,9 @@ class PrefillAdder:
             finally:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool):
+    def add_one_req_ignore_eos(
+        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+    ):
         # Early exit if no enough tokens for the input tokens
         if self.ceil_paged_tokens(req.extend_input_len) > min(
             self.cur_rem_tokens, self.rem_total_tokens
@@ -558,6 +560,13 @@ class PrefillAdder:
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
+            if truncation_align_size is not None:
+                if trunc_len < truncation_align_size:
+                    return AddReqResult.OTHER
+                else:
+                    trunc_len = truncation_align_size * (
+                        trunc_len // truncation_align_size
+                    )
 
             req.extend_input_len = trunc_len
             req.fill_ids = req.fill_ids[:trunc_len]
@@ -576,7 +585,9 @@ class PrefillAdder:
         if self.nsa_enable_prefill_cp and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req, has_chunked_req)
+            return self.add_one_req_ignore_eos(
+                req, has_chunked_req, truncation_align_size
+            )
 
         total_tokens = req.extend_input_len + min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
