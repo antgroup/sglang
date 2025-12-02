@@ -2669,7 +2669,7 @@ class ModelRunner:
                     dtype=torch.int32,
                     device=get_global_server_args().device,
                 )
-                create_chunked_prefix_cache_kv_indices(
+                create_chunked_prefix_cache_kv_indices[(len(forward_batch.seq_lens),)](
                     forward_batch.req_to_token_pool.req_to_token,
                     forward_batch.req_pool_indices,
                     extend_prefix_starts,
