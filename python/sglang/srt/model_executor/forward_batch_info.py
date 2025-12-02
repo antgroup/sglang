@@ -354,6 +354,13 @@ class ForwardBatch:
     # Record the split metadata of the sequence number of NSA context parallels.
     nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
 
+    # For decode context parallel
+    dcp_kv_indptr: Optional[torch.Tensor] = None
+    dcp_local_prefix_kv_indices: Optional[torch.Tensor] = None
+    dcp_kv_buffer: Optional[torch.Tensor] = None
+    dcp_kv_indices: Optional[torch.Tensor] = None
+    dcp_extend_prefix_lens_sum: Optional[int] = None
+
     @classmethod
     def init_new(
         cls,
