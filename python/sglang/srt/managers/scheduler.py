@@ -672,6 +672,8 @@ class Scheduler(
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
         )
+
+    def init_truncation_align_size_for_dcp(self):
         if get_dcp_world_size() > 1:
             if self.truncation_align_size is None:
                 self.truncation_align_size = get_dcp_world_size()
