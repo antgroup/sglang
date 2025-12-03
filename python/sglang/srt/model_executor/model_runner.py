@@ -2731,9 +2731,9 @@ class ModelRunner:
                         mask = offset < prefix_len
                         data = (
                             prefix_start
-                            + (offset % local_prefix_len)
-                            + (offset // local_prefix_len)
+                            + (offset % dcp_world_size)
                             * (extend_prefix_lens_sum // dcp_world_size)
+                            + (offset // dcp_world_size % local_prefix_len)
                         )
                         tl.store(
                             kv_indices_ptr + kv_ind_start + offset, data, mask=mask
