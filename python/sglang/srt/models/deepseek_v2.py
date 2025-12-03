@@ -1783,6 +1783,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
             if get_dcp_world_size() > 1:
                 kv_a = self._all_gather_dcp_kv_cache(kv_a)
+                k_pe = self._all_gather_dcp_kv_cache(k_pe)
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
@@ -2558,6 +2559,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             if get_dcp_world_size() > 1:
                 kv_a_normed = self._all_gather_dcp_kv_cache(kv_a_normed)
+                k_pe = self._all_gather_dcp_kv_cache(k_pe)
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
