@@ -2684,7 +2684,7 @@ class ModelRunner:
                     device=get_global_server_args().device,
                 )
                 dcp_kv_indptr[1:] = forward_batch.seq_lens.cumsum(dim=0)
-                dcp_kv_indptr = dcp_kv_indptr[:-1]
+                dcp_kv_indptr = dcp_kv_indptr[: (len(forward_batch.seq_lens) + 1)]
                 forward_batch.dcp_kv_indptr = dcp_kv_indptr
                 forward_batch.dcp_local_prefix_kv_indices = (
                     dcp_prefix_kv_indices[::8] // get_dcp_world_size()
