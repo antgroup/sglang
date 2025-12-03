@@ -2692,9 +2692,10 @@ class DeepseekV2AttentionMLA(nn.Module):
     ):
         if _is_cuda or _use_aiter_gfx95:
             if get_dcp_world_size() > 1:
-                kv_indices = kv_indices[
-                    kv_indices % get_dcp_world_size() == get_dcp_rank()
-                ]
+                kv_indices = (
+                    kv_indices[kv_indices % get_dcp_world_size() == get_dcp_rank()]
+                    // get_dcp_world_size()
+                )
             kv_a, k_pe = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )
