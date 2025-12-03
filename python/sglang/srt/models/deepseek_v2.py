@@ -44,6 +44,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed import (
     divide,
     get_dcp_group,
+    get_dcp_rank,
     get_dcp_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -1780,6 +1781,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                     q.dtype,
                     forward_batch,
                 )
+            if get_dcp_world_size() > 1:
+                kv_a = self._all_gather_dcp_kv_cache(kv_a)
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
@@ -2522,6 +2525,20 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         return output
 
+    def _all_gather_dcp_kv_cache(self, kv_a):
+        dcp_world_size = get_dcp_world_size()
+        dcp_rank = get_dcp_rank()
+        gathered_kv_a = torch.empty(
+            (kv_a.shape[0] * get_dcp_world_size(), *kv_a.shape[1:]),
+            dtype=kv_a.dtype,
+            device=kv_a.device,
+        )
+        idxs = torch.arange(kv_a.shape[0] * dcp_world_size)
+        mask = idxs % dcp_world_size == dcp_rank
+        gathered_kv_a[mask] = kv_a
+        get_dcp_group().all_reduce(gathered_kv_a)
+        return gathered_kv_a
+
     def _chunked_prefix_attn_mha(
         self,
         q: torch.Tensor,
@@ -2539,6 +2556,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             kv_a_normed, k_pe = self._get_mla_kv_buffer(
                 kv_indices, q.dtype, forward_batch
             )
+            if get_dcp_world_size() > 1:
+                kv_a_normed = self._all_gather_dcp_kv_cache(kv_a_normed)
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -2670,6 +2689,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
+            if get_dcp_world_size() > 1:
+                kv_indices = kv_indices[
+                    kv_indices % get_dcp_world_size() == get_dcp_rank()
+                ]
             kv_a, k_pe = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )
