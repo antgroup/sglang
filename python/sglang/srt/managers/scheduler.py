@@ -671,6 +671,15 @@ class Scheduler(
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
         )
+        if get_dcp_world_size() > 1:
+            if self.truncation_align_size is None:
+                self.truncation_align_size = get_dcp_world_size()
+            else:
+                import math
+
+                self.truncation_align_size = (
+                    self.truncation_align_size * get_dcp_world_size()
+                ) // (math.gcd(self.truncation_align_size, get_dcp_world_size()))
 
     def init_tokenizer(self):
         server_args = self.server_args
