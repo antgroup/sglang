@@ -2070,7 +2070,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 }
 
             # TODO(augusto.yjh) 返回lse, correct attn_output
-            if forward_batch.forward_mode.is_decode() and get_dcp_world_size > 1:
+            if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
                 attn_output, lse = self.attn_mqa_for_dcp_decode(
                     q_nope_out,
                     k_nope,
