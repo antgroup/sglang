@@ -1775,15 +1775,24 @@ class DeepseekV2AttentionMLA(nn.Module):
                 # FP8 path: dequantize NSA-specific FP8 format to BF16
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8(forward_batch)
             else:
-                # BF16/FP16 path: directly fetch from cache
-                kv_a, k_pe = self._get_mla_kv_buffer(
-                    forward_batch.fetch_mha_one_shot_kv_indices(),
-                    q.dtype,
-                    forward_batch,
-                )
-            if get_dcp_world_size() > 1:
-                kv_a = self._all_gather_dcp_kv_cache(kv_a)
-                k_pe = self._all_gather_dcp_kv_cache(k_pe)
+                if get_dcp_world_size() > 1:
+                    prefix_kv_a = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
+                        self.attn_mqa, forward_batch.dcp_local_prefix_kv_indices
+                    )
+                    prefix_k_pe = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
+                        self.attn_mqa, forward_batch.dcp_local_prefix_kv_indices
+                    )
+                    prefix_kv_a = self._all_gather_dcp_kv_cache(prefix_kv_a)
+                    prefix_k_pe = self._all_gather_dcp_kv_cache(prefix_k_pe)
+                    kv_a = torch.cat((prefix_kv_a, kv_a), dim=0)
+                    k_pe = torch.cat((prefix_k_pe, k_pe), dim=0)
+                else:
+                    # BF16/FP16 path: directly fetch from cache
+                    kv_a, k_pe = self._get_mla_kv_buffer(
+                        forward_batch.fetch_mha_one_shot_kv_indices(),
+                        q.dtype,
+                        forward_batch,
+                    )
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
