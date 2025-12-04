@@ -1776,13 +1776,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8(forward_batch)
             else:
                 if get_dcp_world_size() > 1:
-                    prefix_kv_a = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
-                        self.attn_mqa, forward_batch.dcp_local_prefix_kv_indices
+                    prefix_kv_a, prefix_k_pe = (
+                        forward_batch.token_to_kv_pool.get_mla_kv_buffer(
+                            self.attn_mqa, forward_batch.dcp_local_prefix_kv_indices
+                        )
                     )
-                    prefix_k_pe = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
-                        self.attn_mqa, forward_batch.dcp_local_prefix_kv_indices
-                    )
-                    prefix_kv_a = self._all_gather_dcp_kv_cache(prefix_kv_a)
+                    prefix_kv_a = self._all_gather_dcp_kv_cache(prefix_kv_a.squeeze(1))
                     prefix_k_pe = self._all_gather_dcp_kv_cache(prefix_k_pe)
                     kv_a = torch.cat((prefix_kv_a, kv_a), dim=0)
                     k_pe = torch.cat((prefix_k_pe, k_pe), dim=0)
