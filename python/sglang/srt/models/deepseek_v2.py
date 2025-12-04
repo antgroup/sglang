@@ -1783,8 +1783,32 @@ class DeepseekV2AttentionMLA(nn.Module):
                     )
                     prefix_kv_a = self._all_gather_dcp_kv_cache(prefix_kv_a.squeeze(1))
                     prefix_k_pe = self._all_gather_dcp_kv_cache(prefix_k_pe)
-                    kv_a = torch.cat((prefix_kv_a, kv_a), dim=0)
-                    k_pe = torch.cat((prefix_k_pe, k_pe), dim=0)
+                    # re-organize kv with query orders
+                    prefix_lens_cu = torch.zeros(
+                        len(forward_batch.seq_lens) + 1,
+                        dtype=torch.int32,
+                        device=kv_a.device,
+                    )
+                    extend_lens_cu = torch.zeros_like(prefix_lens_cu)
+                    prefix_lens_cu[1:] = torch.cumsum(
+                        forward_batch.extend_prefix_lens, dim=0
+                    )
+                    extend_lens_cu[1:] = torch.cumsum(
+                        forward_batch.extend_seq_lens, dim=0
+                    )
+                    kv_a_tuple = ()
+                    k_pe_tuple = ()
+                    for i in range(len(forward_batch.seq_lens)):
+                        kv_a_tuple += (
+                            prefix_kv_a[prefix_lens_cu[i] : prefix_lens_cu[i + 1]],
+                            kv_a[extend_lens_cu[i] : extend_lens_cu[i + 1]],
+                        )
+                        k_pe_tuple += (
+                            prefix_k_pe[prefix_lens_cu[i] : prefix_lens_cu[i + 1]],
+                            k_pe[extend_lens_cu[i] : extend_lens_cu[i + 1]],
+                        )
+                    kv_a = torch.cat(kv_a_tuple, dim=0)
+                    k_pe = torch.cat(k_pe_tuple, dim=0)
                 else:
                     # BF16/FP16 path: directly fetch from cache
                     kv_a, k_pe = self._get_mla_kv_buffer(
@@ -2537,7 +2561,7 @@ class DeepseekV2AttentionMLA(nn.Module):
     def _all_gather_dcp_kv_cache(self, kv_a):
         dcp_world_size = get_dcp_world_size()
         dcp_rank = get_dcp_rank()
-        gathered_kv_a = torch.empty(
+        gathered_kv_a = torch.zeros(
             (kv_a.shape[0] * get_dcp_world_size(), *kv_a.shape[1:]),
             dtype=kv_a.dtype,
             device=kv_a.device,
@@ -2545,8 +2569,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         idxs = torch.arange(kv_a.shape[0] * dcp_world_size)
         mask = idxs % dcp_world_size == dcp_rank
         gathered_kv_a[mask] = kv_a
-        get_dcp_group().all_reduce(gathered_kv_a)
-        return gathered_kv_a
+        return get_dcp_group().all_reduce(gathered_kv_a)
 
     def _chunked_prefix_attn_mha(
         self,
