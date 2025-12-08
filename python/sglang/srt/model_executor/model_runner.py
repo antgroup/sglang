@@ -2057,6 +2057,7 @@ class ModelRunner:
                             dcp_world_size=get_dcp_world_size(),
                         )
                     else:
+                        assert not self.is_hybrid_swa
                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                             self.max_total_num_tokens,
                             page_size=self.page_size,
@@ -2065,16 +2066,6 @@ class ModelRunner:
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
                         )
-                else:
-                    assert not self.is_hybrid_swa
-                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
         else:
             assert self.is_draft_worker
 
