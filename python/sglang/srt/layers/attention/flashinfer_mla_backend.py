@@ -660,7 +660,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             k_buffer[:, :, : layer.v_head_dim],
             k_buffer[:, :, layer.v_head_dim :],
             out=o,
-            return_lse=forward_batch.forward_mode.is_decode(),
+            return_lse=forward_batch.dcp_kv_buffer is not None,
         )
         return out
 
