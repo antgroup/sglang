@@ -684,17 +684,6 @@ class Scheduler(
                     self.truncation_align_size * get_dcp_world_size()
                 ) // (math.gcd(self.truncation_align_size, get_dcp_world_size()))
 
-    def init_truncation_align_size_for_dcp(self):
-        if get_dcp_world_size() > 1:
-            if self.truncation_align_size is None:
-                self.truncation_align_size = get_dcp_world_size()
-            else:
-                import math
-
-                self.truncation_align_size = (
-                    self.truncation_align_size * get_dcp_world_size()
-                ) // (math.gcd(self.truncation_align_size, get_dcp_world_size()))
-
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
