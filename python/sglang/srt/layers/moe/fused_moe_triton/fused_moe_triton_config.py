@@ -264,7 +264,8 @@ def try_get_optimal_moe_config(
         assert (
             down_config is None or config["BLOCK_SIZE_M"] == down_config["BLOCK_SIZE_M"]
         )
-        return config, (down_config, max_block_m)
+        return config, down_config, max_block_m
+    config.pop("USE_TMA", False)
     return config
 
 

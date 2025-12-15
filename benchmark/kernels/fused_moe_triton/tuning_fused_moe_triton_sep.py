@@ -5,6 +5,7 @@ import os
 import time
 from contextlib import nullcontext
 from datetime import datetime
+from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 import ray
@@ -20,9 +21,7 @@ from common_utils import (
     sort_config,
 )
 from ray.experimental.tqdm_ray import tqdm
-from sgl_kernel import silu_and_mul
 
-from sglang.srt.layers.moe.fused_moe_triton import override_config
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     get_config_dtype_str,
     invoke_fused_moe_kernel,
@@ -36,6 +35,49 @@ from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
+
+
+class KernelWrapper:
+    def __init__(self, *args, use_cuda_graph=True, loop_cnt=10, **kwargs):
+        self.func = invoke_fused_moe_kernel
+        self.use_cuda_graph = use_cuda_graph
+        self.loop_cnt = loop_cnt
+        self.args = args
+        self.kwargs = kwargs
+        if use_cuda_graph:
+            self.graph = self.cuda_graph_wrapper()
+        else:
+            self.graph = None
+
+    def cuda_graph_wrapper(self):
+        self.func(*self.args, **self.kwargs)
+        torch.cuda.synchronize()
+
+        # Capture 10 invocations with CUDA graph
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(self.loop_cnt):
+                self.func(*self.args, **self.kwargs)
+        torch.cuda.synchronize()
+
+        # Warmup
+        for _ in range(5):
+            graph.replay()
+        torch.cuda.synchronize()
+        return graph
+
+    def forward(self):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        if self.use_cuda_graph:
+            self.graph.replay()
+        else:
+            for i in range(self.loop_cnt):
+                self.func(*self.args, **self.kwargs)
+        end_event.record()
+        torch.cuda.synchronize()
+        return start_event.elapsed_time(end_event)
 
 
 def benchmark_config(
@@ -86,7 +128,6 @@ def benchmark_config(
         w2 = torch.randn(
             num_experts, hidden_size, shard_intermediate_size // 2, dtype=init_dtype
         )
-    gating_output = torch.randn(num_iters, num_tokens, num_experts, dtype=torch.float32)
 
     w1_scale = None
     w2_scale = None
@@ -131,195 +172,192 @@ def benchmark_config(
         renormalize=True,
     )
     topk_output = select_experts(hidden_states, input_gating, topk_config)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_output.topk_ids, config["BLOCK_SIZE_M"], num_experts
+    )
 
-    def prepare(i: int):
-        input_gating = gating_output[i]
-        topk_ids = torch.load(f"{topk_ids_dir}/topk_ids_layer{i%58+3}_idx{i//58}.pt")
-        new_topk_output = select_experts(hidden_states, input_gating, topk_config)
-        topk_output.topk_weights.copy_(new_topk_output.topk_weights)
+    M = hidden_states.shape[0]
+    E, N, _ = w1.shape
+
+    padded_tokens = min(M * topk, E + 1) * (
+        config["BLOCK_SIZE_M"] - 1
+    )  # if moe_use_tma else 0
+    total_tokens = M * topk + padded_tokens
+    cache = torch.empty(
+        total_tokens * max(N, w2.shape[1]),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    intermediate_cache1 = cache[: total_tokens * N].view(
+        (total_tokens, N),
+    )
+    intermediate_cache2 = torch.empty(
+        (total_tokens, N // 2),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    intermediate_cache3 = cache[: M * topk * w2.shape[1]].view(
+        (M, topk, w2.shape[1]),
+    )
+
+    compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+    moe_runner_config = MoeRunnerConfig(
+        inplace=True,
+    )
+    apply_router_weight_on_input = moe_runner_config.apply_router_weight_on_input
+
+    @lru_cache
+    def load_topk_ids(topk_ids_dir, i: int):
+        num_layers = 61
+        dense_layers = 3
+        moe_layers = num_layers - dense_layers
+        return torch.load(
+            f"{topk_ids_dir}/topk_ids_layer{i % moe_layers + dense_layers}_idx{i // moe_layers}.pt"
+        )
+
+    def prepare(i: int):  # update inputs according to topk_ids
+        topk_ids = load_topk_ids(topk_ids_dir, i)
         tokens, _topk = topk_output.topk_ids.shape
         topk_output.topk_ids.copy_(topk_ids[:tokens, :_topk])
-        topk_output.router_logits.copy_(new_topk_output.router_logits)
-
-    moe_use_tma = False
-
-    def run():
-        moe_runner_config = MoeRunnerConfig(
-            inplace=True,
+        sorted_token_ids_, expert_ids_, num_tokens_post_padded_ = moe_align_block_size(
+            topk_output.topk_ids, config["BLOCK_SIZE_M"], num_experts
         )
-        topk_weights, topk_ids, _ = topk_output
+        sorted_token_ids.copy_(sorted_token_ids_)
+        expert_ids.copy_(expert_ids_)
+        num_tokens_post_padded.copy_(num_tokens_post_padded_)
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, config["BLOCK_SIZE_M"], num_experts
+    def get_kernel_wrapper(moe_use_tma, loop_cnt, use_cuda_graph):
+        kernel0 = KernelWrapper(
+            hidden_states,
+            w1,
+            None,
+            intermediate_cache1,
+            None,
+            w1_scale,
+            None,
+            topk_output.topk_weights,
+            topk_output.topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            apply_router_weight_on_input,
+            topk_output.topk_ids.shape[1],
+            config,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            per_channel_quant=False,
+            block_shape=block_shape,
+            b_use_tma=moe_use_tma,
+            c_sorted=moe_use_tma,
+            filter_expert=False,
+            use_cuda_graph=use_cuda_graph,
+            loop_cnt=loop_cnt,
         )
-        M = hidden_states.shape[0]
-        E, N, _ = w1.shape
+        kernel1 = KernelWrapper(
+            intermediate_cache2,
+            w2,
+            None,
+            intermediate_cache3,
+            a2_scale,
+            w2_scale,
+            None,
+            topk_output.topk_weights,
+            topk_output.topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            not apply_router_weight_on_input,
+            1,
+            config,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            per_channel_quant=False,
+            block_shape=block_shape,
+            a_use_tma=moe_use_tma,
+            b_use_tma=moe_use_tma,
+            filter_expert=False,
+            use_cuda_graph=use_cuda_graph,
+            loop_cnt=loop_cnt,
+        )
+        return kernel0, kernel1
 
-        topk = topk_ids.shape[1]
-        padded_tokens = (
-            min(M * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1) if moe_use_tma else 0
-        )
-        total_tokens = M * topk + padded_tokens
-        cache = torch.empty(
-            total_tokens * max(N, w2.shape[1]),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        intermediate_cache1 = cache[: total_tokens * N].view(
-            (total_tokens, N),
-        )
-        intermediate_cache2 = torch.empty(
-            (total_tokens, N // 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        intermediate_cache3 = cache[: M * topk * w2.shape[1]].view(
-            (M, topk, w2.shape[1]),
-        )
+    loop_cnt = 10 if not ncu_enable else 1
+    use_cuda_graph = True if not ncu_enable else False
 
-        compute_type = (
-            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
-        )
-        apply_router_weight_on_input = moe_runner_config.apply_router_weight_on_input
-
-        with override_config(config):
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize()
-            start_event.record()
-            for _ in range(10 if not ncu_enable else 1):
-                invoke_fused_moe_kernel(
-                    hidden_states,
-                    w1,
-                    None,
-                    intermediate_cache1,
-                    None,
-                    w1_scale,
-                    None,
-                    topk_weights,
-                    topk_ids,
-                    sorted_token_ids,
-                    expert_ids,
-                    num_tokens_post_padded,
-                    apply_router_weight_on_input,
-                    topk_ids.shape[1],
-                    config,
-                    compute_type=compute_type,
-                    use_fp8_w8a8=use_fp8_w8a8,
-                    use_int8_w8a8=False,
-                    use_int8_w8a16=False,
-                    use_int4_w4a16=False,
-                    per_channel_quant=False,
-                    block_shape=block_shape,
-                    b_use_tma=moe_use_tma,
-                    c_sorted=moe_use_tma,
-                    filter_expert=False,
-                )
-            end_event.record()
-            end_event.synchronize()
-            time_cost0 = start_event.elapsed_time(end_event)
-
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize()
-            start_event.record()
-
-            silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            for _ in range(10 if not ncu_enable else 1):
-                invoke_fused_moe_kernel(
-                    intermediate_cache2,
-                    w2,
-                    None,
-                    intermediate_cache3,
-                    a2_scale,
-                    w2_scale,
-                    None,
-                    topk_weights,
-                    topk_ids,
-                    sorted_token_ids,
-                    expert_ids,
-                    num_tokens_post_padded,
-                    not apply_router_weight_on_input,
-                    1,
-                    config,
-                    compute_type=compute_type,
-                    use_fp8_w8a8=use_fp8_w8a8,
-                    use_int8_w8a8=False,
-                    use_int8_w8a16=False,
-                    use_int4_w4a16=False,
-                    per_channel_quant=False,
-                    block_shape=block_shape,
-                    a_use_tma=moe_use_tma,
-                    b_use_tma=moe_use_tma,
-                    filter_expert=False,
-                )
-            end_event.record()
-            end_event.synchronize()
-            time_cost1 = start_event.elapsed_time(end_event)
-        return time_cost0, time_cost1
+    kernel0, kernel1 = get_kernel_wrapper(False, loop_cnt, use_cuda_graph)
+    kernel_tma0, kernel_tma1 = get_kernel_wrapper(True, loop_cnt, use_cuda_graph)
 
     # JIT compilation & warmup
     if not ncu_enable:
-        moe_use_tma = False
-        run()
-        moe_use_tma = True
-        run()
-    latencies: List[float] = []
-    latencies1: List[float] = []
-    latencies_tma: List[float] = []
-    latencies1_tma: List[float] = []
+        kernel0.forward()
+        kernel1.forward()
+        kernel_tma0.forward()
+        kernel_tma1.forward()
+
+    ts0 = []
+    ts1 = []
+    ts_tma0 = []
+    ts_tma1 = []
 
     for i in range(num_iters):
         prepare(i)
-        torch.cuda.synchronize()
-        moe_use_tma = False
-        t0, t1 = run()
-        torch.cuda.synchronize()
-        latencies.append(t0)
-        latencies1.append(t1)
+        ts0.append(kernel0.forward())
+        ts1.append(kernel1.forward())
+        ts_tma0.append(kernel_tma0.forward())
+        ts_tma1.append(kernel_tma1.forward())
+    torch.cuda.synchronize()
 
-        moe_use_tma = True
-        t0, t1 = run()
-        torch.cuda.synchronize()
-        latencies_tma.append(t0)
-        latencies1_tma.append(t1)
-
-    avg = sum(latencies) / (num_iters * 10) * 1000  # us
-    avg_tma = sum(latencies_tma) / (num_iters * 10) * 1000  # us
-    avg1 = sum(latencies1) / (num_iters * 10) * 1000  # us
-    avg1_tma = sum(latencies1_tma) / (num_iters * 10) * 1000  # us
+    avg = sum(ts0) / (num_iters * loop_cnt) * 1000  # us
+    avg1 = sum(ts1) / (num_iters * loop_cnt) * 1000  # us
+    avg_tma = sum(ts_tma0) / (num_iters * loop_cnt) * 1000  # us
+    avg1_tma = sum(ts_tma1) / (num_iters * loop_cnt) * 1000  # us
 
     return avg, avg_tma, avg1, avg1_tma
 
 
 class BestConfigTrace:
-    def __init__(self, name):
+    def __init__(self, name, down_moe=False):
         self.name = name
-        self.config = None
-        self.time_cost = float("inf")
-        self.time_cost_all = None  # kernel0 without tma,, kernel0 with tma, kernel1 without tma, kernel1 with tma
+        self.down_moe = down_moe
+        self.best_costs_m = {}  # block_m: best_cost
 
-    def update(self, config, time_cost, time_cost_all):
-        if time_cost < self.time_cost:
-            print(
-                f"New best config for {self.name}: {config}, {time_cost=}, {time_cost_all=}, org: {self.config}, {self.time_cost_all}",
-                flush=True,
-            )
-            self.config = config
-            self.time_cost = time_cost
-            self.time_cost_all = time_cost_all
+    def update(self, config, time_cost_all):
+        block_m = config["BLOCK_SIZE_M"]
+        if not self.down_moe:
+            time_cost = min(time_cost_all[0], time_cost_all[1])
+        else:
+            time_cost = min(time_cost_all[2], time_cost_all[3])
+        if (
+            block_m not in self.best_costs_m
+            or time_cost < self.best_costs_m[block_m][1]
+        ):
+            self.best_costs_m[block_m] = config, time_cost, time_cost_all
 
-    @property
-    def total_time(self):
-        return self.time_cost_all[0] + min(self.time_cost_all[2], self.time_cost_all[3])
+    def time_cost(self, block_m):
+        if block_m not in self.best_costs_m:
+            return float("inf")
+        time_cost = self.best_costs_m[block_m][1]
+        return time_cost
 
-    def config_dict(self, down_moe=False):
-        if not down_moe:
-            return self.config
+    def config_dict(self, block_m):
+        if block_m not in self.best_costs_m:
+            return {}
+        config, _, time_cost_all = self.best_costs_m[block_m]
+        if not self.down_moe:
+            return {
+                **config,
+                "USE_TMA": time_cost_all[0] > time_cost_all[1],
+            }
         else:
             return {
-                **self.config,
-                "USE_TMA": self.time_cost_all[2] > self.time_cost_all[3],
+                **config,
+                "USE_TMA": time_cost_all[2] > time_cost_all[3],
             }
 
 
@@ -388,9 +426,8 @@ class BenchmarkWorker:
         search_space: List[Dict[str, int]],
         topk_ids_dir: str,
     ) -> Dict[str, int]:
-        trace0 = BestConfigTrace("kernel0")
-        trace1 = BestConfigTrace("kernel1")
-        trace2 = BestConfigTrace("kernel all")
+        trace0 = BestConfigTrace("kernel0", down_moe=False)
+        trace1 = BestConfigTrace("kernel1", down_moe=True)
 
         with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
             for config in tqdm(search_space):
@@ -413,47 +450,29 @@ class BenchmarkWorker:
                 except triton.runtime.autotuner.OutOfResources:
                     # Some configurations may be invalid and fail to compile.
                     continue
-                kt0 = kt0_no_tma
-                kt1 = min(kt1_no_tma, kt1_tma)
                 trace0.update(
                     config,
-                    kt0,
                     (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma),
                 )
                 trace1.update(
                     config,
-                    kt1,
-                    (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma),
-                )
-                trace2.update(
-                    config,
-                    kt0 + kt1,
                     (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma),
                 )
 
         now = datetime.now()
         print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
-        assert trace0.config is not None
-        assert trace1.config is not None
-        print(
-            f"{num_tokens=}, {trace0.config=}, {trace0.time_cost_all=}, {trace1.config=}, {trace1.time_cost_all=}"
-        )
-        if trace0.config["BLOCK_SIZE_M"] != trace1.config["BLOCK_SIZE_M"]:
-            best_trace = trace0 if trace0.total_time < trace1.total_time else trace1
-            best_trace = (
-                best_trace if best_trace.total_time < trace2.total_time else trace2
-            )
-            return (
-                best_trace.config_dict(),
-                best_trace.config_dict(True),
-                best_trace.time_cost_all,
-                best_trace.time_cost_all,
-            )
+        best_block_m = 16
+        for block_m in (32, 64, 128, 256):
+            if trace0.time_cost(block_m) + trace1.time_cost(block_m) < trace0.time_cost(
+                best_block_m
+            ) + trace1.time_cost(best_block_m):
+                best_block_m = block_m
+
         return (
-            trace0.config_dict(),
-            trace1.config_dict(True),
-            trace0.time_cost_all,
-            trace1.time_cost_all,
+            trace0.config_dict(best_block_m),
+            trace1.config_dict(best_block_m),
+            trace0.time_cost(best_block_m),
+            trace1.time_cost(best_block_m),
         )
 
 

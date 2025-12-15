@@ -363,7 +363,7 @@ def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
 
 
 @functools.lru_cache()
-def _down_moe_use_tma():
+def _fused_moe_use_tma():
     return support_tensor_descriptor()
 
 
@@ -439,15 +439,20 @@ def fused_experts_impl(
         return_down_config=True,
     )
 
-    config, (down_config, max_block_m) = get_config_func(M)
+    config, down_config, max_block_m = get_config_func(M)
+    up_moe_use_tma = (
+        _fused_moe_use_tma() and config is not None and config.pop("USE_TMA", False)
+    )
     down_moe_use_tma = (
-        _down_moe_use_tma()
+        _fused_moe_use_tma()
         and down_config is not None
         and down_config.pop("USE_TMA", False)
     )
     topk = topk_ids.shape[1]
     max_padded_tokens = (
-        min(M * topk, E + 1) * (max_block_m - 1) if down_moe_use_tma else 0
+        min(M * topk, E + 1) * (max_block_m - 1)
+        if (up_moe_use_tma or down_moe_use_tma)
+        else 0
     )
     total_tokens = M * topk + max_padded_tokens
     cache = torch.empty(
@@ -489,9 +494,14 @@ def fused_experts_impl(
             # chunk. Note that in most cases we only have one chunk
             # so the cache size and config are already set correctly and
             # do not need to be adjusted.
-            config, (down_config, _) = get_config_func(tokens_in_chunk)
+            config, down_config, _ = get_config_func(tokens_in_chunk)
+            up_moe_use_tma = (
+                _fused_moe_use_tma()
+                and config is not None
+                and config.pop("USE_TMA", False)
+            )
             down_moe_use_tma = (
-                _down_moe_use_tma()
+                _fused_moe_use_tma()
                 and down_config is not None
                 and down_config.pop("USE_TMA", False)
             )
@@ -499,7 +509,7 @@ def fused_experts_impl(
 
         padded_tokens = (
             min(tokens_in_chunk * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
-            if down_moe_use_tma
+            if (up_moe_use_tma or down_moe_use_tma)
             else 0
         )
         total_tokens = tokens_in_chunk * topk + padded_tokens
@@ -542,6 +552,7 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            b_use_tma=up_moe_use_tma,
             c_sorted=down_moe_use_tma,
             filter_expert=filter_expert,
         )
