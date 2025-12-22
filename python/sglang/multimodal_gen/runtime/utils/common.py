@@ -260,7 +260,7 @@ def is_cuda_alike():
 def is_blackwell():
     if not is_cuda():
         return False
-    return torch.cuda.get_device_capability()[0] == 10
+    return torch.cuda.get_device_capability()[0] in [10, 12]
 
 
 @lru_cache(maxsize=1)
