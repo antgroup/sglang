@@ -314,6 +314,19 @@ class NativeSparseAttnBackend(
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+        if self.speculative_num_draft_tokens is not None:
+            self.spec_tokens_range = torch.arange(
+                1,
+                self.speculative_num_draft_tokens + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.spec_tokens_neg_range = torch.arange(
+                -self.speculative_num_draft_tokens + 1,
+                1,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
@@ -816,28 +829,7 @@ class NativeSparseAttnBackend(
                 dtype=torch.int32,
                 device=self.device,
             )
-
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
-
-            seqlens_int32_cpu = [
-                self.speculative_num_draft_tokens + kv_len
-                for kv_len in seq_lens.tolist()
-            ]
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    for qo_len, kv_len in zip(
-                        extend_seq_lens_cpu,
-                        seqlens_int32_cpu,
-                        strict=True,
-                    )
-                ]
-            )
+            seqlens_expanded = (seq_lens.view(-1, 1) + self.spec_tokens_range).view(-1)
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
                 seqlens_expanded, nsa_index_topk=self.nsa_index_topk
             )
@@ -960,27 +952,7 @@ class NativeSparseAttnBackend(
                 page_indices, repeats=self.speculative_num_draft_tokens, dim=0
             )
             metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
-
-            seqlens_int32_cpu = [
-                self.speculative_num_draft_tokens + kv_len
-                for kv_len in seq_lens_cpu.tolist()
-            ]
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    for qo_len, kv_len in zip(
-                        extend_seq_lens_cpu,
-                        seqlens_int32_cpu,
-                        strict=True,
-                    )
-                ]
-            )
+            seqlens_expanded = (seq_lens.view(-1, 1) + self.spec_tokens_range).view(-1)
             metadata.nsa_seqlens_expanded.copy_(seqlens_expanded)
             nsa_cache_seqlens = compute_nsa_seqlens(
                 seqlens_expanded, self.nsa_index_topk
@@ -993,32 +965,38 @@ class NativeSparseAttnBackend(
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
-
-            extend_seq_lens = spec_info.accept_length[:bs]
-            extend_seq_lens_cpu = extend_seq_lens.tolist()
-
             page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
-            page_indices = torch.repeat_interleave(
-                page_indices, repeats=extend_seq_lens, dim=0
-            )
+            if forward_mode.is_draft_extend_v2():
+                page_indices = torch.repeat_interleave(
+                    page_indices, repeats=self.speculative_num_draft_tokens, dim=0
+                )
+                seqlens_expanded = (
+                    seq_lens.view(-1, 1) + self.spec_tokens_neg_range
+                ).view(-1)
+            else:
+                extend_seq_lens = spec_info.accept_length[:bs]
+                extend_seq_lens_cpu = extend_seq_lens.tolist()
+
+                page_indices = torch.repeat_interleave(
+                    page_indices, repeats=extend_seq_lens, dim=0
+                )
+                seqlens_expanded = torch.cat(
+                    [
+                        torch.arange(
+                            kv_len - qo_len + 1,
+                            kv_len + 1,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        for qo_len, kv_len in zip(
+                            extend_seq_lens_cpu,
+                            seq_lens_cpu.tolist(),
+                            strict=True,
+                        )
+                    ]
+                )
             metadata.page_table_1[: page_indices.shape[0], :max_seqlen_k].copy_(
                 page_indices
-            )
-
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    for qo_len, kv_len in zip(
-                        extend_seq_lens_cpu,
-                        seq_lens_cpu.tolist(),
-                        strict=True,
-                    )
-                ]
             )
             metadata.nsa_seqlens_expanded[: seqlens_expanded.shape[0]].copy_(
                 seqlens_expanded
@@ -1261,7 +1239,16 @@ class NativeSparseAttnBackend(
                     page_size=1,
                 )
 
-        if self.nsa_prefill_impl == "tilelang":
+        nsa_prefill_impl = (
+            self.nsa_decode_impl
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend()
+            )
+            else self.nsa_prefill_impl
+        )
+
+        if nsa_prefill_impl == "tilelang":
             if q_rope is not None:
                 q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
@@ -1271,7 +1258,7 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif self.nsa_prefill_impl == "flashmla_sparse":
+        elif nsa_prefill_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
 
@@ -1297,7 +1284,7 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif self.nsa_prefill_impl == "flashmla_kv":
+        elif nsa_prefill_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
@@ -1310,7 +1297,7 @@ class NativeSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
             )
-        elif self.nsa_prefill_impl == "fa3":
+        elif nsa_prefill_impl == "fa3":
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
@@ -1326,7 +1313,7 @@ class NativeSparseAttnBackend(
                 page_size=1,
             )
         else:
-            raise ValueError(f"Unsupported {self.nsa_prefill_impl = }")
+            raise ValueError(f"Unsupported {nsa_prefill_impl = }")
 
     def forward_decode(
         self,
