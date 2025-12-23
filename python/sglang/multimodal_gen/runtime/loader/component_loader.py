@@ -712,9 +712,11 @@ class TransformerLoader(ComponentLoader):
 
         model = model.eval()
 
-        if server_args.dit_layerwise_offload and hasattr(model, "blocks"):
+        if server_args.dit_layerwise_offload and hasattr(model, "dit_module_names"):
+            # TODO(will): support multiple module names
+            module_name = getattr(model, "dit_module_names", ["transformer_blocks"])[0]
             try:
-                num_layers = len(getattr(model, "blocks"))
+                num_layers = len(getattr(model, module_name))
             except Exception:
                 num_layers = None
 

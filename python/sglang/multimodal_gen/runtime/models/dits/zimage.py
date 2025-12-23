@@ -365,6 +365,7 @@ class ZImageTransformer2DModel(CachableDiT):
         self.rope_theta = arch_config.rope_theta
         self.t_scale = arch_config.t_scale
         self.gradient_checkpointing = False
+        self.dit_module_names = ["layers"]
 
         assert len(self.all_patch_size) == len(self.all_f_patch_size)
 
@@ -590,8 +591,19 @@ class ZImageTransformer2DModel(CachableDiT):
             torch.cat([x_freqs_cis[1], cap_freqs_cis[1]], dim=0),
         )
 
-        for layer in self.layers:
-            unified = layer(unified, unified_freqs_cis, adaln_input)
+        offload_mgr = getattr(self, "_layerwise_offload_manager", None)
+        if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
+            for index_layer, layer in enumerate(self.layers):
+                with offload_mgr.layer_scope(
+                    prefetch_layer_idx=index_layer + 1,
+                    release_layer_idx=index_layer,
+                    non_blocking=True,
+                ):
+                    unified = layer(unified, unified_freqs_cis, adaln_input)
+
+        else:
+            for layer in self.layers:
+                unified = layer(unified, unified_freqs_cis, adaln_input)
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
             unified, adaln_input
