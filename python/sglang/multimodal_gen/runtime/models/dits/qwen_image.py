@@ -23,7 +23,6 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_kernel,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.models.utils import process_layers_with_offload
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -558,7 +557,6 @@ class QwenImageTransformer2DModel(CachableDiT):
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
         self.zero_cond_t = zero_cond_t
-        self.dit_module_names = ["transformer_blocks"]
         self.rotary_emb = QwenEmbedRope(
             theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
         )
@@ -662,10 +660,7 @@ class QwenImageTransformer2DModel(CachableDiT):
         temb = self.time_text_embed(timestep, hidden_states)
 
         image_rotary_emb = freqs_cis
-
-        for index_block, block in process_layers_with_offload(
-            self, self.transformer_blocks
-        ):
+        for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
