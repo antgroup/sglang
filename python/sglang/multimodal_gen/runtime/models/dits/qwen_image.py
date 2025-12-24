@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_kernel,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.utils import process_layers_with_offload
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -661,56 +662,30 @@ class QwenImageTransformer2DModel(CachableDiT):
         temb = self.time_text_embed(timestep, hidden_states)
 
         image_rotary_emb = freqs_cis
-        offload_mgr = getattr(self, "_layerwise_offload_manager", None)
-        if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
-            for index_block, block in enumerate(self.transformer_blocks):
-                with offload_mgr.layer_scope(
-                    prefetch_layer_idx=index_block + 1,
-                    release_layer_idx=index_block,
-                    non_blocking=True,
-                ):
-                    encoder_hidden_states, hidden_states = block(
-                        hidden_states=hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        encoder_hidden_states_mask=encoder_hidden_states_mask,
-                        temb=temb,
-                        image_rotary_emb=image_rotary_emb,
-                        joint_attention_kwargs=attention_kwargs,
-                        modulate_index=modulate_index,
-                    )
 
-                    # controlnet residual
-                    if controlnet_block_samples is not None:
-                        interval_control = len(self.transformer_blocks) / len(
-                            controlnet_block_samples
-                        )
-                        interval_control = int(np.ceil(interval_control))
-                        hidden_states = (
-                            hidden_states
-                            + controlnet_block_samples[index_block // interval_control]
-                        )
-        else:
-            for index_block, block in enumerate(self.transformer_blocks):
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_hidden_states_mask=encoder_hidden_states_mask,
-                    temb=temb,
-                    image_rotary_emb=image_rotary_emb,
-                    joint_attention_kwargs=attention_kwargs,
-                    modulate_index=modulate_index,
+        for index_block, block in process_layers_with_offload(
+            self, self.transformer_blocks
+        ):
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=attention_kwargs,
+                modulate_index=modulate_index,
+            )
+
+            # controlnet residual
+            if controlnet_block_samples is not None:
+                interval_control = len(self.transformer_blocks) / len(
+                    controlnet_block_samples
                 )
-
-                # controlnet residual
-                if controlnet_block_samples is not None:
-                    interval_control = len(self.transformer_blocks) / len(
-                        controlnet_block_samples
-                    )
-                    interval_control = int(np.ceil(interval_control))
-                    hidden_states = (
-                        hidden_states
-                        + controlnet_block_samples[index_block // interval_control]
-                    )
+                interval_control = int(np.ceil(interval_control))
+                hidden_states = (
+                    hidden_states
+                    + controlnet_block_samples[index_block // interval_control]
+                )
         if self.zero_cond_t:
             temb = temb.chunk(2, dim=0)[0]
         # Use only the image part (hidden_states) from the dual-stream blocks

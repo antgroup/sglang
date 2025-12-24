@@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.utils import process_layers_with_offload
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -591,19 +592,8 @@ class ZImageTransformer2DModel(CachableDiT):
             torch.cat([x_freqs_cis[1], cap_freqs_cis[1]], dim=0),
         )
 
-        offload_mgr = getattr(self, "_layerwise_offload_manager", None)
-        if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
-            for index_layer, layer in enumerate(self.layers):
-                with offload_mgr.layer_scope(
-                    prefetch_layer_idx=index_layer + 1,
-                    release_layer_idx=index_layer,
-                    non_blocking=True,
-                ):
-                    unified = layer(unified, unified_freqs_cis, adaln_input)
-
-        else:
-            for layer in self.layers:
-                unified = layer(unified, unified_freqs_cis, adaln_input)
+        for _, layer in process_layers_with_offload(self, self.layers):
+            unified = layer(unified, unified_freqs_cis, adaln_input)
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
             unified, adaln_input

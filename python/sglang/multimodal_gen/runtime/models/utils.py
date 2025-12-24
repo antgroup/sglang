@@ -3,9 +3,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/utils.py
 """Utils for model executor."""
-from typing import Any
+from typing import Any, Iterator, Tuple
 
 import torch
+
+
+def process_layers_with_offload(model, layers, **kwargs) -> Iterator[Tuple[Any, int]]:
+    """
+        Unified processing layer iteration, support layer unloading
+
+    Args:
+            model: A model instance that needs to have _layerwise_offload_manager properties
+            layers: A list of layers to work with
+            kwargs: Additional parameters passed to the layer_scope
+
+    Yields:
+            Tuple[Any, int]: ( index, layer ) tuple
+    """
+    offload_mgr = getattr(model, "_layerwise_offload_manager", None)
+    if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
+        for index, layer in enumerate(layers):
+            with offload_mgr.layer_scope(
+                prefetch_layer_idx=index + 1,
+                release_layer_idx=index,
+                non_blocking=True,
+                **kwargs,
+            ):
+                yield index, layer
+    else:
+        for index, layer in enumerate(layers):
+            yield index, layer
 
 
 def set_weight_attrs(
