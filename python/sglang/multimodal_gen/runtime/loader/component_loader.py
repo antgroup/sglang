@@ -719,11 +719,10 @@ class TransformerLoader(ComponentLoader):
                 num_layers = len(getattr(model, module_name))
             except Exception:
                 num_layers = None
-
             if isinstance(num_layers, int) and num_layers > 0:
                 mgr = LayerwiseOffloadManager(
                     model,
-                    module_list_attr="blocks",
+                    module_list_attr=module_name,
                     num_layers=num_layers,
                     enabled=True,
                     pin_cpu_memory=server_args.pin_cpu_memory,
