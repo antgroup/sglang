@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -147,6 +148,8 @@ class Indexer(CustomOp):
         if is_cuda():
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
+            self.pp_size = get_global_server_args().pp_size
+            self.pp_recv_sm_count = 1 if self.pp_size > 1 else 0
 
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
@@ -184,6 +187,16 @@ class Indexer(CustomOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+
+    @contextlib.contextmanager
+    def _with_real_sm_count(self):
+        if is_cuda() and self.pp_size > 1:
+            with deep_gemm_wrapper.configure_deep_gemm_num_sms(
+                self.sm_count - self.pp_recv_sm_count
+            ):
+                yield
+        else:
+            yield
 
     @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
@@ -334,7 +347,6 @@ class Indexer(CustomOp):
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_fp8,
             kv_cache_fp8,
@@ -433,14 +445,15 @@ class Indexer(CustomOp):
 
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8[:q_offset],
-                kv_fp8,
-                weights[:q_offset],
-                ks,
-                ke,
-                clean_logits=False,
-            )
+            with self._with_real_sm_count():
+                logits = deep_gemm.fp8_mqa_logits(
+                    q_fp8[:q_offset],
+                    kv_fp8,
+                    weights[:q_offset],
+                    ks,
+                    ke,
+                    clean_logits=False,
+                )
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
@@ -469,14 +482,15 @@ class Indexer(CustomOp):
         while start < q_offset:
             end = min(start + max_rows, q_offset)
 
-            logits_chunk = deep_gemm.fp8_mqa_logits(
-                q_fp8[start:end],
-                kv_fp8,
-                weights[start:end],
-                ks[start:end],
-                ke[start:end],
-                clean_logits=False,
-            )
+            with self._with_real_sm_count():
+                logits_chunk = deep_gemm.fp8_mqa_logits(
+                    q_fp8[start:end],
+                    kv_fp8,
+                    weights[start:end],
+                    ks[start:end],
+                    ke[start:end],
+                    clean_logits=False,
+                )
 
             lengths_chunk = seq_lens_expanded[start:end]
 
@@ -631,14 +645,15 @@ class Indexer(CustomOp):
             ke_offset = torch.cat(ke_offset_list, dim=0)
             ke = ks + ke_offset
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8,
-                kv_fp8,
-                weights,
-                ks,
-                ke,
-                clean_logits=False,
-            )
+            with self._with_real_sm_count():
+                logits = deep_gemm.fp8_mqa_logits(
+                    q_fp8,
+                    kv_fp8,
+                    weights,
+                    ks,
+                    ke,
+                    clean_logits=False,
+                )
             topk_result = metadata.topk_transform(
                 logits,
                 self.index_topk,
@@ -676,14 +691,15 @@ class Indexer(CustomOp):
             )
             ke = ks + ke_offset
 
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8,
-                kv_fp8,
-                weights,
-                ks,
-                ke,
-                clean_logits=False,
-            )
+            with self._with_real_sm_count():
+                logits = deep_gemm.fp8_mqa_logits(
+                    q_fp8,
+                    kv_fp8,
+                    weights,
+                    ks,
+                    ke,
+                    clean_logits=False,
+                )
             actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
                 device="cuda", non_blocking=True
             )
