@@ -597,9 +597,8 @@ class VisionAttention(nn.Module):
                 total_num_kv_heads=num_dummy_heads + num_heads,
                 bias=qkv_bias,
                 quant_config=quant_config,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
                 prefix=add_prefix("qkv_proj", prefix),
+                disable_tp=use_data_parallel,
             )
         else:
             self.qkv_proj = ColumnParallelLinear(
@@ -607,18 +606,16 @@ class VisionAttention(nn.Module):
                 output_size=3 * self.dummy_dim,
                 bias=qkv_bias,
                 quant_config=quant_config,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
                 prefix=add_prefix("qkv_proj", prefix),
+                disable_tp=use_data_parallel,
             )
         self.proj = RowParallelLinear(
             input_size=self.dummy_dim,
             output_size=embed_dim,
             bias=proj_bias,
             quant_config=quant_config,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
             prefix=add_prefix("proj", prefix),
+            disable_tp=use_data_parallel,
         )
 
     def _determine_attention_backend(self, passed_backend: Optional[str]) -> str:
