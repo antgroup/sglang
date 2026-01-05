@@ -341,6 +341,7 @@ def _register_configs():
         pipeline_config_cls=TurboWanT2V480PConfig,
         hf_model_paths=[
             "IPostYellow/TurboWan2.1-T2V-14B-Diffusers",
+            "IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers",
         ],
     )
     register_configs(
