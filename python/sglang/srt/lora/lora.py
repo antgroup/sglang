@@ -19,7 +19,10 @@
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
 import logging
-from typing import Dict, List
+import multiprocessing
+import os
+from typing import Dict, List, Union
+
 
 import torch
 from torch import nn
@@ -30,6 +33,7 @@ from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import LORA_SUPPORTED_BACKENDS
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
@@ -117,6 +121,30 @@ class LoRAAdapter(nn.Module):
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self.normalize_gate_up_proj(weight_names, layer.weights)
+
+
+    # initialize the LoRA weights from shm on cpu
+    def initialize_weights_from_tensor(self, lora_weights: List[Union[str, bytes]]):
+        # set same auth_key
+        if os.environ['IPC_GLOBAL_AUTHKEY'] is not None:
+            multiprocessing.current_process().authkey = os.environ['IPC_GLOBAL_AUTHKEY'].encode()
+
+        # unwarp first pack
+        named_tensors = MultiprocessingSerializer.deserialize(lora_weights)
+
+        # unwarp second pack
+        for name, tensor_meta in named_tensors:
+            layer_id = get_layer_id(name)
+            if layer_id is not None:
+                self.layers[layer_id].weights[name] = MultiprocessingSerializer.deserialize(
+                    tensor_meta)
+
+        # normalize kv_proj and gate_up_proj
+        for layer in self.layers:
+            weight_names = list(layer.weights.keys())
+            self.normalize_qkv_proj(weight_names, layer.weights)
+            self.normalize_gate_up_proj(weight_names, layer.weights)
+
 
     def normalize_qkv_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]

@@ -1621,6 +1621,32 @@ class LoadLoRAAdapterReqInput(BaseReq):
         )
 
 
+
+@dataclass
+class LoadLoRAAdapterFromTensorReqInput(BaseReq):
+    # The name of the lora module to newly loaded.
+    lora_name: str
+    # The path of loading.
+    lora_path: str
+    # peft config
+    peft_config: str
+    # serialized tensors
+    serialized_named_tensors: List[Union[str, bytes]]
+    # Whether to pin the LoRA adapter in memory.
+    pinned: bool = False
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            peft_config=json.loads(self.peft_config),
+            lora_weights=self.serialized_named_tensors,
+            pinned=self.pinned,
+        )
+
+
 @dataclass
 class UnloadLoRAAdapterReqInput(BaseReq):
     # The name of lora module to unload.

@@ -121,6 +121,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
+    LoadLoRAAdapterFromTensorReqInput
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
@@ -1056,6 +1057,26 @@ async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
             status_code=HTTPStatus.OK,
         )
     else:
+        return ORJSONResponse(
+            result,
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+@app.api_route("/load_lora_adapter_from_tensor", methods=["POST"])
+async def load_lora_adapter_from_tensor(obj: LoadLoRAAdapterFromTensorReqInput, request: Request):
+    """Load a new LoRA adapter without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensor(
+        obj, request
+    )
+
+    if result.success:
+        return ORJSONResponse(
+            result,
+            status_code=HTTPStatus.OK,
+        )
+    else:
+        logger.error(f"Load LoRA adapter from tensor failed: {result}")
         return ORJSONResponse(
             result,
             status_code=HTTPStatus.BAD_REQUEST,

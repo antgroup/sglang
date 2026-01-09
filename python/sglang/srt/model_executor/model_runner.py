@@ -1434,6 +1434,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return result
 
+    def load_lora_adapter_from_tensor(self, lora_ref: LoRARef):
+        """Load a new lora adapter from tensor."""
+
+        logger.info(
+            f"LoRA adapter loading starts: {lora_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        result = self.lora_manager.load_lora_adapter_from_tensor(lora_ref)
+
+        logger.info(
+            f"LoRA adapter loading completes: {lora_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        return result
+
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
 

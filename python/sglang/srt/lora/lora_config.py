@@ -14,6 +14,8 @@
 
 import json
 import os
+from typing import Optional
+
 
 from huggingface_hub import snapshot_download
 
@@ -22,9 +24,13 @@ class LoRAConfig:
     def __init__(
         self,
         path: str,
+        peft_config: Optional[dict] = None,
     ) -> None:
         self.path = path
-        self.hf_config = self.get_lora_config()
+        if peft_config is not None:
+            self.hf_config = peft_config
+        else:
+            self.hf_config = self.get_lora_config()
         self.target_modules = self.hf_config["target_modules"]
 
         self.r = self.hf_config["r"]

@@ -36,6 +36,8 @@ class LoRARef:
     lora_id: str = field(default_factory=lambda: uuid4().hex)
     lora_name: Optional[str] = None
     lora_path: Optional[str] = None
+    peft_config: Optional[dict] = None
+    lora_weights: List[Union[str, bytes]] = None
     pinned: Optional[bool] = None
 
     def __post_init__(self):
@@ -44,7 +46,7 @@ class LoRARef:
 
     def __str__(self) -> str:
         parts = [
-            f"{f.name}={value}"
+            f"{f.name}={len(value)}" if f.name == "lora_weights" else f"{f.name}={value}"
             for f in fields(self)
             if (value := getattr(self, f.name)) is not None
         ]

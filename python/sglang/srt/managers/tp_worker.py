@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    LoadLoRAAdapterFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -183,6 +184,10 @@ class BaseTpWorker(ABC):
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
         result = self.model_runner.load_lora_adapter(recv_req.to_ref())
+        return result
+
+    def load_lora_adapter_from_tensor(self, recv_req: LoadLoRAAdapterFromTensorReqInput):
+        result = self.model_runner.load_lora_adapter_from_tensor(recv_req.to_ref())
         return result
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):

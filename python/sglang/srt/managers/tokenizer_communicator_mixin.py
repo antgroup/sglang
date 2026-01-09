@@ -70,6 +70,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    LoadLoRAAdapterFromTensorReqInput,
 )
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -568,6 +569,86 @@ class TokenizerCommunicatorMixin:
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
                     lora_path=obj.lora_path,
+                    pinned=obj.pinned,
+                )
+
+                # Trigger the actual loading operation at the backend processes.
+                obj.lora_id = new_adapter.lora_id
+                result = (await self.update_lora_adapter_communicator(obj))[0]
+
+                # Register the LoRA adapter only after loading is successful.
+                if result.success:
+                    await self.lora_registry.register(new_adapter)
+                    self.lora_ref_cache[obj.lora_name] = new_adapter
+
+                if self.server_args.max_loaded_loras is not None:
+                    while (
+                        self.lora_registry.num_registered_loras
+                        > self.server_args.max_loaded_loras
+                    ):
+                        lru_lora_name = await self.lora_registry.lru_lora_name(
+                            exclude_pinned=True
+                        )
+                        if lru_lora_name is None:
+                            raise ValueError(
+                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
+                                f"LoRA registry is: {self.lora_registry._registry}"
+                            )
+
+                        logger.info(
+                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
+                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
+                            f"max allowed: {self.server_args.max_loaded_loras})"
+                        )
+
+                        unload_result = await self._unload_lora_adapter_locked(
+                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
+                        )
+                        if not unload_result.success:
+                            raise ValueError(
+                                f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
+                                f"{unload_result.error_message}"
+                            )
+                        del result.loaded_adapters[lru_lora_name]
+
+                return result
+        except ValueError as e:
+            return LoadLoRAAdapterReqOutput(
+                success=False,
+                error_message=str(e),
+            )
+
+    async def load_lora_adapter_from_tensor(
+        self: TokenizerManager,
+        obj: LoadLoRAAdapterFromTensorReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoadLoRAAdapterReqOutput:
+        self.auto_create_handle_loop()
+
+        try:
+            if not self.server_args.enable_lora:
+                raise ValueError(
+                    "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+                )
+
+            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+            # with dp_size > 1.
+            assert (
+                self.server_args.dp_size == 1
+            ), "dp_size must be 1 for dynamic lora loading"
+            logger.info(
+                "Start load Lora adapter. Lora name=%s, path=%s",
+                obj.lora_name,
+                obj.lora_path,
+            )
+
+            async with self.lora_update_lock:
+                # Generate new uniquely identifiable LoRARef object.
+                new_adapter = LoRARef(
+                    lora_name=obj.lora_name,
+                    lora_path=obj.lora_path,
+                    peft_config=obj.peft_config,
+                    lora_weights=obj.serialized_named_tensors,
                     pinned=obj.pinned,
                 )
 

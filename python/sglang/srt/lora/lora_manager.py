@@ -147,6 +147,56 @@ class LoRAManager:
 
         return self.create_lora_update_result(success=True)
 
+    def load_lora_adapter_from_tensor(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
+        """
+        Load a single LoRA adapter from the tensor.
+
+        Args:
+            lora_ref (LoRARef): The LoRARef object containing the LoRA name, perf_config and LoRA weights.
+        """
+        assert (
+            lora_ref.lora_name is not None and lora_ref.lora_weights is not None and lora_ref.peft_config is not None
+        ), "LoRARef must have both lora_name, peft_config, lora_weights set for loading."
+        assert (
+            lora_ref.lora_id not in self.loras
+        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+
+        try:
+            # load configs
+            new_adapter = LoRAConfig(lora_ref.lora_path, lora_ref.peft_config)
+            self.validate_new_adapter(new_adapter, lora_ref)
+            self.configs[lora_ref.lora_id] = new_adapter
+
+            # load weights from tensor
+            self.load_lora_weights_from_tensor(lora_ref)
+
+            # keep metadata for displayed messages
+            self.lora_refs[lora_ref.lora_id] = lora_ref
+            self.num_pinned_loras += int(lora_ref.pinned)
+        except Exception as e:
+            import traceback
+            logger.error(f"Failed to load LoRA adapter {lora_ref.lora_name} with error: {e}, traceback: {traceback.format_exc()}")
+            return self.create_lora_update_result(
+                success=False,
+                error_message=str(e),
+            )
+
+        return self.create_lora_update_result(success=True)
+
+    def load_lora_weights_from_tensor(self, lora_ref):
+
+        lora_adapter = LoRAAdapter(
+            lora_ref.lora_id,
+            self.configs[lora_ref.lora_id],
+            self.base_hf_config,
+            self.load_config,
+            self.lora_backend,
+        )
+        # all tp_rank has same meta but different resource_sharer
+        lora_adapter.initialize_weights_from_tensor(lora_ref.lora_weights[self.tp_rank])
+        self.loras[lora_ref.lora_id] = lora_adapter
+
+
     def validate_new_adapter(self, lora_config: LoRAConfig, lora_ref: LoRARef):
         """
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.

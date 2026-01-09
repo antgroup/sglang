@@ -117,6 +117,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    LoadLoRAAdapterFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -1075,6 +1076,7 @@ class Scheduler(
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
+                (LoadLoRAAdapterFromTensorReqInput, self.load_lora_adapter_from_tensor),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadReqInput, self.get_load),
                 (PauseGenerationReqInput, self.pause_generation),
@@ -2719,6 +2721,14 @@ class Scheduler(
         """In-place loading a new lora adapter from disk or huggingface."""
 
         result = self.tp_worker.load_lora_adapter(recv_req)
+        return result
+
+    def load_lora_adapter_from_tensor(
+        self, recv_req: LoadLoRAAdapterFromTensorReqInput
+    ) -> LoadLoRAAdapterReqOutput:
+        """In-place loading a new lora adapter from tensor."""
+
+        result = self.tp_worker.load_lora_adapter_from_tensor(recv_req)
         return result
 
     def unload_lora_adapter(
