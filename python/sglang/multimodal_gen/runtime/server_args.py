@@ -251,6 +251,7 @@ class ServerArgs:
     # sequence parallelism
     ulysses_degree: Optional[int] = None
     ring_degree: Optional[int] = None
+    ulysses_all2all_parallel: bool = False
     # data parallelism
     # number of data parallelism groups
     dp_size: int = 1
@@ -513,6 +514,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_cfg_parallel,
             help="Enable cfg parallel.",
+        )
+        parser.add_argument(
+            "--ulysses-all2all-parallel",
+            type=bool,
+            default=False,
+            help="ulysses-all2all-parallel",
         )
         parser.add_argument(
             "--data-parallel-size",

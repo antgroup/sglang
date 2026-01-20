@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.utils import get_compute_dtype
 
 
@@ -366,10 +367,18 @@ class USPAttention(nn.Module):
 
         # Ulysses-style All-to-All for sequence/head sharding
         if get_ulysses_parallel_world_size() > 1:
-            # -> [B, S, H_local, D]
-            q = _usp_input_all_to_all(q, head_dim=2)
-            k = _usp_input_all_to_all(k, head_dim=2)
-            v = _usp_input_all_to_all(v, head_dim=2)
+            if get_global_server_args().ulysses_all2all_parallel:
+                # Stack QKV and do all-to-all together [3*B, S_local, H, D] -> [3*B, S, H_local, D]
+                qkv = torch.cat([q, k, v], dim=0)  # [3, S_local, H, D]
+                qkv = sequence_model_parallel_all_to_all_4D(
+                    qkv, scatter_dim=2, gather_dim=1
+                )
+                q, k, v = qkv.chunk(3, dim=0)
+            else:
+                # -> [B, S, H_local, D]
+                q = _usp_input_all_to_all(q, head_dim=2)
+                k = _usp_input_all_to_all(k, head_dim=2)
+                v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
@@ -387,7 +396,13 @@ class USPAttention(nn.Module):
 
         # Ulysses-style All-to-All to restore original sharding
         if get_ulysses_parallel_world_size() > 1:
-            # -> [B, S_local, H, D]
-            out = _usp_output_all_to_all(out, head_dim=2)
+            if get_global_server_args().ulysses_all2all_parallel:
+                # Stack output and do all-to-all together [B, S, H_local, D] -> [B, S_local, H, D]
+                out = sequence_model_parallel_all_to_all_4D(
+                    out, scatter_dim=1, gather_dim=2
+                )
+            else:
+                # -> [B, S_local, H, D]
+                out = _usp_output_all_to_all(out, head_dim=2)
 
         return out
