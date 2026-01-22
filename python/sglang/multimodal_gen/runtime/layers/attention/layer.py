@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionBackend,
     AttentionImpl,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
@@ -305,6 +306,7 @@ class USPAttention(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         dropout_rate: float = 0.0,
+        redirected_attention_backend: AttentionBackend | None = None,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -317,9 +319,14 @@ class USPAttention(nn.Module):
             num_kv_heads = num_heads
 
         dtype = get_compute_dtype()
-        attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
-        )
+        if redirected_attention_backend is not None:
+            attn_backend = redirected_attention_backend
+        else:
+            attn_backend = get_attn_backend(
+                head_size,
+                dtype,
+                supported_attention_backends=supported_attention_backends,
+            )
         impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
         self.attn_impl = impl_cls(
             num_heads=num_heads,
