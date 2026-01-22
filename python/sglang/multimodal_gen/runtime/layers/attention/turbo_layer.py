@@ -10,10 +10,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn 
 )
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
-from sglang.multimodal_gen.runtime.managers.forward_context import (
-    ForwardContext,
-    get_forward_context,
-)
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import get_compute_dtype
@@ -28,6 +24,7 @@ class MinimalA2AAttnOp(torch.nn.Module):
         head_size: int,
         attention_type: str,
         topk: float,
+        prefix: str = "",
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ):
         super().__init__()
@@ -51,13 +48,12 @@ class MinimalA2AAttnOp(torch.nn.Module):
         self.local_attn = USPAttention(
             num_heads=num_heads,
             head_size=head_size,
+            prefix=prefix,
             supported_attention_backends=supported_attention_backends,
             redirected_attention_backend=attn_backend,
             topk_ratio=topk,
         )
 
     def forward(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
-        forward_context: ForwardContext = get_forward_context()
-        ctx_attn_metadata = forward_context.attn_metadata
-        results = super().forward(query, key, value, ctx_attn_metadata)
+        results = self.local_attn(query, key, value)
         return rearrange(results, "b ... h l -> b ... (h l)")
