@@ -9,6 +9,10 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.nn import Module
 
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sequence_parallel_world_size,
+    get_sp_group,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionImpl,
 )
@@ -189,7 +193,7 @@ class DistributedAttention(torch.nn.Module):
     def __init__(self, local_attention: Union[Module, Callable]) -> None:
         super(DistributedAttention, self).__init__()
         self.local_attn = local_attention
-        self.pg = None
+        self.pg = get_sp_group()
         self.stream = None
 
     def forward(
@@ -205,9 +209,7 @@ class DistributedAttention(torch.nn.Module):
         Returns:
             * output (Tensor): context output
         """
-        if self.pg is None:
-            return self.local_attn(query, key, value, ctx_attn_metadata)
-        pg_size = dist.get_world_size(self.pg)
+        pg_size = get_sequence_parallel_world_size()
         if pg_size < 2:
             return self.local_attn(query, key, value, ctx_attn_metadata)
 
@@ -220,10 +222,6 @@ class DistributedAttention(torch.nn.Module):
 
         output = _SeqAllToAll.apply(self.pg, context_layer, False)
         return output
-
-    def set_context_parallel_group(self, group, stream):
-        self.pg = group
-        self.stream = stream
 
 
 class MinimalA2AAttnOp(DistributedAttention):
@@ -269,4 +267,4 @@ class MinimalA2AAttnOp(DistributedAttention):
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
         results = super().forward(query, key, value, ctx_attn_metadata)
-        return rearrange(results, "b ... h l -> b ... (h l)")
+        return results
