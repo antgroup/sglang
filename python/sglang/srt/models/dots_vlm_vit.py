@@ -12,6 +12,7 @@ from sglang.srt.configs.dots_vlm import DotsVisionConfig
 from sglang.srt.distributed import parallel_state
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -308,13 +309,8 @@ class DotsVisionTransformer(PreTrainedModel):
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
         rotary_pos_emb = self.calc_cos_sin(rotary_pos_emb)
 
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        ).cumsum(
-            dim=0,
-            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
-        )
-        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+        # compute cu_seqlens
+        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
