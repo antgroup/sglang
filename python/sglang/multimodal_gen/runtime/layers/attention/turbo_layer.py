@@ -58,31 +58,5 @@ class MinimalA2AAttnOp(torch.nn.Module):
         self.head_size = head_size
 
     def forward(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
-        """
-        Forward pass with proper tensor shape handling.
-
-        Args:
-            query: Query tensor of shape (batch, seq_len, hidden_dim)
-            key: Key tensor of shape (batch, seq_len, hidden_dim)
-            value: Value tensor of shape (batch, seq_len, hidden_dim)
-
-        Returns:
-            Output tensor of shape (batch, seq_len, hidden_dim)
-        """
-        batch, seq_len, hidden_dim = query.shape
-        expected_hidden_dim = self.num_heads * self.head_size
-
-        if hidden_dim != expected_hidden_dim:
-            raise ValueError(
-                f"Hidden dimension mismatch: expected {expected_hidden_dim}, got {hidden_dim}"
-            )
-        # rearrange to match USPAttention
-        query_4d = rearrange(query, "b s (h d) -> b s h d", h=self.num_heads)
-        key_4d = rearrange(key, "b s (h d) -> b s h d", h=self.num_heads)
-        value_4d = rearrange(value, "b s (h d) -> b s h d", h=self.num_heads)
-
-        results, _ = self.local_attn(query_4d, key_4d, value_4d)
-
-        output = rearrange(results, "b s h d -> b s (h d)")
-
-        return output
+        results = self.local_attn(query, key, value)
+        return rearrange(results, "b ... h l -> b ... (h l)")
