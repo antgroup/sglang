@@ -319,6 +319,16 @@ class WanTransformerBlock(nn.Module):
                     AttentionBackendEnum.SAGE_SLA_ATTN,
                 },
             )
+            # 根据SP状态设置CP
+            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                get_sp_group,
+                get_sp_world_size,
+            )
+
+            if get_sp_world_size() > 1:
+                self.attn1.set_context_parallel_group(
+                    get_sp_group().device_group, torch.cuda.Stream()
+                )
         else:
             self.attn1 = USPAttention(
                 num_heads=divide(num_heads, get_tensor_model_parallel_world_size()),
