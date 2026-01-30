@@ -287,3 +287,14 @@ class Turbo_Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
 @dataclass
 class SelfForcingWanT2V480PConfig(WanT2V_1_3B_SamplingParams):
     pass
+
+
+# =============================================
+# ============= LingBot World Models =============
+# =============================================
+@dataclass
+class LingBotWorldI2V_SamplingParam(Wan2_2_I2V_A14B_SamplingParam):
+    guidance_scale: float = 5.0  # high_noise
+    guidance_scale_2: float = 5.0  # low_noise
+    num_inference_steps: int = 40
+    fps: int = 16

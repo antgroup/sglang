@@ -24,6 +24,8 @@ from typing import (
     Union,
 )
 
+from python.sglang.multimodal_gen.configs.sample.wan import LingBotWorldI2VPConfig
+
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import Backend
 
@@ -60,6 +62,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
+    LingBotWorldI2VPConfig,
     TurboWanI2V720Config,
     TurboWanT2V480PConfig,
     Wan2_2_I2V_A14B_Config,
@@ -88,6 +91,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
 )
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
+    LingBotWorldI2V_SamplingParam,
     Turbo_Wan2_2_I2V_A14B_SamplingParam,
     Wan2_1_Fun_1_3B_InP_SamplingParams,
     Wan2_2_I2V_A14B_SamplingParam,
@@ -546,6 +550,11 @@ def _register_configs():
         sampling_param_cls=Wan2_2_I2V_A14B_SamplingParam,
         pipeline_config_cls=Wan2_2_I2V_A14B_Config,
         hf_model_paths=["Wan-AI/Wan2.2-I2V-A14B-Diffusers"],
+    )
+    register_configs(
+        sampling_param_cls=LingBotWorldI2V_SamplingParam,
+        pipeline_config_cls=LingBotWorldI2VPConfig,
+        hf_model_paths=["IPostYellow/lingbot-world-base-cam-Diffusers"],
     )
     register_configs(
         sampling_param_cls=FastWanT2V480PConfig,

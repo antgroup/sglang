@@ -234,3 +234,11 @@ class SelfForcingWanT2V480PConfig(WanT2V480PConfig):
         default_factory=lambda: [1000, 750, 500, 250]
     )
     warp_denoising_step: bool = True
+
+
+# lingbot world
+@dataclass
+class LingBotWorldI2VPConfig(WanI2V720PConfig):
+    boundary_ratio: float | None = 0.947
+    flow_shift: float | None = 10.0
+    vae_stride = (4, 8, 8)
