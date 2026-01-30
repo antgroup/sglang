@@ -353,3 +353,6 @@ class LingBotWanTransformer3DModel(WanTransformer3DModel):
         output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
         return output
+
+
+EntryClass = LingBotWanTransformer3DModel
