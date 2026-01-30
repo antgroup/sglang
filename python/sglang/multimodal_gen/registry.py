@@ -24,8 +24,6 @@ from typing import (
     Union,
 )
 
-from python.sglang.multimodal_gen.configs.sample.wan import LingBotWorldI2VPConfig
-
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import Backend
 
