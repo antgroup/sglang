@@ -6,6 +6,7 @@ import os
 import time
 from typing import Any, Dict, Optional
 
+import numpy as np
 from fastapi import (
     APIRouter,
     File,
@@ -209,6 +210,12 @@ async def create_video(
                 extra_from_form = {}
 
         fps_val = fps if fps is not None else extra_from_form.get("fps")
+        action_path = "/ossfs/workspace/lingbot-world/examples/00/"
+        if action_path is not None:
+            c2ws = np.load(os.path.join(action_path, "poses.npy"))  # opencv coordinate
+            len_c2ws = ((len(c2ws) - 1) // 4) * 4 + 1
+            num_frames = min(num_frames, len_c2ws)
+
         num_frames_val = (
             num_frames if num_frames is not None else extra_from_form.get("num_frames")
         )
