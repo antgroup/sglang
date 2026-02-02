@@ -133,9 +133,7 @@ class LingBotWanTransformerBlock(WanTransformerBlock):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+
         # cam injection (only if dit_cond_dict is provided and contains c2ws_plucker_emb)
         if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
             c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
@@ -146,6 +144,10 @@ class LingBotWanTransformerBlock(WanTransformerBlock):
             cam_scale = self.cam_scale_layer(c2ws_hidden_states)
             cam_shift = self.cam_shift_layer(c2ws_hidden_states)
             hidden_states = (1.0 + cam_scale) * hidden_states + cam_shift
+
+        norm_hidden_states, hidden_states = norm_hidden_states.to(
+            orig_dtype
+        ), hidden_states.to(orig_dtype)
 
         # 2. Cross-attention
         attn_output = self.attn2(
@@ -251,6 +253,25 @@ class LingBotWanTransformer3DModel(WanTransformer3DModel):
             timestep = timestep.flatten()  # batch_size * seq_len
         else:
             ts_seq_len = None
+        if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
+            c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
+            c2ws_plucker_emb = [
+                rearrange(
+                    i,
+                    "1 c (f c1) (h c2) (w c3) -> 1 (f h w) (c c1 c2 c3)",
+                    c1=self.patch_size[0],
+                    c2=self.patch_size[1],
+                    c3=self.patch_size[2],
+                )
+                for i in c2ws_plucker_emb
+            ]
+            c2ws_plucker_emb = torch.cat(c2ws_plucker_emb, dim=1)  # [1, (L1+...+Ln), C]
+            c2ws_plucker_emb = self.patch_embedding_wancamctrl(c2ws_plucker_emb)
+            c2ws_hidden_states = self.c2ws_hidden_states_layer2(
+                torch_F.silu(self.c2ws_hidden_states_layer1(c2ws_plucker_emb))
+            )
+            dit_cond_dict = dict(dit_cond_dict)
+            dit_cond_dict["c2ws_plucker_emb"] = c2ws_plucker_emb + c2ws_hidden_states
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
             self.condition_embedder(
@@ -285,25 +306,6 @@ class LingBotWanTransformer3DModel(WanTransformer3DModel):
         should_skip_forward = self.should_skip_forward_for_cached_states(
             timestep_proj=timestep_proj, temb=temb
         )
-        if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
-            c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
-            c2ws_plucker_emb = [
-                rearrange(
-                    i,
-                    "1 c (f c1) (h c2) (w c3) -> 1 (f h w) (c c1 c2 c3)",
-                    c1=self.patch_size[0],
-                    c2=self.patch_size[1],
-                    c3=self.patch_size[2],
-                )
-                for i in c2ws_plucker_emb
-            ]
-            c2ws_plucker_emb = torch.cat(c2ws_plucker_emb, dim=1)  # [1, (L1+...+Ln), C]
-            c2ws_plucker_emb = self.patch_embedding_wancamctrl(c2ws_plucker_emb)
-            c2ws_hidden_states = self.c2ws_hidden_states_layer2(
-                torch_F.silu(self.c2ws_hidden_states_layer1(c2ws_plucker_emb))
-            )
-            dit_cond_dict = dict(dit_cond_dict)
-            dit_cond_dict["c2ws_plucker_emb"] = c2ws_plucker_emb + c2ws_hidden_states
 
         if should_skip_forward:
             hidden_states = self.retrieve_cached_states(hidden_states)
