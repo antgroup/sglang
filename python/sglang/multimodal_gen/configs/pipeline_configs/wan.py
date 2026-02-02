@@ -280,8 +280,8 @@ class LingBotWorldI2VPConfig(WanI2V720PConfig):
             c2ws_infer = compute_relative_poses(c2ws_infer, framewise=True)
             Ks = Ks.repeat(len(c2ws_infer), 1)
 
-            c2ws_infer = c2ws_infer.to(self.device)
-            Ks = Ks.to(self.device)
+            c2ws_infer = c2ws_infer.to(batch.latents.device)
+            Ks = Ks.to(batch.latents.device)
             c2ws_plucker_emb = get_plucker_embeddings(
                 c2ws_infer, Ks, batch.height, batch.width
             )
