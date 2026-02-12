@@ -1,34 +1,43 @@
 import logging
+from types import ModuleType
 from typing import Optional, Tuple
 
 import torch
-import torch.distributed as dist
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
-_flashinfer_comm = None
+flashinfer_comm: ModuleType | None = None
 _workspace_manager = None
 
 if is_flashinfer_available():
     try:
-        import flashinfer.comm as comm
 
-        _flashinfer_comm = comm
+        import flashinfer.comm as _flashinfer_comm
+
+        if hasattr(_flashinfer_comm, "allreduce_fusion") and hasattr(
+            _flashinfer_comm, "create_allreduce_fusion_workspace"
+        ):
+            flashinfer_comm = _flashinfer_comm
+
     except ImportError:
         logger.warning(
             "flashinfer.comm is not available, falling back to standard "
             "implementation"
         )
 
+_FI_WORKSPACE = None
+
 
 class FlashInferWorkspaceManager:
     def __init__(self):
         self.workspace_tensor = None
-        self.ipc_handles = None
         self.world_size = None
         self.rank = None
         self.initialized = False
@@ -39,14 +48,13 @@ class FlashInferWorkspaceManager:
         rank: int,
         max_token_num: int,
         hidden_dim: int,
-        group=None,
-        use_fp32_lamport: bool = False,
+        dtype: torch.dtype = torch.bfloat16,
     ):
         """Initialize workspace"""
         if self.initialized and self.world_size == world_size:
             return
 
-        if _flashinfer_comm is None:
+        if flashinfer_comm is None:
             logger.warning(
                 "FlashInfer comm not available, skipping workspace " "initialization"
             )
@@ -54,16 +62,16 @@ class FlashInferWorkspaceManager:
 
         self.cleanup()
 
-        self.ipc_handles, self.workspace_tensor = (
-            comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
-                rank,
-                world_size,
-                max_token_num,
-                hidden_dim,
-                group=group,
-                use_fp32_lamport=use_fp32_lamport,
-            )
+        self.workspace_tensor = flashinfer_comm.create_allreduce_fusion_workspace(
+            backend="trtllm",
+            world_size=world_size,
+            rank=rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
         )
+        global _FI_WORKSPACE
+        _FI_WORKSPACE = self.workspace_tensor
 
         self.world_size = world_size
         self.rank = rank
@@ -76,16 +84,13 @@ class FlashInferWorkspaceManager:
 
     def cleanup(self):
         """Clean up workspace"""
-        if self.initialized and self.ipc_handles is not None:
+        if self.initialized:
             try:
-                _flashinfer_comm.trtllm_destroy_ipc_workspace_for_all_reduce(
-                    self.ipc_handles, group=dist.group.WORLD
-                )
+                self.workspace_tensor.destroy()
             except Exception as e:
                 logger.warning(f"Failed to cleanup FlashInfer workspace: {e}")
             finally:
                 self.workspace_tensor = None
-                self.ipc_handles = None
                 self.initialized = False
 
 
@@ -93,17 +98,19 @@ _workspace_manager = FlashInferWorkspaceManager()
 
 
 def ensure_workspace_initialized(
-    max_token_num: int = 2048, hidden_dim: int = 4096, use_fp32_lamport: bool = False
+    max_token_num: int = 2048,
+    hidden_dim: int = 4096,
+    dtype: torch.dtype = torch.bfloat16,
 ):
     """Ensure workspace is initialized"""
-    if not is_flashinfer_available() or _flashinfer_comm is None:
+    if not is_flashinfer_available() or flashinfer_comm is None:
         return False
 
     world_size = get_tensor_model_parallel_world_size()
     if world_size <= 1:
         return False
 
-    rank = dist.get_rank()
+    rank = get_tensor_model_parallel_rank()
 
     if (
         not _workspace_manager.initialized
@@ -114,7 +121,7 @@ def ensure_workspace_initialized(
             rank=rank,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
-            use_fp32_lamport=use_fp32_lamport,
+            dtype=dtype,
         )
 
     return _workspace_manager.initialized
@@ -165,7 +172,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (norm_output, residual_output)
     """
-    if not is_flashinfer_available() or _flashinfer_comm is None:
+    if not is_flashinfer_available() or flashinfer_comm is None:
         logger.debug(
             "FlashInfer not available, falling back to standard " "implementation"
         )
@@ -181,7 +188,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     if not ensure_workspace_initialized(
         max_token_num=max_token_num,
         hidden_dim=input_tensor.shape[-1],
-        use_fp32_lamport=(input_tensor.dtype == torch.float32),
+        dtype=input_tensor.dtype,
     ):
         logger.debug("FlashInfer workspace not available")
         return None, None
@@ -191,28 +198,23 @@ def flashinfer_allreduce_residual_rmsnorm(
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
 
-    _flashinfer_comm.trtllm_allreduce_fusion(
-        allreduce_in=input_tensor,
-        world_size=world_size,
-        world_rank=dist.get_rank(),
-        token_num=token_num,
-        hidden_dim=hidden_dim,
-        workspace_ptrs=_workspace_manager.workspace_tensor,
-        launch_with_pdl=True,
-        use_oneshot=use_oneshot,
-        trigger_completion_at_end=trigger_completion_at_end,
-        fp32_acc=fp32_acc,
-        pattern_code=(_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm),
-        allreduce_out=None,
+    flashinfer_comm.allreduce_fusion(
+        input=input_tensor,
+        workspace=_FI_WORKSPACE,
+        pattern=flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
         residual_in=residual,
         residual_out=residual_out,
         norm_out=norm_out,
-        quant_out=None,
-        scale_out=None,
         rms_gamma=weight,
         rms_eps=eps,
+        launch_with_pdl=True,
+        use_oneshot=use_oneshot,
+        fp32_acc=fp32_acc,
+        quant_out=None,
+        scale_out=None,
+        # in sglang we only support swizzled layout
+        layout_code=flashinfer_comm.QuantizationSFLayout.SWIZZLED_128x4,
         scale_factor=None,
-        layout_code=None,
     )
 
     return norm_out, residual_out
