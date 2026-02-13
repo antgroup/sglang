@@ -791,7 +791,7 @@ inline void transfer_kv_page_first_direct_impl(
     }
   };
 
-#if defined(USE_ROCM) || !defined(CUDART_VERSION) || CUDART_VERSION < 12080
+#if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
   fallback_to_page_copy();
   return;
 
