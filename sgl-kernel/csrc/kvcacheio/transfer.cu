@@ -796,6 +796,13 @@ inline void transfer_kv_page_first_direct_impl(
   return;
 
 #else
+  int driver_version = 0;
+  cudaError_t driver_version_err = cudaDriverGetVersion(&driver_version);
+  if (driver_version_err != cudaSuccess || driver_version < 12080) {
+    fallback_to_page_copy();
+    return;
+  }
+
   size_t num_copies = 0;
   std::vector<void*> batch_srcs;
   std::vector<void*> batch_dsts;
