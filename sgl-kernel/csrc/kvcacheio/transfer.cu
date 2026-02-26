@@ -806,16 +806,8 @@ inline void transfer_kv_page_first_direct_impl(
   }
 
   // Symbol gate: runtime may not expose cudaMemcpyBatchAsync in some environments.
-  using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
-      void**,
-      void**,
-      size_t*,
-      size_t,
-      cudaMemcpyAttributes*,
-      size_t*,
-      size_t,
-      size_t*,
-      cudaStream_t);
+  using CudaMemcpyBatchAsyncFn =
+      cudaError_t (*)(void**, void**, size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
   static CudaMemcpyBatchAsyncFn cuda_memcpy_batch_async = []() {
     void* symbol = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
     return reinterpret_cast<CudaMemcpyBatchAsyncFn>(symbol);
