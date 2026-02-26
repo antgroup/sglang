@@ -797,7 +797,16 @@ inline void transfer_kv_page_first_direct_impl(
   return;
 
 #else
-  using CudaMemcpyBatchAsyncFn = decltype(&cudaMemcpyBatchAsync);
+  using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
+      void**,
+      void**,
+      size_t*,
+      size_t,
+      cudaMemcpyAttributes*,
+      size_t*,
+      size_t,
+      size_t*,
+      cudaStream_t);
   static CudaMemcpyBatchAsyncFn cuda_memcpy_batch_async = []() {
     void* symbol = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
     return reinterpret_cast<CudaMemcpyBatchAsyncFn>(symbol);
