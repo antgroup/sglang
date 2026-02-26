@@ -8,6 +8,7 @@
 #include <vector>
 
 #ifndef USE_ROCM
+#include <dlfcn.h>
 #define WARP_SIZE 32
 #include "pytorch_extension_utils.h"
 #else
@@ -796,9 +797,12 @@ inline void transfer_kv_page_first_direct_impl(
   return;
 
 #else
-  int driver_version = 0;
-  cudaError_t driver_version_err = cudaDriverGetVersion(&driver_version);
-  if (driver_version_err != cudaSuccess || driver_version < 12080) {
+  using CudaMemcpyBatchAsyncFn = decltype(&cudaMemcpyBatchAsync);
+  static CudaMemcpyBatchAsyncFn cuda_memcpy_batch_async = []() {
+    void* symbol = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
+    return reinterpret_cast<CudaMemcpyBatchAsyncFn>(symbol);
+  }();
+  if (cuda_memcpy_batch_async == nullptr) {
     fallback_to_page_copy();
     return;
   }
@@ -903,7 +907,7 @@ inline void transfer_kv_page_first_direct_impl(
   TORCH_CHECK(batch_srcs.size() == num_copies, "Batch memcpy count mismatch");
   if (num_copies > 0) {
     size_t fail_idx = std::numeric_limits<size_t>::max();
-    cudaError_t err = cudaMemcpyBatchAsync(
+    cudaError_t err = cuda_memcpy_batch_async(
         batch_dsts.data(),
         batch_srcs.data(),
         batch_sizes.data(),
