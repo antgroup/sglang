@@ -797,6 +797,15 @@ inline void transfer_kv_page_first_direct_impl(
   return;
 
 #else
+  // Driver capability gate: only use cudaMemcpyBatchAsync on CUDA 12.8+ drivers.
+  int driver_version = 0;
+  cudaError_t driver_version_err = cudaDriverGetVersion(&driver_version);
+  if (driver_version_err != cudaSuccess || driver_version < 12080) {
+    fallback_to_page_copy();
+    return;
+  }
+
+  // Symbol gate: runtime may not expose cudaMemcpyBatchAsync in some environments.
   using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
       void**,
       void**,
@@ -926,6 +935,10 @@ inline void transfer_kv_page_first_direct_impl(
         1,
         &fail_idx,
         stream);
+    if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
+      fallback_to_page_copy();
+      return;
+    }
     if (err != cudaSuccess) {
       TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
     }
