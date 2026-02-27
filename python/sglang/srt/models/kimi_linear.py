@@ -283,27 +283,6 @@ class KimiDeltaAttention(nn.Module):
 
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
-        # self.q_conv1d = ColumnParallelLinear(
-        #     input_size=self.conv_size,
-        #     output_size=projection_size,
-        #     bias=False,
-        #     params_dtype=torch.float32,
-        #     prefix=f"{prefix}.q_conv1d",
-        # )
-        # self.k_conv1d = ColumnParallelLinear(
-        #     input_size=self.conv_size,
-        #     output_size=projection_size,
-        #     bias=False,
-        #     params_dtype=torch.float32,
-        #     prefix=f"{prefix}.k_conv1d",
-        # )
-        # self.v_conv1d = ColumnParallelLinear(
-        #     input_size=self.conv_size,
-        #     output_size=projection_size,
-        #     bias=False,
-        #     params_dtype=torch.float32,
-        #     prefix=f"{prefix}.v_conv1d",
-        # )
         self.qkv_conv1d = MergedColumnParallelLinear(
             input_size=self.conv_size,
             output_sizes=[projection_size, projection_size, projection_size],
@@ -315,9 +294,6 @@ class KimiDeltaAttention(nn.Module):
         # Can't do this in `weight_loader` since it already exists in
         # `ColumnParallelLinear` and `set_weight_attrs`
         # doesn't allow to override it
-        # self.q_conv1d.weight.data = self.q_conv1d.weight.data.unsqueeze(1)
-        # self.k_conv1d.weight.data = self.k_conv1d.weight.data.unsqueeze(1)
-        # self.v_conv1d.weight.data = self.v_conv1d.weight.data.unsqueeze(1)
         self.qkv_conv1d.weight.data = self.qkv_conv1d.weight.data.unsqueeze(1)
 
         self.A_log = nn.Parameter(
@@ -336,18 +312,6 @@ class KimiDeltaAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        # self.q_conv_weights = self.q_conv1d.weight.view(
-        #     self.q_conv1d.weight.size(0), self.q_conv1d.weight.size(2)
-        # )
-        # self.k_conv_weights = self.k_conv1d.weight.view(
-        #     self.k_conv1d.weight.size(0), self.k_conv1d.weight.size(2)
-        # )
-        # self.v_conv_weights = self.v_conv1d.weight.view(
-        #     self.v_conv1d.weight.size(0), self.v_conv1d.weight.size(2)
-        # )
-        #
-        # conv_weights = (self.q_conv_weights, self.k_conv_weights, self.v_conv_weights)
-        # bias = (self.q_conv1d.bias, self.k_conv1d.bias, self.v_conv1d.bias)
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
