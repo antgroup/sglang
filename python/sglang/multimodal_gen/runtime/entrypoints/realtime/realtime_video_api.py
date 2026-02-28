@@ -73,7 +73,8 @@ async def _listen_actions(ws: WebSocket, session: GenerateSession):
             continue
 
 
-async def _handle_generate_request(data, session_id: str):
+async def _listen_generate_request(ws: WebSocket, session_id: str):
+    data = unpackb(await ws.receive_bytes())
     realtime_req = RealtimeVideoGenerationsRequest.model_validate(data)
     # TODO: convert RGB for krea
     # params.start_frame = Image.open(params.start_frame).convert("RGB")
@@ -91,23 +92,23 @@ async def _handle_generate_request(data, session_id: str):
 async def generate(websocket: WebSocket, id: str):
     await websocket.accept()
     try:
+        # receive new generate request
         while True:
-            # receive new generate request
             try:
-                data = unpackb(await websocket.receive_bytes())
-                realtime_req = await _handle_generate_request(data, id)
+                realtime_req = await _listen_generate_request(websocket, id)
+                break
             except Exception as e:
                 logger.warning(f"invalid generate request, session_id={id}, error={e}")
                 await write_error_msg("invalid generate request", websocket)
                 continue
 
-            # TODO: init session
-            session = GenerateSession(id)
+        # TODO: init session
+        session = GenerateSession(id)
 
-            # generate video chunk
-            generate_task = asyncio.create_task(_generate_loop(websocket, session))
-            # listen for actions
-            await _listen_actions(websocket, session)
+        # generate video chunk
+        generate_task = asyncio.create_task(_generate_loop(websocket, session))
+        # listen for actions
+        await _listen_actions(websocket, session)
 
     except WebSocketDisconnect:
         logger.info(f"client disconnected, session_id: {id}")
