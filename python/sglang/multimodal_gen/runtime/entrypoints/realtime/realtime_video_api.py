@@ -3,7 +3,7 @@ import os
 from collections import deque
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from msgpack import unpackb
+from msgpack import packb, unpackb
 from pydantic import ValidationError
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
@@ -44,11 +44,12 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             # save_file_path = save_file_path_list[0]
             # TODO: receive bytes stream or file path?
             # websocket.send_bytes(next_frame)
+            logger.info(f"generate video chunk, session_id: {session.id}")
             await asyncio.sleep(5)
         except asyncio.CancelledError:
             logger.info(f"generation completed, session_id: {session.id}")
             try:
-                await ws.send_json({"session_id": session.id, "status": "completed"})
+                await write_status_msg("cancel", ws)
             except Exception as e:
                 logger.error(f"error during sending complete msg: {e}")
                 pass
@@ -63,9 +64,12 @@ async def _listen_actions(ws: WebSocket, session: GenerateSession):
         try:
             realtime_action = RealtimeAction.model_validate(data)
             session.action_queue.append(realtime_action)
+            logger.info(
+                f"receive realtime action, session_id: {session.id}, realtime_action: {realtime_action}"
+            )
         except ValidationError as e:
             logger.warning(f"invalid action, data={data}, error={e}")
-            await ws.send_json({"error": e.errors()})
+            await write_error_msg("invalid action", ws)
             continue
 
 
@@ -94,7 +98,7 @@ async def generate(websocket: WebSocket, id: str):
                 realtime_req = await _handle_generate_request(data, id)
             except Exception as e:
                 logger.warning(f"invalid generate request, session_id={id}, error={e}")
-                await websocket.send_json({"error": e.errors()})
+                await write_error_msg("invalid generate request", websocket)
                 continue
 
             # TODO: init session
@@ -103,7 +107,7 @@ async def generate(websocket: WebSocket, id: str):
             # generate video chunk
             generate_task = asyncio.create_task(_generate_loop(websocket, session))
             # listen for actions
-            _listen_actions(websocket, session)
+            await _listen_actions(websocket, session)
 
     except WebSocketDisconnect:
         logger.info(f"client disconnected, session_id: {id}")
@@ -113,7 +117,11 @@ async def generate(websocket: WebSocket, id: str):
             generate_task.cancel()
         if session:
             session.dispose()
-        try:
-            await websocket.send_json({"session_id": id, "status": "completed"})
-        except:
-            pass
+
+
+async def write_error_msg(error_msg: str, websocket: WebSocket):
+    await websocket.send_bytes(packb({"type": "error", "content": error_msg}))
+
+
+async def write_status_msg(status: str, websocket: WebSocket):
+    await websocket.send_bytes(packb({"type": "status", "content": status}))
