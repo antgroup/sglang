@@ -187,19 +187,51 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         has_initial_state = forward_batch.extend_prefix_lens > 0
 
-        qkv = causal_conv1d_fn(
-            mixed_qkv.transpose(0, 1),
-            layer.conv_weights,
-            layer.bias,
+        splits = [layer.q_dim, layer.k_dim, layer.v_dim]
+        q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
+        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+            splits, dim=0
+        )
+        q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
+        if layer.bias is not None:
+            q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+        else:
+            q_bias, k_bias, v_bias = None, None, None
+
+        q = causal_conv1d_fn(
+            q,
+            q_conv_weight,
+            q_bias,
             activation="silu",
-            conv_states=conv_states,
+            conv_states=q_conv_state,
+            has_initial_state=has_initial_state,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        ).transpose(0, 1)
+        k = causal_conv1d_fn(
+            k,
+            k_conv_weight,
+            k_bias,
+            activation="silu",
+            conv_states=k_conv_state,
+            has_initial_state=has_initial_state,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        ).transpose(0, 1)
+        v = causal_conv1d_fn(
+            v,
+            v_conv_weight,
+            v_bias,
+            activation="silu",
+            conv_states=v_conv_state,
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
 
-        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = rearrange(q, "n (h d) -> 1 n h d", d=layer.head_q_dim)
         k = rearrange(k, "n (h d) -> 1 n h d", d=layer.head_k_dim)
         v = rearrange(v, "n (h d) -> 1 n h d", d=layer.head_v_dim)
