@@ -585,6 +585,19 @@ class HiCacheController:
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
+        # Least Common Multiple among heterogeneous tp size
+        tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
+        should_split_heads = False
+
+        if tp_lcm_size:
+            assert (
+                tp_lcm_size % self.tp_size == 0
+            ), "tp_lcm_size must be divisible by tp_size."
+            should_split_heads = (
+                not is_mla_backend
+                and self.mem_pool_host.layout == "page_head"
+                and tp_lcm_size > self.tp_size
+            )
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
@@ -595,6 +608,8 @@ class HiCacheController:
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
+            tp_lcm_size=tp_lcm_size,
+            should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
         )
 
