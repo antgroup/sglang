@@ -93,7 +93,7 @@ async def generate(websocket: WebSocket, id: str):
                 data = unpackb(await websocket.receive_bytes())
                 realtime_req = await _handle_generate_request(data, id)
             except Exception as e:
-                logger.warning(f"invalid generate request, data={data}, error={e}")
+                logger.warning(f"invalid generate request, session_id={id}, error={e}")
                 await websocket.send_json({"error": e.errors()})
                 continue
 
