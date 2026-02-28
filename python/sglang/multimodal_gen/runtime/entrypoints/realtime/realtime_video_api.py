@@ -73,17 +73,13 @@ async def _handle_generate_request(data, session_id: str):
     realtime_req = RealtimeVideoGenerationsRequest.model_validate(data)
     # TODO: convert RGB for krea
     # params.start_frame = Image.open(params.start_frame).convert("RGB")
-    ref_img = realtime_req.input_reference
     uploads_dir = os.path.join("inputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
 
-    filename = ref_img.filename if hasattr(ref_img, "filename") else "url_image"
-    target_path = os.path.join(uploads_dir, f"{session_id}_{filename}")
-    image_path = await save_image_to_path(realtime_req.input_reference, target_path)
+    target_path = os.path.join(uploads_dir, f"{session_id}_start_frame")
+    image_path = await save_image_to_path(realtime_req.start_frame, target_path)
 
-    realtime_req.input_reference_local = image_path
-    realtime_req.input_reference = None
-
+    realtime_req.start_frame = image_path
     return realtime_req
 
 

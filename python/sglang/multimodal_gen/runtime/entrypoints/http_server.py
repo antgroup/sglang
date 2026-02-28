@@ -14,7 +14,6 @@ from fastapi.responses import ORJSONResponse
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai import (
     image_api,
-    realtime_video_api,
     video_api,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
@@ -22,6 +21,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
 from sglang.multimodal_gen.runtime.entrypoints.post_training import weights_api
+from sglang.multimodal_gen.runtime.entrypoints.realtime import realtime_video_api
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
