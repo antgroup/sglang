@@ -76,10 +76,10 @@ async def _handle_generate_request(data, session_id: str):
     uploads_dir = os.path.join("inputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
 
-    target_path = os.path.join(uploads_dir, f"{session_id}_start_frame")
-    image_path = await save_image_to_path(realtime_req.start_frame, target_path)
+    target_path = os.path.join(uploads_dir, f"{session_id}_first_frame")
+    image_path = await save_image_to_path(realtime_req.first_frame, target_path)
 
-    realtime_req.start_frame = image_path
+    realtime_req.first_frame = image_path
     return realtime_req
 
 
