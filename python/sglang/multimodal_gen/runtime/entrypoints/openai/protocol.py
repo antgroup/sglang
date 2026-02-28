@@ -4,7 +4,6 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from fastapi import File, UploadFile
 from pydantic import BaseModel, Field
 
 
@@ -107,10 +106,8 @@ class VideoRemixRequest(BaseModel):
 
 
 class RealtimeVideoGenerationsRequest(BaseModel):
-    model: Optional[str] = None
     prompt: str
-    input_reference: Optional[UploadFile] = (File(None),)
-    input_reference_local: Optional[str] = None
+    first_frame: bytes | str
     width: int = 832
     height: int = 480
     seed: Optional[int] = 1024
