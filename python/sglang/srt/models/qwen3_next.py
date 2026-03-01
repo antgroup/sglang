@@ -253,7 +253,9 @@ class Qwen3GatedDeltaNet(nn.Module):
             key_dim=self.key_dim,
             value_dim=self.value_dim,
             quant_config=quant_config,
-            prefix=prefix,
+            prefix=add_prefix("in_proj_qkvz", prefix),
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
         )
 
         self.in_proj_ba = MergedColumnParallelLinear(
@@ -347,13 +349,17 @@ class Qwen3GatedDeltaNet(nn.Module):
         value_dim: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ) -> MergedColumnParallelLinear:
         return MergedColumnParallelLinear(
             input_size=hidden_size,
-            output_sizes=[sum((key_dim, key_dim, value_dim)), value_dim],
+            output_sizes=[key_dim, key_dim, value_dim, value_dim],
             bias=False,
             quant_config=quant_config,
             prefix=prefix,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
 
     def fix_query_key_value_ordering(
