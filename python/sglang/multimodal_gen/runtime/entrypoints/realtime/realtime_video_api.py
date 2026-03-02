@@ -28,26 +28,29 @@ router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 class GenerateSession:
 
     def __init__(self, id: str, request: RealtimeVideoGenerationsRequest):
-        self.id = id
+        self.id = uuid4().hex
         self.request_id = None
-        self.request = request
+        self.request = None
         self.action_queue = deque(maxlen=3)
         self.generate_chunk_cnt = 0
 
+    def setRequest(self, request: RealtimeVideoGenerationsRequest):
+        self.request = request
+
     def dispose(self):
         self.action_queue.clear()
+
+    def new_request(self):
+        self.request_id = f"{self.id}_{uuid4().hex}"
+
+    def generate_chunk_completed(self):
+        self.generate_chunk_cnt += 1
 
     def append_action(self, action: RealtimeAction):
         self.action_queue.append(action)
 
     def sample_action(self) -> RealtimeAction:
         return self.action_queue.popleft()
-
-    def new_request(self):
-        self.request_id = uuid4().hex
-
-    def generate_chunk_completed(self):
-        self.generate_chunk_cnt += 1
 
     def build_sampling_params(self):
         if self.generate_chunk_cnt == 0:
@@ -104,7 +107,7 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
 
             logger.info(
                 f"generate video chunk, "
-                f"session_id: {session.id},"
+                f"request_id: {session.request_id},"
                 f"chunk_cnt: {session.generate_chunk_cnt},"
                 f"save_file_path: {save_file_path}"
             )
@@ -112,13 +115,19 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
         except asyncio.CancelledError:
             logger.info(f"generation completed, session_id: {session.id}")
             try:
-                await write_status_msg("cancel", ws)
+                await write_status_msg("generation canceled.", ws)
             except Exception as e:
                 logger.error(f"error during sending complete msg: {e}")
                 pass
             break
         except Exception as e:
             logger.error(f"error during generate loop: {e}")
+            try:
+                await write_error_msg(f"error during generate loop: {e}", ws)
+            except Exception as e:
+                logger.error(f"error during sending complete msg: {e}")
+                pass
+            break
 
 
 async def _listen_actions(ws: WebSocket, session: GenerateSession):
@@ -136,7 +145,7 @@ async def _listen_actions(ws: WebSocket, session: GenerateSession):
             continue
 
 
-async def _listen_generate_request(ws: WebSocket, session_id: str):
+async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
     data = unpackb(await ws.receive_bytes())
     realtime_req = RealtimeVideoGenerationsRequest.model_validate(data)
     # TODO: convert RGB for krea
@@ -144,34 +153,37 @@ async def _listen_generate_request(ws: WebSocket, session_id: str):
     uploads_dir = os.path.join("inputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
 
-    target_path = os.path.join(uploads_dir, f"{session_id}_first_frame")
+    target_path = os.path.join(uploads_dir, f"{session.id}_first_frame")
     image_path = await save_image_to_path(realtime_req.first_frame, target_path)
 
     realtime_req.first_frame = image_path
     return realtime_req
 
 
-@router.websocket("/generate/{id}")
-async def generate(websocket: WebSocket, id: str):
+@router.websocket("/generate")
+async def generate(websocket: WebSocket):
     await websocket.accept()
+    session = GenerateSession()
     try:
         # receive new generate request
         while True:
             try:
-                realtime_req = await _listen_generate_request(websocket, id)
+                realtime_req = await _listen_generate_request(websocket, session)
+                session.setRequest(realtime_req)
                 break
             except Exception as e:
                 logger.warning(f"invalid generate request, session_id={id}, error={e}")
                 await write_error_msg("invalid generate request", websocket)
                 continue
 
-        # TODO: init session
-        session = GenerateSession(id, realtime_req)
-
         # generate video chunk
         generate_task = asyncio.create_task(_generate_loop(websocket, session))
         # listen for actions
-        await _listen_actions(websocket, session)
+        listen_task = asyncio.create_task(_listen_actions(websocket, session))
+
+        await asyncio.wait(
+            [generate_task, listen_task], return_when=asyncio.FIRST_COMPLETED
+        )
 
     except WebSocketDisconnect:
         logger.info(f"client disconnected, session_id: {id}")
@@ -179,6 +191,8 @@ async def generate(websocket: WebSocket, id: str):
         logger.info(f"terminating session, session_id: {id}")
         if generate_task:
             generate_task.cancel()
+        if listen_task:
+            listen_task.cancel()
         if session:
             session.dispose()
 
