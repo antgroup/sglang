@@ -107,8 +107,8 @@ class VideoRemixRequest(BaseModel):
 
 class RealtimeVideoGenerationsRequest(BaseModel):
     prompt: str
-    first_frame: bytes | str
-    size: Optional[int] = "832x480"
+    first_frame: Optional[bytes | str] = None
+    size: Optional[str] = "832x480"
     seconds: Optional[int] = 4
     fps: Optional[int] = None
     num_frames: Optional[int] = None

@@ -57,11 +57,6 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
 
         except asyncio.CancelledError:
             logger.info(f"generation completed, session_id: {session.id}")
-            try:
-                await write_status_msg("generation canceled.", ws)
-            except Exception as e:
-                logger.error(f"error during sending complete msg: {e}")
-                pass
             break
         except Exception as e:
             logger.error(f"error during generate loop: {e}")
@@ -107,6 +102,8 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
 async def generate(websocket: WebSocket):
     await websocket.accept()
     session = GenerateSession()
+    generate_task = None
+    listen_task = None
     try:
         # receive new generate request
         while True:
@@ -115,7 +112,9 @@ async def generate(websocket: WebSocket):
                 session.setRequest(realtime_req)
                 break
             except Exception as e:
-                logger.warning(f"invalid generate request, session_id={id}, error={e}")
+                logger.warning(
+                    f"invalid generate request, session_id: {session.id}, error={e}"
+                )
                 await write_error_msg("invalid generate request", websocket)
                 continue
 
@@ -129,12 +128,12 @@ async def generate(websocket: WebSocket):
         )
 
     except WebSocketDisconnect:
-        logger.info(f"client disconnected, session_id: {id}")
+        logger.info(f"client disconnected, session_id: {session.id}")
     finally:
-        logger.info(f"terminating session, session_id: {id}")
-        if generate_task:
+        logger.info(f"terminating session, session_id: {session.id}")
+        if generate_task and not generate_task.done():
             generate_task.cancel()
-        if listen_task:
+        if listen_task and not generate_task.done():
             listen_task.cancel()
         if session:
             session.dispose()
