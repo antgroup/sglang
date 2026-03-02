@@ -15,11 +15,11 @@ from torch.nn.attention.flex_attention import (
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
-from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
+    tensor_parallel_rms_norm,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
@@ -43,6 +43,31 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+class ScaleResidual(nn.Module):
+    """
+    Applies gated residual connection.
+    """
+
+    def __init__(self, prefix: str = ""):
+        super().__init__()
+
+    def forward(
+        self, residual: torch.Tensor, x: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply gated residual connection."""
+        # x.shape: [batch_size, seq_len, inner_dim]
+        if gate.dim() == 4:
+            # gate.shape: [batch_size, num_frames, 1, inner_dim]
+            num_frames = gate.shape[1]
+            frame_seqlen = x.shape[1] // num_frames
+            return residual + (
+                x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
+            ).flatten(1, 2)
+        else:
+            # gate.shape: [batch_size, 1, inner_dim]
+            return residual + x * gate
 
 
 @functools.lru_cache(maxsize=32)
@@ -95,40 +120,58 @@ def get_block_mask(
     return block_mask
 
 
-def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
-    n, c = x.size(2), x.size(3) // 2
+class WanT2VCrossAttentionWithCache(WanT2VCrossAttention):
 
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    def forward(self, x, context, context_lens, crossattn_cache=None):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L1, C]
+            context(Tensor): Shape [B, L2, C]
+            context_lens(Tensor): Shape [B]
+            crossattn_cache (List[dict], *optional*): Contains the cached key and value tensors for context embedding.
+        """
+        q, _ = self.to_q(x)
+        if self.tp_rmsnorm:
+            q = tensor_parallel_rms_norm(q, self.norm_q)
+        else:
+            q = self.norm_q(q)
+        q = q.unflatten(2, (self.local_num_heads, self.head_dim))
 
-    # loop over samples
-    output = []
+        if crossattn_cache is not None:
+            if not crossattn_cache["is_init"]:
+                crossattn_cache["is_init"] = True
+                k, _ = self.to_k(context)
+                if self.tp_rmsnorm:
+                    k = tensor_parallel_rms_norm(k, self.norm_k)
+                else:
+                    k = self.norm_k(k)
+                k = k.unflatten(2, (self.local_num_heads, self.head_dim))
 
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
+                v, _ = self.to_v(context)
+                v = v.unflatten(2, (self.local_num_heads, self.head_dim))
+                crossattn_cache["k"] = k
+                crossattn_cache["v"] = v
+            else:
+                k = crossattn_cache["k"]
+                v = crossattn_cache["v"]
+        else:
+            k, _ = self.to_k(context)
+            if self.tp_rmsnorm:
+                k = tensor_parallel_rms_norm(k, self.norm_k)
+            else:
+                k = self.norm_k(k)
+            k = k.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(
-            x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2)
-        )
-        freqs_i = torch.cat(
-            [
-                freqs[0][start_frame : start_frame + f]
-                .view(f, 1, 1, -1)
-                .expand(f, h, w, -1),
-                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-            ],
-            dim=-1,
-        ).reshape(seq_len, 1, -1)
+            v, _ = self.to_v(context)
+            v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
+        # compute attention
+        x = self.attn(q, k, v)
 
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).type_as(x)
+        # output
+        x = x.flatten(2)
+        x, _ = self.to_out(x)
+        return x
 
 
 class KreaCausalWanSelfAttention(nn.Module):
@@ -175,7 +218,6 @@ class KreaCausalWanSelfAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        grid_sizes,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         block_mask: BlockMask,
         kv_cache: dict | None = None,
@@ -184,18 +226,23 @@ class KreaCausalWanSelfAttention(nn.Module):
     ):
         r"""
         Args:
-            x(Tensor): Shape [B, L, num_heads, C / num_heads]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            q(Tensor): Shape [B, L, num_heads, C / num_heads]
+            k(Tensor): Shape [B, L, num_heads, C / num_heads]
+            v(Tensor): Shape [B, L, num_heads, C / num_heads]
+            freqs_cis(Tuple[Tensor, Tensor] ): Rope freqs, (cos, sin) tuple
+            block_mask(BlockMask): Attention block mask
+            kv_cache(dict | None): KV cache dictionary
+            current_start(int): Current start index
+            cache_start(int | None): Cache start index
         """
         if cache_start is None:
             cache_start = current_start
 
-        if kv_cache is None or block_mask is not None:
-            cos, sin = freqs_cis
-            roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
-            roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
+        cos, sin = freqs_cis
+        roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
+        roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
+
+        if block_mask is not None:
             local_end_index = roped_key.shape[1]
             kv_cache["k"][:, :local_end_index] = roped_key
             kv_cache["v"][:, :local_end_index] = v
@@ -250,14 +297,7 @@ class KreaCausalWanSelfAttention(nn.Module):
                 },
             )[:, :, :-padded_length].transpose(2, 1)
         else:
-            frame_seqlen = 1560
-            current_start_frame = current_start // frame_seqlen
-            roped_query = causal_rope_apply(
-                q, grid_sizes, freqs_cis, start_frame=current_start_frame
-            ).type_as(v)
-            roped_key = causal_rope_apply(
-                k, grid_sizes, freqs_cis, start_frame=current_start_frame
-            ).type_as(v)
+            frame_seqlen = q.shape[1]
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
@@ -403,7 +443,9 @@ class KreaCausalWanTransformerBlock(nn.Module):
 
         # 2. Cross-attention
         # Only T2V for now
-        self.attn2 = WanT2VCrossAttention(dim, num_heads, qk_norm=qk_norm, eps=eps)
+        self.attn2 = WanT2VCrossAttentionWithCache(
+            dim, num_heads, qk_norm=qk_norm, eps=eps
+        )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
             eps=eps,
@@ -413,7 +455,7 @@ class KreaCausalWanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
-        self.mlp_residual = MulAdd()
+        self.mlp_residual = ScaleResidual()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
@@ -480,7 +522,9 @@ class KreaCausalWanTransformerBlock(nn.Module):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = null_scale = torch.tensor([0], device=hidden_states.device)
+        null_shift = null_scale = torch.tensor(
+            [0], device=hidden_states.device, dtype=hidden_states.dtype
+        )
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
@@ -581,7 +625,6 @@ class KreaCausalWanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         # 4. Output norm & projection
         self.norm_out = LayerNormScaleShift(
             inner_dim,
-            norm_type="layer",
             eps=config.eps,
             elementwise_affine=False,
             dtype=torch.float32,
@@ -602,6 +645,8 @@ class KreaCausalWanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         self.independent_first_frame = False
 
         self.__post_init__()
+
+        self.layer_names = ["blocks"]
 
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(
@@ -799,6 +844,32 @@ class KreaCausalWanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     def forward(self, *args, **kwargs):
         assert kwargs.get("kv_cache") is not None
         return self._forward_inference(*args, **kwargs)
+
+    def unpatchify(self, x, grid_sizes):
+        r"""
+
+
+        Args:
+            x (List[Tensor]):
+                List of patchified features, each with shape [L, C_out * prod(patch_size)]
+            grid_sizes (Tensor):
+                Original spatial-temporal grid dimensions before patching,
+
+
+        Returns:
+            Tensor:
+                Reconstructed video tensors with shape [B, C_out, F, H / 8, W / 8]
+        """
+
+        c = self.out_channels
+        out = []
+        for u, v in zip(x, grid_sizes.tolist()):
+            u = u[: math.prod(v)].view(*v, *self.patch_size, c)
+            u = u.permute(6, 0, 3, 1, 4, 2, 5)
+            # u = torch.einsum('fhwpqrc->cfphqwr', u.contiguous())
+            u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
+            out.append(u)
+        return out
 
 
 EntryClass = KreaCausalWanTransformer3DModel
