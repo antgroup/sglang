@@ -27,7 +27,7 @@ router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 
 class GenerateSession:
 
-    def __init__(self, id: str, request: RealtimeVideoGenerationsRequest):
+    def __init__(self):
         self.id = uuid4().hex
         self.request_id = None
         self.request = None
