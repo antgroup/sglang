@@ -90,12 +90,15 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
             realtime_req = RealtimeVideoGenerationsRequest.model_validate(data)
             # TODO: convert RGB for krea
             # params.start_frame = Image.open(params.start_frame).convert("RGB")
-            uploads_dir = os.path.join("inputs", "uploads")
-            os.makedirs(uploads_dir, exist_ok=True)
+            if realtime_req.first_frame is not None:
+                uploads_dir = os.path.join("inputs", "uploads")
+                os.makedirs(uploads_dir, exist_ok=True)
 
-            target_path = os.path.join(uploads_dir, f"{session.id}_first_frame")
-            image_path = await save_image_to_path(realtime_req.first_frame, target_path)
-            realtime_req.first_frame = image_path
+                target_path = os.path.join(uploads_dir, f"{session.id}_first_frame")
+                image_path = await save_image_to_path(
+                    realtime_req.first_frame, target_path
+                )
+                realtime_req.first_frame = image_path
 
             session.setRequest(realtime_req)
             break
