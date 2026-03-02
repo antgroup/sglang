@@ -84,18 +84,27 @@ async def _listen_actions(ws: WebSocket, session: GenerateSession):
 
 
 async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
-    data = unpackb(await ws.receive_bytes())
-    realtime_req = RealtimeVideoGenerationsRequest.model_validate(data)
-    # TODO: convert RGB for krea
-    # params.start_frame = Image.open(params.start_frame).convert("RGB")
-    uploads_dir = os.path.join("inputs", "uploads")
-    os.makedirs(uploads_dir, exist_ok=True)
+    while True:
+        try:
+            data = unpackb(await ws.receive_bytes())
+            realtime_req = RealtimeVideoGenerationsRequest.model_validate(data)
+            # TODO: convert RGB for krea
+            # params.start_frame = Image.open(params.start_frame).convert("RGB")
+            uploads_dir = os.path.join("inputs", "uploads")
+            os.makedirs(uploads_dir, exist_ok=True)
 
-    target_path = os.path.join(uploads_dir, f"{session.id}_first_frame")
-    image_path = await save_image_to_path(realtime_req.first_frame, target_path)
+            target_path = os.path.join(uploads_dir, f"{session.id}_first_frame")
+            image_path = await save_image_to_path(realtime_req.first_frame, target_path)
+            realtime_req.first_frame = image_path
 
-    realtime_req.first_frame = image_path
-    return realtime_req
+            session.setRequest(realtime_req)
+            break
+        except Exception as e:
+            logger.warning(
+                f"invalid generate request, session_id: {session.id}, error={e}"
+            )
+            await write_error_msg("invalid generate request", ws)
+            continue
 
 
 @router.websocket("/generate")
@@ -106,17 +115,7 @@ async def generate(websocket: WebSocket):
     listen_task = None
     try:
         # receive new generate request
-        while True:
-            try:
-                realtime_req = await _listen_generate_request(websocket, session)
-                session.setRequest(realtime_req)
-                break
-            except Exception as e:
-                logger.warning(
-                    f"invalid generate request, session_id: {session.id}, error={e}"
-                )
-                await write_error_msg("invalid generate request", websocket)
-                continue
+        await _listen_generate_request(websocket, session)
 
         # generate video chunk
         generate_task = asyncio.create_task(_generate_loop(websocket, session))
