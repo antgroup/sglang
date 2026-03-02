@@ -38,11 +38,14 @@ class GenerateSession:
     def build_sampling_params(self):
         if self.generate_chunk_cnt == 0:
             prompt = self.request.prompt
-        else:
+        elif len(self.action_queue) > 0:
             realtime_action = self.action_queue.popleft()
             # only support prompt action
             if realtime_action.type == "prompt":
                 prompt = realtime_action.action_content
+        else:
+            # TODO(@puf147): generate with empty action
+            prompt = self.request.prompt
 
         return build_sampling_params(
             self.request_id,

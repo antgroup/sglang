@@ -88,7 +88,7 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
         try:
             data = unpackb(await ws.receive_bytes())
             realtime_req = RealtimeVideoGenerationsRequest.model_validate(data)
-            # TODO: convert RGB for krea
+            # TODO(puf147): convert RGB for krea
             # params.start_frame = Image.open(params.start_frame).convert("RGB")
             if realtime_req.first_frame is not None:
                 uploads_dir = os.path.join("inputs", "uploads")
