@@ -396,7 +396,6 @@ class KreaCausalWanTransformerBlock(nn.Module):
         assert cross_attn_norm is True
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=True,
             dtype=torch.float32,
@@ -407,7 +406,6 @@ class KreaCausalWanTransformerBlock(nn.Module):
         self.attn2 = WanT2VCrossAttention(dim, num_heads, qk_norm=qk_norm, eps=eps)
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
