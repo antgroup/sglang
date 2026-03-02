@@ -60,6 +60,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
+    SelfForcingWanT2V480PConfig,
     TurboWanI2V720Config,
     TurboWanT2V480PConfig,
     Wan2_2_I2V_A14B_Config,
@@ -488,7 +489,7 @@ def _register_configs():
     )
     register_configs(
         sampling_param_cls=Krea_Wan2_1_T2V_A14B_SamplingParam,
-        pipeline_config_cls=WanT2V720PConfig,
+        pipeline_config_cls=SelfForcingWanT2V480PConfig,
         hf_model_paths=[
             "Wan-AI/krea-realtime-video-diffusers",
         ],
