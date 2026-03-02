@@ -165,7 +165,7 @@ class KreaCausalWanSelfAttention(nn.Module):
             softmax_scale=None,
             causal=False,
             supported_attention_backends=(
-                AttentionBackendEnum.FLASH_ATTN,
+                AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
             ),
         )
