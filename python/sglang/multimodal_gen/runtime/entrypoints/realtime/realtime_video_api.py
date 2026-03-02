@@ -1,6 +1,7 @@
 import asyncio
 import os
 from collections import deque
+from uuid import uuid4
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from msgpack import packb, unpackb
@@ -11,8 +12,13 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeVideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    build_sampling_params,
+    process_generation_batch,
     save_image_to_path,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -21,31 +27,88 @@ router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 
 class GenerateSession:
 
-    def __init__(self, id: str):
+    def __init__(self, id: str, request: RealtimeVideoGenerationsRequest):
         self.id = id
+        self.request_id = None
+        self.request = request
         self.action_queue = deque(maxlen=3)
+        self.generate_chunk_cnt = 0
 
     def dispose(self):
         self.action_queue.clear()
 
-    def sample_action(self):
+    def append_action(self, action: RealtimeAction):
+        self.action_queue.append(action)
+
+    def sample_action(self) -> RealtimeAction:
         return self.action_queue.popleft()
+
+    def new_request(self):
+        self.request_id = uuid4().hex
+
+    def generate_chunk_completed(self):
+        self.generate_chunk_cnt += 1
+
+    def build_sampling_params(self):
+        if self.generate_chunk_cnt == 0:
+            prompt = self.request.prompt
+        else:
+            realtime_action = self.action_queue.popleft()
+            # only support prompt action
+            if realtime_action.type == "prompt":
+                prompt = realtime_action.action_content
+
+        return build_sampling_params(
+            self.request_id,
+            prompt=prompt,
+            size=self.request.size,
+            num_frames=self.request.num_frames,
+            fps=self.request.fps,
+            image_path=self.request.first_frame,
+            output_file_name=self.request_id,
+            seed=self.request.seed,
+            generator_device=self.request.generator_device,
+            num_inference_steps=self.request.num_inference_steps,
+            guidance_scale=self.request.guidance_scale,
+            guidance_scale_2=self.request.guidance_scale_2,
+            negative_prompt=self.request.negative_prompt,
+            enable_teacache=self.request.enable_teacache,
+            output_path=self.request.output_path,
+            output_compression=self.request.output_compression,
+            output_quality=self.request.output_quality,
+        )
 
 
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
+
     while True:
         try:
-            # TODO: send to scheduler
-            # rt_act = session.sample_action()
-            # from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
-            # save_file_path_list, result = await process_generation_batch(
-            #     async_scheduler_client, batch
-            # )
-            # save_file_path = save_file_path_list[0]
-            # TODO: receive bytes stream or file path?
-            # websocket.send_bytes(next_frame)
-            logger.info(f"generate video chunk, session_id: {session.id}")
-            await asyncio.sleep(5)
+            session.new_request()
+
+            # send to scheduler and generate video chunk
+            batch = prepare_request(
+                server_args=get_global_server_args(),
+                sampling_params=session.build_sampling_params(),
+            )
+            save_file_path_list, result = await process_generation_batch(
+                async_scheduler_client, batch
+            )
+
+            # send to client
+            save_file_path = save_file_path_list[0]
+            with open(save_file_path, "rb") as f:
+                frame_bytes = f.read()
+            await write_frame_msg(frame_bytes, ws)
+
+            session.generate_chunk_completed()
+
+            logger.info(
+                f"generate video chunk, "
+                f"session_id: {session.id},"
+                f"chunk_cnt: {session.generate_chunk_cnt},"
+                f"save_file_path: {save_file_path}"
+            )
+
         except asyncio.CancelledError:
             logger.info(f"generation completed, session_id: {session.id}")
             try:
@@ -63,7 +126,7 @@ async def _listen_actions(ws: WebSocket, session: GenerateSession):
         data = unpackb(data)
         try:
             realtime_action = RealtimeAction.model_validate(data)
-            session.action_queue.append(realtime_action)
+            session.append_action(realtime_action)
             logger.info(
                 f"receive realtime action, session_id: {session.id}, realtime_action: {realtime_action}"
             )
@@ -103,7 +166,7 @@ async def generate(websocket: WebSocket, id: str):
                 continue
 
         # TODO: init session
-        session = GenerateSession(id)
+        session = GenerateSession(id, realtime_req)
 
         # generate video chunk
         generate_task = asyncio.create_task(_generate_loop(websocket, session))
@@ -126,3 +189,7 @@ async def write_error_msg(error_msg: str, websocket: WebSocket):
 
 async def write_status_msg(status: str, websocket: WebSocket):
     await websocket.send_bytes(packb({"type": "status", "content": status}))
+
+
+async def write_frame_msg(content: bytes, websocket: WebSocket):
+    await websocket.send_bytes(packb({"type": "frame", "content": content}))

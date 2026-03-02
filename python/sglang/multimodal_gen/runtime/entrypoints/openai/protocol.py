@@ -108,9 +108,25 @@ class VideoRemixRequest(BaseModel):
 class RealtimeVideoGenerationsRequest(BaseModel):
     prompt: str
     first_frame: bytes | str
-    width: int = 832
-    height: int = 480
+    size: Optional[int] = "832x480"
+    seconds: Optional[int] = 4
+    fps: Optional[int] = None
+    num_frames: Optional[int] = None
     seed: Optional[int] = 1024
+    generator_device: Optional[str] = "cuda"
+    # SGLang extensions
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    guidance_scale_2: Optional[float] = None
+    true_cfg_scale: Optional[float] = (
+        None  # for CFG vs guidance distillation (e.g., QwenImage)
+    )
+    negative_prompt: Optional[str] = None
+    enable_teacache: Optional[bool] = False
+    output_quality: Optional[str] = "default"
+    output_compression: Optional[int] = None
+    output_path: Optional[str] = None
+    diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
 class RealtimeAction(BaseModel):
