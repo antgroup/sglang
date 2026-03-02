@@ -793,3 +793,6 @@ class KreaCausalWanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     def forward(self, *args, **kwargs):
         assert kwargs.get("kv_cache") is not None
         return self._forward_inference(*args, **kwargs)
+
+
+EntryClass = KreaCausalWanTransformer3DModel
