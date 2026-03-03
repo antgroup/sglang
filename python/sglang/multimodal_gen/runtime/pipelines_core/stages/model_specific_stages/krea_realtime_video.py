@@ -90,8 +90,8 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
             # text to video
             init_latents = self.prepare_latents(
                 1,
-                server_args.pipeline_config.vae_config.vae_scale_factor,
-                server_args.pipeline_config.dit_config.num_channels_latents,
+                server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial,
+                server_args.pipeline_config.dit_config.arch_config.num_channels_latents,
                 batch.height,
                 batch.width,
                 batch.num_blocks,
@@ -338,7 +338,6 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         max_sequence_length: int,
         device: torch.device,
     ):
-
         prompt = [prompt] if isinstance(prompt, str) else prompt
         prompt = [prompt_clean(u) for u in prompt]
 
@@ -356,7 +355,6 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         prompt_embeds = self.text_encoder(
             text_input_ids.to(device), mask.to(device)
         ).last_hidden_state
-
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
         prompt_embeds = torch.stack(
             [
