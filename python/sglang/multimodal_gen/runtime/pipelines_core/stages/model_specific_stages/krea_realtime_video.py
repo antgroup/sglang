@@ -22,12 +22,12 @@ import regex as re
 
 
 class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
-    def __init__(self, textencoder, tokenizer, transformer, vae) -> None:
+    def __init__(self, text_encoder, tokenizer, transformer, vae) -> None:
         super().__init__()
         self.vae = vae
         self.tokenizer = tokenizer
         self.transformer = transformer
-        self.textencoder = textencoder
+        self.text_encoder = text_encoder
         self.video_processor = VideoProcessor(vae_scale_factor=8)
 
     def forward(
@@ -338,7 +338,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         max_sequence_length: int,
         device: torch.device,
     ):
-        dtype = self.text_encoder.dtype
+
         prompt = [prompt] if isinstance(prompt, str) else prompt
         prompt = [prompt_clean(u) for u in prompt]
 
@@ -356,7 +356,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         prompt_embeds = self.text_encoder(
             text_input_ids.to(device), mask.to(device)
         ).last_hidden_state
-        prompt_embeds = prompt_embeds.to(dtype=dtype)
+
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
         prompt_embeds = torch.stack(
             [
