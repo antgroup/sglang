@@ -5,6 +5,9 @@ Krea Wan Causal pipeline implementation.
 This module wires the causal DMD denoising stage into the modular pipeline.
 """
 
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
+    FlowUniPCMultistepScheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -47,6 +50,12 @@ class KreaWanCausalPipeline(LoRAPipeline, ComposedPipelineBase):
                 scheduler=self.get_module("scheduler"),
                 vae=self.get_module("vae"),
             ),
+        )
+
+    def initialize_pipeline(self, server_args: ServerArgs):
+        # We use UniPCMScheduler from Wan2.1 official repo, not the one in diffusers.
+        self.modules["scheduler"] = FlowUniPCMultistepScheduler(
+            shift=server_args.pipeline_config.flow_shift
         )
 
 
