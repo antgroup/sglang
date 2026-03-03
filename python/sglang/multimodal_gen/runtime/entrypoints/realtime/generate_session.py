@@ -1,14 +1,12 @@
 from collections import deque
-from typing import Any
 from uuid import uuid4
-
-import torch
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeAction,
     RealtimeVideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import RealtimeSession
 
 
 class GenerateSession:
@@ -19,12 +17,7 @@ class GenerateSession:
         self.request = None
         self.action_queue = deque(maxlen=3)
         self.generate_chunk_cnt = 0
-        self.kv_cache: Any = None
-        self.crossattn_cache: Any = None
-        self.current_denoised_latents: torch.Tensor = None
-        self.frame_cache_context: deque = None
-        self.decoder_cache: Any = None
-        self.input_frames_cache: deque = None
+        self.realtime_session = RealtimeSession()
 
     def setRequest(self, request: RealtimeVideoGenerationsRequest):
         self.request = request
