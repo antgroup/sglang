@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import pprint
+from collections import deque
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import Any, Optional
 
@@ -23,9 +24,6 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
-)
-from sglang.multimodal_gen.runtime.entrypoints.realtime.generate_session import (
-    GenerateSession,
 )
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
@@ -166,7 +164,7 @@ class Req:
     audio_sample_rate: int | None = None
 
     # realtime
-    session: GenerateSession | None = None
+    session: RealtimeSession | None = None
     block_idx: int = 0
     num_blocks: int = 1
     update_prompt_embeds: bool = False
@@ -330,6 +328,17 @@ class Req:
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
         logger.debug(debug_str)
+
+
+@dataclass
+class RealtimeSession:
+    def __init__(self):
+        self.kv_cache: Any = None
+        self.crossattn_cache: Any = None
+        self.current_denoised_latents: torch.Tensor = None
+        self.frame_cache_context: deque = None
+        self.decoder_cache: Any = None
+        self.input_frames_cache: deque = None
 
 
 @dataclass
