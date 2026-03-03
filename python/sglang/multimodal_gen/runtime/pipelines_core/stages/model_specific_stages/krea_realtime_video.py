@@ -51,10 +51,10 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         # step3 prepare latents
         # video to video
         if (
-            batch.session.input_frame_cache is not None
+            batch.session.input_frames_cache is not None
             and batch.input_video is not None
         ):
-            batch.session.input_frame_cache.extend(batch.input_video)
+            batch.session.input_frames_cache.extend(batch.input_video)
             video = (
                 self.video_processor.preprocess(
                     list(batch.session.input_frames_cache),
@@ -163,7 +163,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
             self.transformer(
                 hidden_states=context_frames.to(self.transformer.dtype),
                 timestep=context_timestep,
-                encoder_hidden_states=self.prompt_embeds.to(self.transformer.dtype),
+                encoder_hidden_states=batch.prompt_embeds.to(self.transformer.dtype),
                 kv_cache=batch.session.kv_cache,
                 crossattn_cache=batch.session.crossattn_cache,
                 current_start=0,  # when updating the kv cache with block_mask the current_start is unused
@@ -580,9 +580,9 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
 
         # Call the Transformer to predict noise
         noise_pred = self.transformer(
-            x=latents,
-            t=timestep.expand(latents.shape[0], num_frames_per_block),
-            context=prompt_embeds,
+            hidden_states=latents,
+            timestep=timestep.expand(latents.shape[0], num_frames_per_block),
+            encoder_hidden_states=prompt_embeds,
             kv_cache=kv_cache,
             seq_len=seq_length,
             crossattn_cache=crossattn_cache,
