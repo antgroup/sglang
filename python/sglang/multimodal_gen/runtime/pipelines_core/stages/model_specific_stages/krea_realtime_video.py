@@ -9,9 +9,11 @@ from diffusers.video_processor import VideoProcessor
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
     get_local_torch_device,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 if is_ftfy_available():
     import ftfy
@@ -42,6 +44,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             batch.prompt, device, 1, False, batch.negative_prompt
         )
+        transformer_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
         batch.prompt_embeds = prompt_embeds.contiguous()
         block_idx = batch.block_idx
         num_frames_per_block = self.transformer.config.arch_config.num_frames_per_block
@@ -78,12 +81,12 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
             noise = randn_tensor(
                 init_latents.shape,
                 device=self.transformer.device,
-                dtype=self.transformer.dtype,
+                dtype=transformer_dtype,
                 generator=batch.generator,
             )
 
             init_latents = init_latents * (1.0 - strength) + noise * strength
-            init_latents = init_latents.to(self.transformer.dtype).contiguous()
+            init_latents = init_latents.to(transformer_dtype).contiguous()
 
             batch.latents = init_latents
         else:
@@ -96,7 +99,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
                 batch.width,
                 batch.num_blocks,
                 num_frames_per_block,
-                self.transformer.dtype,
+                transformer_dtype,
                 self.transformer.device,
                 batch.generator,
                 batch.latents,
@@ -122,15 +125,15 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
                 * self.transformer.attention_head_dim,
                 crossattn_cache,
                 1,
-                self.transformer.dtype,
+                transformer_dtype,
                 self.transformer.device,
             )
 
         batch.local_attn_size = kv_cache_num_frames + num_frames_per_block
         for block in self.transformer.blocks:
-            block.self_attn.local_attn_size = -1
+            block.attn1.local_attn_size = -1
         for block in self.transformer.blocks:
-            block.self_attn.num_frame_per_block = num_frames_per_block
+            block.attn1.num_frame_per_block = num_frames_per_block
 
         batch.session.kv_cache = _initialize_kv_cache(
             len(self.transformer.blocks),
@@ -138,7 +141,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
             self.transformer.num_attention_heads * self.transformer.attention_head_dim,
             kv_cache,
             1,
-            self.transformer.dtype,
+            transformer_dtype,
             self.transformer.device,
             batch.local_attn_size,
             frame_seq_length,
@@ -161,15 +164,20 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
                 device=self.transformer.device,
                 dtype=torch.int64,
             )
-            self.transformer(
-                hidden_states=context_frames.to(self.transformer.dtype),
-                timestep=context_timestep,
-                encoder_hidden_states=batch.prompt_embeds.to(self.transformer.dtype),
-                kv_cache=batch.session.kv_cache,
-                crossattn_cache=batch.session.crossattn_cache,
-                current_start=0,  # when updating the kv cache with block_mask the current_start is unused
-                cache_start=None,
-            )
+            with set_forward_context(
+                current_timestep=0,
+                attn_metadata=None,
+                forward_batch=batch,
+            ):
+                self.transformer(
+                    hidden_states=context_frames.to(transformer_dtype),
+                    timestep=context_timestep,
+                    encoder_hidden_states=batch.prompt_embeds.to(transformer_dtype),
+                    kv_cache=batch.session.kv_cache,
+                    crossattn_cache=batch.session.crossattn_cache,
+                    current_start=0,  # when updating the kv cache with block_mask the current_start is unused
+                    cache_start=None,
+                )
             self.transformer.block_mask = None
         return batch
 
@@ -208,7 +216,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         ).to(latents.device, latents.dtype)
         latents = (latents - latents_mean) * latents_std
 
-        return latents.to(self.transformer.dtype)
+        return latents
 
     def encode_frames(
         self,
@@ -446,13 +454,17 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         kv_cache_num_frames = self.transformer.config.arch_config.kv_cache_num_frames
         num_frames_per_block = self.transformer.config.arch_config.num_frames_per_block
         frame_seq_length = self.transformer.config.arch_config.frame_seq_length
-
+        self.transformer_dtype = PRECISION_TO_TYPE[
+            server_args.pipeline_config.dit_precision
+        ]
+        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         # Iterate over each timestep
         for i, t in enumerate(timesteps):
             # Step 1: predict noise
             noise_pred = self.predict_noise(
                 latents=latents,
                 timestep=t,
+                timestep_index=i,
                 prompt_embeds=prompt_embeds,
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
@@ -461,6 +473,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
                 num_frames_per_block=num_frames_per_block,
                 seq_length=32760,
                 frame_seq_length=frame_seq_length,
+                batch=batch,
             )
 
             # Step 2: update latents
@@ -514,40 +527,86 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         if batch.block_idx != 0:
             self.vae._feat_map = batch.decoder_cache
 
-        if not batch.output_type == "latent":
-            latents = batch.latents.to(self.vae.device)
+        latents = batch.latents.to(self.vae.device)
 
-            # Create tensors directly on target device and dtype to avoid redundant conversions
-            latents_mean = torch.tensor(
-                self.vae.config.latents_mean,
-                device=latents.device,
-                dtype=latents.dtype,
-            ).view(1, self.vae.config.z_dim, 1, 1, 1)
-            latents_std = 1.0 / torch.tensor(
-                self.vae.config.latents_std,
-                device=latents.device,
-                dtype=latents.dtype,
-            ).view(1, self.vae.config.z_dim, 1, 1, 1)
+        # Create tensors directly on target device and dtype to avoid redundant conversions
+        latents_mean = torch.tensor(
+            self.vae.config.latents_mean,
+            device=latents.device,
+            dtype=latents.dtype,
+        ).view(1, self.vae.config.z_dim, 1, 1, 1)
+        latents_std = 1.0 / torch.tensor(
+            self.vae.config.latents_std,
+            device=latents.device,
+            dtype=latents.dtype,
+        ).view(1, self.vae.config.z_dim, 1, 1, 1)
 
-            latents = latents / latents_std + latents_mean
-            latents = latents.to(self.vae.dtype)
+        latents = latents / latents_std + latents_mean
+        latents = latents.to(vae_dtype)
 
-            videos = self.vae.decode(latents, return_dict=False)[0]
-
-        else:
-            batch.latents = latents
+        videos = self.vae.decode(latents)
 
         batch.session.decoder_cache = self.vae._feat_map
         batch.session.frame_cache_context.extend(videos.split(1, dim=2))
-        videos = self.video_processor.postprocess_video(
-            videos, output_type=self.vae.dtype
+        videos = self.video_processor.postprocess_video(videos, output_type="pil")
+
+        output_batch = OutputBatch(
+            output=videos,
+            trajectory_timesteps=batch.trajectory_timesteps,
+            trajectory_latents=batch.trajectory_latents,
+            trajectory_decoded=None,
+            metrics=batch.metrics,
         )
-        batch.videos = videos
+        return output_batch
+
+    def add_noise(
+        self,
+        sample: torch.Tensor,
+        noise: torch.Tensor,
+        timestep: torch.Tensor,
+        all_timesteps: torch.Tensor,
+        sigmas: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Add noise to a sample.
+
+        Uses the formula: noisy_sample = (1 - sigma) * sample + sigma * noise
+
+        Args:
+            sample: clean sample
+            noise: noise tensor
+            timestep: current timestep
+            all_timesteps: all timesteps
+            sigmas: sigma lookup table
+
+        Returns:
+            The noisy sample.
+        """
+        # Ensure sigmas is on the correct device
+        sigmas = sigmas.to(all_timesteps.device)
+
+        # Handle multi-dimensional timestep
+        if timestep.ndim == 2:
+            timestep = timestep.flatten(0, 1)
+
+        # Find the sigma corresponding to each timestep
+        timestep_id = torch.argmin(
+            (all_timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1
+        )
+        sigma = sigmas[timestep_id].reshape(-1, 1, 1, 1)
+
+        # Add noise
+        noisy_sample = (
+            (1 - sigma.double()) * sample.double() + sigma.double() * noise.double()
+        ).type_as(noise)
+
+        return noisy_sample
 
     def predict_noise(
         self,
         latents: torch.Tensor,
         timestep: torch.Tensor,
+        timestep_index: int,
         prompt_embeds: torch.Tensor,
         kv_cache: torch.Tensor,
         crossattn_cache: torch.Tensor,
@@ -556,6 +615,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         num_frames_per_block: int,
         seq_length: int,
         frame_seq_length: int,
+        batch: Req,
     ) -> torch.Tensor:
         """
         Predict noise using the Transformer.
@@ -563,6 +623,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         Args:
             latents: Current latent representation [B, C, F, H, W]
             timestep: Current timestep
+            timestep_index: Current timestep index
             prompt_embeds: Text embeddings
             kv_cache: Transformer KV cache
             crossattn_cache: Cross-attention cache
@@ -571,24 +632,30 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
             num_frames_per_block: Number of frames per block
             seq_length: Total sequence length
             frame_seq_length: Sequence length per frame
+            batch: Request batch
 
         Returns:
             noise_pred: Predicted noise
         """
         # Compute the effective start frame (not exceeding cache capacity)
         start_frame = min(current_start_frame, kv_cache_num_frames)
-
+        prompt_embeds = prompt_embeds.to(self.transformer_dtype)
         # Call the Transformer to predict noise
-        noise_pred = self.transformer(
-            hidden_states=latents,
-            timestep=timestep.expand(latents.shape[0], num_frames_per_block),
-            encoder_hidden_states=prompt_embeds,
-            kv_cache=kv_cache,
-            seq_len=seq_length,
-            crossattn_cache=crossattn_cache,
-            current_start=start_frame * frame_seq_length,
-            cache_start=None,
-        )
+        with set_forward_context(
+            current_timestep=timestep_index,
+            attn_metadata=None,
+            forward_batch=batch,
+        ):
+            noise_pred = self.transformer(
+                hidden_states=latents,
+                timestep=timestep.expand(latents.shape[0], num_frames_per_block),
+                encoder_hidden_states=prompt_embeds,
+                kv_cache=kv_cache,
+                seq_len=seq_length,
+                crossattn_cache=crossattn_cache,
+                current_start=start_frame * frame_seq_length,
+                cache_start=None,
+            )
 
         return noise_pred
 
