@@ -23,6 +23,7 @@ import regex as re
 
 class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
     def __init__(self, textencoder, tokenizer, transformer, vae) -> None:
+        super().__init__()
         self.vae = vae
         self.tokenizer = tokenizer
         self.transformer = transformer
@@ -429,6 +430,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
 
 class KreaRealtimeVideoDenoisingStage(PipelineStage):
     def __init__(self, transformer, scheduler, vae):
+        super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
         self.vae = vae
