@@ -24,6 +24,9 @@ from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
 )
+from sglang.multimodal_gen.runtime.entrypoints.realtime.generate_session import (
+    GenerateSession,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     _sanitize_for_logging,
@@ -161,6 +164,13 @@ class Req:
     output: torch.Tensor | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+
+    # realtime
+    session: GenerateSession | None = None
+    block_idx: int = 0
+    num_blocks: int = 1
+    update_prompt_embeds: bool = False
+    input_video: torch.Tensor = None
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields
