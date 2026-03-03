@@ -548,7 +548,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
 
         batch.session.decoder_cache = self.vae._feat_map
         batch.session.frame_cache_context.extend(videos.split(1, dim=2))
-        videos = self.video_processor.postprocess_video(videos, output_type="pil")
+        videos = self.video_processor.postprocess_video(videos, output_type="np")
 
         output_batch = OutputBatch(
             output=videos,
