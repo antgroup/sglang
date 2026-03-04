@@ -12,10 +12,7 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import ORJSONResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.openai import (
-    image_api,
-    video_api,
-)
+from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
@@ -82,7 +79,7 @@ async def get_models(request: Request):
     from sglang.multimodal_gen.registry import get_model_info
 
     server_args: ServerArgs = request.app.state.server_args
-    model_info = get_model_info(server_args.model_path)
+    model_info = get_model_info(server_args.model_path, model_id=server_args.model_id)
 
     response = {
         "model_path": server_args.model_path,
@@ -145,6 +142,10 @@ async def forward_to_scheduler(
                 lambda _idx: output_file_path,
                 audio=response.audio,
                 audio_sample_rate=response.audio_sample_rate,
+                enable_frame_interpolation=sp.enable_frame_interpolation,
+                frame_interpolation_exp=sp.frame_interpolation_exp,
+                frame_interpolation_scale=sp.frame_interpolation_scale,
+                frame_interpolation_model_path=sp.frame_interpolation_model_path,
             )
 
         if hasattr(response, "model_dump"):
@@ -214,11 +215,12 @@ def create_app(server_args: ServerArgs):
     app.include_router(health_router)
     app.include_router(vertex_router)
 
-    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api
+    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api, mesh_api
 
     app.include_router(common_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
+    app.include_router(mesh_api.router)
     app.include_router(realtime_video_api.router)
     app.include_router(weights_api.router)
 
