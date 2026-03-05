@@ -24,12 +24,11 @@ import regex as re
 
 
 class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
-    def __init__(self, text_encoder, tokenizer, transformer, vae) -> None:
+    def __init__(self, tokenizer, transformer, vae) -> None:
         super().__init__()
         self.vae = vae
         self.tokenizer = tokenizer
         self.transformer = transformer
-        self.text_encoder = text_encoder
         self.video_processor = VideoProcessor(vae_scale_factor=8)
 
     def forward(
@@ -40,18 +39,18 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         # step1 TextEncoder
         device = get_local_torch_device()
         strength = 1 if batch.input_video is None else 0.3
-        num_inference_steps = 4
-        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-            batch.prompt, device, 1, False, batch.negative_prompt
-        )
+        num_inference_steps = 6
+        batch.num_inference_steps = 6
+
         transformer_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
-        batch.prompt_embeds = prompt_embeds.contiguous()
         block_idx = batch.block_idx
         num_frames_per_block = self.transformer.config.arch_config.num_frames_per_block
         kv_cache_num_frames = self.transformer.config.arch_config.kv_cache_num_frames
         frame_seq_length = self.transformer.config.arch_config.frame_seq_length
         # step2 set timesteps
-        batch.timesteps, batch.sigmas = self.prepare_timesteps(5, strength, 4)
+        batch.timesteps, batch.sigmas = self.prepare_timesteps(
+            5, strength, num_inference_steps
+        )
         # step3 prepare latents
         # video to video
         if (
@@ -172,7 +171,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
                 self.transformer(
                     hidden_states=context_frames.to(transformer_dtype),
                     timestep=context_timestep,
-                    encoder_hidden_states=batch.prompt_embeds.to(transformer_dtype),
+                    encoder_hidden_states=batch.prompt_embeds[0].to(transformer_dtype),
                     kv_cache=batch.session.kv_cache,
                     crossattn_cache=batch.session.crossattn_cache,
                     current_start=0,  # when updating the kv cache with block_mask the current_start is unused
@@ -254,126 +253,6 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
 
         return init_latents
 
-    def encode_prompt(
-        self,
-        prompt: str,
-        device: Optional[torch.device] = None,
-        num_videos_per_prompt: int = 1,
-        prepare_unconditional_embeds: bool = True,
-        negative_prompt: Optional[str] = None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        max_sequence_length: int = 512,
-    ):
-        r"""
-        Encodes the prompt into text encoder hidden states.
-
-        Args:
-            prompt (`str` or `List[str]`, *optional*):
-                prompt to be encoded
-            device: (`torch.device`):
-                torch device
-            num_videos_per_prompt (`int`):
-                number of videos that should be generated per prompt
-            prepare_unconditional_embeds (`bool`):
-                whether to use prepare unconditional embeddings or not
-            negative_prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts not to guide the image generation. If not defined, one has to pass
-                `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
-                less than `1`).
-            prompt_embeds (`torch.Tensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
-                provided, text embeddings will be generated from `prompt` input argument.
-            negative_prompt_embeds (`torch.Tensor`, *optional*):
-                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
-                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
-                argument.
-            max_sequence_length (`int`, defaults to `512`):
-                The maximum number of text tokens to be used for the generation process.
-        """
-        device = device
-        prompt = [prompt] if isinstance(prompt, str) else prompt
-        batch_size = len(prompt) if prompt is not None else prompt_embeds.shape[0]
-
-        if prompt_embeds is None:
-            prompt_embeds = self._get_t5_prompt_embeds(
-                prompt, max_sequence_length, device
-            )
-
-        if prepare_unconditional_embeds and negative_prompt_embeds is None:
-            negative_prompt = negative_prompt or ""
-            negative_prompt = (
-                batch_size * [negative_prompt]
-                if isinstance(negative_prompt, str)
-                else negative_prompt
-            )
-
-            if prompt is not None and type(prompt) is not type(negative_prompt):
-                raise TypeError(
-                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
-                    f" {type(prompt)}."
-                )
-            elif batch_size != len(negative_prompt):
-                raise ValueError(
-                    f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
-                    f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
-                    " the batch size of `prompt`."
-                )
-
-            negative_prompt_embeds = self._get_t5_prompt_embeds(
-                negative_prompt, max_sequence_length, device
-            )
-
-        bs_embed, seq_len, _ = prompt_embeds.shape
-        prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(
-            bs_embed * num_videos_per_prompt, seq_len, -1
-        )
-
-        if prepare_unconditional_embeds:
-            negative_prompt_embeds = negative_prompt_embeds.repeat(
-                1, num_videos_per_prompt, 1
-            )
-            negative_prompt_embeds = negative_prompt_embeds.view(
-                batch_size * num_videos_per_prompt, seq_len, -1
-            )
-
-        return prompt_embeds, negative_prompt_embeds
-
-    def _get_t5_prompt_embeds(
-        self,
-        prompt: Union[str, List[str]],
-        max_sequence_length: int,
-        device: torch.device,
-    ):
-        prompt = [prompt] if isinstance(prompt, str) else prompt
-        prompt = [prompt_clean(u) for u in prompt]
-
-        text_inputs = self.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=max_sequence_length,
-            truncation=True,
-            add_special_tokens=True,
-            return_attention_mask=True,
-            return_tensors="pt",
-        )
-        text_input_ids, mask = text_inputs.input_ids, text_inputs.attention_mask
-        seq_lens = mask.gt(0).sum(dim=1).long()
-        prompt_embeds = self.text_encoder(
-            text_input_ids.to(device), mask.to(device)
-        ).last_hidden_state
-        prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
-        prompt_embeds = torch.stack(
-            [
-                torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))])
-                for u in prompt_embeds
-            ],
-            dim=0,
-        )
-
-        return prompt_embeds
-
     def prepare_timesteps(self, shift, strength, num_inference_steps):
         sigmas = torch.linspace(1.0, 0.0, 1001)[:-1]
         sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
@@ -444,7 +323,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs):
         latents = batch.latents
-        prompt_embeds = batch.prompt_embeds
+        prompt_embeds = batch.prompt_embeds[0]
         kv_cache = batch.session.kv_cache
         crossattn_cache = batch.session.crossattn_cache
         current_start_frame = batch.current_start_frame

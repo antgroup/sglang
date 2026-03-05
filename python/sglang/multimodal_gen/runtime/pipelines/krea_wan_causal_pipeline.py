@@ -36,9 +36,9 @@ class KreaWanCausalPipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        self.add_standard_text_encoding_stage()
         self.add_stage(
             KreaRealtimeVideoBeforeDenoisingStage(
-                text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
                 transformer=self.get_module("transformer"),
                 vae=self.get_module("vae"),
