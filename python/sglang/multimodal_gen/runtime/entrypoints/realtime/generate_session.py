@@ -15,7 +15,7 @@ class GenerateSession:
         self.id = uuid4().hex
         self.request_id = None
         self.request = None
-        self.action_queue = deque(maxlen=3)
+        self.action_queue = deque(maxlen=1)
         self.generate_chunk_cnt = 0
         self.realtime_session = RealtimeSession()
 
@@ -41,7 +41,7 @@ class GenerateSession:
         if self.generate_chunk_cnt == 0:
             prompt = self.request.prompt
         elif len(self.action_queue) > 0:
-            realtime_action = self.action_queue.popleft()
+            realtime_action = self.sample_action()
             # only support prompt action
             if realtime_action.type == "prompt":
                 prompt = realtime_action.action_content
