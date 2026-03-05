@@ -1221,8 +1221,8 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.index_k_with_scale_buffer],
                     dst_ptrs=[device_pool.index_k_with_scale_buffer[layer_id]],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
+                    src_indices=host_page_indices,
+                    dst_indices=device_page_indices,
                     layer_id=layer_id,
                     page_size=1,
                 )
