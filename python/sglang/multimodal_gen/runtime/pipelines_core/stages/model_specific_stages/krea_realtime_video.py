@@ -48,7 +48,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         kv_cache_num_frames = self.transformer.config.arch_config.kv_cache_num_frames
         frame_seq_length = self.transformer.config.arch_config.frame_seq_length
         # step2 set timesteps
-        batch.timesteps, batch.sigmas = self.prepare_timesteps(
+        batch.timesteps, batch.all_timesteps, batch.sigmas = self.prepare_timesteps(
             5, strength, num_inference_steps
         )
         # step3 prepare latents
@@ -256,10 +256,10 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
     def prepare_timesteps(self, shift, strength, num_inference_steps):
         sigmas = torch.linspace(1.0, 0.0, 1001)[:-1]
         sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
-        timesteps = sigmas.to(self.transformer.device) * 1000.0
+        all_timesteps = sigmas.to(self.transformer.device) * 1000.0
         zero_padded_timesteps = torch.cat(
             [
-                timesteps,
+                all_timesteps,
                 torch.tensor([0], device=self.transformer.device),
             ]
         )
@@ -271,7 +271,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         ).to(torch.long)
         timesteps = zero_padded_timesteps[1000 - denoising_steps]
 
-        return timesteps, sigmas
+        return timesteps, all_timesteps, sigmas
 
     def prepare_latents(
         self,
@@ -328,6 +328,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         crossattn_cache = batch.session.crossattn_cache
         current_start_frame = batch.current_start_frame
         timesteps = batch.timesteps
+        all_timesteps = batch.all_timesteps
         sigmas = batch.sigmas
         num_inference_steps = batch.num_inference_steps
         kv_cache_num_frames = self.transformer.config.arch_config.kv_cache_num_frames
@@ -360,7 +361,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
                 latents=latents,
                 noise_pred=noise_pred,
                 timestep=t,
-                all_timesteps=timesteps,
+                all_timesteps=all_timesteps,
                 sigmas=sigmas,
             )
 
@@ -385,7 +386,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
                         timestep=next_timestep.expand(
                             latents.shape[0], num_frames_per_block
                         ),
-                        all_timesteps=timesteps,
+                        all_timesteps=all_timesteps,
                         sigmas=sigmas,
                     )
                     .unsqueeze(0)
