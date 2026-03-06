@@ -1151,16 +1151,16 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             )
         elif self.layout in ["page_first", "page_first_direct"]:
             self.index_k_with_scale_buffer = alloc_func(
-                (self.indexer_page_num, self.layer_num, self.indexer_page_stride_size),
+                (
+                    self.indexer_page_num,
+                    self.layer_num,
+                    1,
+                    self.indexer_page_stride_size,
+                ),
                 dtype=self.indexer_dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
-            )
-            self.index_k_data_ptrs = torch.tensor(
-                [self.index_k_with_scale_buffer.data_ptr()],
-                dtype=torch.uint64,
-                device=self.device_pool.device,
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1249,7 +1249,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             elif self.layout == "page_first":
                 transfer_kv_all_layer_mla_lf_pf(
                     src_layers=self.index_k_device_ptrs,
-                    dst=self.index_k_data_ptrs,
+                    dst=self.index_k_with_scale_buffer,
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,
                     item_size=self.indexer_page_stride_size,
