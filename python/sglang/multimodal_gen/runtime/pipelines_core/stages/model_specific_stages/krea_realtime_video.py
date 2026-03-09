@@ -32,6 +32,23 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         self.transformer = transformer
         self.video_processor = VideoProcessor(vae_scale_factor=8)
 
+    def _reset_vae_encode_cache(self):
+        """Initialize VAE encoder-side cache state even if clear_cache was monkeypatched."""
+        if hasattr(self.vae, "_original_clear_cache"):
+            self.vae._original_clear_cache()
+        else:
+            self.vae.clear_cache()
+
+        # Defensive reset for encoder cache fields used by Wan VAE encode().
+        if not hasattr(self.vae, "_enc_conv_idx"):
+            self.vae._enc_conv_idx = 0
+        if hasattr(self.vae, "_enc_conv_num"):
+            self.vae._enc_feat_map = [None] * self.vae._enc_conv_num
+        elif hasattr(self.vae, "_enc_feat_map"):
+            self.vae._enc_feat_map = [None] * len(self.vae._enc_feat_map)
+        else:
+            self.vae._enc_feat_map = [None] * 55
+
     def forward(
         self,
         batch: Req,
@@ -91,13 +108,16 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
             batch.latents = init_latents
         else:
             # text to video
+            # For realtime chunked generation, we need enough latent blocks to index
+            # the current block; otherwise slicing can produce an empty frame range.
+            effective_num_blocks = max(batch.num_blocks, batch.block_idx + 1)
             init_latents = self.prepare_latents(
                 1,
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial,
                 server_args.pipeline_config.dit_config.arch_config.num_channels_latents,
                 batch.height,
                 batch.width,
-                batch.num_blocks,
+                effective_num_blocks,
                 num_frames_per_block,
                 transformer_dtype,
                 self.transformer.device,
@@ -112,6 +132,14 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
             # final_latents shape: [B, C, total_frames, H, W]
             # Extract frames along the time dimension (dim=2)
             batch.latents = init_latents[:, :, start_frame:end_frame, :, :]
+            if batch.latents.shape[2] == 0:
+                raise RuntimeError(
+                    "Krea realtime latents are empty after slicing. "
+                    f"block_idx={block_idx}, num_frames_per_block={num_frames_per_block}, "
+                    f"effective_num_blocks={effective_num_blocks}, "
+                    f"start_frame={start_frame}, end_frame={end_frame}, "
+                    f"init_latents_frames={init_latents.shape[2]}"
+                )
             batch.current_start_frame = start_frame
         # step4 setup kvcache
         num_heads = self.transformer.num_attention_heads
@@ -204,7 +232,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         return context_frames
 
     def prepare_frame_latents(self, frames):
-        self.vae._enc_feat_map = [None] * 55
+        self._reset_vae_encode_cache()
         latents = retrieve_latents(self.vae.encode(frames), sample_mode="argmax")
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
@@ -228,10 +256,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         if latents is not None:
             return latents.to(device, dtype)
 
-        if not hasattr(self.vae, "_enc_feat_map"):
-            self.vae.clear_cache()
-        else:
-            self.vae._enc_feat_map = [None] * 55
+        self._reset_vae_encode_cache()
 
         init_latents = [
             retrieve_latents(
@@ -402,9 +427,12 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
 
         # Disable clearing cache
         if batch.block_idx == 0:
-            self.vae.clear_cache()
+            if not hasattr(self.vae, "_original_clear_cache"):
+                self.vae._original_clear_cache = self.vae.clear_cache
+            self.vae._original_clear_cache()
             self.vae.clear_cache = lambda: None
-            self.vae._feat_map = [None] * 55
+            decoder_cache_len = getattr(self.vae, "_conv_num", 55)
+            self.vae._feat_map = [None] * decoder_cache_len
 
         if batch.block_idx != 0:
             self.vae._feat_map = batch.session.decoder_cache
@@ -516,6 +544,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
                 seq_len=seq_length,
                 crossattn_cache=crossattn_cache,
                 current_start=start_frame * frame_seq_length,
+                start_frame=start_frame,
                 cache_start=None,
             )
 
