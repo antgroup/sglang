@@ -37,6 +37,7 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                 sampling_params=session.build_sampling_params(),
             )
             batch.session = session.realtime_session
+            batch.extra["realtime_session_id"] = session.id
             batch.block_idx = session.generate_chunk_cnt
             save_file_path_list, result = await process_generation_batch(
                 async_scheduler_client, batch

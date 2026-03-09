@@ -393,7 +393,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
                     .transpose(1, 2)
                 )
         batch.latents = latents
-
+        batch.session.current_denoised_latents = latents
         if batch.session.frame_cache_context is None:
             frame_cache_len = 1 + (kv_cache_num_frames - 1) * 4
             batch.session.frame_cache_context = deque(maxlen=frame_cache_len)
@@ -405,7 +405,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
             self.vae._feat_map = [None] * 55
 
         if batch.block_idx != 0:
-            self.vae._feat_map = batch.decoder_cache
+            self.vae._feat_map = batch.session.decoder_cache
 
         latents = batch.latents.to(self.vae.device)
 
