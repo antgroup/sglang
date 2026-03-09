@@ -61,6 +61,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         batch.num_inference_steps = 6
 
         transformer_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         block_idx = batch.block_idx
         num_frames_per_block = self.transformer.config.arch_config.num_frames_per_block
         kv_cache_num_frames = self.transformer.config.arch_config.kv_cache_num_frames
@@ -83,13 +84,13 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
                     batch.width,
                 )
                 .unsqueeze(0)
-                .to(self.vae.device, self.vae.dtype)
+                .to(vae_dtype)
             )
             batch.current_start_frame = block_idx * num_frames_per_block
             init_latents = self.encode_frames(
                 video,
-                self.vae.dtype,
-                self.vae.device,
+                vae_dtype,
+                device,
                 None,
             )
             init_latents = init_latents[:, :, -num_frames_per_block:]
@@ -177,7 +178,10 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         # step5 recomputeKVCache
         if batch.block_idx != 0:
             context_frames = self.get_context_frames(
-                kv_cache_num_frames, num_frames_per_block, batch
+                kv_cache_num_frames,
+                num_frames_per_block,
+                batch,
+                vae_dtype,
             )
             block_mask = self.transformer._prepare_blockwise_causal_attn_mask(
                 self.transformer.device,
@@ -209,7 +213,13 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
             self.transformer.block_mask = None
         return batch
 
-    def get_context_frames(self, kv_cache_num_frames, num_frames_per_block, batch):
+    def get_context_frames(
+        self,
+        kv_cache_num_frames,
+        num_frames_per_block,
+        batch,
+        vae_dtype,
+    ):
         current_kv_cache_num_frames = kv_cache_num_frames
         total_frames_generated = (batch.block_idx - 1) * num_frames_per_block
 
@@ -224,15 +234,17 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
                 :, :, -current_kv_cache_num_frames + 1 :
             ]
             first_frame_latent = self.prepare_frame_latents(
-                frames=batch.session.frame_cache_context[0].half()
+                frames=batch.session.frame_cache_context[0],
+                dtype=vae_dtype,
             )
             first_frame_latent = first_frame_latent.to(batch.latents)
             context_frames = torch.cat((first_frame_latent, context_frames), dim=2)
 
         return context_frames
 
-    def prepare_frame_latents(self, frames):
+    def prepare_frame_latents(self, frames, dtype):
         self._reset_vae_encode_cache()
+        frames = frames.to(dtype=dtype)
         latents = retrieve_latents(self.vae.encode(frames), sample_mode="argmax")
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
@@ -260,7 +272,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
 
         init_latents = [
             retrieve_latents(
-                self.vae.encode(vid.unsqueeze(0).transpose(2, 1)),
+                self.vae.encode(vid.unsqueeze(0).transpose(2, 1).to(dtype=dtype)),
                 sample_mode="argmax",
             )
             for vid in video
@@ -591,10 +603,10 @@ def retrieve_latents(
     generator: Optional[torch.Generator] = None,
     sample_mode: str = "sample",
 ):
-    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
-        return encoder_output.latent_dist.sample(generator)
-    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
-        return encoder_output.latent_dist.mode()
+    if hasattr(encoder_output, "sample") and sample_mode == "sample":
+        return encoder_output.sample(generator)
+    elif hasattr(encoder_output, "mode") and sample_mode == "argmax":
+        return encoder_output.mode()
     elif hasattr(encoder_output, "latents"):
         return encoder_output.latents
     else:
