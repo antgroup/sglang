@@ -154,6 +154,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         for block in self.transformer.blocks:
             block.attn1.num_frame_per_block = num_frames_per_block
 
+        sink_size = self.transformer.blocks[0].attn1.sink_size
         manager = batch.session.kv_cache_manager
         if manager is None:
             manager = KVCacheManager(
@@ -162,12 +163,9 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
                 sa_max_size=sa_max_size,
                 sa_num_heads=num_heads,
                 sa_head_dim=head_dim,
-                ca_batch_size=1,
-                ca_seq_len=512,
-                ca_num_heads=num_heads,
-                ca_head_dim=head_dim,
                 dtype=transformer_dtype,
                 device=self.transformer.device,
+                sink_size=sink_size,
             )
             batch.session.kv_cache_manager = manager
         else:

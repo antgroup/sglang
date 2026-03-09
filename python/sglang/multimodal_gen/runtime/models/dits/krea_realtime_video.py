@@ -180,8 +180,7 @@ class KreaCausalWanSelfAttention(nn.Module):
             )[:, :, :-padded_length].transpose(2, 1)
         else:
             # Incremental mode: append to cache, then attend over active window
-            sink_tokens = self.sink_size * q.shape[1]
-            kv_cache.append(roped_key, v, current_start, sink_tokens)
+            kv_cache.append(roped_key, v, current_start)
             active_k, active_v = kv_cache.get_active_kv(self.max_attention_size)
             x = self.attn(roped_query, active_k, active_v)
 

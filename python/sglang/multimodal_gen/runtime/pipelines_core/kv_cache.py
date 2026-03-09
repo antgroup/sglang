@@ -23,7 +23,7 @@ class SelfAttentionKVCache:
     - append: incremental write with automatic sliding window eviction when full
     """
 
-    __slots__ = ("k", "v", "_global_end", "_local_end")
+    __slots__ = ("k", "v", "_global_end", "_local_end", "_sink_size")
 
     def __init__(
         self,
@@ -33,6 +33,7 @@ class SelfAttentionKVCache:
         head_dim: int,
         dtype: torch.dtype,
         device: torch.device,
+        sink_size: int = 0,
     ):
         self.k = torch.zeros(
             batch_size, max_size, num_heads, head_dim,
@@ -44,6 +45,7 @@ class SelfAttentionKVCache:
         ).contiguous()
         self._global_end: int = 0
         self._local_end: int = 0
+        self._sink_size: int = sink_size
 
     @property
     def max_size(self) -> int:
@@ -58,9 +60,7 @@ class SelfAttentionKVCache:
         return self._local_end
 
     def reset(self) -> None:
-        """Zero buffers and reset indices. Reuses allocated memory."""
-        self.k.zero_()
-        self.v.zero_()
+        """Reset position indices. Buffer contents will be overwritten on next write."""
         self._global_end = 0
         self._local_end = 0
 
@@ -80,13 +80,12 @@ class SelfAttentionKVCache:
         key: Tensor,
         value: Tensor,
         current_start: int,
-        sink_tokens: int = 0,
     ) -> None:
         """Append new KV entries, with sliding window eviction if the buffer is full.
 
         When the buffer cannot fit the new tokens:
           1. Compute how many old tokens to evict
-          2. Preserve the first ``sink_tokens`` positions (attention sink)
+          2. Preserve the first ``sink_size * frame_seq_len`` positions (attention sink)
           3. Shift remaining entries left to make room
           4. Write new tokens at the end
 
@@ -96,6 +95,7 @@ class SelfAttentionKVCache:
         current_end = current_start + key.shape[1]
         num_new = key.shape[1]
         buf_size = self.max_size
+        sink_tokens = self._sink_size * num_new
 
         needs_eviction = (
             current_end > self._global_end
@@ -146,27 +146,16 @@ class CrossAttentionKVCache:
     On the first call the caller computes K,V from encoder hidden states
     and stores them via ``update()``. All subsequent calls retrieve the
     cached tensors via ``get()``.
+
+    No memory is pre-allocated; tensors are stored on the first ``update()``
+    call and released on ``reset()``.
     """
 
     __slots__ = ("k", "v", "_is_initialized")
 
-    def __init__(
-        self,
-        batch_size: int,
-        seq_len: int,
-        num_heads: int,
-        head_dim: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ):
-        self.k = torch.zeros(
-            batch_size, seq_len, num_heads, head_dim,
-            dtype=dtype, device=device,
-        ).contiguous()
-        self.v = torch.zeros(
-            batch_size, seq_len, num_heads, head_dim,
-            dtype=dtype, device=device,
-        ).contiguous()
+    def __init__(self):
+        self.k: Tensor | None = None
+        self.v: Tensor | None = None
         self._is_initialized: bool = False
 
     @property
@@ -174,17 +163,13 @@ class CrossAttentionKVCache:
         return self._is_initialized
 
     def reset(self) -> None:
-        """Zero buffers and mark uninitialized. Reuses allocated memory."""
-        self.k.zero_()
-        self.v.zero_()
+        """Release cached tensors and mark uninitialized."""
+        self.k = None
+        self.v = None
         self._is_initialized = False
 
     def update(self, k: Tensor, v: Tensor) -> None:
-        """Store computed KV tensors and mark as initialized.
-
-        The stored references replace the pre-allocated buffers
-        (projections may produce different shapes).
-        """
+        """Store computed KV tensors and mark as initialized."""
         self.k = k
         self.v = v
         self._is_initialized = True
@@ -213,32 +198,27 @@ class KVCacheManager:
         sa_max_size: int,
         sa_num_heads: int,
         sa_head_dim: int,
-        ca_batch_size: int,
-        ca_seq_len: int,
-        ca_num_heads: int,
-        ca_head_dim: int,
         dtype: torch.dtype,
         device: torch.device,
+        sink_size: int = 0,
     ):
         self.self_attn_caches: list[SelfAttentionKVCache] = [
             SelfAttentionKVCache(
-                sa_batch_size, sa_max_size, sa_num_heads, sa_head_dim, dtype, device,
+                sa_batch_size, sa_max_size, sa_num_heads, sa_head_dim,
+                dtype, device, sink_size=sink_size,
             )
             for _ in range(num_blocks)
         ]
         self.cross_attn_caches: list[CrossAttentionKVCache] = [
-            CrossAttentionKVCache(
-                ca_batch_size, ca_seq_len, ca_num_heads, ca_head_dim, dtype, device,
-            )
-            for _ in range(num_blocks)
+            CrossAttentionKVCache() for _ in range(num_blocks)
         ]
 
     def reset_self_attn(self) -> None:
-        """Reset all self-attention caches (zero buffers, reset indices)."""
+        """Reset all self-attention caches (reset indices)."""
         for cache in self.self_attn_caches:
             cache.reset()
 
     def reset_cross_attn(self) -> None:
-        """Reset all cross-attention caches (zero buffers, mark uninitialized)."""
+        """Reset all cross-attention caches (release tensors, mark uninitialized)."""
         for cache in self.cross_attn_caches:
             cache.reset()
