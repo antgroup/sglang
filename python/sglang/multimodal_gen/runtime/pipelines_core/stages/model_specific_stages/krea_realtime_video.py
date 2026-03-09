@@ -166,6 +166,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
                 dtype=transformer_dtype,
                 device=self.transformer.device,
                 sink_size=sink_size,
+                frame_seq_length=frame_seq_length,
             )
             batch.session.kv_cache_manager = manager
         else:

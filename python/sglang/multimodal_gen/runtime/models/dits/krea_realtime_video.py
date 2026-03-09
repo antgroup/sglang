@@ -622,8 +622,8 @@ class KreaCausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
         # 4. Transformer blocks
         for block_index, block in enumerate(self.blocks):
             causal_kwargs = {
-                "kv_cache": kv_cache[block_index],
-                "crossattn_cache": crossattn_cache[block_index],
+                "kv_cache": kv_cache[block_index] if kv_cache is not None else None,
+                "crossattn_cache": crossattn_cache[block_index] if crossattn_cache is not None else None,
                 "current_start": current_start,
                 "cache_start": cache_start,
                 "block_mask": self.block_mask,
