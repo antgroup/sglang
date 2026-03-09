@@ -1,13 +1,4 @@
-"""
-General-purpose KV cache abstractions for causal video diffusion inference.
-
-Provides typed cache classes that replace raw List[Dict] patterns:
-- SelfAttentionKVCache: per-layer self-attention buffer with position tracking
-  and sliding window eviction (streaming-specific)
-- CrossAttentionKVCache: per-layer cross-attention buffer with compute-once
-  semantics (general optimization, also managed here for convenience)
-- KVCacheManager: container managing per-layer caches for all transformer blocks
-"""
+"""KV cache abstractions for causal video diffusion inference."""
 
 from __future__ import annotations
 
@@ -16,12 +7,7 @@ from torch import Tensor
 
 
 class SelfAttentionKVCache:
-    """Per-layer self-attention KV buffer with position tracking and sliding window eviction.
-
-    The buffer is pre-allocated to a fixed max_size. Two write modes are supported:
-    - bulk_write: overwrite from position 0 (used during KV recompute with block_mask)
-    - append: incremental write with automatic sliding window eviction when full
-    """
+    """Per-layer self-attention KV buffer with sliding window eviction."""
 
     __slots__ = (
         "k",
@@ -81,34 +67,19 @@ class SelfAttentionKVCache:
     def max_size(self) -> int:
         return self._max_size
 
-    @property
-    def global_end_index(self) -> int:
-        return self._global_end
-
-    @property
-    def local_end_index(self) -> int:
-        return self._local_end
-
     def reset(self) -> None:
-        """Reset position indices. Buffer contents will be overwritten on next write."""
         self._global_end = 0
         self._local_end = 0
 
     def release(self) -> None:
-        """Release GPU memory while keeping metadata for lazy re-allocation."""
+        """Release GPU memory; buffers are lazily re-allocated on next write."""
         self.k = None
         self.v = None
         self._global_end = 0
         self._local_end = 0
 
     def bulk_write(self, key: Tensor, value: Tensor) -> None:
-        """Write KV from position 0 and update indices.
-
-        Used during the recompute phase (with block_mask / flex_attention).
-
-        Raises:
-            ValueError: If the sequence length exceeds the buffer capacity.
-        """
+        """Overwrite from position 0 (recompute phase with block_mask)."""
         self._ensure_allocated()
         seq_len = key.shape[1]
         if seq_len > self.max_size:
@@ -126,18 +97,7 @@ class SelfAttentionKVCache:
         value: Tensor,
         current_start: int,
     ) -> None:
-        """Append new KV entries, with sliding window eviction if the buffer is full.
-
-        When the buffer cannot fit the new tokens:
-          1. Compute how many old tokens to evict
-          2. Preserve the first ``sink_size * frame_seq_length`` positions
-             (attention sink)
-          3. Shift remaining entries left to make room
-          4. Write new tokens at the end
-
-        When there is room, detach the buffer from the computation graph
-        (to avoid gradient accumulation across denoising steps) and write directly.
-        """
+        """Append new KV; evicts old tokens (preserving sink) when buffer is full."""
         self._ensure_allocated()
         current_end = current_start + key.shape[1]
         num_new = key.shape[1]
@@ -186,11 +146,7 @@ class SelfAttentionKVCache:
         self._local_end = local_end
 
     def get_active_kv(self, max_attention_size: int) -> tuple[Tensor, Tensor]:
-        """Return the (k, v) window the attention layer should attend to.
-
-        Sliced to at most ``max_attention_size`` tokens from the end of
-        the valid range.
-        """
+        """Return (k, v) sliced to at most ``max_attention_size`` from the end."""
         self._ensure_allocated()
         start = max(0, self._local_end - max_attention_size)
         return (
@@ -202,67 +158,38 @@ class SelfAttentionKVCache:
 class CrossAttentionKVCache:
     """Per-layer cross-attention KV cache with compute-once semantics.
 
-    On the first call the caller computes K,V from encoder hidden states
-    and stores them via ``update()``. All subsequent calls retrieve the
-    cached tensors via ``get()``.
-
-    No memory is pre-allocated; tensors are stored on the first ``update()``
-    call and released on ``reset()``.
+    First ``update()`` stores K,V; subsequent calls use ``get()``.
+    Lazy-initialized: no memory allocated until ``update()``.
     """
 
-    __slots__ = ("k", "v", "_is_initialized")
+    __slots__ = ("k", "v")
 
     def __init__(self):
         self.k: Tensor | None = None
         self.v: Tensor | None = None
-        self._is_initialized: bool = False
 
     @property
     def is_initialized(self) -> bool:
-        return self._is_initialized
+        return self.k is not None
 
     def reset(self) -> None:
-        """Release cached tensors and mark uninitialized."""
         self.k = None
         self.v = None
-        self._is_initialized = False
 
     def update(self, k: Tensor, v: Tensor) -> None:
-        """Store computed KV tensors and mark as initialized."""
         self.k = k
         self.v = v
-        self._is_initialized = True
 
     def get(self) -> tuple[Tensor, Tensor]:
-        """Return cached (k, v)."""
         return self.k, self.v
 
 
 class KVCacheManager:
-    """Container managing per-layer KV caches for all transformer blocks.
+    """Per-layer KV cache container for all transformer blocks.
 
-    Both self-attention and cross-attention caches are independently optional:
-    - Omit ``sa_*`` parameters to skip self-attention cache allocation.
-    - Set ``create_cross_attn=False`` to skip cross-attention cache creation.
-
-    Typical lifecycle (per streaming block):
-      1. First block: ``session.kv_cache_manager = KVCacheManager(...)``
-      2. Subsequent blocks: ``manager.reset_self_attn()``
-         (and ``manager.reset_cross_attn()`` if the prompt changed)
-
-    Examples::
-
-        # Both self-attention and cross-attention
-        mgr = KVCacheManager(num_blocks=40, sa_batch_size=1, sa_max_size=32760,
-                             sa_num_heads=40, sa_head_dim=128,
-                             dtype=torch.float16, device="cuda")
-
-        # Cross-attention only
-        mgr = KVCacheManager(num_blocks=40)
-
-        # Self-attention only
-        mgr = KVCacheManager(num_blocks=40, sa_batch_size=1, ...,
-                             create_cross_attn=False)
+    Self-attention and cross-attention caches are independently optional:
+    omit ``sa_*`` params to skip self-attention, set ``create_cross_attn=False``
+    to skip cross-attention.
     """
 
     def __init__(
@@ -313,20 +240,17 @@ class KVCacheManager:
             self.cross_attn_caches = None
 
     def reset_self_attn(self) -> None:
-        """Reset all self-attention caches (reset indices)."""
         if self.self_attn_caches is not None:
             for cache in self.self_attn_caches:
                 cache.reset()
 
     def reset_cross_attn(self) -> None:
-        """Reset all cross-attention caches (release tensors, mark uninitialized)."""
         if self.cross_attn_caches is not None:
             for cache in self.cross_attn_caches:
                 cache.reset()
 
     def release(self) -> None:
-        """Release all GPU memory held by self-attention caches and
-        drop cross-attention cached tensors."""
+        """Release all GPU memory from both cache types."""
         if self.self_attn_caches is not None:
             for cache in self.self_attn_caches:
                 cache.release()
