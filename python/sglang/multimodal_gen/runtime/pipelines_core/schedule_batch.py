@@ -344,7 +344,8 @@ class RealtimeSession:
     def dispose(self):
         self.last_embeds.clear()
         self.interpolated_embeds.clear()
-        self.kv_cache_manager.release()
+        if self.kv_cache_manager:
+            self.kv_cache_manager.release()
         self.current_denoised_latents = None
         if self.frame_cache_context:
             self.frame_cache_context.clear()
