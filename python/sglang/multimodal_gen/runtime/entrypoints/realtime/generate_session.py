@@ -26,6 +26,7 @@ class GenerateSession:
     def dispose(self):
         self.action_queue.clear()
         self.video_chunk_queue.clear()
+        self.realtime_session.dispose()
 
     def new_request(self):
         self.request_id = f"{self.id}_{uuid4().hex}"

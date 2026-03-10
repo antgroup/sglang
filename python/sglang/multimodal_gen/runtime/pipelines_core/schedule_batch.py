@@ -341,6 +341,18 @@ class RealtimeSession:
         self.decoder_cache: Any = None
         self.input_frames_cache: deque = None
 
+    def dispose(self):
+        self.last_embeds.clear()
+        self.interpolated_embeds.clear()
+        self.kv_cache_manager.release()
+        self.current_denoised_latents = None
+        if self.frame_cache_context:
+            self.frame_cache_context.clear()
+        self.decoder_cache = None
+        if self.input_frames_cache:
+            self.input_frames_cache.clear()
+        torch.cuda.empty_cache()
+
     def is_prompt_changed(self, prompts: str | list[str]) -> bool:
         return prompts != self.last_prompts
 
