@@ -72,12 +72,6 @@ class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
             server_args.pipeline_config.text_encoder_configs
         )
 
-        # pop interpolated_embeds from session
-        if batch.session.interpolated_embeds:
-            interpolated_embeds = batch.session.interpolated_embeds.pop(0)
-            batch.prompt_embeds.extend(interpolated_embeds)
-            return batch
-
         assert batch.prompt is not None
         # encode new prompt
         if batch.session.is_prompt_changed(batch.prompt):
@@ -96,19 +90,15 @@ class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
                 interpolate_embeds = self.interpolate_embeds(
                     batch.session.last_embeds, prompt_embeds_list
                 )
-                interpolated_embeds = interpolate_embeds.pop(0)
-                batch.prompt_embeds.extend(interpolated_embeds)
-            else:
-                batch.prompt_embeds.extend(prompt_embeds_list)
 
             # update session
             batch.session.save_prompt_changed(
                 batch.prompt, prompt_embeds_list, interpolate_embeds
             )
-            return batch
 
-        # use last embeddings when prompt is not changed
-        batch.prompt_embeds.extend(batch.session.last_embeds)
+        # set correct embeds
+        curr_embeds = batch.session.get_current_embeds()
+        batch.prompt_embeds.extend(curr_embeds)
 
         return batch
 

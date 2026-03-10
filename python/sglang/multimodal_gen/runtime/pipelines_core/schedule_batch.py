@@ -356,6 +356,13 @@ class RealtimeSession:
         if interpolated_embeds:
             self.interpolated_embeds.extend(interpolated_embeds)
 
+    def get_current_embeds(self) -> list[torch.Tensor]:
+        if self.interpolated_embeds:
+            self.kv_cache_manager.reset_cross_attn()
+            return self.interpolated_embeds.pop(0)
+
+        return self.last_embeds
+
 
 @dataclass
 class OutputBatch:
