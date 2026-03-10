@@ -48,7 +48,7 @@ class GenerateSession:
             if realtime_action.type == "prompt":
                 prompt = realtime_action.action_content
         else:
-            prompt = None
+            prompt = self.request.prompt
 
         return build_sampling_params(
             self.request_id,

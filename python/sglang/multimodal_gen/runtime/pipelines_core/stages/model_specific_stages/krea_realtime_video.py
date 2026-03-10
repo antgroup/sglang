@@ -47,10 +47,7 @@ class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify text encoding stage inputs."""
         result = VerificationResult()
-        if batch.prompt is not None:
-            result.add_check("prompt", batch.prompt, V.string_or_list_strings)
-        if batch.prompt is None:
-            result.add_check("last_embeds", batch.session.last_embeds, V.is_list)
+        result.add_check("prompt", batch.prompt, V.string_or_list_strings)
         result.add_check("prompt_embeds", batch.prompt_embeds, V.is_list)
         return result
 
@@ -81,8 +78,9 @@ class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
             batch.prompt_embeds.extend(interpolated_embeds)
             return batch
 
+        assert batch.prompt is not None
         # encode new prompt
-        if batch.prompt is not None:
+        if batch.session.is_prompt_changed(batch.prompt):
             prompt_text: str | list[str] = batch.prompt
             all_indices: list[int] = list(range(len(self.text_encoders)))
             prompt_embeds_list, _ = self.encode_text(
@@ -93,22 +91,23 @@ class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
             )
 
             # interpolate embeds for prompt change
+            interpolate_embeds = None
             if batch.session.last_embeds:
                 interpolate_embeds = self.interpolate_embeds(
                     batch.session.last_embeds, prompt_embeds_list
                 )
-                batch.session.interpolated_embeds.extend(interpolate_embeds)
-                interpolated_embeds = batch.session.interpolated_embeds.pop(0)
+                interpolated_embeds = interpolate_embeds.pop(0)
                 batch.prompt_embeds.extend(interpolated_embeds)
             else:
                 batch.prompt_embeds.extend(prompt_embeds_list)
 
             # update session
-            batch.session.last_embeds.clear()
-            batch.session.last_embeds.extend(prompt_embeds_list)
+            batch.session.save_prompt_changed(
+                batch.prompt, prompt_embeds_list, interpolate_embeds
+            )
             return batch
 
-        # empty prompt
+        # use last embeddings when prompt is not changed
         batch.prompt_embeds.extend(batch.session.last_embeds)
 
         return batch

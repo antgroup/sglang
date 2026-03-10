@@ -332,6 +332,7 @@ class Req:
 @dataclass
 class RealtimeSession:
     def __init__(self):
+        self.last_prompts: str | list[str] | None = None
         self.last_embeds: list[torch.Tensor] = []
         self.interpolated_embeds: list[list[torch.Tensor]] = []
         self.kv_cache_manager: KVCacheManager | None = None
@@ -339,6 +340,21 @@ class RealtimeSession:
         self.frame_cache_context: deque = None
         self.decoder_cache: Any = None
         self.input_frames_cache: deque = None
+
+    def is_prompt_changed(self, prompts: str | list[str]) -> bool:
+        return prompts == self.last_prompts
+
+    def save_prompt_changed(
+        self,
+        prompts: str | list[str],
+        prompt_embeds_list: list[torch.Tensor],
+        interpolated_embeds: list[list[torch.Tensor]],
+    ):
+        self.last_prompts = prompts
+        self.last_embeds.clear()
+        self.last_embeds.extend(prompt_embeds_list)
+        if interpolated_embeds:
+            self.interpolated_embeds.extend(interpolated_embeds)
 
 
 @dataclass
