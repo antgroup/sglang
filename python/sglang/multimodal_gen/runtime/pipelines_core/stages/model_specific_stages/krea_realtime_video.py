@@ -41,9 +41,7 @@ class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
         Initialize the prompt encoding stage.
 
         """
-        super().__init__()
-        self.tokenizers = tokenizers
-        self.text_encoders = text_encoders
+        super().__init__(text_encoders, tokenizers)
         self.interpolation_steps = 4
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
