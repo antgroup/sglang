@@ -55,13 +55,14 @@ class GenerateSession:
     def build_sampling_params(self):
         if self.generate_chunk_cnt == 0:
             prompt = self.request.prompt
-        elif len(self.action_queue) > 0:
+        elif (
+            not self.realtime_session.interpolated_embeds and len(self.action_queue) > 0
+        ):
             realtime_action = self.sample_action()
-            # only support prompt action
+            # only support prompt action for now
             if realtime_action.type == "prompt":
                 prompt = realtime_action.action_content
         else:
-            # TODO(@puf147): generate with empty action
             prompt = self.request.prompt
 
         return build_sampling_params(
