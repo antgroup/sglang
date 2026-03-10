@@ -51,12 +51,20 @@ class SelfAttentionKVCache:
 
     def _allocate_buffers(self) -> None:
         self.k = torch.zeros(
-            self._batch_size, self._max_size, self._num_heads, self._head_dim,
-            dtype=self._dtype, device=self._device,
+            self._batch_size,
+            self._max_size,
+            self._num_heads,
+            self._head_dim,
+            dtype=self._dtype,
+            device=self._device,
         ).contiguous()
         self.v = torch.zeros(
-            self._batch_size, self._max_size, self._num_heads, self._head_dim,
-            dtype=self._dtype, device=self._device,
+            self._batch_size,
+            self._max_size,
+            self._num_heads,
+            self._head_dim,
+            dtype=self._dtype,
+            device=self._device,
         ).contiguous()
 
     def _ensure_allocated(self) -> None:
@@ -110,8 +118,7 @@ class SelfAttentionKVCache:
             )
 
         needs_eviction = (
-            current_end > self._global_end
-            and num_new + self._local_end > buf_size
+            current_end > self._global_end and num_new + self._local_end > buf_size
         )
 
         if needs_eviction:
@@ -131,9 +138,7 @@ class SelfAttentionKVCache:
                 :,
                 sink_tokens + num_evicted : sink_tokens + num_evicted + num_rolled,
             ].clone()
-            local_end = (
-                self._local_end + current_end - self._global_end - num_evicted
-            )
+            local_end = self._local_end + current_end - self._global_end - num_evicted
         else:
             self.k = self.k.detach()
             self.v = self.v.detach()
@@ -205,16 +210,31 @@ class KVCacheManager:
         frame_seq_length: int = 1,
         create_cross_attn: bool = True,
     ):
-        sa_params = (sa_batch_size, sa_max_size, sa_num_heads, sa_head_dim, dtype, device)
+        sa_params = (
+            sa_batch_size,
+            sa_max_size,
+            sa_num_heads,
+            sa_head_dim,
+            dtype,
+            device,
+        )
         sa_any_set = any(p is not None for p in sa_params)
         sa_all_set = all(p is not None for p in sa_params)
         if sa_any_set and not sa_all_set:
             missing = [
-                name for name, val in zip(
-                    ("sa_batch_size", "sa_max_size", "sa_num_heads",
-                     "sa_head_dim", "dtype", "device"),
+                name
+                for name, val in zip(
+                    (
+                        "sa_batch_size",
+                        "sa_max_size",
+                        "sa_num_heads",
+                        "sa_head_dim",
+                        "dtype",
+                        "device",
+                    ),
                     sa_params,
-                ) if val is None
+                )
+                if val is None
             ]
             raise ValueError(
                 f"Self-attention cache requires all parameters; missing: {missing}"
@@ -223,8 +243,13 @@ class KVCacheManager:
         if sa_all_set:
             self.self_attn_caches: list[SelfAttentionKVCache] | None = [
                 SelfAttentionKVCache(
-                    sa_batch_size, sa_max_size, sa_num_heads, sa_head_dim,
-                    dtype, device, sink_size=sink_size,
+                    sa_batch_size,
+                    sa_max_size,
+                    sa_num_heads,
+                    sa_head_dim,
+                    dtype,
+                    device,
+                    sink_size=sink_size,
                     frame_seq_length=frame_seq_length,
                 )
                 for _ in range(num_blocks)
@@ -256,4 +281,4 @@ class KVCacheManager:
                 cache.release()
         if self.cross_attn_caches is not None:
             for cache in self.cross_attn_caches:
-                cache.reset()
+                cache.release()
