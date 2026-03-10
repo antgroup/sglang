@@ -56,7 +56,6 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
     ):
         # step1 TextEncoder
         device = get_local_torch_device()
-        strength = 1 if batch.input_video is None else 0.3
         num_inference_steps = 6
         batch.num_inference_steps = 6
 
@@ -65,21 +64,44 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         block_idx = batch.block_idx
         num_frames_per_block = self.transformer.config.arch_config.num_frames_per_block
         kv_cache_num_frames = self.transformer.config.arch_config.kv_cache_num_frames
+        has_video_condition = batch.input_video is not None or (
+            batch.session.input_frames_cache is not None
+            and len(batch.session.input_frames_cache) > 0
+        )
+        strength = 0.7 if has_video_condition else 1.0
         frame_seq_length = self.transformer.config.arch_config.frame_seq_length
         # step2 set timesteps
         batch.timesteps, batch.all_timesteps, batch.sigmas = self.prepare_timesteps(
             5, strength, num_inference_steps
         )
+
+        if batch.input_video is not None:
+            if batch.session.input_frames_cache is None:
+                # Keep a bounded rolling frame history for realtime camera stream.
+                cache_len = max(
+                    kv_cache_num_frames + num_frames_per_block,
+                    num_frames_per_block * 32,
+                )
+                batch.session.input_frames_cache = deque(maxlen=cache_len)
+            if isinstance(batch.input_video, list):
+                batch.session.input_frames_cache.extend(batch.input_video)
+            else:
+                batch.session.input_frames_cache.append(batch.input_video)
+
         # step3 prepare latents
         # video to video
         if (
             batch.session.input_frames_cache is not None
-            and batch.input_video is not None
+            and len(batch.session.input_frames_cache) > 0
         ):
-            batch.session.input_frames_cache.extend(batch.input_video)
+            conditioning_frames = list(batch.session.input_frames_cache)
+            if len(conditioning_frames) < num_frames_per_block:
+                conditioning_frames = conditioning_frames + [
+                    conditioning_frames[-1]
+                ] * (num_frames_per_block - len(conditioning_frames))
             video = (
                 self.video_processor.preprocess(
-                    list(batch.session.input_frames_cache),
+                    conditioning_frames,
                     batch.height,
                     batch.width,
                 )
@@ -243,7 +265,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
 
     def prepare_frame_latents(self, frames, dtype):
         self._reset_vae_encode_cache()
-        frames = frames.to(dtype=dtype)
+        frames = frames.to(device=self.vae.device, dtype=dtype).contiguous()
         latents = retrieve_latents(self.vae.encode(frames), sample_mode="argmax")
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
@@ -271,7 +293,12 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
 
         init_latents = [
             retrieve_latents(
-                self.vae.encode(vid.unsqueeze(0).transpose(2, 1).to(dtype=dtype)),
+                self.vae.encode(
+                    vid.unsqueeze(0)
+                    .transpose(2, 1)
+                    .to(device=self.vae.device, dtype=dtype)
+                    .contiguous()
+                ),
                 sample_mode="argmax",
             )
             for vid in video
@@ -407,23 +434,24 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
             # This is a common practice in samplers like DDIM
             if i < (num_inference_steps - 1):
                 next_timestep = timesteps[i + 1]
+                current_num_frames = latents.shape[2]
 
                 # Prepare noise
+                sample = latents.transpose(1, 2).squeeze(0)
                 noise = randn_tensor(
-                    latents.transpose(1, 2).squeeze(0).shape,
+                    sample.shape,
                     device=latents.device,
                     dtype=latents.dtype,
                     generator=batch.generator,
                 )
+                timestep = next_timestep.repeat(current_num_frames)
 
                 # Add noise to latents
                 latents = (
                     self.add_noise(
-                        sample=latents.transpose(1, 2).squeeze(0),
+                        sample=sample,
                         noise=noise,
-                        timestep=next_timestep.expand(
-                            latents.shape[0], num_frames_per_block
-                        ),
+                        timestep=timestep,
                         all_timesteps=all_timesteps,
                         sigmas=sigmas,
                     )
@@ -515,6 +543,9 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
             (all_timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1
         )
         sigma = sigmas[timestep_id].reshape(-1, 1, 1, 1)
+        if sigma.shape[0] != sample.shape[0]:
+            # Align sigma to the runtime frame count when upstream blocks have variable T.
+            sigma = sigma[: sample.shape[0]]
 
         # Add noise
         noisy_sample = (
