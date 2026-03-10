@@ -115,7 +115,7 @@ class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
     def interpolate_embeds(self, prev_embeds: torch.Tensor, curr_embeds: torch.Tensor):
         assert len(prev_embeds) == len(curr_embeds)
         interpolated_embeds_list = []
-        for i in prev_embeds:
+        for i in range(len(prev_embeds)):
             assert prev_embeds[i].shape == curr_embeds[i].shape
             x = torch.lerp(
                 prev_embeds[i],
@@ -128,7 +128,14 @@ class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
             interpolated_embeds_list.append(
                 list(x.chunk(self.interpolation_steps, dim=0))
             )
-        return interpolated_embeds_list
+        # change shape from [num_embeds, interpolation_steps, ...] to [interpolation_steps, num_embeds, ...]
+        result = []
+        for step_idx in range(self.interpolation_steps):
+            step_embeds = []
+            for layer_chunks in interpolated_embeds_list:
+                step_embeds.append(layer_chunks[step_idx])
+            result.append(step_embeds)
+        return result
 
 
 class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
