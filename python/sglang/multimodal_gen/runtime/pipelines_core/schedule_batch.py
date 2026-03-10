@@ -342,6 +342,16 @@ class RealtimeSession:
         self.decoder_cache: Any = None
         self.input_frames_cache: deque = None
 
+    def dispose(self):
+        self.kv_cache = None
+        self.crossattn_cache = None
+        self.current_denoised_latents = None
+        if self.frame_cache_context:
+            self.frame_cache_context.clear()
+        self.decoder_cache = None
+        if self.input_frames_cache:
+            self.input_frames_cache.clear()
+
 
 @dataclass
 class OutputBatch:
