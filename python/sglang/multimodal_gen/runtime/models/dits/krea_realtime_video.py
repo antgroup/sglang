@@ -53,6 +53,10 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.kv_cache import (
+    CrossAttentionKVCache,
+    SelfAttentionKVCache,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -105,16 +109,20 @@ class KreaCausalWanSelfAttention(nn.Module):
         v: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         block_mask: BlockMask,
-        kv_cache: dict | None = None,
+        kv_cache: SelfAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
     ):
         r"""
         Args:
-            x(Tensor): Shape [B, L, num_heads, C / num_heads]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            q(Tensor): Shape [B, L, num_heads, C / num_heads]
+            k(Tensor): Shape [B, L, num_heads, C / num_heads]
+            v(Tensor): Shape [B, L, num_heads, C / num_heads]
+            freqs_cis: Rope frequencies (cos, sin)
+            block_mask: FlexAttention block mask (non-None during recompute)
+            kv_cache: Self-attention KV cache for this layer
+            current_start: Global token position of the current sequence
+            cache_start: Cache write position (defaults to current_start)
         """
         if cache_start is None:
             cache_start = current_start
@@ -124,13 +132,9 @@ class KreaCausalWanSelfAttention(nn.Module):
         roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
 
         if kv_cache is None or block_mask is not None:
-            local_end_index = roped_key.shape[1]
-            kv_cache["k"][:, :local_end_index] = roped_key
-            kv_cache["v"][:, :local_end_index] = v
+            # Bulk write mode: populate cache from position 0 and use flex_attention
+            kv_cache.bulk_write(roped_key, v)
 
-            kv_cache["global_end_index"] = local_end_index
-            kv_cache["local_end_index"] = local_end_index
-            # Padding for flex attention
             padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
             padded_roped_query = torch.cat(
                 [
@@ -175,80 +179,10 @@ class KreaCausalWanSelfAttention(nn.Module):
                 block_mask=block_mask,
             )[:, :, :-padded_length].transpose(2, 1)
         else:
-            frame_seqlen = q.shape[1]
-            current_end = current_start + roped_query.shape[1]
-            sink_tokens = self.sink_size * frame_seqlen
-            # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
-            kv_cache_size = kv_cache["k"].shape[1]
-            num_new_tokens = roped_query.shape[1]
-            if (
-                self.local_attn_size != -1
-                and (current_end > kv_cache["global_end_index"])
-                and (num_new_tokens + kv_cache["local_end_index"] > kv_cache_size)
-            ):
-                # Calculate the number of new tokens added in this step
-                # Shift existing cache content left to discard oldest tokens
-                # Clone the source slice to avoid overlapping memory error
-                num_evicted_tokens = (
-                    num_new_tokens + kv_cache["local_end_index"] - kv_cache_size
-                )
-                num_rolled_tokens = (
-                    kv_cache["local_end_index"] - num_evicted_tokens - sink_tokens
-                )
-                kv_cache["k"][
-                    :, sink_tokens : sink_tokens + num_rolled_tokens
-                ] = kv_cache["k"][
-                    :,
-                    sink_tokens
-                    + num_evicted_tokens : sink_tokens
-                    + num_evicted_tokens
-                    + num_rolled_tokens,
-                ].clone()
-                kv_cache["v"][
-                    :, sink_tokens : sink_tokens + num_rolled_tokens
-                ] = kv_cache["v"][
-                    :,
-                    sink_tokens
-                    + num_evicted_tokens : sink_tokens
-                    + num_evicted_tokens
-                    + num_rolled_tokens,
-                ].clone()
-                # Insert the new keys/values at the end
-                local_end_index = (
-                    kv_cache["local_end_index"]
-                    + current_end
-                    - kv_cache["global_end_index"]
-                    - num_evicted_tokens
-                )
-                local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
-            else:
-                # Assign new keys/values directly up to current_end
-                local_end_index = (
-                    kv_cache["local_end_index"]
-                    + current_end
-                    - kv_cache["global_end_index"]
-                )
-                local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"] = kv_cache["k"].detach()
-                kv_cache["v"] = kv_cache["v"].detach()
-                # logger.info("kv_cache['k'] is in comp graph: %s", kv_cache["k"].requires_grad or kv_cache["k"].grad_fn is not None)
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
-            x = self.attn(
-                roped_query,
-                kv_cache["k"][
-                    :,
-                    max(0, local_end_index - self.max_attention_size) : local_end_index,
-                ],
-                kv_cache["v"][
-                    :,
-                    max(0, local_end_index - self.max_attention_size) : local_end_index,
-                ],
-            )
-            kv_cache["global_end_index"] = current_end
-            kv_cache["local_end_index"] = local_end_index
+            # Incremental mode: append to cache, then attend over active window
+            kv_cache.append(roped_key, v, current_start)
+            active_k, active_v = kv_cache.get_active_kv(self.max_attention_size)
+            x = self.attn(roped_query, active_k, active_v)
 
         return x
 
@@ -338,8 +272,8 @@ class KreaCausalWanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         block_mask: BlockMask,
-        kv_cache: dict | None = None,
-        crossattn_cache: dict | None = None,
+        kv_cache: SelfAttentionKVCache | None = None,
+        crossattn_cache: CrossAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
     ) -> torch.Tensor:
@@ -603,8 +537,8 @@ class KreaCausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
         encoder_hidden_states: torch.Tensor | list[torch.Tensor],
         timestep: torch.LongTensor,
         encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
-        kv_cache: dict = None,
-        crossattn_cache: dict = None,
+        kv_cache: list[SelfAttentionKVCache] = None,
+        crossattn_cache: list[CrossAttentionKVCache] = None,
         current_start: int = 0,
         cache_start: int = 0,
         start_frame: int = 0,
@@ -688,8 +622,8 @@ class KreaCausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
         # 4. Transformer blocks
         for block_index, block in enumerate(self.blocks):
             causal_kwargs = {
-                "kv_cache": kv_cache[block_index],
-                "crossattn_cache": crossattn_cache[block_index],
+                "kv_cache": kv_cache[block_index] if kv_cache is not None else None,
+                "crossattn_cache": crossattn_cache[block_index] if crossattn_cache is not None else None,
                 "current_start": current_start,
                 "cache_start": cache_start,
                 "block_mask": self.block_mask,
@@ -729,13 +663,19 @@ class KreaCausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
 
 class WanT2VCrossAttentionWithCache(WanT2VCrossAttention):
 
-    def forward(self, x, context, context_lens, crossattn_cache=None):
+    def forward(
+        self,
+        x,
+        context,
+        context_lens,
+        crossattn_cache: CrossAttentionKVCache | None = None,
+    ):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
-            crossattn_cache (List[dict], *optional*): Contains the cached key and value tensors for context embedding.
+            crossattn_cache: Cross-attention KV cache for this layer
         """
         q, _ = self.to_q(x)
         if self.tp_rmsnorm:
@@ -745,8 +685,7 @@ class WanT2VCrossAttentionWithCache(WanT2VCrossAttention):
         q = q.unflatten(2, (self.local_num_heads, self.head_dim))
 
         if crossattn_cache is not None:
-            if not crossattn_cache["is_init"]:
-                crossattn_cache["is_init"] = True
+            if not crossattn_cache.is_initialized:
                 k, _ = self.to_k(context)
                 if self.tp_rmsnorm:
                     k = tensor_parallel_rms_norm(k, self.norm_k)
@@ -756,11 +695,9 @@ class WanT2VCrossAttentionWithCache(WanT2VCrossAttention):
 
                 v, _ = self.to_v(context)
                 v = v.unflatten(2, (self.local_num_heads, self.head_dim))
-                crossattn_cache["k"] = k
-                crossattn_cache["v"] = v
+                crossattn_cache.update(k, v)
             else:
-                k = crossattn_cache["k"]
-                v = crossattn_cache["v"]
+                k, v = crossattn_cache.get()
         else:
             k, _ = self.to_k(context)
             if self.tp_rmsnorm:
@@ -772,10 +709,8 @@ class WanT2VCrossAttentionWithCache(WanT2VCrossAttention):
             v, _ = self.to_v(context)
             v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        # compute attention
         x = self.attn(q, k, v)
 
-        # output
         x = x.flatten(2)
         x, _ = self.to_out(x)
         return x
