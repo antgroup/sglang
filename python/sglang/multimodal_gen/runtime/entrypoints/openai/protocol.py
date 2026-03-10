@@ -153,8 +153,10 @@ class RealtimeVideoGenerationsRequest(BaseModel):
 
 
 class RealtimeAction(BaseModel):
-    type: Literal["prompt", "camera"]
-    action_content: str
+    type: Literal["prompt", "video"]
+    action_content: Optional[str] = None
+    video_frame: Optional[bytes] = None
+    video_frames: Optional[List[bytes]] = None
 
 
 # Mesh API protocol models
