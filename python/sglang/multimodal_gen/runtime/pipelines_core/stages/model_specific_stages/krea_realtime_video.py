@@ -11,8 +11,16 @@ from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages import TextEncodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    StageValidators as V,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    VerificationResult,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 if is_ftfy_available():
@@ -21,6 +29,108 @@ if is_ftfy_available():
 import html
 
 import regex as re
+
+logger = init_logger(__name__)
+
+
+class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
+
+    def __init__(self, text_encoders, tokenizers) -> None:
+        """
+        Initialize the prompt encoding stage.
+
+        """
+        super().__init__()
+        self.tokenizers = tokenizers
+        self.text_encoders = text_encoders
+        self.interpolation_steps = 4
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify text encoding stage inputs."""
+        result = VerificationResult()
+        if batch.prompt is not None:
+            result.add_check("prompt", batch.prompt, V.string_or_list_strings)
+        if batch.prompt is None:
+            result.add_check("last_embeds", batch.session.last_embeds, V.is_list)
+        result.add_check("prompt_embeds", batch.prompt_embeds, V.is_list)
+        return result
+
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify text encoding stage outputs."""
+        result = VerificationResult()
+        result.add_check(
+            "prompt_embeds", batch.prompt_embeds, V.list_of_tensors_min_dims(2)
+        )
+        if batch.debug:
+            logger.debug(f"{batch.prompt_embeds=}")
+        return result
+
+    @torch.no_grad()
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ):
+        assert len(self.tokenizers) == len(self.text_encoders)
+        assert len(self.text_encoders) == len(
+            server_args.pipeline_config.text_encoder_configs
+        )
+
+        # pop interpolated_embeds from session
+        if batch.session.interpolated_embeds:
+            interpolated_embeds = batch.session.interpolated_embeds.pop(0)
+            batch.prompt_embeds.extend(interpolated_embeds)
+            return batch
+
+        # encode new prompt
+        if batch.prompt is not None:
+            prompt_text: str | list[str] = batch.prompt
+            all_indices: list[int] = list(range(len(self.text_encoders)))
+            prompt_embeds_list, _ = self.encode_text(
+                prompt_text,
+                server_args,
+                encoder_index=all_indices,
+                return_attention_mask=False,
+            )
+
+            # interpolate embeds for prompt change
+            if batch.session.last_embeds:
+                interpolate_embeds = self.interpolate_embeds(
+                    batch.session.last_embeds, prompt_embeds_list
+                )
+                batch.session.interpolated_embeds.extend(interpolate_embeds)
+                interpolated_embeds = batch.session.interpolated_embeds.pop(0)
+                batch.prompt_embeds.extend(interpolated_embeds)
+            else:
+                batch.prompt_embeds.extend(prompt_embeds_list)
+
+            # update session
+            batch.session.last_embeds.clear()
+            batch.session.last_embeds.extend(prompt_embeds_list)
+            return batch
+
+        # empty prompt
+        batch.prompt_embeds.extend(batch.session.last_embeds)
+
+        return batch
+
+    def interpolate_embeds(self, prev_embeds: torch.Tensor, curr_embeds: torch.Tensor):
+        assert prev_embeds.size() == curr_embeds.size()
+        interpolated_embeds_list = []
+        for i in prev_embeds:
+            assert prev_embeds[i].shape == curr_embeds[i].shape
+            x = torch.lerp(
+                prev_embeds[i],
+                curr_embeds[i],
+                torch.linspace(0, 1, steps=self.interpolation_steps)
+                .unsqueeze(1)
+                .unsqueeze(2)
+                .to(prev_embeds[i]),
+            )
+            interpolated_embeds_list.append(
+                list(x.chunk(self.interpolation_steps, dim=0))
+            )
+        return interpolated_embeds_list
 
 
 class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):

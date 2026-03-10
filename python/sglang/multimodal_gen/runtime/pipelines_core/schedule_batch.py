@@ -331,6 +331,8 @@ class Req:
 @dataclass
 class RealtimeSession:
     def __init__(self):
+        self.last_embeds: list[torch.Tensor] = None
+        self.interpolated_embeds: list[list[torch.Tensor]] = None
         self.kv_cache: Any = None
         self.crossattn_cache: Any = None
         self.current_denoised_latents: torch.Tensor = None

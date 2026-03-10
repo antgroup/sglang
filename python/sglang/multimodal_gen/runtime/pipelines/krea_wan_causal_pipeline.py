@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipel
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.krea_realtime_video import (
     KreaRealtimeVideoBeforeDenoisingStage,
     KreaRealtimeVideoDenoisingStage,
+    KreaRealtimeVideoTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -36,7 +37,12 @@ class KreaWanCausalPipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        self.add_standard_text_encoding_stage()
+        self.add_stage(
+            KreaRealtimeVideoTextEncodingStage(
+                text_encoders=[self.get_module("text_encoder")],
+                tokenizers=[self.get_module("tokenizer")],
+            ),
+        )
         self.add_stage(
             KreaRealtimeVideoBeforeDenoisingStage(
                 tokenizer=self.get_module("tokenizer"),
