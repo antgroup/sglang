@@ -413,9 +413,9 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
 
     mask_k = o_k < K
     mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
+    mask_h = mask_v[:, None] & mask_k[None, :]
 
-    b_h = tl.zeros([BK, BV], dtype=tl.float32)
+    b_h = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
         idx = tl.load(h0_indices + i_n)
         # Add bounds checking for idx
@@ -424,8 +424,8 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
                 h0_source
                 + idx * HV * K * V
                 + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
+                + o_v[:, None] * K
+                + o_k[None, :]
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
@@ -466,17 +466,17 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         # [BK, BV]
         b_h *= exp(b_g)
         # [BV]
-        b_v -= tl.sum(b_h * b_k[:, None], 0)
+        b_v -= tl.sum(b_h * b_k[None, :], 1)
         if IS_BETA_HEADWISE:
             b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
         else:
             b_beta = tl.load(p_beta).to(tl.float32)
         b_v *= b_beta
-        # [BK, BV]
-        b_h += b_k[:, None] * b_v[None, :]
+        # [BV, BK]
+        b_h += b_v[:, None] * b_k[None, :]
         # [BV]
         if not DISABLE_OUTPUT_CALCULATION:
-            b_o = tl.sum(b_h * b_q[:, None], 0)
+            b_o = tl.sum(b_h * b_q[None, :], 1)
             # core attn output
             tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
@@ -490,8 +490,8 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
                     + cache_idx * cache_steps * HV * K * V
                     + step_offset
                     + i_hv * K * V
-                    + o_k[:, None] * V
-                    + o_v[None, :]
+                    + o_v[:, None] * K
+                    + o_k[None, :]
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
@@ -513,8 +513,8 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
                 h0_source
                 + idx * HV * K * V
                 + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
+                + o_v[:, None] * K
+                + o_k[None, :]
             )
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
