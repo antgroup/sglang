@@ -25,6 +25,7 @@ from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.kv_cache import KVCacheManager
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     _sanitize_for_logging,
@@ -333,8 +334,7 @@ class RealtimeSession:
     def __init__(self):
         self.last_embeds: list[torch.Tensor] = None
         self.interpolated_embeds: list[list[torch.Tensor]] = None
-        self.kv_cache: Any = None
-        self.crossattn_cache: Any = None
+        self.kv_cache_manager: KVCacheManager | None = None
         self.current_denoised_latents: torch.Tensor = None
         self.frame_cache_context: deque = None
         self.decoder_cache: Any = None

@@ -1,5 +1,5 @@
 from collections import deque
-from typing import Dict, List, Optional, Union
+from typing import List, Optional, Union
 
 import torch
 from diffusers.utils import is_ftfy_available
@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
     get_local_torch_device,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.pipelines_core.kv_cache import KVCacheManager
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import TextEncodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -252,20 +253,10 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
                 )
             batch.current_start_frame = start_frame
         # step4 setup kvcache
-        # Get existing caches if they exist
-        kv_cache = batch.session.kv_cache
-        crossattn_cache = batch.session.crossattn_cache
-        if crossattn_cache is None or batch.update_prompt_embeds:
-            batch.session.crossattn_cache = _initialize_crossattn_cache(
-                len(self.transformer.blocks),
-                self.transformer.num_attention_heads,
-                self.transformer.num_attention_heads
-                * self.transformer.attention_head_dim,
-                crossattn_cache,
-                1,
-                transformer_dtype,
-                self.transformer.device,
-            )
+        num_heads = self.transformer.num_attention_heads
+        head_dim = self.transformer.attention_head_dim
+        num_blocks = len(self.transformer.blocks)
+        sa_max_size = (kv_cache_num_frames + num_frames_per_block) * frame_seq_length
 
         batch.local_attn_size = kv_cache_num_frames + num_frames_per_block
         for block in self.transformer.blocks:
@@ -273,17 +264,26 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         for block in self.transformer.blocks:
             block.attn1.num_frame_per_block = num_frames_per_block
 
-        batch.session.kv_cache = _initialize_kv_cache(
-            len(self.transformer.blocks),
-            self.transformer.num_attention_heads,
-            self.transformer.num_attention_heads * self.transformer.attention_head_dim,
-            kv_cache,
-            1,
-            transformer_dtype,
-            self.transformer.device,
-            batch.local_attn_size,
-            frame_seq_length,
-        )
+        sink_size = self.transformer.blocks[0].attn1.sink_size
+        manager = batch.session.kv_cache_manager
+        if manager is None:
+            manager = KVCacheManager(
+                num_blocks=num_blocks,
+                sa_batch_size=1,
+                sa_max_size=sa_max_size,
+                sa_num_heads=num_heads,
+                sa_head_dim=head_dim,
+                dtype=transformer_dtype,
+                device=self.transformer.device,
+                sink_size=sink_size,
+                frame_seq_length=frame_seq_length,
+            )
+            batch.session.kv_cache_manager = manager
+        else:
+            manager.reset_self_attn()
+            if batch.update_prompt_embeds:
+                manager.reset_cross_attn()
+
         # step5 recomputeKVCache
         if batch.block_idx != 0:
             context_frames = self.get_context_frames(
@@ -314,9 +314,9 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
                     hidden_states=context_frames.to(transformer_dtype),
                     timestep=context_timestep,
                     encoder_hidden_states=batch.prompt_embeds[0].to(transformer_dtype),
-                    kv_cache=batch.session.kv_cache,
-                    crossattn_cache=batch.session.crossattn_cache,
-                    current_start=0,  # when updating the kv cache with block_mask the current_start is unused
+                    kv_cache=manager.self_attn_caches,
+                    crossattn_cache=manager.cross_attn_caches,
+                    current_start=0,
                     cache_start=None,
                 )
             self.transformer.block_mask = None
@@ -471,8 +471,9 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs):
         latents = batch.latents
         prompt_embeds = batch.prompt_embeds[0]
-        kv_cache = batch.session.kv_cache
-        crossattn_cache = batch.session.crossattn_cache
+        manager = batch.session.kv_cache_manager
+        kv_cache = manager.self_attn_caches
+        crossattn_cache = manager.cross_attn_caches
         current_start_frame = batch.current_start_frame
         timesteps = batch.timesteps
         all_timesteps = batch.all_timesteps
@@ -638,8 +639,8 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         timestep: torch.Tensor,
         timestep_index: int,
         prompt_embeds: torch.Tensor,
-        kv_cache: torch.Tensor,
-        crossattn_cache: torch.Tensor,
+        kv_cache: list,
+        crossattn_cache: list,
         current_start_frame: int,
         kv_cache_num_frames: int,
         num_frames_per_block: int,
@@ -647,26 +648,6 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         frame_seq_length: int,
         batch: Req,
     ) -> torch.Tensor:
-        """
-        Predict noise using the Transformer.
-
-        Args:
-            latents: Current latent representation [B, C, F, H, W]
-            timestep: Current timestep
-            timestep_index: Current timestep index
-            prompt_embeds: Text embeddings
-            kv_cache: Transformer KV cache
-            crossattn_cache: Cross-attention cache
-            current_start_frame: Start frame index of the current video block
-            kv_cache_num_frames: Number of frames stored in the KV cache
-            num_frames_per_block: Number of frames per block
-            seq_length: Total sequence length
-            frame_seq_length: Sequence length per frame
-            batch: Request batch
-
-        Returns:
-            noise_pred: Predicted noise
-        """
         # Compute the effective start frame (not exceeding cache capacity)
         start_frame = min(current_start_frame, kv_cache_num_frames)
         prompt_embeds = prompt_embeds.to(self.transformer_dtype)
@@ -724,105 +705,6 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         )
 
         return latents
-
-
-def _initialize_crossattn_cache(
-    num_transformer_blocks,
-    num_heads,
-    dim,
-    crossattn_cache_existing: Optional[List[Dict]],
-    batch_size: int,
-    dtype: torch.dtype,
-    device: torch.device,
-):
-    """
-    Initialize a Per-GPU cross-attention cache for the Wan model.
-    Mirrors causal_inference.py:315-338
-    """
-    crossattn_cache = []
-
-    k_shape = [batch_size, 512, num_heads, dim // num_heads]
-    v_shape = [batch_size, 512, num_heads, dim // num_heads]
-
-    # Check if we can reuse existing cache
-    if (
-        crossattn_cache_existing
-        and len(crossattn_cache_existing) > 0
-        and list(crossattn_cache_existing[0]["k"].shape) == k_shape
-        and list(crossattn_cache_existing[0]["v"].shape) == v_shape
-    ):
-        for i in range(num_transformer_blocks):
-            crossattn_cache_existing[i]["k"].zero_()
-            crossattn_cache_existing[i]["v"].zero_()
-            crossattn_cache_existing[i]["is_init"] = False
-        return crossattn_cache_existing
-    else:
-        # Create new cache
-        for _ in range(num_transformer_blocks):
-            crossattn_cache.append(
-                {
-                    "k": torch.zeros(k_shape, dtype=dtype, device=device).contiguous(),
-                    "v": torch.zeros(v_shape, dtype=dtype, device=device).contiguous(),
-                    "is_init": False,
-                }
-            )
-        return crossattn_cache
-
-
-def _initialize_kv_cache(
-    num_transformer_blocks,
-    num_heads,
-    dim,
-    kv_cache_existing: Optional[List[Dict]],
-    batch_size: int,
-    dtype: torch.dtype,
-    device: torch.device,
-    local_attn_size: int,
-    frame_seq_length: int,
-):
-    """
-    Initialize a Per-GPU KV cache for the Wan model.
-    Mirrors causal_inference.py:279-313
-    """
-    kv_cache = []
-
-    # Calculate KV cache size
-    if local_attn_size != -1:
-        # Use the local attention size to compute the KV cache size
-        kv_cache_size = local_attn_size * frame_seq_length
-    else:
-        # Use the default KV cache size
-        kv_cache_size = 32760
-
-    # Get transformer config
-    k_shape = [batch_size, kv_cache_size, num_heads, dim // num_heads]
-    v_shape = [batch_size, kv_cache_size, num_heads, dim // num_heads]
-
-    # Check if we can reuse existing cache
-    if (
-        kv_cache_existing
-        and len(kv_cache_existing) > 0
-        and list(kv_cache_existing[0]["k"].shape) == k_shape
-        and list(kv_cache_existing[0]["v"].shape) == v_shape
-    ):
-        for i in range(num_transformer_blocks):
-            kv_cache_existing[i]["k"].zero_()
-            kv_cache_existing[i]["v"].zero_()
-            kv_cache_existing[i]["global_end_index"] = 0
-            kv_cache_existing[i]["local_end_index"] = 0
-        return kv_cache_existing
-    else:
-        # Create new cache
-        for _ in range(num_transformer_blocks):
-            kv_cache.append(
-                {
-                    "k": torch.zeros(k_shape, dtype=dtype, device=device).contiguous(),
-                    "v": torch.zeros(v_shape, dtype=dtype, device=device).contiguous(),
-                    "global_end_index": 0,
-                    "local_end_index": 0,
-                }
-            )
-        return kv_cache
 
 
 def retrieve_latents(
