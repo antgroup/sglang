@@ -113,7 +113,7 @@ class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
         return batch
 
     def interpolate_embeds(self, prev_embeds: torch.Tensor, curr_embeds: torch.Tensor):
-        assert prev_embeds.size() == curr_embeds.size()
+        assert len(prev_embeds) == len(curr_embeds)
         interpolated_embeds_list = []
         for i in prev_embeds:
             assert prev_embeds[i].shape == curr_embeds[i].shape
