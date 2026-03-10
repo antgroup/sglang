@@ -64,7 +64,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     if not IS_KDA:
         p_g = g + bos * HV + i_hv
     else:
-        p_gk = g + (bos * HV + i_hv) * K + o_k
+        p_gk = g + (bos * H + i_h) * K + o_k
 
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
@@ -91,7 +91,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             b_g = tl.load(p_g).to(tl.float32)
             b_h *= exp(b_g)
         else:
-            b_gk = tl.load(p_gk).to(tl.float32)
+            b_gk = tl.load(p_gk, mask=mask_k, other=0).to(tl.float32)
             b_h *= exp(b_gk[None, :])
         # [BV]
         b_v -= tl.sum(b_h * b_k[None, :], 1)
@@ -113,7 +113,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         if not IS_KDA:
             p_g += HV
         else:
-            p_gk += HV * K
+            p_gk += H * K
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
     if STORE_FINAL_STATE:
