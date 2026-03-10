@@ -62,6 +62,7 @@ class GenerateSession:
             # only support prompt action for now
             if realtime_action.type == "prompt":
                 prompt = realtime_action.action_content
+                self.request.prompt = prompt
         else:
             prompt = self.request.prompt
 

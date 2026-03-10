@@ -74,12 +74,6 @@ class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
             server_args.pipeline_config.text_encoder_configs
         )
 
-        # pop interpolated_embeds from session
-        if batch.session.interpolated_embeds:
-            interpolated_embeds = batch.session.interpolated_embeds.pop(0)
-            batch.prompt_embeds.extend(interpolated_embeds)
-            return batch
-
         assert batch.prompt is not None
         # encode new prompt
         if batch.session.is_prompt_changed(batch.prompt):
@@ -98,26 +92,22 @@ class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
                 interpolate_embeds = self.interpolate_embeds(
                     batch.session.last_embeds, prompt_embeds_list
                 )
-                interpolated_embeds = interpolate_embeds.pop(0)
-                batch.prompt_embeds.extend(interpolated_embeds)
-            else:
-                batch.prompt_embeds.extend(prompt_embeds_list)
 
             # update session
             batch.session.save_prompt_changed(
                 batch.prompt, prompt_embeds_list, interpolate_embeds
             )
-            return batch
 
-        # use last embeddings when prompt is not changed
-        batch.prompt_embeds.extend(batch.session.last_embeds)
+        # set correct embeds
+        curr_embeds = batch.session.get_current_embeds()
+        batch.prompt_embeds.extend(curr_embeds)
 
         return batch
 
     def interpolate_embeds(self, prev_embeds: torch.Tensor, curr_embeds: torch.Tensor):
         assert len(prev_embeds) == len(curr_embeds)
         interpolated_embeds_list = []
-        for i in prev_embeds:
+        for i in range(len(prev_embeds)):
             assert prev_embeds[i].shape == curr_embeds[i].shape
             x = torch.lerp(
                 prev_embeds[i],
@@ -130,7 +120,14 @@ class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
             interpolated_embeds_list.append(
                 list(x.chunk(self.interpolation_steps, dim=0))
             )
-        return interpolated_embeds_list
+        # change shape from [num_embeds, interpolation_steps, ...] to [interpolation_steps, num_embeds, ...]
+        result = []
+        for step_idx in range(self.interpolation_steps):
+            step_embeds = []
+            for layer_chunks in interpolated_embeds_list:
+                step_embeds.append(layer_chunks[step_idx])
+            result.append(step_embeds)
+        return result
 
 
 class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
