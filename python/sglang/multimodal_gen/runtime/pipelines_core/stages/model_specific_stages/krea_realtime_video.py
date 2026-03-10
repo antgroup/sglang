@@ -22,6 +22,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 if is_ftfy_available():
@@ -510,61 +512,70 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
             server_args.pipeline_config.dit_precision
         ]
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        is_warmup = batch.is_warmup
         # Iterate over each timestep
         for i, t in enumerate(timesteps):
-            # Step 1: predict noise
-            noise_pred = self.predict_noise(
-                latents=latents,
-                timestep=t,
-                timestep_index=i,
-                prompt_embeds=prompt_embeds,
-                kv_cache=kv_cache,
-                crossattn_cache=crossattn_cache,
-                current_start_frame=current_start_frame,
-                kv_cache_num_frames=kv_cache_num_frames,
-                num_frames_per_block=num_frames_per_block,
-                seq_length=32760,
-                frame_seq_length=frame_seq_length,
-                batch=batch,
-            )
-
-            # Step 2: update latents
-            latents = self.update_latents(
-                latents=latents,
-                noise_pred=noise_pred,
-                timestep=t,
-                all_timesteps=all_timesteps,
-                sigmas=sigmas,
-            )
-
-            # Step 3: if not the last step, add noise for the next timestep
-            # This is a common practice in samplers like DDIM
-            if i < (num_inference_steps - 1):
-                next_timestep = timesteps[i + 1]
-                current_num_frames = latents.shape[2]
-
-                # Prepare noise
-                sample = latents.transpose(1, 2).squeeze(0)
-                noise = randn_tensor(
-                    sample.shape,
-                    device=latents.device,
-                    dtype=latents.dtype,
-                    generator=batch.generator,
+            with StageProfiler(
+                f"denoising_step_{i}",
+                logger=logger,
+                metrics=batch.metrics,
+                perf_dump_path_provided=batch.perf_dump_path is not None,
+            ):
+                # Step 1: predict noise
+                noise_pred = self.predict_noise(
+                    latents=latents,
+                    timestep=t,
+                    timestep_index=i,
+                    prompt_embeds=prompt_embeds,
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start_frame=current_start_frame,
+                    kv_cache_num_frames=kv_cache_num_frames,
+                    num_frames_per_block=num_frames_per_block,
+                    seq_length=32760,
+                    frame_seq_length=frame_seq_length,
+                    batch=batch,
                 )
-                timestep = next_timestep.repeat(current_num_frames)
 
-                # Add noise to latents
-                latents = (
-                    self.add_noise(
-                        sample=sample,
-                        noise=noise,
-                        timestep=timestep,
-                        all_timesteps=all_timesteps,
-                        sigmas=sigmas,
+                # Step 2: update latents
+                latents = self.update_latents(
+                    latents=latents,
+                    noise_pred=noise_pred,
+                    timestep=t,
+                    all_timesteps=all_timesteps,
+                    sigmas=sigmas,
+                )
+
+                # Step 3: if not the last step, add noise for the next timestep
+                # This is a common practice in samplers like DDIM
+                if i < (num_inference_steps - 1):
+                    next_timestep = timesteps[i + 1]
+                    current_num_frames = latents.shape[2]
+
+                    # Prepare noise
+                    sample = latents.transpose(1, 2).squeeze(0)
+                    noise = randn_tensor(
+                        sample.shape,
+                        device=latents.device,
+                        dtype=latents.dtype,
+                        generator=batch.generator,
                     )
-                    .unsqueeze(0)
-                    .transpose(1, 2)
-                )
+                    timestep = next_timestep.repeat(current_num_frames)
+
+                    # Add noise to latents
+                    latents = (
+                        self.add_noise(
+                            sample=sample,
+                            noise=noise,
+                            timestep=timestep,
+                            all_timesteps=all_timesteps,
+                            sigmas=sigmas,
+                        )
+                        .unsqueeze(0)
+                        .transpose(1, 2)
+                    )
+            if not is_warmup:
+                self.step_profile()
         batch.latents = latents
         batch.session.current_denoised_latents = latents
         if batch.session.frame_cache_context is None:
@@ -614,6 +625,11 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
             metrics=batch.metrics,
         )
         return output_batch
+
+    def step_profile(self):
+        profiler = SGLDiffusionProfiler.get_instance()
+        if profiler:
+            profiler.step_denoising_step()
 
     def add_noise(
         self,
