@@ -342,7 +342,7 @@ class RealtimeSession:
         self.input_frames_cache: deque = None
 
     def is_prompt_changed(self, prompts: str | list[str]) -> bool:
-        return prompts == self.last_prompts
+        return prompts != self.last_prompts
 
     def save_prompt_changed(
         self,
