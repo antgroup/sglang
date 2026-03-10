@@ -36,6 +36,62 @@ import regex as re
 logger = init_logger(__name__)
 
 
+def _maybe_compile_module(
+    module: object, module_name: str, server_args: ServerArgs, fullgraph: bool = False
+) -> object:
+    if not server_args.enable_torch_compile or not isinstance(module, torch.nn.Module):
+        return module
+    marker = "_sglang_torch_compile_module_enabled"
+    if getattr(module, marker, False):
+        return module
+    # Keep compile policy close to krea/realtime-video:
+    # transformer: torch.compile(transformer)
+    logger.info("Compiling %s (fullgraph=%s)", module_name, fullgraph)
+    try:
+        module.compile(fullgraph=fullgraph)
+        setattr(module, marker, True)
+    except Exception as e:
+        logger.warning(
+            "Failed to compile %s, falling back to eager: %s", module_name, e
+        )
+    return module
+
+
+def _maybe_compile_method(
+    module: object,
+    method_name: str,
+    module_name: str,
+    server_args: ServerArgs,
+    fullgraph: bool = False,
+) -> None:
+    if not server_args.enable_torch_compile:
+        return
+    marker = f"_sglang_torch_compile_{method_name}_enabled"
+    if getattr(module, marker, False):
+        return
+    method = getattr(module, method_name, None)
+    if not callable(method):
+        return
+
+    logger.info(
+        "Compiling %s.%s (fullgraph=%s)",
+        module_name,
+        method_name,
+        fullgraph,
+    )
+    try:
+        compiled_method = torch.compile(method, fullgraph=fullgraph)
+        setattr(module, method_name, compiled_method)
+        setattr(module, marker, True)
+    except Exception as e:
+        logger.warning(
+            "Failed to compile %s.%s, falling back to eager: %s",
+            module_name,
+            method_name,
+            e,
+        )
+
+
 class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
 
     def __init__(self, text_encoders, tokenizers) -> None:
@@ -137,6 +193,15 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         self.tokenizer = tokenizer
         self.transformer = transformer
         self.video_processor = VideoProcessor(vae_scale_factor=8)
+        self._maybe_enable_torch_compile()
+
+    def _maybe_enable_torch_compile(self) -> None:
+        _maybe_compile_module(
+            self.transformer,
+            "KreaTransformer",
+            self.server_args,
+            fullgraph=False,
+        )
 
     def _reset_vae_encode_cache(self):
         """Initialize VAE encoder-side cache state even if clear_cache was monkeypatched."""
@@ -424,13 +489,17 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         return init_latents
 
     def prepare_timesteps(self, shift, strength, num_inference_steps):
-        sigmas = torch.linspace(1.0, 0.0, 1001)[:-1]
+        sigmas = torch.linspace(1.0, 0.0, 1001, device=self.transformer.device)[:-1]
         sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
-        all_timesteps = sigmas.to(self.transformer.device) * 1000.0
+        all_timesteps = sigmas * 1000.0
         zero_padded_timesteps = torch.cat(
             [
                 all_timesteps,
-                torch.tensor([0], device=self.transformer.device),
+                torch.tensor(
+                    [0],
+                    device=self.transformer.device,
+                    dtype=all_timesteps.dtype,
+                ),
             ]
         )
         denoising_steps = torch.linspace(
@@ -490,6 +559,15 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         self.scheduler = scheduler
         self.vae = vae
         self.video_processor = VideoProcessor(vae_scale_factor=8)
+        self._maybe_enable_torch_compile()
+
+    def _maybe_enable_torch_compile(self) -> None:
+        _maybe_compile_module(
+            self.transformer,
+            "KreaTransformer",
+            self.server_args,
+            fullgraph=False,
+        )
 
     def forward(self, batch: Req, server_args: ServerArgs):
         latents = batch.latents
@@ -510,6 +588,11 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         ]
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         is_warmup = batch.is_warmup
+        # Precompute sigma for each denoising step once to avoid per-step sync.
+        step_timestep_ids = torch.argmin(
+            (all_timesteps.unsqueeze(0) - timesteps.unsqueeze(1)).abs(), dim=1
+        )
+        step_sigmas = sigmas[step_timestep_ids]
         # Iterate over each timestep
         for i, t in enumerate(timesteps):
             with StageProfiler(
@@ -538,17 +621,12 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
                 latents = self.update_latents(
                     latents=latents,
                     noise_pred=noise_pred,
-                    timestep=t,
-                    all_timesteps=all_timesteps,
-                    sigmas=sigmas,
+                    sigma_t=step_sigmas[i],
                 )
 
                 # Step 3: if not the last step, add noise for the next timestep
                 # This is a common practice in samplers like DDIM
                 if i < (num_inference_steps - 1):
-                    next_timestep = timesteps[i + 1]
-                    current_num_frames = latents.shape[2]
-
                     # Prepare noise
                     sample = latents.transpose(1, 2).squeeze(0)
                     noise = randn_tensor(
@@ -557,16 +635,13 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
                         dtype=latents.dtype,
                         generator=batch.generator,
                     )
-                    timestep = next_timestep.repeat(current_num_frames)
 
                     # Add noise to latents
                     latents = (
                         self.add_noise(
                             sample=sample,
                             noise=noise,
-                            timestep=timestep,
-                            all_timesteps=all_timesteps,
-                            sigmas=sigmas,
+                            sigma_t=step_sigmas[i + 1],
                         )
                         .unsqueeze(0)
                         .transpose(1, 2)
@@ -632,9 +707,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         self,
         sample: torch.Tensor,
         noise: torch.Tensor,
-        timestep: torch.Tensor,
-        all_timesteps: torch.Tensor,
-        sigmas: torch.Tensor,
+        sigma_t: torch.Tensor,
     ) -> torch.Tensor:
         """
         Add noise to a sample.
@@ -644,28 +717,12 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         Args:
             sample: clean sample
             noise: noise tensor
-            timestep: current timestep
-            all_timesteps: all timesteps
-            sigmas: sigma lookup table
+            sigma_t: scalar sigma at the current step
 
         Returns:
             The noisy sample.
         """
-        # Ensure sigmas is on the correct device
-        sigmas = sigmas.to(all_timesteps.device)
-
-        # Handle multi-dimensional timestep
-        if timestep.ndim == 2:
-            timestep = timestep.flatten(0, 1)
-
-        # Find the sigma corresponding to each timestep
-        timestep_id = torch.argmin(
-            (all_timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1
-        )
-        sigma = sigmas[timestep_id].reshape(-1, 1, 1, 1)
-        if sigma.shape[0] != sample.shape[0]:
-            # Align sigma to the runtime frame count when upstream blocks have variable T.
-            sigma = sigma[: sample.shape[0]]
+        sigma = sigma_t.to(device=sample.device).reshape(1, 1, 1, 1)
 
         # Add noise
         noisy_sample = (
@@ -716,9 +773,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         self,
         latents: torch.Tensor,
         noise_pred: torch.Tensor,
-        timestep: torch.Tensor,
-        all_timesteps: torch.Tensor,
-        sigmas: torch.Tensor,
+        sigma_t: torch.Tensor,
     ) -> torch.Tensor:
         """
         Update latents based on the predicted noise.
@@ -728,19 +783,14 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         Args:
             latents: Current latent representation
             noise_pred: Predicted noise
-            timestep: Current timestep
-            all_timesteps: Tensor of all timesteps
-            sigmas: Sigma values corresponding to each timestep
+            sigma_t: scalar sigma at the current step
 
         Returns:
             Updated latents
         """
-        # Find the index corresponding to the current timestep
-        timestep_id = torch.argmin((all_timesteps - timestep).abs())
-        sigma_t = sigmas[timestep_id]
-
         # Use float64 for numerical stability
         latents_dtype = latents.dtype
+        sigma_t = sigma_t.to(device=latents.device)
         latents = (latents.double() - sigma_t.double() * noise_pred.double()).to(
             latents_dtype
         )

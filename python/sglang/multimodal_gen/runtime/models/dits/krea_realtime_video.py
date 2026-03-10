@@ -49,13 +49,13 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanT2VCrossAttention,
     WanTimeTextImageEmbedding,
 )
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-    current_platform,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.kv_cache import (
     CrossAttentionKVCache,
     SelfAttentionKVCache,
+)
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -587,9 +587,8 @@ class KreaCausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
             ),
             rope_theta=10000,
             start_frame=start_frame,  # Assume that start_frame is 0 when kv_cache is None
+            device=hidden_states.device,
         )
-        freqs_cos = freqs_cos.to(hidden_states.device)
-        freqs_sin = freqs_sin.to(hidden_states.device)
         freqs_cis = (
             (freqs_cos.float(), freqs_sin.float()) if freqs_cos is not None else None
         )
@@ -623,7 +622,11 @@ class KreaCausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
         for block_index, block in enumerate(self.blocks):
             causal_kwargs = {
                 "kv_cache": kv_cache[block_index] if kv_cache is not None else None,
-                "crossattn_cache": crossattn_cache[block_index] if crossattn_cache is not None else None,
+                "crossattn_cache": (
+                    crossattn_cache[block_index]
+                    if crossattn_cache is not None
+                    else None
+                ),
                 "current_start": current_start,
                 "cache_start": cache_start,
                 "block_mask": self.block_mask,
