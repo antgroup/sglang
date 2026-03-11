@@ -141,6 +141,10 @@ class RealtimeVideoGenerationsRequest(BaseModel):
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     output_path: Optional[str] = None
+    profile: Optional[bool] = False
+    num_profiled_timesteps: Optional[int] = None
+    profile_all_stages: Optional[bool] = False
+    perf_dump_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
