@@ -1208,7 +1208,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
-        else:
+        elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=[self.index_k_with_scale_buffer[layer_id]],
@@ -1228,6 +1228,8 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def _backup_indexer_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -1258,7 +1260,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
-        else:
+        elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=device_pool.index_k_with_scale_buffer,
@@ -1277,6 +1279,8 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def load_to_device_per_layer(
         self,
