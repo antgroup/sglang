@@ -227,8 +227,18 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
     ):
         # step1 TextEncoder
         device = get_local_torch_device()
-        num_inference_steps = 6
-        batch.num_inference_steps = 6
+        default_num_inference_steps = 6
+        num_inference_steps = batch.num_inference_steps
+        if num_inference_steps is None:
+            num_inference_steps = default_num_inference_steps
+        elif num_inference_steps <= 0:
+            logger.warning(
+                "Invalid num_inference_steps=%s for krea realtime; fallback to %s",
+                num_inference_steps,
+                default_num_inference_steps,
+            )
+            num_inference_steps = default_num_inference_steps
+        batch.num_inference_steps = num_inference_steps
 
         transformer_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]

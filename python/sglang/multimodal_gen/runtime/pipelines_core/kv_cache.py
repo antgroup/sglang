@@ -181,6 +181,10 @@ class CrossAttentionKVCache:
         self.k = None
         self.v = None
 
+    def release(self) -> None:
+        """Alias of reset() for lifecycle symmetry with self-attn cache."""
+        self.reset()
+
     def update(self, k: Tensor, v: Tensor) -> None:
         self.k = k
         self.v = v

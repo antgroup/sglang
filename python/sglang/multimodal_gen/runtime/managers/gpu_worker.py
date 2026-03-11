@@ -95,6 +95,40 @@ class GPUWorker:
         self._realtime_session_cache: OrderedDict[str, RealtimeSession] = OrderedDict()
         self._max_realtime_sessions = 128
 
+    def _dispose_realtime_session(
+        self, session_id: str, session: RealtimeSession | None
+    ) -> None:
+        if session is None:
+            return
+        try:
+            session.dispose()
+        except Exception as e:
+            logger.warning(
+                "Failed to dispose realtime session cache entry %s: %s",
+                session_id,
+                e,
+            )
+
+    def release_realtime_session(self, session_id: str) -> OutputBatch:
+        if not session_id:
+            return OutputBatch(
+                output={
+                    "released": False,
+                    "session_id": session_id,
+                    "reason": "empty_session_id",
+                }
+            )
+
+        session = self._realtime_session_cache.pop(session_id, None)
+        released = session is not None
+        self._dispose_realtime_session(session_id, session)
+        logger.info(
+            "Realtime session release: session_id=%s released=%s",
+            session_id,
+            released,
+        )
+        return OutputBatch(output={"released": released, "session_id": session_id})
+
     def _attach_realtime_session(self, req: Req) -> None:
         """Attach a persistent realtime session object for chunked generation."""
         has_explicit_session_id = (
@@ -128,7 +162,10 @@ class GPUWorker:
         self._realtime_session_cache.move_to_end(session_id)
 
         while len(self._realtime_session_cache) > self._max_realtime_sessions:
-            stale_session_id, _ = self._realtime_session_cache.popitem(last=False)
+            stale_session_id, stale_session = self._realtime_session_cache.popitem(
+                last=False
+            )
+            self._dispose_realtime_session(stale_session_id, stale_session)
             logger.debug("Evicted stale realtime session cache: %s", stale_session_id)
 
     def init_device_and_model(self) -> None:
