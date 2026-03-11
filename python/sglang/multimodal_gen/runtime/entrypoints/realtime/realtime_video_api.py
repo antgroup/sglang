@@ -18,7 +18,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.entrypoints.realtime.generate_session import (
     GenerateSession,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    ReleaseRealtimeSessionReq,
+    prepare_request,
+)
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -183,6 +186,16 @@ async def generate(websocket: WebSocket):
             generate_task.cancel()
         if listen_task and not generate_task.done():
             listen_task.cancel()
+        try:
+            await async_scheduler_client.forward(
+                ReleaseRealtimeSessionReq(session_id=session.id)
+            )
+        except Exception as e:
+            logger.warning(
+                "failed to release realtime session on scheduler, session_id=%s, error=%s",
+                session.id,
+                e,
+            )
         if session:
             session.dispose()
 
