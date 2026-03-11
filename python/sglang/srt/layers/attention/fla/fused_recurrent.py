@@ -449,8 +449,8 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
                     + cache_idx * cache_steps * HV * K * V
                     + step_offset
                     + i_hv * K * V
-                    + o_k[:, None] * V
-                    + o_v[None, :]
+                    + o_v[:, None] * K
+                    + o_k[None, :]
                 )
                 b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
 
