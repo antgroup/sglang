@@ -6,6 +6,7 @@ from diffusers.utils import is_ftfy_available
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 
+from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
     get_local_torch_device,
 )
@@ -227,7 +228,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
     ):
         # step1 TextEncoder
         device = get_local_torch_device()
-        default_num_inference_steps = 6
+        default_num_inference_steps = 4
         num_inference_steps = batch.num_inference_steps
         if num_inference_steps is None:
             num_inference_steps = default_num_inference_steps
@@ -346,7 +347,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
                 )
             batch.current_start_frame = start_frame
         # step4 setup kvcache
-        num_heads = self.transformer.num_attention_heads
+        num_heads = divide(self.transformer.num_attention_heads, get_tp_world_size())
         head_dim = self.transformer.attention_head_dim
         num_blocks = len(self.transformer.blocks)
         sa_max_size = (kv_cache_num_frames + num_frames_per_block) * frame_seq_length

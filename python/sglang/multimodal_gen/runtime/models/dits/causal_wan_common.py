@@ -18,7 +18,11 @@ from torch.nn.attention.flex_attention import (
 )
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    divide,
+    get_sp_world_size,
+    get_tp_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -26,8 +30,12 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
+    tensor_parallel_rms_norm,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -80,12 +88,15 @@ class BaseCausalWanSelfAttention(nn.Module):
         qk_norm=True,
         eps=1e-6,
         parallel_attention=False,
+        head_dim: int | None = None,
     ) -> None:
-        assert dim % num_heads == 0
+        if head_dim is None:
+            assert dim % num_heads == 0
+            head_dim = dim // num_heads
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        self.head_dim = head_dim
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
         self.qk_norm = qk_norm
@@ -247,23 +258,52 @@ class BaseCausalWanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
-        self.to_k = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
-        self.to_v = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
+        self.tp_size = get_tp_world_size()
+        self.local_num_heads = divide(num_heads, self.tp_size)
+        dim_head = dim // num_heads
 
-        self.to_out = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
+        self.to_q = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+        )
+        self.to_k = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+        )
+        self.to_v = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+        )
+
+        self.to_out = RowParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            reduce_results=True,
+            quant_config=quant_config,
+        )
         self.attn1 = self.self_attn_cls(
             dim,
-            num_heads,
+            self.local_num_heads,
             local_attn_size=local_attn_size,
             sink_size=sink_size,
             qk_norm=qk_norm,
             eps=eps,
+            head_dim=dim_head,
         )
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
         self.local_attn_size = local_attn_size
-        dim_head = dim // num_heads
         if qk_norm == "rms_norm":
             self.norm_q = RMSNorm(dim_head, eps=eps)
             self.norm_k = RMSNorm(dim_head, eps=eps)
@@ -272,6 +312,7 @@ class BaseCausalWanTransformerBlock(nn.Module):
             self.norm_k = RMSNorm(dim, eps=eps)
         else:
             raise ValueError(f"QK norm type not supported: {qk_norm}")
+        self.tp_rmsnorm = qk_norm == "rms_norm_across_heads" and self.tp_size > 1
         assert cross_attn_norm is True
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim, eps=eps, elementwise_affine=True, dtype=torch.float32
@@ -346,13 +387,19 @@ class BaseCausalWanTransformerBlock(nn.Module):
         value, _ = self.to_v(norm_hidden_states)
 
         if self.norm_q is not None:
-            query = self.norm_q(query)
+            if self.tp_rmsnorm:
+                query = tensor_parallel_rms_norm(query, self.norm_q)
+            else:
+                query = self.norm_q(query)
         if self.norm_k is not None:
-            key = self.norm_k(key)
+            if self.tp_rmsnorm:
+                key = tensor_parallel_rms_norm(key, self.norm_k)
+            else:
+                key = self.norm_k(key)
 
-        query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        query = query.squeeze(1).unflatten(2, (self.local_num_heads, -1))
+        key = key.squeeze(1).unflatten(2, (self.local_num_heads, -1))
+        value = value.squeeze(1).unflatten(2, (self.local_num_heads, -1))
 
         attn_output = self.attn1(
             query,
@@ -476,8 +523,12 @@ class BaseCausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
             elementwise_affine=False,
             dtype=torch.float32,
         )
-        self.proj_out = nn.Linear(
-            inner_dim, config.out_channels * math.prod(config.patch_size)
+        self.proj_out = ColumnParallelLinear(
+            inner_dim,
+            config.out_channels * math.prod(config.patch_size),
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
         )
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 2, inner_dim) / inner_dim**0.5
@@ -740,7 +791,7 @@ class BaseCausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
         temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)
         shift, scale = (self.scale_shift_table.unsqueeze(1) + temb).chunk(2, dim=2)
         hidden_states = self.norm_out(hidden_states, shift, scale)
-        hidden_states = self.proj_out(hidden_states)
+        hidden_states, _ = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(
             shape_info.batch_size,
