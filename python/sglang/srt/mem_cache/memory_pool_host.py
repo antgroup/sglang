@@ -1205,10 +1205,10 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         )
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
-        self._init_indexer_buffers()
         self.can_use_jit_indexer = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.indexer_page_stride_size * self.indexer_dtype.itemsize
         )
+        self._init_indexer_buffers()
         logger.info(
             f"NSATokenToKVPoolHost initialized with indexer page stride size: {self.indexer_page_stride_size}, page num: {self.indexer_page_num}"
         )
