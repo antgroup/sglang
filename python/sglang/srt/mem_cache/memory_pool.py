@@ -469,6 +469,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
+        self.layer_transfer_counter = None
+        self.model_layer_id_to_local: dict[int, int] = {}
         self._init_mamba_pool(
             size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
@@ -509,6 +511,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     device=self.device,
                 )
             )
+
+    def register_layer_transfer_counter(
+        self, layer_transfer_counter: "LayerDoneCounter"
+    ):
+        self.layer_transfer_counter = layer_transfer_counter
+
+    def set_model_layer_id_mapping(self, model_layer_ids: List[int]):
+        self.model_layer_id_to_local = {
+            layer_id: i for i, layer_id in enumerate(model_layer_ids)
+        }
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
@@ -564,6 +576,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map
+        if self.layer_transfer_counter is not None:
+            wait_id = self.model_layer_id_to_local.get(layer_id, layer_id)
+            self.layer_transfer_counter.wait_until(wait_id)
         return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
@@ -1234,6 +1249,8 @@ class HybridLinearKVPool(KVCache):
         self.page_size = page_size
         # TODO support pp?
         self.start_layer = 0
+        self.layer_transfer_counter = None
+        self.model_layer_id_to_local: dict[int, int] = {}
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
@@ -1317,15 +1334,34 @@ class HybridLinearKVPool(KVCache):
             )
         return self.full_attention_layer_id_mapping[layer_id]
 
+    def register_layer_transfer_counter(
+        self, layer_transfer_counter: "LayerDoneCounter"
+    ):
+        self.layer_transfer_counter = layer_transfer_counter
+
+    def set_model_layer_id_mapping(self, model_layer_ids: List[int]):
+        self.model_layer_id_to_local = {
+            layer_id: i for i, layer_id in enumerate(model_layer_ids)
+        }
+
+    def _wait_for_model_layer(self, layer_id: int):
+        if self.layer_transfer_counter is None:
+            return
+        wait_id = self.model_layer_id_to_local.get(layer_id, layer_id)
+        self.layer_transfer_counter.wait_until(wait_id)
+
     def get_key_buffer(self, layer_id: int):
+        self._wait_for_model_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_key_buffer(layer_id)
 
     def get_value_buffer(self, layer_id: int):
+        self._wait_for_model_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):
+        self._wait_for_model_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
 
