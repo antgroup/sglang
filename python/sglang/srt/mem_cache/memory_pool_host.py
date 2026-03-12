@@ -1204,6 +1204,9 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         )
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
         self._init_indexer_buffers()
+        self.can_use_jit_indexer = _is_cuda and can_use_hicache_jit_kernel(
+            element_size=self.indexer_page_stride_size * self.indexer_dtype.itemsize
+        )
         logger.info(
             f"NSATokenToKVPoolHost initialized with indexer page stride size: {self.indexer_page_stride_size}, page num: {self.indexer_page_num}"
         )
@@ -1263,7 +1266,15 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             host_indices, device_indices
         )
         use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
-        if use_kernel:
+        if use_kernel and self.can_use_jit_indexer:
+            jit_transfer_hicache_one_layer_mla(
+                cache_dst=device_pool.index_k_with_scale_buffer[layer_id],
+                cache_src=self.index_k_with_scale_buffer[layer_id],
+                indices_dst=device_page_indices,
+                indices_src=host_page_indices,
+                element_dim=self.indexer_page_stride_size,
+            )
+        elif use_kernel:
             transfer_kv_per_layer_mla(
                 src=self.index_k_with_scale_buffer[layer_id],
                 dst=device_pool.index_k_with_scale_buffer[layer_id],
@@ -1287,7 +1298,20 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             host_indices, device_indices
         )
         use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
-        if use_kernel:
+        if use_kernel and self.can_use_jit_indexer:
+            indexer_element_size = (
+                self.indexer_page_stride_size * self.indexer_dtype.itemsize
+            )
+            jit_transfer_hicache_all_layer_mla(
+                ptr_dst=self.index_k_data_ptrs,
+                indices_dst=host_page_indices,
+                ptr_src=self.index_k_device_ptrs,
+                indices_src=device_page_indices,
+                cache_src_stride_bytes=indexer_element_size,
+                cache_dst_stride_bytes=indexer_element_size,
+                element_size=indexer_element_size,
+            )
+        elif use_kernel:
             transfer_kv_all_layer_mla(
                 src_layers=self.index_k_device_ptrs,
                 dst_layers=self.index_k_data_ptrs,
