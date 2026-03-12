@@ -15,13 +15,7 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
 )
 from sglang.jit_kernel.hicache import (
-    transfer_hicache_all_layer_lf_pf as jit_transfer_hicache_all_layer_lf_pf,
-)
-from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
-)
-from sglang.jit_kernel.hicache import (
-    transfer_hicache_per_layer_pf_lf as jit_transfer_hicache_per_layer_pf_lf,
 )
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
@@ -306,8 +300,16 @@ class MHATokenToKVPoolHost(HostKVCache):
             element_size=self.element_dim * self.dtype.itemsize
         )
 
-        self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
-        self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
+        if self.layout == "page_first":
+            # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
+            # This swaps strides without copying data
+            k_transposed = self.k_buffer.transpose(0, 1)
+            v_transposed = self.v_buffer.transpose(0, 1)
+            self.k_data_refs = [k_transposed[i] for i in range(self.layer_num)]
+            self.v_data_refs = [v_transposed[i] for i in range(self.layer_num)]
+        else:
+            self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
+            self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_data_refs],
             dtype=torch.uint64,
@@ -407,15 +409,16 @@ class MHATokenToKVPoolHost(HostKVCache):
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
-                    jit_transfer_hicache_per_layer_pf_lf(
+                    # Transpose [page, layer, ...] -> [layer, page, ...] then
+                    # index by layer_id to get a per-layer view with strided layout.
+                    # The kernel handles different src/dst strides automatically.
+                    jit_transfer_hicache_one_layer(
                         k_cache_dst=device_pool.k_buffer[layer_id],
                         v_cache_dst=device_pool.v_buffer[layer_id],
-                        k_cache_src=self.k_buffer,
-                        v_cache_src=self.v_buffer,
+                        k_cache_src=self.k_data_refs[layer_id],
+                        v_cache_src=self.v_data_refs[layer_id],
                         indices_dst=device_indices,
                         indices_src=host_indices,
-                        layer_id=layer_id,
-                        src_layout_dim=self.layout_dim,
                         element_dim=self.element_dim,
                     )
                 else:
@@ -521,16 +524,17 @@ class MHATokenToKVPoolHost(HostKVCache):
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
-                    jit_transfer_hicache_all_layer_lf_pf(
-                        k_ptr_dst=self.k_buffer,
-                        v_ptr_dst=self.v_buffer,
+                    # Use transposed data ptrs so the kernel writes to
+                    # [layer, page, item] view with stride layout_dim per token.
+                    jit_transfer_hicache_all_layer(
+                        k_ptr_dst=self.k_data_ptrs,
+                        v_ptr_dst=self.v_data_ptrs,
                         indices_dst=host_indices,
                         k_ptr_src=device_pool.k_data_ptrs,
                         v_ptr_src=device_pool.v_data_ptrs,
                         indices_src=device_indices,
                         kv_cache_src_stride_bytes=self.token_stride_size,
-                        kv_cache_dst_stride_bytes=self.token_stride_size,
-                        dst_layout_dim=self.layout_dim,
+                        kv_cache_dst_stride_bytes=self.layout_dim,
                         element_size=self.element_dim * self.dtype.itemsize,
                     )
                 else:
