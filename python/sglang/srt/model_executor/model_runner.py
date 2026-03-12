@@ -130,12 +130,14 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     DecodeInputBuffers,
     set_torch_compile_config,
 )
+from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+    create_chunked_prefix_cache_kv_indices,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
-    create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
