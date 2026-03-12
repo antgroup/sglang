@@ -5,13 +5,11 @@ import torch
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
-    NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     ALLOC_MEMORY_FUNCS,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
-    NSATokenToKVPoolHost,
     alloc_with_pin_memory,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -283,166 +281,6 @@ class TestMLAJITTransfer(unittest.TestCase):
 
     def test_mla_page_first(self):
         self._run_backup_and_load("page_first")
-
-
-class TestNSAJITTransfer(unittest.TestCase):
-    """Test NSA JIT kernel transfers for layer_first and page_first,
-    including both kv_buffer and indexer buffers."""
-
-    def setUp(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required.")
-        if is_npu() or is_xpu():
-            self.skipTest("Only CUDA/ROCm supported.")
-        if not (is_cuda() or is_hip()):
-            self.skipTest("CUDA/ROCm not available.")
-
-    def _create_pools(self, layout):
-        # kv_cache_dim=256 → element_size = 256*2 = 512 = 128*4 ✓
-        # indexer: quant_block_size=128, index_head_dim=128
-        #   indexer_size_per_token = 128 + 128/128*4 = 132
-        #   indexer element_size not 128-aligned → JIT indexer will fallback to sgl_kernel
-        page_size = 1 if is_hip() else 64
-        layer_num = 2
-        size = page_size * 8
-
-        device_pool = NSATokenToKVPool(
-            size=size,
-            page_size=page_size,
-            kv_lora_rank=192,
-            dtype=torch.bfloat16,
-            qk_rope_head_dim=64,
-            layer_num=layer_num,
-            device="cuda",
-            enable_memory_saver=False,
-            kv_cache_dim=256,
-            index_head_dim=128,
-        )
-
-        original_alloc = ALLOC_MEMORY_FUNCS["cuda"]
-        ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
-        try:
-            host_pool = NSATokenToKVPoolHost(
-                device_pool=device_pool,
-                host_to_device_ratio=2.0,
-                host_size=0,
-                page_size=page_size,
-                layout=layout,
-                pin_memory=True,
-                device="cpu",
-            )
-        finally:
-            ALLOC_MEMORY_FUNCS["cuda"] = original_alloc
-
-        self.assertTrue(
-            host_pool.can_use_jit, "JIT kernel should be available for NSA kv_buffer"
-        )
-        return device_pool, host_pool, page_size, layer_num
-
-    def _fill_device_pool(self, device_pool, layer_num):
-        for layer_id in range(layer_num):
-            # Fill indexer
-            buf = device_pool.index_k_with_scale_buffer[layer_id]
-            data = torch.arange(
-                buf.numel(), device=buf.device, dtype=torch.uint8
-            ).view_as(buf)
-            buf.copy_((data + layer_id) % 256)
-            # Fill kv buffer
-            kv_buf = device_pool.kv_buffer[layer_id]
-            kv_data = torch.arange(
-                kv_buf.numel(), device=kv_buf.device, dtype=kv_buf.dtype
-            ).view_as(kv_buf)
-            kv_buf.copy_(kv_data + layer_id)
-
-    def _run_backup_and_verify(self, layout):
-        device_pool, host_pool, page_size, layer_num = self._create_pools(layout)
-        self._fill_device_pool(device_pool, layer_num)
-
-        device_pages = torch.tensor([1, 2, 3], device="cuda", dtype=torch.int64)
-        host_pages = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int64)
-        device_indices = _token_indices_for_pages(
-            device_pages, page_size, device="cuda"
-        )
-        host_indices = _token_indices_for_pages(host_pages, page_size, device="cuda")
-
-        # backup: device -> host (all layer)
-        host_pool.backup_from_device_all_layer(
-            device_pool, host_indices, device_indices, "kernel"
-        )
-        torch.cuda.synchronize()
-
-        # Verify kv_buffer
-        for layer_id in range(layer_num):
-            for hp, dp in zip(host_pages.tolist(), device_pages.tolist()):
-                hs, ds = hp * page_size, dp * page_size
-                got_kv = host_pool.data_refs[layer_id][hs : hs + page_size].cpu()
-                expected_kv = device_pool.kv_buffer[layer_id][ds : ds + page_size].cpu()
-                self.assertTrue(
-                    torch.equal(got_kv, expected_kv),
-                    f"kv mismatch layout={layout} layer={layer_id} hp={hp} dp={dp}",
-                )
-
-        # Verify indexer
-        for layer_id in range(layer_num):
-            for hp, dp in zip(host_pages.tolist(), device_pages.tolist()):
-                if layout == "layer_first":
-                    got = host_pool.index_k_with_scale_buffer[layer_id][hp].cpu()
-                else:
-                    # page_first: index_k_with_scale_buffer is [page, layer, 1, stride]
-                    got = host_pool.index_k_with_scale_buffer[hp, layer_id, 0].cpu()
-                expected = device_pool.index_k_with_scale_buffer[layer_id][dp].cpu()
-                self.assertTrue(
-                    torch.equal(got, expected),
-                    f"indexer mismatch layout={layout} layer={layer_id} hp={hp} dp={dp}",
-                )
-
-        # load: host -> device (per layer) - verify kv + indexer round-trip
-        for layer_id in range(layer_num):
-            device_pool.kv_buffer[layer_id].zero_()
-            device_pool.index_k_with_scale_buffer[layer_id].zero_()
-
-        load_device_pages = torch.tensor([4, 5, 6], device="cuda", dtype=torch.int64)
-        load_device_indices = _token_indices_for_pages(
-            load_device_pages, page_size, device="cuda"
-        )
-
-        for layer_id in range(layer_num):
-            host_pool.load_to_device_per_layer(
-                device_pool, host_indices, load_device_indices, layer_id, "kernel"
-            )
-        torch.cuda.synchronize()
-
-        # Verify kv_buffer after load
-        for layer_id in range(layer_num):
-            for hp, dp in zip(host_pages.tolist(), load_device_pages.tolist()):
-                hs, ds = hp * page_size, dp * page_size
-                got_kv = device_pool.kv_buffer[layer_id][ds : ds + page_size].cpu()
-                expected_kv = host_pool.data_refs[layer_id][hs : hs + page_size].cpu()
-                self.assertTrue(
-                    torch.equal(got_kv, expected_kv),
-                    f"kv load mismatch layout={layout} layer={layer_id} hp={hp} dp={dp}",
-                )
-
-        # Verify indexer after load
-        for layer_id in range(layer_num):
-            for hp, dp in zip(host_pages.tolist(), load_device_pages.tolist()):
-                if layout == "layer_first":
-                    expected = host_pool.index_k_with_scale_buffer[layer_id][hp].cpu()
-                else:
-                    expected = host_pool.index_k_with_scale_buffer[
-                        hp, layer_id, 0
-                    ].cpu()
-                got = device_pool.index_k_with_scale_buffer[layer_id][dp].cpu()
-                self.assertTrue(
-                    torch.equal(got, expected),
-                    f"indexer load mismatch layout={layout} layer={layer_id} hp={hp} dp={dp}",
-                )
-
-    def test_nsa_layer_first(self):
-        self._run_backup_and_verify("layer_first")
-
-    def test_nsa_page_first(self):
-        self._run_backup_and_verify("page_first")
 
 
 if __name__ == "__main__":

@@ -1205,9 +1205,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         )
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
-        self.can_use_jit_indexer = _is_cuda and can_use_hicache_jit_kernel(
-            element_size=self.indexer_page_stride_size * self.indexer_dtype.itemsize
-        )
         self._init_indexer_buffers()
         logger.info(
             f"NSATokenToKVPoolHost initialized with indexer page stride size: {self.indexer_page_stride_size}, page num: {self.indexer_page_num}"
@@ -1259,15 +1256,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-            if self.can_use_jit_indexer:
-                # Transpose [page, layer, ...] -> [layer, page, ...] for per-layer views
-                transposed = self.index_k_with_scale_buffer.transpose(0, 1)
-                self.index_k_data_refs = [transposed[i] for i in range(self.layer_num)]
-                self.index_k_data_ptrs = torch.tensor(
-                    [x.data_ptr() for x in self.index_k_data_refs],
-                    dtype=torch.uint64,
-                    device=self.device_pool.device,
-                )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
@@ -1295,41 +1283,23 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
         if use_kernel:
             if self.layout == "layer_first":
-                if self.can_use_jit_indexer:
-                    jit_transfer_hicache_one_layer_mla(
-                        cache_dst=device_pool.index_k_with_scale_buffer[layer_id],
-                        cache_src=self.index_k_with_scale_buffer[layer_id],
-                        indices_dst=device_page_indices,
-                        indices_src=host_page_indices,
-                        element_dim=self.indexer_page_stride_size,
-                    )
-                else:
-                    transfer_kv_per_layer_mla(
-                        src=self.index_k_with_scale_buffer[layer_id],
-                        dst=device_pool.index_k_with_scale_buffer[layer_id],
-                        src_indices=host_page_indices,
-                        dst_indices=device_page_indices,
-                        item_size=self.indexer_page_stride_size,
-                    )
+                transfer_kv_per_layer_mla(
+                    src=self.index_k_with_scale_buffer[layer_id],
+                    dst=device_pool.index_k_with_scale_buffer[layer_id],
+                    src_indices=host_page_indices,
+                    dst_indices=device_page_indices,
+                    item_size=self.indexer_page_stride_size,
+                )
             elif self.layout == "page_first":
-                if self.can_use_jit_indexer:
-                    jit_transfer_hicache_one_layer_mla(
-                        cache_dst=device_pool.index_k_with_scale_buffer[layer_id],
-                        cache_src=self.index_k_data_refs[layer_id],
-                        indices_dst=device_page_indices,
-                        indices_src=host_page_indices,
-                        element_dim=self.indexer_page_stride_size,
-                    )
-                else:
-                    transfer_kv_per_layer_mla_pf_lf(
-                        src=self.index_k_with_scale_buffer,
-                        dst=device_pool.index_k_with_scale_buffer[layer_id],
-                        src_indices=host_page_indices,
-                        dst_indices=device_page_indices,
-                        layer_id=layer_id,
-                        item_size=self.indexer_page_stride_size,
-                        src_layout_dim=self.indexer_layout_dim,
-                    )
+                transfer_kv_per_layer_mla_pf_lf(
+                    src=self.index_k_with_scale_buffer,
+                    dst=device_pool.index_k_with_scale_buffer[layer_id],
+                    src_indices=host_page_indices,
+                    dst_indices=device_page_indices,
+                    layer_id=layer_id,
+                    item_size=self.indexer_page_stride_size,
+                    src_layout_dim=self.indexer_layout_dim,
+                )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
@@ -1362,52 +1332,26 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             host_indices, device_indices
         )
         use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
-        indexer_element_size = (
-            self.indexer_page_stride_size * self.indexer_dtype.itemsize
-        )
         if use_kernel:
             if self.layout == "layer_first":
-                if self.can_use_jit_indexer:
-                    jit_transfer_hicache_all_layer_mla(
-                        ptr_dst=self.index_k_data_ptrs,
-                        indices_dst=host_page_indices,
-                        ptr_src=self.index_k_device_ptrs,
-                        indices_src=device_page_indices,
-                        cache_src_stride_bytes=indexer_element_size,
-                        cache_dst_stride_bytes=indexer_element_size,
-                        element_size=indexer_element_size,
-                    )
-                else:
-                    transfer_kv_all_layer_mla(
-                        src_layers=self.index_k_device_ptrs,
-                        dst_layers=self.index_k_data_ptrs,
-                        src_indices=device_page_indices,
-                        dst_indices=host_page_indices,
-                        item_size=self.indexer_page_stride_size,
-                        num_layers=self.layer_num,
-                    )
+                transfer_kv_all_layer_mla(
+                    src_layers=self.index_k_device_ptrs,
+                    dst_layers=self.index_k_data_ptrs,
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    item_size=self.indexer_page_stride_size,
+                    num_layers=self.layer_num,
+                )
             elif self.layout == "page_first":
-                if self.can_use_jit_indexer:
-                    jit_transfer_hicache_all_layer_mla(
-                        ptr_dst=self.index_k_data_ptrs,
-                        indices_dst=host_page_indices,
-                        ptr_src=self.index_k_device_ptrs,
-                        indices_src=device_page_indices,
-                        cache_src_stride_bytes=indexer_element_size,
-                        cache_dst_stride_bytes=self.indexer_layout_dim
-                        * self.indexer_dtype.itemsize,
-                        element_size=indexer_element_size,
-                    )
-                else:
-                    transfer_kv_all_layer_mla_lf_pf(
-                        src_layers=self.index_k_device_ptrs,
-                        dst=self.index_k_with_scale_buffer,
-                        src_indices=device_page_indices,
-                        dst_indices=host_page_indices,
-                        item_size=self.indexer_page_stride_size,
-                        dst_layout_dim=self.indexer_layout_dim,
-                        num_layers=self.layer_num,
-                    )
+                transfer_kv_all_layer_mla_lf_pf(
+                    src_layers=self.index_k_device_ptrs,
+                    dst=self.index_k_with_scale_buffer,
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    item_size=self.indexer_page_stride_size,
+                    dst_layout_dim=self.indexer_layout_dim,
+                    num_layers=self.layer_num,
+                )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
