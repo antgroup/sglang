@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.realtime.generate_session import (
     GenerateSession,
+    RealtimeVideoMode,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ReleaseRealtimeSessionReq,
@@ -34,18 +35,15 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
 
     while True:
         try:
-            # If the request is video-stream driven (no first_frame), give the
-            # client a short grace period to push the first video chunk.
+            # For stream-driven v2v (no first_frame),
+            # wait until enough frames are buffered for this block.
             if (
-                session.generate_chunk_cnt == 0
-                and session.request is not None
+                session.request is not None
+                and session.is_v2v_enabled()
                 and session.request.first_frame is None
-                and not session.has_pending_video_frames()
             ):
-                for _ in range(30):  # ~300ms max
+                while not session.has_pending_video_frames():
                     await asyncio.sleep(0.01)
-                    if session.has_pending_video_frames():
-                        break
 
             session.new_request()
 
@@ -57,7 +55,9 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             batch.session = session.realtime_session
             batch.extra["realtime_session_id"] = session.id
             batch.block_idx = session.generate_chunk_cnt
-            batch.input_video = session.sample_video_frames()
+            batch.input_video = (
+                session.sample_video_frames() if session.is_v2v_enabled() else None
+            )
             save_file_path_list, result = await process_generation_batch(
                 async_scheduler_client, batch
             )
@@ -97,6 +97,17 @@ async def _listen_actions(ws: WebSocket, session: GenerateSession):
         try:
             realtime_action = RealtimeAction.model_validate(data)
             if realtime_action.type == "video":
+                if not session.is_v2v_enabled():
+                    logger.warning(
+                        "ignore video action in non-v2v mode, session_id=%s",
+                        session.id,
+                    )
+                    await write_error_msg(
+                        "video action requires mode=v2v (or first_frame in auto mode)",
+                        ws,
+                    )
+                    continue
+
                 encoded_frames = list(realtime_action.video_frames or [])
                 if realtime_action.video_frame is not None:
                     encoded_frames.append(realtime_action.video_frame)
@@ -136,6 +147,27 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
     while True:
         try:
             data = unpackb(await ws.receive_bytes())
+            if not isinstance(data, dict):
+                raise ValueError("generate request must be a map")
+
+            mode_raw = data.get("mode")
+            if mode_raw is None:
+                mode = None
+            else:
+                if isinstance(mode_raw, bytes):
+                    try:
+                        mode_raw = mode_raw.decode("utf-8")
+                    except Exception as e:
+                        raise ValueError("mode must be a utf-8 string") from e
+                if not isinstance(mode_raw, str):
+                    raise ValueError("mode must be one of: t2v, v2v")
+                try:
+                    mode = RealtimeVideoMode(mode_raw)
+                except Exception as e:
+                    raise ValueError("mode must be one of: t2v, v2v") from e
+            if mode == RealtimeVideoMode.T2V and data.get("first_frame") is not None:
+                raise ValueError("first_frame is not allowed when mode=t2v")
+
             realtime_req = RealtimeVideoGenerationsRequest.model_validate(data)
             # TODO(puf147): convert RGB for krea
             # params.start_frame = Image.open(params.start_frame).convert("RGB")
@@ -149,6 +181,8 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
                 )
                 realtime_req.first_frame = image_path
 
+            # Keep session state update atomic with validated request.
+            session.set_mode(mode)
             session.setRequest(realtime_req)
             break
         except Exception as e:

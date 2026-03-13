@@ -37,6 +37,9 @@ Send a MessagePack object that matches `RealtimeVideoGenerationsRequest`.
 Common fields:
 
 - `prompt` (`str`, required): initial prompt
+- `mode` (`"t2v" | "v2v"`, optional): force mode selection
+  - `"v2v"`: force v2v mode
+  - `"t2v"`: force t2v mode (video actions are rejected)
 - `first_frame` (`bytes | str`, optional): first conditioning frame
 - `size` (`str`, optional): e.g. `"832x480"`
 - `seed` (`int`, optional)
@@ -147,6 +150,7 @@ You can stream actions continuously while generation is running:
 - `type="video"`: stream live input frames
   - `video_frame`: one encoded frame bytes
   - `video_frames`: multiple encoded frame bytes in one action
+  - requires v2v mode (`mode="v2v"`, or auto mode with `first_frame` set)
 
 The server consumes prompt/video actions concurrently with generation. If no
 new action is provided, generation continues with the latest effective state.
