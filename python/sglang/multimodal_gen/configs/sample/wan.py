@@ -287,6 +287,8 @@ class Krea_Wan2_1_T2V_A14B_SamplingParam(SamplingParams):
     height: int = 480
     num_inference_steps: int = 4
     kv_cache_num_frames: int = 3
+    guidance_scale: float = 1
+    fps: int = 12
 
 
 # =============================================
