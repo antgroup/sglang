@@ -259,10 +259,12 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
 
         if batch.input_video is not None:
             if batch.session.input_frames_cache is None:
-                # Keep a bounded rolling frame history for realtime camera stream.
+                # Keep conditioning history bounded to avoid unbounded
+                # preprocess+encode cost growth. Match official Krea realtime
+                # behavior (24 frames when num_frames_per_block=3).
                 cache_len = max(
                     kv_cache_num_frames + num_frames_per_block,
-                    num_frames_per_block * 32,
+                    num_frames_per_block * 8,
                 )
                 batch.session.input_frames_cache = deque(maxlen=cache_len)
             if isinstance(batch.input_video, list):
