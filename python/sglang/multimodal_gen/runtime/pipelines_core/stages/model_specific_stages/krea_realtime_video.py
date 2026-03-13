@@ -246,10 +246,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         block_idx = batch.block_idx
         num_frames_per_block = self.transformer.config.arch_config.num_frames_per_block
         kv_cache_num_frames = self.transformer.config.arch_config.kv_cache_num_frames
-        has_video_condition = batch.input_video is not None or (
-            batch.session.input_frames_cache is not None
-            and len(batch.session.input_frames_cache) > 0
-        )
+        has_video_condition = batch.input_video is not None
         strength = 0.7 if has_video_condition else 1.0
         frame_seq_length = self.transformer.config.arch_config.frame_seq_length
         # step2 set timesteps
@@ -257,28 +254,14 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
             5, strength, num_inference_steps
         )
 
-        if batch.input_video is not None:
-            if batch.session.input_frames_cache is None:
-                # Keep conditioning history bounded to avoid unbounded
-                # preprocess+encode cost growth. Match official Krea realtime
-                # behavior (24 frames when num_frames_per_block=3).
-                cache_len = max(
-                    kv_cache_num_frames + num_frames_per_block,
-                    num_frames_per_block * 8,
-                )
-                batch.session.input_frames_cache = deque(maxlen=cache_len)
-            if isinstance(batch.input_video, list):
-                batch.session.input_frames_cache.extend(batch.input_video)
-            else:
-                batch.session.input_frames_cache.append(batch.input_video)
-
         # step3 prepare latents
         # video to video
-        if (
-            batch.session.input_frames_cache is not None
-            and len(batch.session.input_frames_cache) > 0
-        ):
-            conditioning_frames = list(batch.session.input_frames_cache)
+        if batch.input_video is not None:
+            if isinstance(batch.input_video, list):
+                conditioning_frames = batch.input_video
+            else:
+                conditioning_frames = [batch.input_video]
+
             if len(conditioning_frames) < num_frames_per_block:
                 conditioning_frames = conditioning_frames + [
                     conditioning_frames[-1]

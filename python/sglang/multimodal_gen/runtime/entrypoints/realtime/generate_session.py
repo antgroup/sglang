@@ -1,5 +1,8 @@
 from collections import deque
+from enum import Enum
 from uuid import uuid4
+
+import numpy as np
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeAction,
@@ -9,23 +12,38 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_samplin
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import RealtimeSession
 
 
+class RealtimeVideoMode(str, Enum):
+    T2V = "t2v"
+    V2V = "v2v"
+
+
 class GenerateSession:
+    _FIRST_BLOCK_ENCODE_FRAMES = 9
+    _NEXT_BLOCK_ENCODE_FRAMES = 12
 
     def __init__(self):
         self.id = uuid4().hex
         self.request_id = None
         self.request = None
+        self.mode: RealtimeVideoMode | None = None
         self.action_queue = deque(maxlen=1)
-        self.video_chunk_queue = deque(maxlen=64)
+        self.video_frame_queue = deque(maxlen=256)
         self.generate_chunk_cnt = 0
         self.realtime_session = RealtimeSession()
 
     def setRequest(self, request: RealtimeVideoGenerationsRequest):
         self.request = request
 
+    def set_mode(self, mode: RealtimeVideoMode | None):
+        self.mode = mode
+
     def dispose(self):
         self.action_queue.clear()
-        self.video_chunk_queue.clear()
+        self.video_frame_queue.clear()
+        self.mode = None
+        self.request = None
+        self.request_id = None
+        self.generate_chunk_cnt = 0
         self.realtime_session.dispose()
 
     def new_request(self):
@@ -39,19 +57,46 @@ class GenerateSession:
 
     def append_video_frames(self, frames: list):
         if len(frames) > 0:
-            # Keep client chunk boundaries so each generation step consumes one chunk.
-            self.video_chunk_queue.append(frames)
+            self.video_frame_queue.extend(frames)
 
     def has_pending_video_frames(self) -> bool:
-        return len(self.video_chunk_queue) > 0
+        return len(self.video_frame_queue) >= self.required_video_frames()
+
+    def is_v2v_enabled(self) -> bool:
+        if self.request is None:
+            return False
+        if self.mode is not None:
+            return self.mode == RealtimeVideoMode.V2V
+        # Auto mode only checks first_frame.
+        return self.request.first_frame is not None
+
+    def required_video_frames(self) -> int:
+        # todo make _FIRST_BLOCK_ENCODE_FRAMES and _NEXT_BLOCK_ENCODE_FRAMES config
+        if self.generate_chunk_cnt == 0:
+            return self._FIRST_BLOCK_ENCODE_FRAMES
+        return self._NEXT_BLOCK_ENCODE_FRAMES
 
     def sample_action(self) -> RealtimeAction:
         return self.action_queue.popleft()
 
     def sample_video_frames(self):
-        if len(self.video_chunk_queue) == 0:
+        required = self.required_video_frames()
+        if len(self.video_frame_queue) < required:
             return None
-        return self.video_chunk_queue.popleft()
+
+        pending_frames = []
+        while len(self.video_frame_queue) > 0:
+            pending_frames.append(self.video_frame_queue.popleft())
+        if len(pending_frames) < required:
+            return None
+        if len(pending_frames) == required:
+            return pending_frames
+
+        # Match official krea-ai/realtime-video sampling strategy.
+        indices = np.round(np.linspace(0, len(pending_frames) - 1, required)).astype(
+            int
+        )
+        return [pending_frames[i] for i in indices]
 
     def build_sampling_params(self):
         if self.generate_chunk_cnt == 0:
