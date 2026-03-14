@@ -1369,21 +1369,6 @@ class HostPoolGroup:
     def set_from_flat_data_page(self, index: int, data_page) -> None:
         return self.anchor_entry.host_pool.set_from_flat_data_page(index, data_page)
 
-    def _resolve_entry_indices(
-        self,
-        entry: PoolEntry,
-        host_indices: torch.Tensor,
-        device_indices: torch.Tensor,
-        pool_transfers: Optional[list] = None,
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        if entry is self.anchor_entry:
-            return host_indices, device_indices
-        for transfer in pool_transfers or []:
-            if transfer.name != entry.name or transfer.host_indices is None:
-                continue
-            return transfer.host_indices, transfer.device_indices
-        return None
-
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -1393,23 +1378,30 @@ class HostPoolGroup:
         io_backend,
         pool_transfers: Optional[list] = None,
     ) -> None:
-        for entry in self.entries:
+        # 1. Anchor (KV) transfer
+        anchor = self.anchor_entry
+        local_layer_id = anchor.layer_mapper(layer_id)
+        if local_layer_id is not None:
+            anchor.host_pool.load_to_device_per_layer(
+                anchor.device_pool,
+                host_indices,
+                device_indices,
+                local_layer_id,
+                io_backend,
+            )
+
+        # 2. Extra pool transfers
+        for transfer in pool_transfers or []:
+            entry = self.entry_map.get(transfer.name)
+            if entry is None or transfer.host_indices is None:
+                continue
             local_layer_id = entry.layer_mapper(layer_id)
             if local_layer_id is None:
                 continue
-            resolved = self._resolve_entry_indices(
-                entry,
-                host_indices,
-                device_indices,
-                pool_transfers=pool_transfers,
-            )
-            if resolved is None:
-                continue
-            entry_host_indices, entry_device_indices = resolved
             entry.host_pool.load_to_device_per_layer(
                 entry.device_pool,
-                entry_host_indices,
-                entry_device_indices,
+                transfer.host_indices,
+                transfer.device_indices,
                 local_layer_id,
                 io_backend,
             )
@@ -1422,20 +1414,22 @@ class HostPoolGroup:
         io_backend,
         pool_transfers: Optional[list] = None,
     ) -> None:
-        for entry in self.entries:
-            resolved = self._resolve_entry_indices(
-                entry,
-                host_indices,
-                device_indices,
-                pool_transfers=pool_transfers,
-            )
-            if resolved is None:
+        # 1. Anchor (KV) backup
+        self.anchor_entry.host_pool.backup_from_device_all_layer(
+            self.anchor_entry.device_pool,
+            host_indices,
+            device_indices,
+            io_backend,
+        )
+        # 2. Extra pool transfers
+        for transfer in pool_transfers or []:
+            entry = self.entry_map.get(transfer.name)
+            if entry is None or transfer.host_indices is None:
                 continue
-            entry_host_indices, entry_device_indices = resolved
             entry.host_pool.backup_from_device_all_layer(
                 entry.device_pool,
-                entry_host_indices,
-                entry_device_indices,
+                transfer.host_indices,
+                transfer.device_indices,
                 io_backend,
             )
 

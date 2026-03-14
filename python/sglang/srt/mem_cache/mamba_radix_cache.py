@@ -117,6 +117,7 @@ class TreeNode:
     @property
     def mamba_backuped(self):
         return self.mamba_host_value is not None
+
     def protect_host(self):
         """Protect the host value from eviction."""
         self.host_ref_counter += 1
