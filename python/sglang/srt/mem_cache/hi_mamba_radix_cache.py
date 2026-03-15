@@ -88,11 +88,7 @@ class HostLRUList(LRUList):
 
 
 class HiMambaRadixCache(MambaRadixCache):
-    """Hierarchical cache for hybrid Mamba models.
-
-    Only the Full (attention) KV cache is backed up to L2 (host) / L3 (storage).
-    Mamba states remain on device and are managed by LRU eviction.
-    """
+    """Hierarchical cache for hybrid Mamba models."""
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
@@ -290,7 +286,7 @@ class HiMambaRadixCache(MambaRadixCache):
             if self.mamba_host_lru_list.in_list(node):
                 self.mamba_host_lru_list.reset_node_mru(node)
 
-        extra_pools = self.backup_transfers(node)
+        extra_pools = self.mamba_backup_transfers(node)
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -306,7 +302,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if host_indices is not None:
             node.host_value = host_indices
             if extra_pools is not None:
-                self.backup_commit(node, extra_pools)
+                self.mamba_backup_commit(node, extra_pools)
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
             if not write_back:
@@ -331,9 +327,6 @@ class HiMambaRadixCache(MambaRadixCache):
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None, req=None
     ) -> Optional[torch.Tensor]:
-        logger.info(
-            f"Try load back, node: {node.id}, mem_quota: {mem_quota}, req: {req.rid if req is not None else None}"
-        )
         """Load full KV back from host."""
         last_hit_node = node
         nodes_to_load = []
@@ -368,8 +361,9 @@ class HiMambaRadixCache(MambaRadixCache):
             self.dec_lock_ref(ancestor_node)
             return None
 
-        mamba_pools = self.restore_transfers(last_hit_node, mamba_restore_nodes, req)
-        logger.info(f"Try init load back, mamba_pools: {mamba_pools}")
+        mamba_pools = self.mamba_restore_transfers(
+            last_hit_node, mamba_restore_nodes, req
+        )
         full_device_indices = self.cache_controller.load(
             host_indices=full_host_indices,
             node_id=last_hit_node.id,
@@ -377,7 +371,7 @@ class HiMambaRadixCache(MambaRadixCache):
         )
         if full_device_indices is None:
             self.evict(EvictParams(num_tokens=len(full_host_indices)))
-            mamba_pools = self.restore_transfers(
+            mamba_pools = self.mamba_restore_transfers(
                 last_hit_node, mamba_restore_nodes, req
             )
             full_device_indices = self.cache_controller.load(
@@ -390,7 +384,7 @@ class HiMambaRadixCache(MambaRadixCache):
             # no sufficient GPU memory to load back KV caches
             return None
 
-        self.restore_commit(mamba_restore_nodes, mamba_pools)
+        self.mamba_restore_commit(mamba_restore_nodes, mamba_pools)
 
         offset = 0
         for n in nodes_to_load:
@@ -567,8 +561,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 return
         self.evictable_full_host_leaves.add(node)
 
-    def _free_gpu_mamba(self, node: TreeNode) -> int:
-        """Free GPU mamba on a node. Returns num mamba tokens freed."""
+    def _free_device_mamba(self, node: TreeNode) -> int:
         if node.mamba_value is None:
             return 0
         mamba_num = len(node.mamba_value)
@@ -584,14 +577,9 @@ class HiMambaRadixCache(MambaRadixCache):
         return mamba_num
 
     def _evict_to_host(self, node: TreeNode) -> Tuple[int, int]:
-        """Evict a backuped device node to host: free GPU KV + GPU mamba.
-
-        Node stays in the tree as evicted+backuped.
-        Caller must ensure node.backuped is True before calling.
-        Returns (full_num_evicted, mamba_num_evicted).
-        """
-        assert not node.evicted, f"_evict_to_host on already-evicted node, {node.id=}"
-        assert node.backuped, f"_evict_to_host on non-backuped node, {node.id=}"
+        # GPU -> CPU demotion: node stays in tree as evicted+backuped
+        assert not node.evicted, f"already evicted, {node.id=}"
+        assert node.backuped, f"not backuped, {node.id=}"
 
         num_full = len(node.value)
 
@@ -600,22 +588,18 @@ class HiMambaRadixCache(MambaRadixCache):
         if self.full_lru_list.in_list(node):
             self.full_lru_list.remove_node(node)
 
-        mamba_num = self._free_gpu_mamba(node)
+        mamba_num = self._free_device_mamba(node)
 
         node.value = None
         self._update_leaf_status(node)
         self._update_full_device_leaf_status(node.parent)
         return num_full, mamba_num
 
-    def _evict_regular_leaf(self, node: TreeNode) -> Tuple[int, int]:
-        """Evict a non-backuped device leaf: free GPU KV + mamba, delete from tree.
-
-        Used in write_through when a node was never backed up.
-        Returns (full_num_evicted, mamba_num_evicted).
-        """
-        assert not node.evicted, f"_evict_regular on already-evicted node, {node.id=}"
-        assert not node.backuped, f"_evict_regular on backuped node, {node.id=}"
-        assert len(node.children) == 0, f"_evict_regular on non-leaf, {node.id=}"
+    def _evict_regular(self, node: TreeNode) -> Tuple[int, int]:
+        # evict a non-backuped device leaf — free GPU KV + mamba, delete from tree
+        assert not node.evicted, f"already evicted, {node.id=}"
+        assert not node.backuped, f"backuped node, {node.id=}"
+        assert len(node.children) == 0, f"non-leaf, {node.id=}"
 
         num_full = len(node.value)
 
@@ -624,7 +608,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if self.full_lru_list.in_list(node):
             self.full_lru_list.remove_node(node)
 
-        mamba_num = self._free_gpu_mamba(node)
+        mamba_num = self._free_device_mamba(node)
 
         if node.mamba_host_value is not None:
             if self.mamba_host_lru_list.in_list(node):
@@ -644,42 +628,38 @@ class HiMambaRadixCache(MambaRadixCache):
         self._iteratively_delete_tombstone_leaf(node)
         return num_full, mamba_num
 
-    def _evict_host_leaf_node(self, x: TreeNode) -> int:
-        """Evict a host-resident leaf: free host KV + host mamba, delete from tree, cascade.
-
-        Returns num host KV tokens evicted.
-        """
-        assert x.evicted, f"host leaf not evicted, {x.id=}"
-        assert x.backuped, f"host leaf not backuped, {x.id=}"
-        assert x.mamba_value is None, f"host leaf has GPU mamba, {x.id=}"
+    def _evict_host_leaf(self, node: TreeNode) -> int:
+        # evict a host-resident leaf: free host KV + mamba, delete from tree, cascade
+        assert node.evicted, f"not evicted, {node.id=}"
+        assert node.backuped, f"not backuped, {node.id=}"
+        assert node.mamba_value is None, f"has device mamba, {node.id=}"
         assert (
-            x.host_ref_counter == 0
-        ), f"host leaf in use, {x.id=} {x.host_ref_counter=}"
+            node.host_ref_counter == 0
+        ), f"in use, {node.id=} {node.host_ref_counter=}"
 
-        full_num_evicted = self.cache_controller.evict_host(x.host_value)
-        x.host_value = None
+        num_evicted = self.cache_controller.evict_host(node.host_value)
+        node.host_value = None
 
-        if x.mamba_host_value is not None:
-            if self.mamba_host_lru_list.in_list(x):
-                self.mamba_host_lru_list.remove_node(x)
-            self.mamba_pool_host.free(x.mamba_host_value)
-            x.mamba_host_value = None
+        if node.mamba_host_value is not None:
+            if self.mamba_host_lru_list.in_list(node):
+                self.mamba_host_lru_list.remove_node(node)
+            self.mamba_pool_host.free(node.mamba_host_value)
+            node.mamba_host_value = None
 
-        self._discard_from_leaf_sets(x)
-        parent = x.parent
-        key = self.get_child_key_fn(x.key)
+        self._discard_from_leaf_sets(node)
+        parent = node.parent
+        key = self.get_child_key_fn(node.key)
         v = parent.children.pop(key, None)
-        assert v == x, f"parent does not have child key, {key}"
+        assert v == node, f"parent does not have child key, {key}"
 
         self._update_leaf_status(parent)
-        self._iteratively_delete_tombstone_leaf(x)
+        self._iteratively_delete_tombstone_leaf(node)
 
-        return full_num_evicted
+        return num_evicted
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
-        """Remove a tombstone leaf from the tree and free HiCache resources."""
-        assert node.mamba_value is None, f"node has mamba value, {node.id=}"
-        assert node.mamba_host_value is None, f"node has mamba host value, {node.id=}"
+        assert node.mamba_value is None, f"has mamba value, {node.id=}"
+        assert node.mamba_host_value is None, f"has mamba host value, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         parent = node.parent
         key = self.get_child_key_fn(node.key)
@@ -697,9 +677,6 @@ class HiMambaRadixCache(MambaRadixCache):
     def _iteratively_delete_tombstone_leaf(
         self, node: TreeNode
     ) -> Tuple[TreeNode, int, int]:
-        """Cascade-delete tombstone parents that became leaves.
-        Returns (node, full_num_evicted, mamba_num_evicted).
-        """
         full_num_evicted = 0
         mamba_num_evicted = 0
 
@@ -733,7 +710,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         - backuped: demote to host via _evict_to_host (node stays in tree)
         - not backuped + write_back: write_backup first, then demote
-        - not backuped + write_through: _evict_regular_leaf (delete from tree)
+        - not backuped + write_through: _evict_regular (delete from tree)
         """
         if not x.backuped:
             if self.cache_controller.write_policy == "write_back":
@@ -741,7 +718,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.writing_check(write_back=True)
                 return self._evict_to_host(x)
             else:
-                return self._evict_regular_leaf(x)
+                return self._evict_regular(x)
         return self._evict_to_host(x)
 
     def evict(self, params: EvictParams) -> EvictResult:
@@ -789,7 +766,7 @@ class HiMambaRadixCache(MambaRadixCache):
             if x not in self.evictable_full_host_leaves:
                 continue
 
-            num_evicted += self._evict_host_leaf_node(x)
+            num_evicted += self._evict_host_leaf(x)
 
             if x.parent in self.evictable_full_host_leaves:
                 heapq.heappush(heap, (x.parent.last_access_time, x.parent))
@@ -813,11 +790,10 @@ class HiMambaRadixCache(MambaRadixCache):
                 continue
 
             if x in self.evictable_full_host_leaves:
-                # Host leaf: evict host KV + mamba, delete from tree
-                self._evict_host_leaf_node(x)
+                self._evict_host_leaf(x)
                 num_evicted += 1
             else:
-                # Internal host node: free host mamba only (tombstone)
+                # internal host node: free host mamba only (tombstone)
                 self.mamba_host_lru_list.remove_node(x)
                 self.mamba_pool_host.free(x.mamba_host_value)
                 x.mamba_host_value = None
@@ -847,7 +823,7 @@ class HiMambaRadixCache(MambaRadixCache):
             ), f"evicted node should not be in mamba_lru_list, {x.id=}"
 
             if len(x.children) > 0:
-                # Internal: free GPU mamba only, KV stays on GPU (tombstone)
+                # Internal: free device mamba only, KV stays on device (tombstone)
                 x_next = self.mamba_lru_list.get_prev_no_lock(x)
                 mamba_num_evicted += len(x.mamba_value)
                 self.req_to_token_pool.mamba_pool.free(x.mamba_value)
@@ -871,12 +847,8 @@ class HiMambaRadixCache(MambaRadixCache):
         return mamba_num_evicted
 
     def _unevict_node(self, node: TreeNode, fresh_value: torch.Tensor):
-        """Restore an evicted node with fresh device KV from the request."""
-        assert node.evicted, f"_unevict_node on non-evicted node, {node.id=}"
-        # invariant: evicted => no GPU mamba
-        assert (
-            node.mamba_value is None
-        ), f"evicted node should not have GPU mamba, {node.id=}"
+        assert node.evicted, f"not evicted, {node.id=}"
+        assert node.mamba_value is None, f"evicted node has device mamba, {node.id=}"
         n = len(fresh_value)
 
         node.value = fresh_value.clone()
@@ -1752,7 +1724,7 @@ class HiMambaRadixCache(MambaRadixCache):
             if self.hicache_storage_pass_prefix_keys
             else None
         )
-        extra_pools = self.archive_transfers(node)
+        extra_pools = self.mamba_archive_transfers(node)
         operation_id = self.cache_controller.write_storage(
             node.host_value,
             node.key,
@@ -1795,7 +1767,7 @@ class HiMambaRadixCache(MambaRadixCache):
             return
 
         # Allocate host mamba slot
-        extra_pools = self.prefetch_prepare(new_input_tokens, last_hash)
+        extra_pools = self.mamba_prefetch_alloc(new_input_tokens, last_hash)
         if extra_pools is None:
             self.cache_controller.mem_pool_host.free(host_indices)
             self._release_host_node(last_host_node)
@@ -1853,7 +1825,6 @@ class HiMambaRadixCache(MambaRadixCache):
             )
             min_completed_tokens = completed_tokens_tensor.item()
 
-        # Resolve mamba transfer state
         mamba_host_indices = None
         mamba_loaded = False
         for transfer in operation.pool_transfers or []:
@@ -1945,7 +1916,6 @@ class HiMambaRadixCache(MambaRadixCache):
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
-        # Insert remaining tokens as a new leaf node
         leaf_node: Optional[TreeNode] = None
         if len(key):
             new_node = TreeNode()
@@ -1992,7 +1962,6 @@ class HiMambaRadixCache(MambaRadixCache):
 
         self.writing_check(write_back=True)
         deadline = time.monotonic() + 30.0
-        last_log_time = 0.0
         while time.monotonic() < deadline:
             self.drain_storage_control_queues()
             backup_qsize = self.cache_controller.backup_queue.qsize()
@@ -2037,8 +2006,10 @@ class HiMambaRadixCache(MambaRadixCache):
             raise RuntimeError(error_message)
         return indices
 
-    def backup_transfers(self, node: TreeNode) -> Optional[list[PoolTransfer]]:
-        """PoolTransfers for D→H backup: mamba device → mamba host."""
+    # -- mamba PoolTransfer builders (D↔H↔S) ----------------------------------
+
+    def mamba_backup_transfers(self, node: TreeNode) -> Optional[list[PoolTransfer]]:
+        # build D→H transfer descriptor for mamba state
         if node.mamba_value is None:
             return None
         return [
@@ -2049,83 +2020,76 @@ class HiMambaRadixCache(MambaRadixCache):
             )
         ]
 
-    def backup_commit(self, node: TreeNode, transfers: list[PoolTransfer]) -> None:
-        """After D→H backup succeeds: store auto-allocated mamba host indices into node."""
+    def mamba_backup_commit(
+        self, node: TreeNode, transfers: list[PoolTransfer]
+    ) -> None:
+        # store auto-allocated mamba host indices into the node after D→H backup
         if not transfers:
             return
-        mamba_host = transfers[0].host_indices
-        if node.mamba_host_value is None and mamba_host is not None:
-            node.mamba_host_value = mamba_host
+        host_indices = transfers[0].host_indices
+        if node.mamba_host_value is None and host_indices is not None:
+            node.mamba_host_value = host_indices
             self.mamba_host_lru_list.insert_mru(node)
 
-    def archive_transfers(self, node: TreeNode) -> Optional[list[PoolTransfer]]:
-        """PoolTransfers for H→Storage archive (write_backup_storage)."""
-        mamba_host_value = getattr(node, "mamba_host_value", None)
-        if mamba_host_value is None or not node.hash_value:
+    def mamba_archive_transfers(self, node: TreeNode) -> Optional[list[PoolTransfer]]:
+        # build H→Storage transfer descriptor for mamba state
+        if node.mamba_host_value is None or not node.hash_value:
             return None
         return [
             PoolTransfer(
                 name="mamba",
-                host_indices=mamba_host_value,
+                host_indices=node.mamba_host_value,
                 keys=[node.hash_value[-1]],
                 hit_policy="trailing_pages",
             )
         ]
 
-    def prefetch_prepare(
+    def mamba_prefetch_alloc(
         self,
         token_ids: List[int],
         last_hash: Optional[str],
     ) -> Optional[list[PoolTransfer]]:
-        """Alloc mamba host slot and build PoolTransfers for Storage→H prefetch.
-
-        Returns (host_handle, transfers) so the caller can track the allocation,
-        or None if allocation fails (caller should cancel the prefetch).
-        """
+        # allocate a mamba host slot and build Storage→H transfer descriptor
         if not token_ids:
             return None
-        mamba_host_index = self._alloc_with_evict(
+        host_indices = self._alloc_with_evict(
             self.mamba_pool_host, 1, self.evict_mamba_host
         )
-        if mamba_host_index is None:
+        if host_indices is None:
             return None
-        # Use a placeholder key; the I/O thread
-        # will replace it with the correct hash after query hit determination.
-        transfers = [
+        # placeholder key; I/O thread replaces with correct hash after hit query
+        return [
             PoolTransfer(
                 name="mamba",
-                host_indices=mamba_host_index,
+                host_indices=host_indices,
                 keys=["__placeholder__"],
                 hit_policy="trailing_pages",
             )
         ]
-        return transfers
 
-    def restore_transfers(
+    def mamba_restore_transfers(
         self,
         last_hit_node: TreeNode,
         nodes_to_restore: list[TreeNode],
         req,
     ) -> Optional[list[PoolTransfer]]:
-        """PoolTransfers for H→D restore (load_back)."""
-        mamba_host_list: list[torch.Tensor] = []
+        # build H→D transfer descriptors for mamba state
+        backed_up_host_indices: list[torch.Tensor] = []
         for node in nodes_to_restore:
             if not node.mamba_backuped:
                 continue
-            mamba_host_list.append(node.mamba_host_value)
+            backed_up_host_indices.append(node.mamba_host_value)
 
         transfers: list[PoolTransfer] = []
-        # Transfer from host to node's device mamba space
-        if mamba_host_list:
+        if backed_up_host_indices:
             transfers.append(
                 PoolTransfer(
                     name="mamba",
-                    host_indices=torch.cat(mamba_host_list),
-                    device_indices=None,  # will be allocated by cache_controller
+                    host_indices=torch.cat(backed_up_host_indices),
+                    device_indices=None,
                 )
             )
 
-        # Transfer from host to request's device mamba space
         if (
             req is not None
             and last_hit_node in nodes_to_restore
@@ -2137,7 +2101,7 @@ class HiMambaRadixCache(MambaRadixCache):
                     len(last_hit_node.mamba_host_value),
                     self.evict_mamba,
                     lock_node=last_hit_node,
-                    error_message="Can not alloc request mamba cache for host load back",
+                    error_message="Cannot alloc request mamba cache for host load back",
                 )[0]
             transfers.append(
                 PoolTransfer(
@@ -2149,17 +2113,17 @@ class HiMambaRadixCache(MambaRadixCache):
 
         return transfers if transfers else None
 
-    def restore_commit(
+    def mamba_restore_commit(
         self,
-        extra_nodes: list[TreeNode],
+        restored_nodes: list[TreeNode],
         transfers: Optional[list[PoolTransfer]],
     ) -> None:
-        """After H→D restore succeeds: write back controller-allocated mamba device indices."""
-        if not extra_nodes or not transfers or transfers[0].device_indices is None:
+        # write back controller-allocated device indices after H→D restore
+        if not restored_nodes or not transfers or transfers[0].device_indices is None:
             return
-        mamba_device = transfers[0].device_indices
+        device_indices = transfers[0].device_indices
         offset = 0
-        for n in extra_nodes:
-            n_len = len(n.mamba_host_value)
-            n.mamba_value = mamba_device[offset : offset + n_len].clone()
-            offset += n_len
+        for node in restored_nodes:
+            count = len(node.mamba_host_value)
+            node.mamba_value = device_indices[offset : offset + count].clone()
+            offset += count

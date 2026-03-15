@@ -1090,7 +1090,10 @@ class MambaPoolHost(HostKVCache):
     ):
         self.device_pool = device_pool
         self.page_size = 1
-        assert layout in ["page_first_direct", "layer_first"], "Unsupported layout: {layout}"
+        assert layout in [
+            "page_first_direct",
+            "layer_first",
+        ], "Unsupported layout: {layout}"
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
