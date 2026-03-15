@@ -408,18 +408,23 @@ class HybridCacheController(BaseHiCacheController):
         )
 
     def _page_transfer(self, operation):
-        super()._page_transfer(operation)
+        # Transfer extra pools
         if operation.pool_transfers and not operation.is_terminated():
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
 
-    def _page_backup(self, operation):
-        super()._page_backup(operation)
+        # Transfer kv pools
+        super()._page_transfer(operation)
 
+    def _page_backup(self, operation):
+        # Backup extra pools
         if operation.pool_transfers:
             results = self.storage_backend.batch_set_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
-
+        
+        # Backup kv pools
+        super()._page_backup(operation)
+        
     def _sync_trailing_keys(
         self,
         pool_transfers: list[PoolTransfer],
