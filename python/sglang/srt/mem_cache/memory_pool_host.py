@@ -1077,6 +1077,7 @@ class MLATokenToKVPoolHost(HostKVCache):
 
 
 class MambaPoolHost(HostKVCache):
+
     def __init__(
         self,
         device_pool: MambaPool,
@@ -1085,10 +1086,12 @@ class MambaPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        layout: str = "layer_first",
     ):
         self.device_pool = device_pool
         self.page_size = 1
-        self.layout = "layer_first"
+        assert layout in ["page_first_direct", "layer_first"], "Unsupported layout: {layout}"
+        self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
@@ -1124,45 +1127,92 @@ class MambaPoolHost(HostKVCache):
                 f"size of the hierarchical cache."
             )
         logger.info(
-            "Allocating %.2f GB host memory for hierarchical Mamba cache.",
+            "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
             requested_bytes / 1e9,
+            self.layout,
         )
 
         self.init_kv_buffer()
         self.lock = threading.RLock()
         self.clear()
 
-    def _iter_serialized_page_tensors(self, index: int):
-        yield self.temporal_buffer[:, index : index + self.page_size]
-        for conv_buf in self.conv_buffer:
-            yield conv_buf[:, index : index + self.page_size]
+    def init_kv_buffer(self):
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+
+        if self.layout == "page_first_direct":
+            # page-first: (size, num_layers, *shape) — per-page data is contiguous
+            temporal_dims = (
+                self.size,
+                self.num_mamba_layers,
+            ) + self.temporal_state_shape
+            self.temporal_buffer = alloc_func(
+                temporal_dims,
+                dtype=self.temporal_dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+            self.conv_buffer = []
+            for conv_shape in self.conv_state_shapes:
+                conv_dims = (self.size, self.num_mamba_layers) + conv_shape
+                self.conv_buffer.append(
+                    alloc_func(
+                        conv_dims,
+                        dtype=self.conv_dtype,
+                        device=self.device,
+                        pin_memory=self.pin_memory,
+                        allocator=self.allocator,
+                    )
+                )
+        else:
+            # layer-first: (num_layers, size, *shape)
+            temporal_dims = (
+                self.num_mamba_layers,
+                self.size,
+            ) + self.temporal_state_shape
+            self.temporal_buffer = alloc_func(
+                temporal_dims,
+                dtype=self.temporal_dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+            self.conv_buffer = []
+            for conv_shape in self.conv_state_shapes:
+                conv_dims = (self.num_mamba_layers, self.size) + conv_shape
+                self.conv_buffer.append(
+                    alloc_func(
+                        conv_dims,
+                        dtype=self.conv_dtype,
+                        device=self.device,
+                        pin_memory=self.pin_memory,
+                        allocator=self.allocator,
+                    )
+                )
+
+    def _get_temporal_view(self, layer_id: int) -> torch.Tensor:
+        if self.layout == "page_first_direct":
+            return self.temporal_buffer[:, layer_id]
+        return self.temporal_buffer[layer_id]
+
+    def _get_conv_view(self, layer_id: int, conv_idx: int) -> torch.Tensor:
+        if self.layout == "page_first_direct":
+            return self.conv_buffer[conv_idx][:, layer_id]
+        return self.conv_buffer[conv_idx][layer_id]
+
+    def _iter_page_tensors(self, index: int):
+        if self.layout == "page_first_direct":
+            yield self.temporal_buffer[index]
+            for conv_buf in self.conv_buffer:
+                yield conv_buf[index]
+        else:
+            yield self.temporal_buffer[:, index : index + self.page_size]
+            for conv_buf in self.conv_buffer:
+                yield conv_buf[:, index : index + self.page_size]
 
     @staticmethod
     def _flatten_tensor_bytes(tensor: torch.Tensor) -> torch.Tensor:
         return tensor.contiguous().view(torch.uint8).reshape(-1)
-
-    def init_kv_buffer(self):
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
-        temporal_dims = (self.num_mamba_layers, self.size) + self.temporal_state_shape
-        self.temporal_buffer = alloc_func(
-            temporal_dims,
-            dtype=self.temporal_dtype,
-            device=self.device,
-            pin_memory=self.pin_memory,
-            allocator=self.allocator,
-        )
-        self.conv_buffer = []
-        for conv_shape in self.conv_state_shapes:
-            conv_dims = (self.num_mamba_layers, self.size) + conv_shape
-            self.conv_buffer.append(
-                alloc_func(
-                    conv_dims,
-                    dtype=self.conv_dtype,
-                    device=self.device,
-                    pin_memory=self.pin_memory,
-                    allocator=self.allocator,
-                )
-            )
 
     @synchronized
     def clear(self):
@@ -1199,6 +1249,9 @@ class MambaPoolHost(HostKVCache):
         )
         return (conv_total_size + temporal_size) * self.num_mamba_layers
 
+    def get_ksize_per_token(self):
+        return self.get_size_per_token()
+
     @staticmethod
     def _item_size_per_index(tensor: torch.Tensor) -> int:
         if tensor.shape[0] == 0:
@@ -1211,11 +1264,11 @@ class MambaPoolHost(HostKVCache):
         dst: torch.Tensor,
         src_indices: torch.Tensor,
         dst_indices: torch.Tensor,
-        io_backend: Optional[str],
+        io_backend: str,
     ) -> None:
         if src_indices.numel() == 0:
             return
-        if io_backend == "kernel" and not (_is_npu or _is_xpu):
+        if io_backend == "kernel":
             transfer_kv_per_layer_mla(
                 src=src,
                 dst=dst,
@@ -1223,8 +1276,7 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 item_size=MambaPoolHost._item_size_per_index(src),
             )
-            return
-        if io_backend == "direct" and not (_is_npu or _is_xpu):
+        elif io_backend == "direct":
             transfer_kv_direct(
                 src_layers=[src],
                 dst_layers=[dst],
@@ -1232,10 +1284,8 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 page_size=1,
             )
-            return
-
-        src_take = src.index_select(0, src_indices.to(src.device))
-        dst.index_copy_(0, dst_indices.to(dst.device), src_take.to(dst.device))
+        else:
+            raise ValueError(f"Unsupported io_backend: {io_backend}")
 
     def load_to_device_per_layer(
         self,
@@ -1245,47 +1295,47 @@ class MambaPoolHost(HostKVCache):
         layer_id,
         io_backend="kernel",
     ):
-        for conv_idx, host_conv_state in enumerate(self.conv_buffer):
-            self._copy_tensor(
-                host_conv_state[layer_id],
-                device_pool.mamba_cache.conv[conv_idx][layer_id],
-                host_indices,
-                device_indices,
-                io_backend,
-            )
         self._copy_tensor(
-            self.temporal_buffer[layer_id],
+            self._get_temporal_view(layer_id),
             device_pool.mamba_cache.temporal[layer_id],
             host_indices,
             device_indices,
             io_backend,
         )
+        for conv_idx in range(len(self.conv_state_shapes)):
+            self._copy_tensor(
+                self._get_conv_view(layer_id, conv_idx),
+                device_pool.mamba_cache.conv[conv_idx][layer_id],
+                host_indices,
+                device_indices,
+                io_backend,
+            )
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
         for layer_id in range(self.num_mamba_layers):
-            for conv_idx, host_conv_state in enumerate(self.conv_buffer):
-                self._copy_tensor(
-                    device_pool.mamba_cache.conv[conv_idx][layer_id],
-                    host_conv_state[layer_id],
-                    device_indices,
-                    host_indices,
-                    io_backend,
-                )
             self._copy_tensor(
                 device_pool.mamba_cache.temporal[layer_id],
-                self.temporal_buffer[layer_id],
+                self._get_temporal_view(layer_id),
                 device_indices,
                 host_indices,
                 io_backend,
             )
+            for conv_idx in range(len(self.conv_state_shapes)):
+                self._copy_tensor(
+                    device_pool.mamba_cache.conv[conv_idx][layer_id],
+                    self._get_conv_view(layer_id, conv_idx),
+                    device_indices,
+                    host_indices,
+                    io_backend,
+                )
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         data_page = torch.cat(
             [
                 self._flatten_tensor_bytes(tensor)
-                for tensor in self._iter_serialized_page_tensors(index)
+                for tensor in self._iter_page_tensors(index)
             ]
         )
         return data_page.flatten() if flat else data_page
@@ -1304,15 +1354,8 @@ class MambaPoolHost(HostKVCache):
         data_page: torch.Tensor,
     ) -> None:
         flat_bytes = data_page.contiguous().view(torch.uint8).reshape(-1)
-        expected_num_bytes = self.page_size * self.size_per_token
-        if flat_bytes.numel() != expected_num_bytes:
-            raise ValueError(
-                f"Invalid Mamba page size: expected {expected_num_bytes} bytes, "
-                f"got {flat_bytes.numel()} bytes."
-            )
-
         start = 0
-        for tensor in self._iter_serialized_page_tensors(index):
+        for tensor in self._iter_page_tensors(index):
             num_bytes = tensor.numel() * tensor.element_size()
             tensor_bytes = flat_bytes[start : start + num_bytes]
             start += num_bytes
@@ -1421,7 +1464,7 @@ class HostPoolGroup:
             device_indices,
             io_backend,
         )
-        # 2. Extra pool transfers
+        # 2. Extra pool backup
         for transfer in pool_transfers or []:
             entry = self.entry_map.get(transfer.name)
             if entry is None or transfer.host_indices is None:

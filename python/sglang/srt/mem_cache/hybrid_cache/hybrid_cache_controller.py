@@ -421,10 +421,10 @@ class HybridCacheController(BaseHiCacheController):
         if operation.pool_transfers:
             results = self.storage_backend.batch_set_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
-        
+
         # Backup kv pools
         super()._page_backup(operation)
-        
+
     def _sync_trailing_keys(
         self,
         pool_transfers: list[PoolTransfer],

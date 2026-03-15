@@ -147,6 +147,7 @@ class HiMambaRadixCache(MambaRadixCache):
             server_args.hicache_ratio,
             server_args.hicache_size,
             allocator_type=server_args.hicache_storage_backend,
+            layout=server_args.hicache_mem_layout,
         )
 
         full_layer_mapping = dict(self.hybrid_kv_cache.full_attention_layer_id_mapping)
