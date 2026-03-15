@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PrefetchOperation,
@@ -330,6 +330,9 @@ class HiMambaRadixCache(MambaRadixCache):
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None, req=None
     ) -> Optional[torch.Tensor]:
+        logger.info(
+            f"Try load back, node: {node.id}, mem_quota: {mem_quota}, req: {req.rid if req is not None else None}"
+        )
         """Load full KV back from host."""
         last_hit_node = node
         nodes_to_load = []
@@ -365,6 +368,7 @@ class HiMambaRadixCache(MambaRadixCache):
             return None
 
         mamba_pools = self.restore_transfers(last_hit_node, mamba_restore_nodes, req)
+        logger.info(f"Try init load back, mamba_pools: {mamba_pools}")
         full_device_indices = self.cache_controller.load(
             host_indices=full_host_indices,
             node_id=last_hit_node.id,
@@ -845,6 +849,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 # Internal: free GPU mamba only, KV stays on GPU (tombstone)
                 x_next = self.mamba_lru_list.get_prev_no_lock(x)
                 mamba_num_evicted += len(x.mamba_value)
+                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
                 self.mamba_lru_list.remove_node(x)
                 self._tombstone_internal_node(x)
             else:
@@ -1777,6 +1782,8 @@ class HiMambaRadixCache(MambaRadixCache):
             return
 
         self._protect_host_node(last_host_node)
+
+        # Allocate host KV memory
         host_indices = self._alloc_with_evict(
             self.cache_controller.mem_pool_host,
             prefetch_length,
@@ -1785,21 +1792,20 @@ class HiMambaRadixCache(MambaRadixCache):
         if host_indices is None:
             self._release_host_node(last_host_node)
             return
-        extra_pools = None
-        prepared = self.prefetch_prepare(new_input_tokens, last_hash)
-        if prefetch_length > 0 and prepared is None:
+
+        # Allocate host mamba slot
+        extra_pools = self.prefetch_prepare(new_input_tokens, last_hash)
+        if extra_pools is None:
             self.cache_controller.mem_pool_host.free(host_indices)
             self._release_host_node(last_host_node)
             return
-        if prepared is not None:
-            _, extra_pools = prepared
-        if extra_pools is not None:
-            logger.info(
-                "HiCache mamba prefetch scheduled for request %s: kv_hit_pages=%s mamba_states=%s",
-                req_id,
-                prefetch_length // self.page_size,
-                1,
-            )
+
+        logger.info(
+            "HiCache mamba prefetch scheduled for request %s: kv_hit_pages=%s mamba_states=%s",
+            req_id,
+            prefetch_length // self.page_size,
+            1,
+        )
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
@@ -1845,13 +1851,21 @@ class HiMambaRadixCache(MambaRadixCache):
                 group=self.tp_group,
             )
             min_completed_tokens = completed_tokens_tensor.item()
-        fetched_token_ids = token_ids[:min_completed_tokens]
-        written_indices = host_indices[:min_completed_tokens]
+
+        # Resolve mamba transfer state
         mamba_host_indices = None
+        mamba_loaded = False
         for transfer in operation.pool_transfers or []:
             if transfer.name == "mamba":
                 mamba_host_indices = transfer.host_indices
+                mamba_loaded = (
+                    operation.pool_storage_result.extra_pool_hit_pages.get("mamba", 0)
+                    >= 1
+                )
                 break
+
+        fetched_token_ids = token_ids[:min_completed_tokens]
+        written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
             last_host_node,
             RadixKey(
@@ -1861,19 +1875,21 @@ class HiMambaRadixCache(MambaRadixCache):
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
             mamba_host_indices,
-            operation.pool_storage_result,
+            mamba_loaded,
         )
 
+        # Free host KV memory: matched portion is already in tree, tail was unused
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
-        mamba_loaded = self.prefetch_commit(
-            operation.pool_transfers,
-            matched_length,
-            min_completed_tokens,
-            operation.pool_storage_result,
-        )
         self.cache_controller.append_host_mem_release(
             host_indices[min_completed_tokens:completed_tokens]
         )
+
+        # Free mamba host slot if it wasn't inserted into the tree
+        if mamba_host_indices is not None:
+            inserted_new = matched_length < min_completed_tokens
+            if not inserted_new or not mamba_loaded:
+                self.mamba_pool_host.free(mamba_host_indices)
+
         self._release_host_node(last_host_node)
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
@@ -1900,7 +1916,7 @@ class HiMambaRadixCache(MambaRadixCache):
         host_value,
         hash_value,
         mamba_host_value: Optional[torch.Tensor] = None,
-        pool_storage_result: Optional[PoolTransferResult] = None,
+        mamba_loaded: bool = False,
     ):
         node.last_access_time = get_last_access_time()
         if len(key) == 0:
@@ -1909,11 +1925,6 @@ class HiMambaRadixCache(MambaRadixCache):
         child_key = self.get_child_key_fn(key)
 
         matched_length = 0
-        host_value_inserted = False
-        final_mamba_node: Optional[TreeNode] = None
-        has_mamba = pool_storage_result is None or (
-            pool_storage_result.extra_pool_hit_pages.get("mamba", 0) >= 1
-        )
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
@@ -1921,24 +1932,10 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.mamba_lru_list.reset_node_mru(node)
             prefix_len = self.key_match_fn(node.key, key)
 
-            if node.evicted and not node.backuped:
-                node.host_value = host_value[:prefix_len].clone()
-                host_value_inserted = True
-                if prefix_len == len(key):
-                    final_mamba_node = node
-                self._update_full_host_leaf_status(node)
-                if node.parent is not None:
-                    self._update_full_host_leaf_status(node.parent)
-            else:
-                assert not host_value_inserted, (
-                    f"matched node after host_value insertion would cause incorrect free, "
-                    f"{node.id=} {matched_length=} {prefix_len=}"
-                )
-                matched_length += prefix_len
-
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
+            matched_length += prefix_len
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -1947,6 +1944,8 @@ class HiMambaRadixCache(MambaRadixCache):
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
+        # Insert remaining tokens as a new leaf node
+        leaf_node: Optional[TreeNode] = None
         if len(key):
             new_node = TreeNode()
             new_node.parent = node
@@ -1956,13 +1955,15 @@ class HiMambaRadixCache(MambaRadixCache):
             new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
             node.children[child_key] = new_node
-            final_mamba_node = new_node
+            leaf_node = new_node
             self._update_full_host_leaf_status(new_node)
             self._update_full_host_leaf_status(node)
-        if final_mamba_node is not None and mamba_host_value is not None and has_mamba:
-            final_mamba_node.mamba_host_value = mamba_host_value.clone()
-            if not self.mamba_host_lru_list.in_list(final_mamba_node):
-                self.mamba_host_lru_list.insert_mru(final_mamba_node)
+
+        # Attach mamba state to the new leaf
+        if leaf_node is not None and mamba_host_value is not None and mamba_loaded:
+            leaf_node.mamba_host_value = mamba_host_value.clone()
+            if not self.mamba_host_lru_list.in_list(leaf_node):
+                self.mamba_host_lru_list.insert_mru(leaf_node)
         return matched_length
 
     def release_aborted_request(self, rid: str):
@@ -2035,11 +2036,6 @@ class HiMambaRadixCache(MambaRadixCache):
             raise RuntimeError(error_message)
         return indices
 
-    def _last_page_index(self, token_count: int) -> Optional[int]:
-        if token_count <= 0:
-            return None
-        return token_count // self.page_size - 1
-
     def backup_transfers(self, node: TreeNode) -> Optional[list[PoolTransfer]]:
         """PoolTransfers for D→H backup: mamba device → mamba host."""
         if node.mamba_value is None:
@@ -2079,7 +2075,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self,
         token_ids: List[int],
         last_hash: Optional[str],
-    ) -> Optional[tuple[torch.Tensor, list[PoolTransfer]]]:
+    ) -> Optional[list[PoolTransfer]]:
         """Alloc mamba host slot and build PoolTransfers for Storage→H prefetch.
 
         Returns (host_handle, transfers) so the caller can track the allocation,
@@ -2092,20 +2088,17 @@ class HiMambaRadixCache(MambaRadixCache):
         )
         if mamba_host_index is None:
             return None
-        last_page_hash = last_hash
-        for start in range(0, len(token_ids), self.page_size):
-            last_page_hash = self.cache_controller.get_hash_str(
-                token_ids[start : start + self.page_size], last_page_hash
-            )
+        # Use a placeholder key; the I/O thread
+        # will replace it with the correct hash after query hit determination.
         transfers = [
             PoolTransfer(
                 name="mamba",
                 host_indices=mamba_host_index,
-                keys=[last_page_hash],
+                keys=["__placeholder__"],
                 hit_policy="trailing_pages",
             )
         ]
-        return mamba_host_index, transfers
+        return transfers
 
     def restore_transfers(
         self,
@@ -2169,27 +2162,3 @@ class HiMambaRadixCache(MambaRadixCache):
             n_len = len(n.mamba_host_value)
             n.mamba_value = mamba_device[offset : offset + n_len].clone()
             offset += n_len
-
-    def prefetch_commit(
-        self,
-        pool_transfers: Optional[list[PoolTransfer]],
-        matched_length: int,
-        min_completed_tokens: int,
-        result: PoolTransferResult,
-    ) -> bool:
-        """After Storage→H prefetch completes: free mamba host slot if not inserted into tree.
-
-        Returns True if a mamba state was successfully loaded into the radix tree.
-        """
-        mamba_host_indices = None
-        for transfer in pool_transfers or []:
-            if transfer.name == "mamba":
-                mamba_host_indices = transfer.host_indices
-                break
-        if mamba_host_indices is None:
-            return False
-        # mamba covers the entire prefix as a single page; loaded means >= 1 page hit.
-        mamba_loaded = result.extra_pool_hit_pages.get("mamba", 0) >= 1
-        if matched_length == min_completed_tokens or not mamba_loaded:
-            self.mamba_pool_host.free(mamba_host_indices)
-        return mamba_loaded
