@@ -767,8 +767,7 @@ class PrefillAdder:
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
-            if req.host_hit_length > 0:
-                # TODO: also need to add a check for mamba_hit_length.
+            if req.should_init_load_back_host:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     req.last_host_node, req.host_hit_length, req=req
                 )

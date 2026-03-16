@@ -639,8 +639,8 @@ class Req(ReqDllmMixin):
         self.extend_logprob_start_len = 0
         self.last_node: Any = None
         self.last_host_node: Any = None
-        self.last_host_backup_node: Any = None
         self.host_hit_length = 0
+        self.mamba_host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
@@ -816,6 +816,10 @@ class Req(ReqDllmMixin):
             return self.output_ids[: self.finished_len]
         return self.output_ids
 
+    @property
+    def should_init_load_back_host(self) -> bool:
+        return self.host_hit_length > 0 or self.mamba_host_hit_length > 0
+
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
         assert (
@@ -891,15 +895,15 @@ class Req(ReqDllmMixin):
                 self.prefix_indices,
                 self.last_node,
                 self.last_host_node,
-                self.last_host_backup_node,
                 self.host_hit_length,
+                self.mamba_host_hit_length,
                 self.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
                 match_result.last_host_node,
-                match_result.last_host_backup_node,
                 match_result.host_hit_length,
+                match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
             if match_result.cache_protected_len is not None:

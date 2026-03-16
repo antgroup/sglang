@@ -345,18 +345,25 @@ class HiMambaRadixCache(MambaRadixCache):
         else:
             full_host_indices = torch.empty((0,), dtype=torch.int64, device="cpu")
 
-        if len(full_host_indices) > 0 and (
-            (len(full_host_indices) < self.load_back_threshold)
-            or (
-                len(full_host_indices) > mem_quota + delta
-                if mem_quota is not None
-                else False
+        if (
+            len(full_host_indices) > 0
+            and (
+                (len(full_host_indices) < self.load_back_threshold)
+                or (
+                    len(full_host_indices) > mem_quota + delta
+                    if mem_quota is not None
+                    else False
+                )
             )
+            and len(mamba_restore_nodes) == 0
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancestor_node)
             return None
 
+        logger.info(
+            f"Init load back from cpu -> gpu, kv hit length: {len(full_host_indices)}, mamba host hit length: {len(mamba_restore_nodes)}"
+        )
         mamba_pools = self.mamba_restore_transfers(
             last_hit_node, mamba_restore_nodes, req
         )
@@ -366,7 +373,9 @@ class HiMambaRadixCache(MambaRadixCache):
             extra_pools=mamba_pools,
         )
         if full_device_indices is None:
-            self.evict(EvictParams(num_tokens=len(full_host_indices)))
+            if len(full_host_indices) > 0:
+                self.evict(EvictParams(num_tokens=len(full_host_indices)))
+
             mamba_pools = self.mamba_restore_transfers(
                 last_hit_node, mamba_restore_nodes, req
             )
@@ -413,9 +422,7 @@ class HiMambaRadixCache(MambaRadixCache):
         mem_quota: Optional[int] = None,
         req=None,
     ):
-        if last_node.evicted or (
-            last_node.mamba_value is None and last_node.mamba_host_value is not None
-        ):
+        if last_node.evicted or (last_node.mamba_evicted and last_node.mamba_backuped):
             loading_values = self.load_back(last_node, mem_quota, req=req)
             if loading_values is not None:
                 logger.debug(
@@ -424,11 +431,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 return loading_values, last_node
 
             while last_node is not self.root_node and (
-                last_node.evicted
-                or (
-                    last_node.mamba_value is None
-                    and last_node.mamba_host_value is not None
-                )
+                last_node.evicted or last_node.mamba_evicted
             ):
                 last_node = last_node.parent
 
@@ -966,7 +969,6 @@ class HiMambaRadixCache(MambaRadixCache):
                 device_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
-                last_host_backup_node=self.root_node,
                 host_hit_length=0,
             )
 
@@ -974,17 +976,13 @@ class HiMambaRadixCache(MambaRadixCache):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        value, best_last_node, best_value_len, deepest_node = self._match_prefix_helper(
-            key
-        )
-        return self._match_post_processor(
-            params, value, best_last_node, best_value_len, deepest_node
-        )
+        value, best_last_node, best_value_len = self._match_prefix_helper(key)
+        return self._match_post_processor(params, value, best_last_node, best_value_len)
 
     def _match_prefix_helper(
         self, key: RadixKey
-    ) -> Tuple[List[torch.Tensor], TreeNode, int, TreeNode]:
-        """Walk tree to find best_last_node (mamba boundary) and deepest node."""
+    ) -> Tuple[List[torch.Tensor], TreeNode, int]:
+        """Walk tree to find best_last_node (mamba boundary)."""
         node = self.root_node
         child_key = self.get_child_key_fn(key)
 
@@ -1021,8 +1019,7 @@ class HiMambaRadixCache(MambaRadixCache):
             best_value_len = len(value)
             best_last_node = node
 
-        deepest_node = best_last_node
-        return value, best_last_node, best_value_len, deepest_node
+        return value, best_last_node, best_value_len
 
     def _match_post_processor(
         self,
@@ -1030,7 +1027,6 @@ class HiMambaRadixCache(MambaRadixCache):
         value: List[torch.Tensor],
         best_last_node: TreeNode,
         best_value_len: int,
-        deepest_node: TreeNode,
     ) -> MatchResult:
         cow_mamba = params.cow_mamba
         req = params.req
@@ -1074,6 +1070,11 @@ class HiMambaRadixCache(MambaRadixCache):
         while last_host_node is not self.root_node and not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
+        # Calculate mamba host hit length
+        mamba_host_hit_length = 0
+        if last_host_node.mamba_evicted and last_host_node.mamba_backuped:
+            mamba_host_hit_length = len(last_host_node.mamba_host_value)
+
         mamba_node = best_last_node
         if cow_mamba and mamba_node.mamba_value is not None:
             if req.mamba_pool_idx is None:
@@ -1102,8 +1103,8 @@ class HiMambaRadixCache(MambaRadixCache):
             device_indices=value,
             last_device_node=last_device_node,
             last_host_node=last_host_node,
-            last_host_backup_node=last_host_node,
             host_hit_length=host_hit_length,
+            mamba_host_hit_length=mamba_host_hit_length,
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
 

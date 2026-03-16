@@ -1427,7 +1427,7 @@ class HostPoolGroup:
         # 1. Anchor (KV) transfer
         anchor = self.anchor_entry
         local_layer_id = anchor.layer_mapper(layer_id)
-        if local_layer_id is not None:
+        if local_layer_id is not None and host_indices.numel() > 0:
             anchor.host_pool.load_to_device_per_layer(
                 anchor.device_pool,
                 host_indices,
