@@ -1091,14 +1091,17 @@ class MambaPoolHost(HostKVCache):
         self.device_pool = device_pool
         self.page_size = 1
         assert layout in [
+            "page_first",
             "page_first_direct",
             "layer_first",
         ], "Unsupported layout: {layout}"
+
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
         self.num_mamba_layers = device_pool.num_mamba_layers
+
         self.conv_state_shapes = [
             conv_state.shape[2:] for conv_state in device_pool.mamba_cache.conv
         ]
@@ -1107,10 +1110,12 @@ class MambaPoolHost(HostKVCache):
         self.temporal_dtype = device_pool.mamba_cache.temporal.dtype
         self.dtype = self.conv_dtype
         self.size_per_token = self.get_size_per_token()
+
         if host_size > 0:
             self.size = int(host_size * 1e9 // self.size_per_token)
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
+
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
 
@@ -1142,11 +1147,12 @@ class MambaPoolHost(HostKVCache):
     def init_kv_buffer(self):
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
 
-        if self.layout == "page_first_direct":
-            # page-first: (size, num_layers, *shape) — per-page data is contiguous
+        if self.layout in ["page_first", "page_first_direct"]:
+            # page-first: (page_num, num_layers, 1, *shape) — per-page data is contiguous
             temporal_dims = (
                 self.size,
                 self.num_mamba_layers,
+                1,
             ) + self.temporal_state_shape
             self.temporal_buffer = alloc_func(
                 temporal_dims,
@@ -1157,7 +1163,7 @@ class MambaPoolHost(HostKVCache):
             )
             self.conv_buffer = []
             for conv_shape in self.conv_state_shapes:
-                conv_dims = (self.size, self.num_mamba_layers) + conv_shape
+                conv_dims = (self.size, self.num_mamba_layers, 1) + conv_shape
                 self.conv_buffer.append(
                     alloc_func(
                         conv_dims,
@@ -1193,18 +1199,8 @@ class MambaPoolHost(HostKVCache):
                     )
                 )
 
-    def _get_temporal_view(self, layer_id: int) -> torch.Tensor:
-        if self.layout == "page_first_direct":
-            return self.temporal_buffer[:, layer_id]
-        return self.temporal_buffer[layer_id]
-
-    def _get_conv_view(self, layer_id: int, conv_idx: int) -> torch.Tensor:
-        if self.layout == "page_first_direct":
-            return self.conv_buffer[conv_idx][:, layer_id]
-        return self.conv_buffer[conv_idx][layer_id]
-
     def _iter_page_tensors(self, index: int):
-        if self.layout == "page_first_direct":
+        if self.layout in ["page_first", "page_first_direct"]:
             yield self.temporal_buffer[index]
             for conv_buf in self.conv_buffer:
                 yield conv_buf[index]
@@ -1290,6 +1286,81 @@ class MambaPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
+    @staticmethod
+    def _copy_tensor_pf_lf(
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        layer_id: int,
+        num_layers: int,
+        io_backend: str,
+    ) -> None:
+        if src_indices.numel() == 0:
+            return
+        if io_backend == "kernel":
+            item_size = MambaPoolHost._item_size_per_index(dst)
+            transfer_kv_per_layer_mla_pf_lf(
+                src=src,
+                dst=dst,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                layer_id=layer_id,
+                item_size=item_size,
+                src_layout_dim=item_size * num_layers,
+            )
+        elif io_backend == "direct":
+            transfer_kv_per_layer_direct_pf_lf(
+                src_ptrs=[src],
+                dst_ptrs=[dst],
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                layer_id=layer_id,
+                page_size=1,
+            )
+        else:
+            raise ValueError(f"Unsupported io_backend: {io_backend}")
+
+    @staticmethod
+    def _copy_tensor_all_layers_lf_pf(
+        src_layers: torch.Tensor,
+        dst: torch.Tensor,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        num_layers: int,
+        device: str,
+        io_backend: str,
+    ) -> None:
+        if src_indices.numel() == 0:
+            return
+        if io_backend == "kernel":
+            item_size = MambaPoolHost._item_size_per_index(src_layers[0])
+            src_ptrs = torch.tensor(
+                [src_layers[i].data_ptr() for i in range(num_layers)],
+                dtype=torch.uint64,
+                device=device,
+            )
+            transfer_kv_all_layer_mla_lf_pf(
+                src_layers=src_ptrs,
+                dst=dst,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                item_size=item_size,
+                dst_layout_dim=item_size * num_layers,
+                num_layers=num_layers,
+            )
+        elif io_backend == "direct":
+            src_ptrs = [src_layers[i] for i in range(num_layers)]
+            transfer_kv_all_layer_direct_lf_pf(
+                src_ptrs=src_ptrs,
+                dst_ptrs=[dst],
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                page_size=1,
+            )
+        else:
+            raise ValueError(f"Unsupported io_backend: {io_backend}")
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -1298,41 +1369,83 @@ class MambaPoolHost(HostKVCache):
         layer_id,
         io_backend="kernel",
     ):
-        self._copy_tensor(
-            self._get_temporal_view(layer_id),
-            device_pool.mamba_cache.temporal[layer_id],
-            host_indices,
-            device_indices,
-            io_backend,
-        )
-        for conv_idx in range(len(self.conv_state_shapes)):
-            self._copy_tensor(
-                self._get_conv_view(layer_id, conv_idx),
-                device_pool.mamba_cache.conv[conv_idx][layer_id],
-                host_indices,
-                device_indices,
-                io_backend,
+        if self.layout in ["page_first", "page_first_direct"]:
+            self._copy_tensor_pf_lf(
+                src=self.temporal_buffer,
+                dst=device_pool.mamba_cache.temporal[layer_id],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                layer_id=layer_id,
+                num_layers=self.num_mamba_layers,
+                io_backend=io_backend,
             )
-
-    def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend="kernel"
-    ):
-        for layer_id in range(self.num_mamba_layers):
+            for conv_idx in range(len(self.conv_state_shapes)):
+                self._copy_tensor_pf_lf(
+                    src=self.conv_buffer[conv_idx],
+                    dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    num_layers=self.num_mamba_layers,
+                    io_backend=io_backend,
+                )
+        else:
             self._copy_tensor(
+                self.temporal_buffer[layer_id],
                 device_pool.mamba_cache.temporal[layer_id],
-                self._get_temporal_view(layer_id),
-                device_indices,
                 host_indices,
+                device_indices,
                 io_backend,
             )
             for conv_idx in range(len(self.conv_state_shapes)):
                 self._copy_tensor(
+                    self.conv_buffer[conv_idx][layer_id],
                     device_pool.mamba_cache.conv[conv_idx][layer_id],
-                    self._get_conv_view(layer_id, conv_idx),
+                    host_indices,
+                    device_indices,
+                    io_backend,
+                )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend="kernel"
+    ):
+        if self.layout in ["page_first", "page_first_direct"]:
+            self._copy_tensor_all_layers_lf_pf(
+                src_layers=device_pool.mamba_cache.temporal,
+                dst=self.temporal_buffer,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                num_layers=self.num_mamba_layers,
+                device=self.device_pool.device,
+                io_backend=io_backend,
+            )
+            for conv_idx in range(len(self.conv_state_shapes)):
+                self._copy_tensor_all_layers_lf_pf(
+                    src_layers=device_pool.mamba_cache.conv[conv_idx],
+                    dst=self.conv_buffer[conv_idx],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    num_layers=self.num_mamba_layers,
+                    device=self.device_pool.device,
+                    io_backend=io_backend,
+                )
+        else:
+            for layer_id in range(self.num_mamba_layers):
+                self._copy_tensor(
+                    device_pool.mamba_cache.temporal[layer_id],
+                    self.temporal_buffer[layer_id],
                     device_indices,
                     host_indices,
                     io_backend,
                 )
+                for conv_idx in range(len(self.conv_state_shapes)):
+                    self._copy_tensor(
+                        device_pool.mamba_cache.conv[conv_idx][layer_id],
+                        self.conv_buffer[conv_idx][layer_id],
+                        device_indices,
+                        host_indices,
+                        io_backend,
+                    )
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         data_page = torch.cat(
