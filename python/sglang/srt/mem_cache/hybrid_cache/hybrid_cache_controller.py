@@ -163,7 +163,6 @@ class HybridCacheController(BaseHiCacheController):
         pp_size: int = 1,
         transfer_layer_num: Optional[int] = None,
     ):
-        self.transfer_layer_num = transfer_layer_num
         startup_storage_backend = storage_backend
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
@@ -180,12 +179,12 @@ class HybridCacheController(BaseHiCacheController):
             pp_rank=pp_rank,
             pp_size=pp_size,
         )
-        self.transfer_layer_num = self.transfer_layer_num or self.layer_num
-        if self.transfer_layer_num != self.layer_done_counter.num_layers:
-            self.layer_done_counter = LayerDoneCounter(self.transfer_layer_num)
-            self.mem_pool_device.register_layer_transfer_counter(
-                self.layer_done_counter
-            )
+        # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
+        # not just the full attention layers reported by full_kv_pool.
+        if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
+            self.layer_num = transfer_layer_num
+            self.layer_done_counter = LayerDoneCounter(self.layer_num)
+
         if startup_storage_backend is not None:
             self.attach_storage_backend(
                 storage_backend=startup_storage_backend,
@@ -313,7 +312,7 @@ class HybridCacheController(BaseHiCacheController):
         producer_event.start_event.record()
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
-            for i in range(self.transfer_layer_num):
+            for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
                     host_indices,

@@ -114,16 +114,6 @@ class HiMambaRadixCache(MambaRadixCache):
                 "HiMambaRadixCache requires HybridReqToTokenPool for hybrid SSM models."
             )
 
-        self.hybrid_model_layer_ids: list[int] = []
-        full_layer_ids = sorted(
-            self.hybrid_kv_cache.full_attention_layer_id_mapping.keys()
-        )
-        mamba_layer_ids = sorted(params.req_to_token_pool.mamba_map.keys())
-        self.hybrid_model_layer_ids = sorted(set(full_layer_ids) | set(mamba_layer_ids))
-        self.transfer_layer_num = len(self.hybrid_model_layer_ids)
-        self.hybrid_kv_cache.set_model_layer_id_mapping(self.hybrid_model_layer_ids)
-        params.req_to_token_pool.set_model_layer_id_mapping(self.hybrid_model_layer_ids)
-
         self.kvcache = self.hybrid_kv_cache.full_kv_pool
         kv_host_pool_cls = (
             MLATokenToKVPoolHost
@@ -146,22 +136,25 @@ class HiMambaRadixCache(MambaRadixCache):
             layout=server_args.hicache_mem_layout,
         )
 
+        full_layer_ids = sorted(
+            self.hybrid_kv_cache.full_attention_layer_id_mapping.keys()
+        )
+        mamba_layer_ids = sorted(params.req_to_token_pool.mamba_map.keys())
+        self.transfer_layer_num = len(set(full_layer_ids) | set(mamba_layer_ids))
+
         full_layer_mapping = dict(self.hybrid_kv_cache.full_attention_layer_id_mapping)
         mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+        transfer_layer_num = self.transfer_layer_num
 
-        def kv_layer_mapper(model_layer_local_id: int) -> Optional[int]:
-            if not 0 <= model_layer_local_id < len(self.hybrid_model_layer_ids):
+        def kv_layer_mapper(layer_id: int) -> Optional[int]:
+            if not 0 <= layer_id < transfer_layer_num:
                 return None
-            return full_layer_mapping.get(
-                self.hybrid_model_layer_ids[model_layer_local_id]
-            )
+            return full_layer_mapping.get(layer_id)
 
-        def mamba_layer_mapper(model_layer_local_id: int) -> Optional[int]:
-            if not 0 <= model_layer_local_id < len(self.hybrid_model_layer_ids):
+        def mamba_layer_mapper(layer_id: int) -> Optional[int]:
+            if not 0 <= layer_id < transfer_layer_num:
                 return None
-            return mamba_layer_mapping.get(
-                self.hybrid_model_layer_ids[model_layer_local_id]
-            )
+            return mamba_layer_mapping.get(layer_id)
 
         self.host_pool_group = HostPoolGroup(
             [
@@ -224,6 +217,9 @@ class HiMambaRadixCache(MambaRadixCache):
             transfer_layer_num=self.transfer_layer_num,
         )
         params.req_to_token_pool.register_layer_transfer_counter(
+            self.cache_controller.layer_done_counter
+        )
+        self.hybrid_kv_cache.register_layer_transfer_counter(
             self.cache_controller.layer_done_counter
         )
         self._apply_storage_runtime_config(
