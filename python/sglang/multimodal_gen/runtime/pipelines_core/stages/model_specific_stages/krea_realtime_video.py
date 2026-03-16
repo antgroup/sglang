@@ -188,12 +188,22 @@ class KreaRealtimeVideoTextEncodingStage(TextEncodingStage):
 
 
 class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
-    def __init__(self, tokenizer, transformer, vae) -> None:
+    def __init__(self, tokenizer, transformer, vae, vae_dtype: torch.dtype) -> None:
         super().__init__()
         self.vae = vae
         self.tokenizer = tokenizer
         self.transformer = transformer
         self.video_processor = VideoProcessor(vae_scale_factor=8)
+        self._vae_latents_mean = torch.tensor(
+            self.vae.config.latents_mean,
+            device=self.vae.device,
+            dtype=vae_dtype,
+        ).view(1, self.vae.config.z_dim, 1, 1, 1)
+        self._vae_latents_std = 1.0 / torch.tensor(
+            self.vae.config.latents_std,
+            device=self.vae.device,
+            dtype=vae_dtype,
+        ).view(1, self.vae.config.z_dim, 1, 1, 1)
         self._maybe_enable_torch_compile()
 
     def _maybe_enable_torch_compile(self) -> None:
@@ -434,15 +444,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
         self._reset_vae_encode_cache()
         frames = frames.to(device=self.vae.device, dtype=dtype).contiguous()
         latents = retrieve_latents(self.vae.encode(frames), sample_mode="argmax")
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
-            1, self.vae.config.z_dim, 1, 1, 1
-        ).to(latents.device, latents.dtype)
-        latents = (latents - latents_mean) * latents_std
+        latents = (latents - self._vae_latents_mean) * self._vae_latents_std
 
         return latents
 
@@ -471,16 +473,7 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
             for vid in video
         ]
         init_latents = torch.cat(init_latents, dim=0).to(dtype)
-
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(device, dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
-            1, self.vae.config.z_dim, 1, 1, 1
-        ).to(device, dtype)
-        init_latents = (init_latents - latents_mean) * latents_std
+        init_latents = (init_latents - self._vae_latents_mean) * self._vae_latents_std
 
         return init_latents
 
@@ -549,12 +542,22 @@ class KreaRealtimeVideoBeforeDenoisingStage(PipelineStage):
 
 
 class KreaRealtimeVideoDenoisingStage(PipelineStage):
-    def __init__(self, transformer, scheduler, vae):
+    def __init__(self, transformer, scheduler, vae, vae_dtype: torch.dtype):
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
         self.vae = vae
         self.video_processor = VideoProcessor(vae_scale_factor=8)
+        self._vae_latents_mean = torch.tensor(
+            self.vae.config.latents_mean,
+            device=self.vae.device,
+            dtype=vae_dtype,
+        ).view(1, self.vae.config.z_dim, 1, 1, 1)
+        self._vae_latents_std = 1.0 / torch.tensor(
+            self.vae.config.latents_std,
+            device=self.vae.device,
+            dtype=vae_dtype,
+        ).view(1, self.vae.config.z_dim, 1, 1, 1)
         self._maybe_enable_torch_compile()
 
     def _maybe_enable_torch_compile(self) -> None:
@@ -662,22 +665,8 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         if batch.block_idx != 0:
             self.vae._feat_map = batch.session.decoder_cache
 
-        latents = batch.latents.to(self.vae.device)
-
-        # Create tensors directly on target device and dtype to avoid redundant conversions
-        latents_mean = torch.tensor(
-            self.vae.config.latents_mean,
-            device=latents.device,
-            dtype=latents.dtype,
-        ).view(1, self.vae.config.z_dim, 1, 1, 1)
-        latents_std = 1.0 / torch.tensor(
-            self.vae.config.latents_std,
-            device=latents.device,
-            dtype=latents.dtype,
-        ).view(1, self.vae.config.z_dim, 1, 1, 1)
-
-        latents = latents / latents_std + latents_mean
-        latents = latents.to(vae_dtype)
+        latents = batch.latents.to(device=self.vae.device, dtype=vae_dtype)
+        latents = latents / self._vae_latents_std + self._vae_latents_mean
 
         videos = self.vae.decode(latents)
 

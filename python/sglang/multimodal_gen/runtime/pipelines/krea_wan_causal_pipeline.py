@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.k
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 # isort: on
 
@@ -38,6 +39,7 @@ class KreaWanCausalPipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         self.add_stage(InputValidationStage())
         self.add_stage(
             KreaRealtimeVideoTextEncodingStage(
@@ -50,6 +52,7 @@ class KreaWanCausalPipeline(LoRAPipeline, ComposedPipelineBase):
                 tokenizer=self.get_module("tokenizer"),
                 transformer=self.get_module("transformer"),
                 vae=self.get_module("vae"),
+                vae_dtype=vae_dtype,
             ),
         )
         self.add_stage(
@@ -57,6 +60,7 @@ class KreaWanCausalPipeline(LoRAPipeline, ComposedPipelineBase):
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
                 vae=self.get_module("vae"),
+                vae_dtype=vae_dtype,
             ),
         )
 
