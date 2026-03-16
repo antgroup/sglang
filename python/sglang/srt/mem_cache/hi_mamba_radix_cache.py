@@ -859,13 +859,6 @@ class HiMambaRadixCache(MambaRadixCache):
         self.full_lru_list.insert_mru(node)
         self.full_evictable_size_ += n
 
-        if node.mamba_value is not None:
-            if self.mamba_lru_list.in_list(node):
-                self.mamba_lru_list.reset_node_mru(node)
-            else:
-                self.mamba_lru_list.insert_mru(node)
-                self.mamba_evictable_size_ += len(node.mamba_value)
-
         self._update_leaf_status(node)
         if node.parent is not None:
             self._update_leaf_status(node.parent)
