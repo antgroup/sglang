@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PrefetchOperation,
@@ -159,14 +159,14 @@ class HiMambaRadixCache(MambaRadixCache):
         self.host_pool_group = HostPoolGroup(
             [
                 PoolEntry(
-                    name="kv",
+                    name=PoolName.KV,
                     host_pool=self.full_kv_pool_host,
                     device_pool=self.kvcache,
                     layer_mapper=kv_layer_mapper,
                     is_primary_index_anchor=True,
                 ),
                 PoolEntry(
-                    name="mamba",
+                    name=PoolName.MAMBA,
                     host_pool=self.mamba_pool_host,
                     device_pool=params.req_to_token_pool.mamba_pool,
                     layer_mapper=mamba_layer_mapper,
@@ -1420,10 +1420,12 @@ class HiMambaRadixCache(MambaRadixCache):
         mamba_host_indices = None
         mamba_loaded = False
         for transfer in operation.pool_transfers or []:
-            if transfer.name == "mamba":
+            if transfer.name == PoolName.MAMBA:
                 mamba_host_indices = transfer.host_indices
                 mamba_loaded = (
-                    operation.pool_storage_result.extra_pool_hit_pages.get("mamba", 0)
+                    operation.pool_storage_result.extra_pool_hit_pages.get(
+                        PoolName.MAMBA, 0
+                    )
                     >= 1
                 )
                 break
@@ -1606,7 +1608,7 @@ class HiMambaRadixCache(MambaRadixCache):
             return None
         return [
             PoolTransfer(
-                name="mamba",
+                name=PoolName.MAMBA,
                 host_indices=node.mamba_host_value,
                 device_indices=node.mamba_value,
             )
@@ -1629,7 +1631,7 @@ class HiMambaRadixCache(MambaRadixCache):
             return None
         return [
             PoolTransfer(
-                name="mamba",
+                name=PoolName.MAMBA,
                 host_indices=node.mamba_host_value,
                 keys=[node.hash_value[-1]],
                 hit_policy="trailing_pages",
@@ -1652,7 +1654,7 @@ class HiMambaRadixCache(MambaRadixCache):
         # placeholder key; I/O thread replaces with correct hash after hit query
         return [
             PoolTransfer(
-                name="mamba",
+                name=PoolName.MAMBA,
                 host_indices=host_indices,
                 keys=["__placeholder__"],
                 hit_policy="trailing_pages",
@@ -1676,7 +1678,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if backed_up_host_indices:
             transfers.append(
                 PoolTransfer(
-                    name="mamba",
+                    name=PoolName.MAMBA,
                     host_indices=torch.cat(backed_up_host_indices),
                     device_indices=None,
                 )
@@ -1697,7 +1699,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 )[0]
             transfers.append(
                 PoolTransfer(
-                    name="mamba",
+                    name=PoolName.MAMBA,
                     host_indices=last_hit_node.mamba_host_value,
                     device_indices=req.mamba_pool_idx.unsqueeze(0),
                 )
@@ -1888,7 +1890,7 @@ class HiMambaRadixCache(MambaRadixCache):
     def prefetch_abort(self, pool_transfers: Optional[list[PoolTransfer]]) -> None:
         """Free any allocated mamba host slots on prefetch abort/revoke."""
         for transfer in pool_transfers or []:
-            if transfer.name == "mamba":
+            if transfer.name == PoolName.MAMBA:
                 if transfer.host_indices is not None:
                     self.mamba_pool_host.free(transfer.host_indices)
                 break
