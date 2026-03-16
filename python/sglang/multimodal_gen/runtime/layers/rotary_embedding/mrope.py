@@ -143,6 +143,11 @@ class OneDRotaryEmbedding(torch.nn.Module):
         This method converts the input tensor to a hashable representation
         and calls a cached helper method to perform the computation.
         """
+        # Avoid GPU -> CPU synchronization from tolist() on CUDA path.
+        if pos.is_cuda:
+            pos = pos.to(self.dtype)
+            return self.build_freqs_outer(pos, pos.device)
+
         pos_tuple = tuple(pos.tolist())
         device_str = str(pos.device)
         return self._forward_cached(pos_tuple, device_str)
@@ -239,6 +244,10 @@ class NDRotaryEmbedding(torch.nn.Module):
         Returns:
             A tuple of (cos, sin) tensors.
         """
+        # Avoid GPU -> CPU synchronization from tolist() on CUDA path.
+        if positions.is_cuda:
+            return self.forward_uncached(pos=positions)
+
         # Caching wrapper: convert tensor to a hashable tuple of tuples.
         pos_tuple = tuple(map(tuple, positions.tolist()))
         device_str = str(positions.device)
@@ -283,8 +292,8 @@ class NDRotaryEmbedding(torch.nn.Module):
             gen_idx = self.dim_idx_to_gen_idx[i]
             generator = self.rope_generators[gen_idx]
 
-            # Calculate 1D embeddings.
-            cos_1d, sin_1d = generator(pos_i)
+            # Use tensor path directly to avoid tolist() sync in generator.forward.
+            cos_1d, sin_1d = generator.build_freqs_outer(pos_i, device)
 
             slice_width = cos_1d.shape[1]
             cos[:, col_offset : col_offset + slice_width] = cos_1d
