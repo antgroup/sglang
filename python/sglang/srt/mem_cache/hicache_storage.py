@@ -470,16 +470,6 @@ class HiCacheFile(HiCacheStorage):
                 hit_count[name] = boundary
             final_pages = min(final_pages, boundary)
 
-        if pool_transfers:
-            logger.info(
-                "HiCacheFile batch_exists_v2: kv_pages=%s final_pages=%s hit_count=%s first_key=%s last_key=%s",
-                kv_pages,
-                final_pages,
-                hit_count,
-                keys[0] if keys else None,
-                keys[final_pages - 1] if final_pages > 0 else None,
-            )
-
         return PoolTransferResult(final_pages, hit_count)
 
     def _log_key(self, pool_name: str, key: str) -> str:
@@ -487,127 +477,60 @@ class HiCacheFile(HiCacheStorage):
 
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         """Read one page from storage into host_pool at page_offset."""
-        tensor_path = self._get_component_path(key, pool_name)
-        if not os.path.exists(tensor_path):
+        storage_key = self._log_key(pool_name, key)
+        data_page = self.get(storage_key, host_pool.get_dummy_flat_data_page())
+        if data_page is None:
             return False
-        try:
-            with open(tensor_path, "rb", buffering=0) as f:
-                file_data = f.read()
-            dummy_page = host_pool.get_dummy_flat_data_page()
-            expected_bytes = dummy_page.numel() * dummy_page.element_size()
-            if len(file_data) != expected_bytes:
-                logger.warning(
-                    "File size mismatch for %s: expected %s, got %s",
-                    self._log_key(pool_name, key),
-                    expected_bytes,
-                    len(file_data),
-                )
-                return False
-            data_page = (
-                torch.frombuffer(
-                    file_data, dtype=dummy_page.dtype, count=dummy_page.numel()
-                )
-                .clone()
-                .reshape(dummy_page.shape)
-            )
-            host_pool.set_from_flat_data_page(page_offset, data_page)
-            return True
-        except Exception as e:
-            logger.error("Failed to read key %s: %s", self._log_key(pool_name, key), e)
-            return False
+        host_pool.set_from_flat_data_page(page_offset, data_page)
+        return True
 
     def _write_page(
         self, pool_name: str, key: str, host_pool, page_offset: int
     ) -> bool:
         """Write one page from host_pool at page_offset to storage as raw bytes."""
-        try:
-            data_page = host_pool.get_data_page(page_offset, flat=True)
-            data_bytes = (
-                data_page.contiguous().view(torch.uint8).reshape(-1).numpy().tobytes()
-            )
-            component_path = self._get_component_path(key, pool_name)
-            if os.path.exists(component_path):
-                existing_size = os.path.getsize(component_path)
-                if existing_size == len(data_bytes):
-                    return True  # same-size file → assume identical, skip write
-                logger.warning(
-                    "Overwriting stale storage entry for %s: expected %s bytes, got %s",
-                    self._log_key(pool_name, key),
-                    len(data_bytes),
-                    existing_size,
+        storage_key = self._log_key(pool_name, key)
+        data_page = host_pool.get_data_page(page_offset, flat=True)
+        return self.set(storage_key, data_page)
+
+    def _batch_io_v2(self, transfers: List[PoolTransfer], op_fn):
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            host_pool = self.registered_pools[transfer.name]
+            keys = transfer.keys or []
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            expected = len(keys) * page_size
+            host_indices = transfer.host_indices
+
+            if host_indices is None or host_indices.numel() != expected:
+                logger.error(
+                    "%s indices length mismatch for %s: expected %s, got %s",
+                    op_fn.__name__,
+                    transfer.name,
+                    expected,
+                    host_indices.numel() if host_indices is not None else 0,
                 )
-            with open(component_path, "wb", buffering=0) as f:
-                f.write(data_bytes)
-            if pool_name != PoolName.KV:
-                logger.info(
-                    "HiCacheFile wrote auxiliary component %s for key %s",
-                    pool_name,
-                    key,
-                )
-            return True
-        except Exception as e:
-            logger.error("Failed to store key %s: %s", self._log_key(pool_name, key), e)
-            return False
+                results[transfer.name] = [False] * len(keys)
+                continue
+
+            results[transfer.name] = [
+                op_fn(transfer.name, key, host_pool, host_indices[i * page_size].item())
+                for i, key in enumerate(keys)
+            ]
+        return results
 
     def batch_get_v2(
         self,
         transfers: List[PoolTransfer],
         extra_info: Optional["HiCacheStorageExtraInfo"] = None,
     ) -> dict[str, List[bool]]:
-        del extra_info
-        results: dict[str, List[bool]] = {}
-        for transfer in transfers:
-            host_pool = self.registered_pools[transfer.name]
-            page_size = getattr(host_pool, "page_size", 1) or 1
-            if transfer.host_indices.numel() != len(transfer.keys) * page_size:
-                logger.error(
-                    "batch_get_v2 indices length mismatch for %s: expected %s, got %s",
-                    transfer.name,
-                    len(transfer.keys) * page_size,
-                    transfer.host_indices.numel(),
-                )
-                results[transfer.name] = [False] * len(transfer.keys)
-            else:
-                results[transfer.name] = [
-                    self._read_page(
-                        transfer.name,
-                        key,
-                        host_pool,
-                        transfer.host_indices[i * page_size].item(),
-                    )
-                    for i, key in enumerate(transfer.keys)
-                ]
-        return results
+        return self._batch_io_v2(transfers, self._read_page)
 
     def batch_set_v2(
         self,
         transfers: List[PoolTransfer],
         extra_info: Optional["HiCacheStorageExtraInfo"] = None,
     ) -> dict[str, List[bool]]:
-        del extra_info
-        results: dict[str, List[bool]] = {}
-        for transfer in transfers:
-            host_pool = self.registered_pools[transfer.name]
-            page_size = getattr(host_pool, "page_size", 1) or 1
-            if transfer.host_indices.numel() != len(transfer.keys) * page_size:
-                logger.error(
-                    "batch_set_v2 indices length mismatch for %s: expected %s, got %s",
-                    transfer.name,
-                    len(transfer.keys) * page_size,
-                    transfer.host_indices.numel(),
-                )
-                results[transfer.name] = [False] * len(transfer.keys)
-            else:
-                results[transfer.name] = [
-                    self._write_page(
-                        transfer.name,
-                        key,
-                        host_pool,
-                        transfer.host_indices[i * page_size].item(),
-                    )
-                    for i, key in enumerate(transfer.keys)
-                ]
-        return results
+        return self._batch_io_v2(transfers, self._write_page)
 
     def clear(self) -> bool:
         try:
