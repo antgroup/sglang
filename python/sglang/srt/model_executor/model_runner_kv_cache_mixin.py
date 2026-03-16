@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 import logging
 from typing import TYPE_CHECKING
 
@@ -42,19 +41,6 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
-
-
-def _filter_linear_cache_params_for_pp(model_runner: "ModelRunner", cache_params):
-    if cache_params is None:
-        return None
-    if model_runner.pp_size <= 1:
-        return cache_params
-    local_layers = [
-        layer_id
-        for layer_id in cache_params.layers
-        if model_runner.start_layer <= layer_id < model_runner.end_layer
-    ]
-    return dataclasses.replace(cache_params, layers=local_layers)
 
 
 class ModelRunnerKVCacheMixin:
@@ -381,16 +367,13 @@ class ModelRunnerKVCacheMixin:
                 # if max_num_reqs <= 32, we pre-allocate 2x requests
                 pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
                 if config := self.mambaish_config:
-                    cache_params = _filter_linear_cache_params_for_pp(
-                        self, config.mamba2_cache_params
-                    )
                     self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
                         size=max_num_reqs,
                         max_context_len=self.model_config.context_len
                         + extra_max_context_len,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
-                        cache_params=cache_params,
+                        cache_params=config.mamba2_cache_params,
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
@@ -407,9 +390,6 @@ class ModelRunnerKVCacheMixin:
                         pre_alloc_size=pre_alloc_size,
                     )
             elif config := self.mambaish_config:
-                cache_params = _filter_linear_cache_params_for_pp(
-                    self, config.mamba2_cache_params
-                )
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
@@ -418,7 +398,7 @@ class ModelRunnerKVCacheMixin:
                     + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
-                    cache_params=cache_params,
+                    cache_params=config.mamba2_cache_params,
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
