@@ -22,6 +22,7 @@ from sglang.srt.managers.cache_controller import (
 )
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
     PoolTransfer,
     PoolTransferResult,
 )
@@ -445,7 +446,7 @@ class HybridCacheController(BaseHiCacheController):
         is a sliding window of the last N hit pages.
         """
         for transfer in pool_transfers:
-            if transfer.hit_policy != "trailing_pages":
+            if transfer.hit_policy != PoolHitPolicy.TRAILING_PAGES:
                 continue
             trailing_n = len(transfer.keys) if transfer.keys else 1
             transfer.keys = all_hashes[max(0, kv_hit_pages - trailing_n) : kv_hit_pages]

@@ -1,10 +1,15 @@
+from __future__ import annotations
+
 import abc
 import logging
 import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.hicache_storage import PoolName
 
 import numpy as np
 import psutil
@@ -1481,7 +1486,7 @@ class MambaPoolHost(HostKVCache):
 
 @dataclass
 class PoolEntry:
-    name: str
+    name: PoolName
     host_pool: Any
     device_pool: Any
     layer_mapper: Callable[[int], Optional[int]]

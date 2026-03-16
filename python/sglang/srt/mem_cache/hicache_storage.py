@@ -4,7 +4,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Literal, Optional, Set
+from typing import Any, List, Optional, Set
 
 import torch
 
@@ -72,23 +72,30 @@ class PoolName(str, Enum):
     MAMBA = "mamba"
 
 
+class PoolHitPolicy(str, Enum):
+    """Hit policy for batch_exists_v2 per-pool prefix matching.
+
+    ALL_PAGES      : every page in [0, kv_hit) must exist (default).
+    TRAILING_PAGES : only the last N pages must exist (e.g. Mamba/SWA states).
+    """
+
+    ALL_PAGES = "all_pages"
+    TRAILING_PAGES = "trailing_pages"
+
+
 @dataclass
 class PoolTransfer:
     """Unified per-pool transfer descriptor for batch v2 interface.
 
     device<->host path : host_indices + device_indices
     host<->storage path: host_indices + keys
-
-    hit_policy controls how batch_exists_v2 checks this pool:
-      "all_pages"     – every page in the KV hit range must exist.
-      "trailing_pages"– only the last len(keys) pages must exist (e.g. mamba/SWA).
     """
 
-    name: str
+    name: PoolName
     host_indices: Optional[torch.Tensor] = None
     device_indices: Optional[torch.Tensor] = None
     keys: Optional[List[str]] = None
-    hit_policy: Literal["all_pages", "trailing_pages"] = "all_pages"
+    hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
 
 
 @dataclass
@@ -445,7 +452,7 @@ class HiCacheFile(HiCacheStorage):
             if final_pages == 0:
                 break
             name = transfer.name
-            if transfer.hit_policy == "all_pages":
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 boundary = next(
                     (i for i in range(kv_pages) if not has_component(i, name)), kv_pages
                 )

@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PrefetchOperation,
@@ -2039,7 +2039,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 name=PoolName.MAMBA,
                 host_indices=node.mamba_host_value,
                 keys=[node.hash_value[-1]],
-                hit_policy="trailing_pages",
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
             )
         ]
 
@@ -2062,7 +2062,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 name=PoolName.MAMBA,
                 host_indices=host_indices,
                 keys=["__placeholder__"],
-                hit_policy="trailing_pages",
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
             )
         ]
 
