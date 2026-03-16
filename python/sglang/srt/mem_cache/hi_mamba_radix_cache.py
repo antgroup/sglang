@@ -600,14 +600,14 @@ class HiMambaRadixCache(MambaRadixCache):
         assert not node.backuped, f"backuped node, {node.id=}"
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
 
-        num_full = len(node.value)
+        full_num_evicted = len(node.value)
 
         self.cache_controller.evict_device(node.value)
-        self.full_evictable_size_ -= num_full
+        self.full_evictable_size_ -= full_num_evicted
         if self.full_lru_list.in_list(node):
             self.full_lru_list.remove_node(node)
 
-        mamba_num = self._free_device_mamba(node)
+        mamba_num_evicted = self._free_device_mamba(node)
 
         if node.mamba_host_value is not None:
             if self.mamba_host_lru_list.in_list(node):
@@ -624,8 +624,13 @@ class HiMambaRadixCache(MambaRadixCache):
         assert v == node, f"parent does not have child key, {key}"
 
         self._update_leaf_status(parent)
-        self._iteratively_delete_tombstone_leaf(node)
-        return num_full, mamba_num
+        _, cascade_full_num_evicted, cascade_mamba_num_evicted = (
+            self._iteratively_delete_tombstone_leaf(node)
+        )
+        return (
+            full_num_evicted + cascade_full_num_evicted,
+            mamba_num_evicted + cascade_mamba_num_evicted,
+        )
 
     def _evict_host_leaf(self, node: TreeNode) -> int:
         # evict a host-resident leaf: free host KV + mamba, delete from tree, cascade
@@ -636,7 +641,7 @@ class HiMambaRadixCache(MambaRadixCache):
             node.host_ref_counter == 0
         ), f"in use, {node.id=} {node.host_ref_counter=}"
 
-        num_evicted = self.cache_controller.evict_host(node.host_value)
+        full_num_evicted = self.cache_controller.evict_host(node.host_value)
         node.host_value = None
 
         if node.mamba_host_value is not None:
@@ -652,9 +657,9 @@ class HiMambaRadixCache(MambaRadixCache):
         assert v == node, f"parent does not have child key, {key}"
 
         self._update_leaf_status(parent)
-        self._iteratively_delete_tombstone_leaf(node)
+        _, cascade_full_num_evicted, _ = self._iteratively_delete_tombstone_leaf(node)
 
-        return num_evicted
+        return full_num_evicted + cascade_full_num_evicted
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
         assert node.mamba_value is None, f"has mamba value, {node.id=}"
