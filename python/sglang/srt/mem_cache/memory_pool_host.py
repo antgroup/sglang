@@ -1274,6 +1274,9 @@ class MambaPoolHost(HostKVCache):
         if src_indices.numel() == 0:
             return
         if io_backend == "kernel":
+            # TODO: Rename the interface for clarity.
+            # Here, transfer_kv_per_layer_mla is reused to transfer the Mamba state.
+            # This has nothing to do with MLA; it's only reused because this interface happens to transfer a single Pool.
             transfer_kv_per_layer_mla(
                 src=src,
                 dst=dst,
