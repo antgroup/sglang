@@ -1,3 +1,4 @@
+import os
 from collections import deque
 from typing import List, Optional, Union
 
@@ -45,11 +46,12 @@ def _maybe_compile_module(
     marker = "_sglang_torch_compile_module_enabled"
     if getattr(module, marker, False):
         return module
-    # Keep compile policy close to krea/realtime-video:
-    # transformer: torch.compile(transformer)
-    logger.info("Compiling %s (fullgraph=%s)", module_name, fullgraph)
+
+    compile_mode = os.environ.get(
+        "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+    )
     try:
-        module.compile(fullgraph=fullgraph)
+        module.compile(mode=compile_mode, fullgraph=fullgraph, dynamic=None)
         setattr(module, marker, True)
     except Exception as e:
         logger.warning(
@@ -67,6 +69,9 @@ def _maybe_compile_method(
 ) -> None:
     if not server_args.enable_torch_compile:
         return
+    compile_mode = os.environ.get(
+        "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+    )
     marker = f"_sglang_torch_compile_{method_name}_enabled"
     if getattr(module, marker, False):
         return
@@ -74,14 +79,10 @@ def _maybe_compile_method(
     if not callable(method):
         return
 
-    logger.info(
-        "Compiling %s.%s (fullgraph=%s)",
-        module_name,
-        method_name,
-        fullgraph,
-    )
     try:
-        compiled_method = torch.compile(method, fullgraph=fullgraph)
+        compiled_method = torch.compile(
+            method, mode=compile_mode, fullgraph=fullgraph, dynamic=None
+        )
         setattr(module, method_name, compiled_method)
         setattr(module, marker, True)
     except Exception as e:
