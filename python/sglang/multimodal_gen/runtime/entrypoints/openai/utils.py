@@ -270,6 +270,9 @@ async def process_generation_batch(
     with log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
 
+        if result.output_file_paths_future is not None:
+            result.output_file_paths = result.output_file_paths_future.result()
+
         if result.output is None and result.output_file_paths is None:
             error_msg = result.error or "Unknown error"
             raise RuntimeError(

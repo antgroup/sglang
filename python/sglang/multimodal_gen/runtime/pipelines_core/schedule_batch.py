@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import pprint
 from collections import deque
+from concurrent.futures import Future
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import Any, Optional
@@ -377,6 +378,7 @@ class OutputBatch:
     """
 
     output: torch.Tensor | None = None
+    output_future: Future[Any] | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
     trajectory_timesteps: list[torch.Tensor] | None = None
@@ -384,6 +386,7 @@ class OutputBatch:
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None
+    output_file_paths_future: Future[Any] | None = None
 
     # logged metrics info, directly from Req.timings
     metrics: Optional["RequestMetrics"] = None

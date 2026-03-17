@@ -6,7 +6,8 @@ import multiprocessing as mp
 import os
 import time
 from collections import OrderedDict
-from typing import List, Union
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, List, Sequence, Union
 
 import torch
 from setproctitle import setproctitle
@@ -94,6 +95,8 @@ class GPUWorker:
         self.cfg_cpu_group = self.cfg_group.cpu_group
         self._realtime_session_cache: OrderedDict[str, RealtimeSession] = OrderedDict()
         self._max_realtime_sessions = 128
+
+        self._save_file_executor = ThreadPoolExecutor(max_workers=10)
 
     def _dispose_realtime_session(
         self, session_id: str, session: RealtimeSession | None
@@ -334,27 +337,50 @@ class GPUWorker:
 
             # Save output to file and return file path only if requested. Avoid the serialization
             # and deserialization overhead between scheduler_client and gpu_worker.
+            def _save_output_file(
+                outputs: Sequence[Any], req: Req, output_batch: OutputBatch
+            ):
+                return save_outputs(
+                    outputs,
+                    req.data_type,
+                    req.fps,
+                    True,
+                    lambda idx: req.output_file_path(len(outputs), idx),
+                    audio=output_batch.audio,
+                    audio_sample_rate=output_batch.audio_sample_rate,
+                    output_compression=req.output_compression,
+                    enable_frame_interpolation=req.enable_frame_interpolation,
+                    frame_interpolation_exp=req.frame_interpolation_exp,
+                    frame_interpolation_scale=req.frame_interpolation_scale,
+                    frame_interpolation_model_path=req.frame_interpolation_model_path,
+                    enable_upscaling=req.enable_upscaling,
+                    upscaling_model_path=req.upscaling_model_path,
+                    upscaling_scale=req.upscaling_scale,
+                )
+
             if req.save_output and req.return_file_paths_only and self.rank == 0:
                 if output_batch.output is not None:
-                    output_paths = save_outputs(
-                        output_batch.output,
-                        req.data_type,
-                        req.fps,
-                        True,
-                        lambda idx: req.output_file_path(len(output_batch.output), idx),
-                        audio=output_batch.audio,
-                        audio_sample_rate=output_batch.audio_sample_rate,
-                        output_compression=req.output_compression,
-                        enable_frame_interpolation=req.enable_frame_interpolation,
-                        frame_interpolation_exp=req.frame_interpolation_exp,
-                        frame_interpolation_scale=req.frame_interpolation_scale,
-                        frame_interpolation_model_path=req.frame_interpolation_model_path,
-                        enable_upscaling=req.enable_upscaling,
-                        upscaling_model_path=req.upscaling_model_path,
-                        upscaling_scale=req.upscaling_scale,
+                    output_batch.output_file_paths = _save_output_file(
+                        output_batch.output, req, output_batch
                     )
-                    output_batch.output_file_paths = output_paths
                     output_batch.output = None
+                elif (
+                    output_batch.output is None
+                    and output_batch.output_future is not None
+                ):
+
+                    _future = output_batch.output_future
+                    _req = req
+                    _output_batch = output_batch
+
+                    def _async_save_with_postprocess():
+                        _output = _future.result()
+                        _output_batch.output_future = None
+                        return _save_output_file(_output, _req, _output_batch)
+
+                    output_batch.output_file_paths_future = (
+                        self._save_file_executor.submit(_async_save_with_postprocess)
+                    )
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:

@@ -1,4 +1,5 @@
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Union
 
 import torch
@@ -559,6 +560,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
             dtype=vae_dtype,
         ).view(1, self.vae.config.z_dim, 1, 1, 1)
         self._maybe_enable_torch_compile()
+        self._postprocess_executor = ThreadPoolExecutor(max_workers=10)
 
     def _maybe_enable_torch_compile(self) -> None:
         _maybe_compile_module(
@@ -672,10 +674,15 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
 
         batch.session.decoder_cache = self.vae._feat_map
         batch.session.frame_cache_context.extend(videos.split(1, dim=2))
-        videos = self.video_processor.postprocess_video(videos, output_type="np")
+
+        # asyn postprocess
+        videos_future = self._postprocess_executor.submit(
+            self.video_processor.postprocess_video, videos, output_type="np"
+        )
 
         output_batch = OutputBatch(
-            output=videos,
+            output=None,
+            output_future=videos_future,
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             trajectory_decoded=None,
