@@ -324,18 +324,6 @@ class HiCacheFile(HiCacheStorage):
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
-    def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
-        if component_name is None or component_name in ("__default__", PoolName.KV):
-            return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
-
-    def _get_component_path(
-        self, key: str, component_name: Optional[str] = None
-    ) -> str:
-        return os.path.join(
-            self.file_path, f"{self._get_component_key(key, component_name)}.bin"
-        )
-
     def get(
         self,
         key: str,
@@ -405,42 +393,22 @@ class HiCacheFile(HiCacheStorage):
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         return os.path.exists(tensor_path)
 
-    def _collect_existing_component_keys(
-        self,
-        keys: List[str],
-        pool_transfers: Optional[List[PoolTransfer]] = None,
-    ) -> Set[str]:
-        target_files = {f"{self._get_component_key(key)}.bin" for key in keys}
-        for transfer in pool_transfers or []:
-            for key in keys:
-                target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
-
-        existing_files = set()
-        with os.scandir(self.file_path) as entries:
-            for entry in entries:
-                if entry.is_file() and entry.name in target_files:
-                    existing_files.add(entry.name)
-        return existing_files
-
     def batch_exists_v2(
         self,
         keys: List[str],
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        existing_files = self._collect_existing_component_keys(keys, pool_transfers)
 
         def has_component(page_idx: int, name: str) -> bool:
-            return (
-                f"{self._get_component_key(keys[page_idx], name)}.bin" in existing_files
-            )
+            return self.exists(self._log_key(name, keys[page_idx]))
 
         # Longest contiguous KV prefix present in storage.
         kv_pages = next(
             (
                 i
                 for i in range(len(keys))
-                if f"{self._get_component_key(keys[i])}.bin" not in existing_files
+                if self.exists(keys[i])
             ),
             len(keys),
         )
