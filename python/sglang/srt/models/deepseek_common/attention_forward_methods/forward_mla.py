@@ -8,7 +8,6 @@ import torch
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed import (
     get_dcp_group,
-    get_dcp_rank,
     get_dcp_world_size,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -590,20 +589,6 @@ class DeepseekMLAForwardMixin:
         output, _ = self.o_proj(attn_bmm_output)
 
         return output
-
-    def _all_gather_dcp_kv_cache(self, kv_a):
-        dcp_world_size = get_dcp_world_size()
-        dcp_rank = get_dcp_rank()
-        with use_symmetric_memory(get_dcp_group()):
-            gathered_kv_a = torch.zeros(
-                (kv_a.shape[0] * get_dcp_world_size(), *kv_a.shape[1:]),
-                dtype=kv_a.dtype,
-                device=kv_a.device,
-            )
-        idxs = torch.arange(kv_a.shape[0] * dcp_world_size)
-        mask = idxs % dcp_world_size == dcp_rank
-        gathered_kv_a[mask] = kv_a
-        return get_dcp_group().all_reduce(gathered_kv_a)
 
     def _fuse_rope_for_trtllm_mla(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
