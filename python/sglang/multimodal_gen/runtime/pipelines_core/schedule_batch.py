@@ -336,6 +336,7 @@ class RealtimeSession:
         self.current_denoised_latents: torch.Tensor = None
         self.frame_cache_context: deque = None
         self.decoder_cache: Any = None
+        self.output_futures: dict[int, Future] = {}
 
     def dispose(self):
         self.last_embeds.clear()
@@ -346,6 +347,8 @@ class RealtimeSession:
         if self.frame_cache_context:
             self.frame_cache_context.clear()
         self.decoder_cache = None
+        if self.output_futures:
+            self.output_futures.clear()
         torch.cuda.empty_cache()
 
     def is_prompt_changed(self, prompts: str | list[str]) -> bool:
@@ -378,7 +381,8 @@ class OutputBatch:
     """
 
     output: torch.Tensor | None = None
-    output_future: Future[Any] | None = None
+    asyn_post_process: bool = False
+    output_size: int | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
     trajectory_timesteps: list[torch.Tensor] | None = None
@@ -386,7 +390,6 @@ class OutputBatch:
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None
-    output_file_paths_future: Future[Any] | None = None
 
     # logged metrics info, directly from Req.timings
     metrics: Optional["RequestMetrics"] = None

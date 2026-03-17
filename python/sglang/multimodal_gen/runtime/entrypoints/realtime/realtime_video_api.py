@@ -31,6 +31,18 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 
 
+async def _scan_output_file_and_send(ws: WebSocket, file_path_list: list[str]):
+    while True:
+        save_file_path = file_path_list[0]
+        # wait for file
+        while not os.path.exists(save_file_path):
+            await asyncio.sleep(0.01)
+        with open(save_file_path, "rb") as f:
+            frame_bytes = f.read()
+        await write_frame_msg(frame_bytes, ws)
+        break
+
+
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
 
     while True:
@@ -62,19 +74,14 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                 async_scheduler_client, batch
             )
 
-            # send to client
-            save_file_path = save_file_path_list[0]
-            with open(save_file_path, "rb") as f:
-                frame_bytes = f.read()
-            await write_frame_msg(frame_bytes, ws)
-
-            session.generate_chunk_completed()
+            # asyn send to client
+            asyncio.create_task(_scan_output_file_and_send(ws, save_file_path_list))
 
             logger.info(
                 f"generate video chunk, "
                 f"request_id: {session.request_id},"
                 f"chunk_cnt: {session.generate_chunk_cnt},"
-                f"save_file_path: {save_file_path}"
+                f"save_file_path: {save_file_path_list[0]}"
             )
 
         except asyncio.CancelledError:

@@ -365,24 +365,27 @@ class GPUWorker:
                     )
                     output_batch.output = None
                 elif (
-                    output_batch.output is None
-                    and output_batch.output_future is not None
+                    output_batch.asyn_post_process
+                    and req.session
+                    and req.request_id in req.session.output_futures
                 ):
 
-                    _future = output_batch.output_future
-                    _req = req
-                    _output_batch = output_batch
-
-                    def _async_save_with_postprocess():
+                    def _async_save_with_postprocess(_future, _req, _output_batch):
                         _output = _future.result()
-                        _output_batch.output_future = None
                         return _save_output_file(_output, _req, _output_batch)
 
-                    output_batch.output_file_paths_future = (
-                        self._save_file_executor.submit(_async_save_with_postprocess)
+                    self._save_file_executor.submit(
+                        _async_save_with_postprocess,
+                        req.session.output_futures[req.request_id],
+                        req,
+                        output_batch,
                     )
+                    output_file_paths = []
+                    for idx in range(output_batch.output_size):
+                        output_file_paths.append(req.build_output_path(idx))
+                    output_batch.output_file_paths = output_file_paths
 
-            # TODO: extract to avoid duplication
+                    # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 # Avoid logging warmup perf records that share the same request_id.
                 if not req.is_warmup:

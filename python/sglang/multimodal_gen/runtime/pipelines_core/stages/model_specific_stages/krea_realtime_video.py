@@ -679,10 +679,12 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
         videos_future = self._postprocess_executor.submit(
             self.video_processor.postprocess_video, videos, output_type="np"
         )
+        batch.session.output_futures[batch.block_idx] = videos_future
 
         output_batch = OutputBatch(
             output=None,
-            output_future=videos_future,
+            asyn_post_process=True,
+            output_size=videos.shape[0],
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             trajectory_decoded=None,
