@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
     IncLockRefResult,
+    InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
 )
@@ -421,11 +422,11 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def init_load_back(
         self,
-        last_node: TreeNode,
-        host_hit_length: int,
-        mem_quota: Optional[int] = None,
-        req=None,
+        params: InitLoadBackParams,
     ):
+        last_node = params.last_host_node
+        mem_quota = params.mem_quota
+        req = params.req
         if last_node.evicted or (last_node.mamba_evicted and last_node.mamba_backuped):
             loading_values = self.load_back(last_node, mem_quota, req=req)
             if loading_values is not None:
