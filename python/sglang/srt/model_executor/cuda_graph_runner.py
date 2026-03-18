@@ -818,7 +818,7 @@ class CudaGraphRunner:
             if not self.enable_pdmux:
                 with graph_capture() as graph_capture_context, profile_context as prof:
                     self.stream = graph_capture_context.stream
-
+                    self._prealloc_symmetric_memory_pool()
                     _capture_one_stream()
             else:
                 set_pdmux_status(False)
