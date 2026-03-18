@@ -308,17 +308,6 @@ class HiMambaRadixCache(MambaRadixCache):
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
-            if extra_pools is not None:
-                logger.info(
-                    "HiCache mamba offload prepared for node %s: kv_tokens=%s mamba_states=%s",
-                    node.id,
-                    len(node.host_value),
-                    (
-                        len(node.mamba_host_value)
-                        if node.mamba_host_value is not None
-                        else 0
-                    ),
-                )
         else:
             return 0
 
@@ -366,7 +355,7 @@ class HiMambaRadixCache(MambaRadixCache):
             self.dec_lock_ref(ancestor_node)
             return None
 
-        logger.info(
+        logger.debug(
             f"Init load back from cpu -> gpu, kv hit length: {len(full_host_indices)}, mamba host hit length: {len(mamba_restore_nodes)}"
         )
         mamba_pools = self.mamba_restore_transfers(
@@ -1778,12 +1767,6 @@ class HiMambaRadixCache(MambaRadixCache):
             self._release_host_node(last_host_node)
             return
 
-        logger.info(
-            "HiCache mamba prefetch scheduled for request %s: kv_hit_pages=%s mamba_states=%s",
-            req_id,
-            prefetch_length // self.page_size,
-            1,
-        )
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,

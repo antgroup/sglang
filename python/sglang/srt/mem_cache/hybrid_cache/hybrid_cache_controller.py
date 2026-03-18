@@ -212,7 +212,6 @@ class HybridCacheController(BaseHiCacheController):
 
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
-        logger.info("Using pool-based interface for hybrid storage operations")
 
     def reset(self):
         super().reset()

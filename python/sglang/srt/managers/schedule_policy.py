@@ -773,7 +773,7 @@ class PrefillAdder:
                     InitLoadBackParams(
                         last_host_node=req.last_host_node,
                         host_hit_length=req.host_hit_length,
-                        req=req
+                        req=req,
                     )
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
