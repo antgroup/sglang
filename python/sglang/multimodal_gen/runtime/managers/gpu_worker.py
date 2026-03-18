@@ -369,6 +369,9 @@ class GPUWorker:
                     and req.session
                     and req.request_id in req.session.output_futures
                 ):
+                    _req = req
+                    _output_batch = output_batch
+                    _future = req.session.output_futures[req.request_id]
 
                     def _async_save_with_postprocess(_future, _req, _output_batch):
                         _output = _future.result()
@@ -376,9 +379,9 @@ class GPUWorker:
 
                     self._save_file_executor.submit(
                         _async_save_with_postprocess,
-                        req.session.output_futures[req.request_id],
-                        req,
-                        output_batch,
+                        _future,
+                        _req,
+                        _output_batch,
                     )
                     output_file_paths = []
                     for idx in range(output_batch.output_size):
