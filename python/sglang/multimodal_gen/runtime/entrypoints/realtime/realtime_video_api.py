@@ -77,6 +77,9 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             # asyn send to client
             asyncio.create_task(_scan_output_file_and_send(ws, save_file_path_list))
 
+            # finish
+            session.generate_chunk_completed()
+
             logger.info(
                 f"generate video chunk, "
                 f"request_id: {session.request_id},"

@@ -371,7 +371,7 @@ class GPUWorker:
                 ):
                     _req = req
                     _output_batch = output_batch
-                    _future = req.session.output_futures[req.request_id]
+                    _future = req.session.output_futures.pop(req.request_id)
 
                     def _async_save_with_postprocess(_future, _req, _output_batch):
                         _output = _future.result()
@@ -388,7 +388,7 @@ class GPUWorker:
                         output_file_paths.append(req.output_file_path(output_idx=idx))
                     output_batch.output_file_paths = output_file_paths
 
-                    # TODO: extract to avoid duplication
+            # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 # Avoid logging warmup perf records that share the same request_id.
                 if not req.is_warmup:
