@@ -382,7 +382,7 @@ class GPUWorker:
                     )
                     output_file_paths = []
                     for idx in range(output_batch.output_size):
-                        output_file_paths.append(req.build_output_path(idx))
+                        output_file_paths.append(req.output_file_path(output_idx=idx))
                     output_batch.output_file_paths = output_file_paths
 
                     # TODO: extract to avoid duplication

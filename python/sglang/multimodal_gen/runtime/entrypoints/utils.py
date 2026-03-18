@@ -483,13 +483,14 @@ def post_process_sample(
     # 4. Save outputs if requested
     if save_output:
         if save_file_path:
+            save_file_path_tmp = save_file_path + ".tmp"
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
             if data_type == DataType.VIDEO:
                 quality = (
                     output_compression / 10 if output_compression is not None else 5
                 )
                 imageio.mimsave(
-                    save_file_path,
+                    save_file_path_tmp,
                     frames,
                     fps=fps,
                     format=data_type.get_default_extension(),
@@ -498,13 +499,13 @@ def post_process_sample(
                 )
 
                 _maybe_mux_audio_into_mp4(
-                    save_file_path=save_file_path,
+                    save_file_path=save_file_path_tmp,
                     audio=audio,
                     frames=frames,
                     fps=fps,
                     audio_sample_rate=audio_sample_rate,
                 )
-
+                os.rename(save_file_path_tmp, save_file_path)
             else:
                 quality = output_compression if output_compression is not None else 75
                 if len(frames) > 1:
@@ -514,9 +515,13 @@ def post_process_sample(
                             indexed_path = f"{parts[0]}_{i}.{parts[1]}"
                         else:
                             indexed_path = f"{save_file_path}_{i}"
-                        imageio.imwrite(indexed_path, image, quality=quality)
+                        indexed_path_tmp = indexed_path + ".tmp"
+                        imageio.imwrite(indexed_path_tmp, image, quality=quality)
+                        os.rename(indexed_path_tmp, indexed_path)
                 else:
-                    imageio.imwrite(save_file_path, frames[0], quality=quality)
+                    imageio.imwrite(save_file_path_tmp, frames[0], quality=quality)
+                    os.rename(save_file_path_tmp, save_file_path)
+
             logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
         else:
             logger.info(f"No output path provided, output not saved")
