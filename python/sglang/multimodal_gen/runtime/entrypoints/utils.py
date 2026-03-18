@@ -483,7 +483,7 @@ def post_process_sample(
     # 4. Save outputs if requested
     if save_output:
         if save_file_path:
-            save_file_path_tmp = save_file_path + ".tmp"
+            save_file_path_tmp = get_tmp_file_path(save_file_path)
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
             if data_type == DataType.VIDEO:
                 quality = (
@@ -515,7 +515,7 @@ def post_process_sample(
                             indexed_path = f"{parts[0]}_{i}.{parts[1]}"
                         else:
                             indexed_path = f"{save_file_path}_{i}"
-                        indexed_path_tmp = indexed_path + ".tmp"
+                        indexed_path_tmp = get_tmp_file_path(indexed_path)
                         imageio.imwrite(indexed_path_tmp, image, quality=quality)
                         os.rename(indexed_path_tmp, indexed_path)
                 else:
@@ -527,3 +527,11 @@ def post_process_sample(
             logger.info(f"No output path provided, output not saved")
 
     return frames
+
+
+def get_tmp_file_path(save_file_path: str) -> str:
+    """Get a temporary file path for the given save file path."""
+    parts = save_file_path.rsplit(".", 1)
+    if len(parts) == 2:
+        return f"{parts[0]}_tmp.{parts[1]}"
+    return f"{save_file_path}_tmp"
