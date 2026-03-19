@@ -244,13 +244,13 @@ def rms_apply_serial(
 class MiniMaxM2RMSNormTP(nn.Module):
     """RMSNorm with Tensor Parallel support for QK normalization."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size: int, eps: float = 1e-6, repeat_n: int = 1) -> None:
         super().__init__()
         self.tp_world = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
         # Weight parameter is sharded across TP ranks
-        self.weight = nn.Parameter(torch.ones(int(hidden_size / self.tp_world)))
+        self.weight = nn.Parameter(torch.ones(int(hidden_size / self.tp_world) * repeat_n))
         self.weight.weight_loader = self.weight_loader
         self.variance_epsilon = eps
 
@@ -263,7 +263,9 @@ class MiniMaxM2RMSNormTP(nn.Module):
         tp_world = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
 
-        shard_size = loaded_weight.shape[0] // tp_world
+        repeat_n = param.data.shape[0] // (loaded_weight.shape[0] // tp_world)
+        shard_size = repeat_n*(loaded_weight.shape[0] // tp_world)
+        tp_rank = tp_rank // repeat_n
         shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
         param.data.copy_(loaded_weight[shard])
 
@@ -613,9 +615,15 @@ class MiniMaxM2Attention(nn.Module):
                 self.q_norm = MiniMaxM2RMSNormTP(
                     self.total_num_heads * self.head_dim, eps=config.rms_norm_eps
                 )
-                self.k_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_kv_heads * self.head_dim, eps=config.rms_norm_eps
-                )
+                if self.total_num_kv_heads >= tp_size:
+                    self.k_norm = MiniMaxM2RMSNormTP(
+                        self.total_num_kv_heads * self.head_dim, eps=config.rms_norm_eps
+                    )
+                else:
+                    repeat_n = tp_size // self.total_num_kv_heads
+                    self.k_norm = MiniMaxM2RMSNormTP(
+                        self.total_num_kv_heads * self.head_dim, eps=config.rms_norm_eps, repeat_n=repeat_n
+                    )
             else:
                 raise ValueError(f"Unsupported qk_norm_type: {self.qk_norm_type}")
 
