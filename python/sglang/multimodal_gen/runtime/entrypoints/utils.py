@@ -74,6 +74,12 @@ class ReleaseRealtimeSessionReq:
     session_id: str
 
 
+@dataclass
+class FileReadyNotification:
+    request_id: str
+    file_paths: list[str]
+
+
 def format_lora_message(
     lora_nickname: Union[str, List[str]],
     target: Union[str, List[str]],

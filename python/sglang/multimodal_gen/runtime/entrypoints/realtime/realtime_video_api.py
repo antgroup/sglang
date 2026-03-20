@@ -20,10 +20,15 @@ from sglang.multimodal_gen.runtime.entrypoints.realtime.generate_session import 
     RealtimeVideoMode,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    FileReadyNotification,
     ReleaseRealtimeSessionReq,
     prepare_request,
 )
-from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+from sglang.multimodal_gen.runtime.scheduler_client import (
+    async_scheduler_client,
+    register_notification_listener,
+    unregister_notification_listener,
+)
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -31,16 +36,27 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 
 
-async def _scan_output_file_and_send(ws: WebSocket, file_path_list: list[str]):
+async def _recv_notify_and_send(
+    ws: WebSocket,
+    notification_queue: asyncio.Queue,
+):
+    """Wait for a file-ready notification from the GPU worker via ZMQ."""
     while True:
-        save_file_path = file_path_list[0]
-        # wait for file
-        while not os.path.exists(save_file_path):
-            await asyncio.sleep(0.01)
-        with open(save_file_path, "rb") as f:
-            frame_bytes = f.read()
-        await write_frame_msg(frame_bytes, ws)
-        break
+        try:
+            notification = await asyncio.wait_for(
+                notification_queue.get(), timeout=None
+            )
+            if not isinstance(notification, FileReadyNotification):
+                continue
+
+            # send file contents to client
+            for file_path in notification.file_paths:
+                with open(file_path, "rb") as f:
+                    frame_bytes = f.read()
+                await write_frame_msg(frame_bytes, ws)
+        except Exception as e:
+            err_msg = str(e).splitlines()[0]
+            logger.error(f"error during sending bytes from queue: {err_msg}")
 
 
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
@@ -70,12 +86,7 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             batch.input_video = (
                 session.sample_video_frames() if session.is_v2v_enabled() else None
             )
-            save_file_path_list, result = await process_generation_batch(
-                async_scheduler_client, batch
-            )
-
-            # asyn send to client
-            asyncio.create_task(_scan_output_file_and_send(ws, save_file_path_list))
+            _, result = await process_generation_batch(async_scheduler_client, batch)
 
             # finish
             session.generate_chunk_completed()
@@ -84,7 +95,6 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                 f"generate video chunk, "
                 f"request_id: {session.request_id},"
                 f"chunk_cnt: {session.generate_chunk_cnt},"
-                f"save_file_path: {save_file_path_list[0]}"
             )
 
         except asyncio.CancelledError:
@@ -209,27 +219,36 @@ async def generate(websocket: WebSocket):
     session = GenerateSession()
     generate_task = None
     listen_task = None
+    send_task = None
+    notification_queue = register_notification_listener(session.id)
     try:
         # receive new generate request
         await _listen_generate_request(websocket, session)
 
         # generate video chunk
         generate_task = asyncio.create_task(_generate_loop(websocket, session))
-        # listen for actions
+        # listen for user actions
         listen_task = asyncio.create_task(_listen_actions(websocket, session))
+        # send video chunk back to client
+        sned_task = asyncio.create_task(
+            _recv_notify_and_send(websocket, notification_queue)
+        )
 
         await asyncio.wait(
-            [generate_task, listen_task], return_when=asyncio.FIRST_COMPLETED
+            [generate_task, listen_task, sned_task], return_when=asyncio.FIRST_COMPLETED
         )
 
     except WebSocketDisconnect:
         logger.info(f"client disconnected, session_id: {session.id}")
     finally:
         logger.info(f"terminating session, session_id: {session.id}")
+        unregister_notification_listener(session.id)
         if generate_task and not generate_task.done():
             generate_task.cancel()
         if listen_task and not listen_task.done():
             listen_task.cancel()
+        if send_task and not send_task.done():
+            send_task.cancel()
         try:
             await async_scheduler_client.forward(
                 ReleaseRealtimeSessionReq(session_id=session.id)

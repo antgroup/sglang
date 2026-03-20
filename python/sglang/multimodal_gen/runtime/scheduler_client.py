@@ -1,3 +1,4 @@
+import asyncio
 import pickle
 from typing import Any
 
@@ -8,6 +9,54 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+# --- Notification listener registry ---
+_notification_registry: dict[str, asyncio.Queue] = {}
+
+
+def register_notification_listener(session_id: str) -> asyncio.Queue:
+    """Register a per-session asyncio.Queue to receive file-ready notifications."""
+    q: asyncio.Queue = asyncio.Queue()
+    _notification_registry[session_id] = q
+    logger.debug(f"Registered notification listener for session {session_id}")
+    return q
+
+
+def unregister_notification_listener(session_id: str) -> None:
+    """Remove the per-session notification queue."""
+    _notification_registry.pop(session_id, None)
+    logger.debug(f"Unregistered notification listener for session {session_id}")
+
+
+def _dispatch_notification(notification: dict) -> None:
+    """Dispatch a notification to the matching session's asyncio.Queue."""
+    session_id = notification.get("session_id", "")
+    q = _notification_registry.get(session_id)
+    if q is not None:
+        q.put_nowait(notification)
+    else:
+        logger.warning(
+            f"No listener for notification session_id={session_id}, dropping"
+        )
+
+
+async def run_notification_listener(server_args: ServerArgs) -> None:
+    """Background coroutine that connects a ZMQ PULL socket to the scheduler's
+    PUSH socket and dispatches incoming file-ready notifications."""
+    ctx = zmq.asyncio.Context()
+    socket = ctx.socket(zmq.PULL)
+    socket.setsockopt(zmq.LINGER, 0)
+    endpoint = server_args.notification_endpoint
+    socket.connect(endpoint)
+    logger.info(f"Notification listener connected to {endpoint}")
+
+    while True:
+        try:
+            payload = await socket.recv()
+            notification = pickle.loads(payload)
+            _dispatch_notification(notification)
+        except Exception as e:
+            logger.error(f"Error in ZMQ Broker: {e}", exc_info=True)
 
 
 async def run_zeromq_broker(server_args: ServerArgs):

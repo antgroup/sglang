@@ -41,6 +41,7 @@ VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
 async def lifespan(app: FastAPI):
     from sglang.multimodal_gen.runtime.scheduler_client import (
         async_scheduler_client,
+        run_notification_listener,
         run_zeromq_broker,
     )
 
@@ -51,10 +52,14 @@ async def lifespan(app: FastAPI):
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
 
+    # 3. Start the notification listener for GPU worker file-ready events
+    notification_task = asyncio.create_task(run_notification_listener(server_args))
+
     yield
 
     # On shutdown
     logger.info("FastAPI app is shutting down...")
+    notification_task.cancel()
     broker_task.cancel()
     async_scheduler_client.close()
 

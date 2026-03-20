@@ -332,6 +332,17 @@ class ServerArgs:
         return self.port + 1
 
     @property
+    def notification_port(self) -> int:
+        return self.scheduler_port + 1
+
+    @property
+    def notification_endpoint(self) -> str:
+        notification_host = self.host
+        if notification_host is None or notification_host == "localhost":
+            notification_host = "127.0.0.1"
+        return f"tcp://{notification_host}:{self.notification_port}"
+
+    @property
     def is_local_mode(self) -> bool:
         """
         If no server is running when a generation task begins, 'local_mode' will be enabled: a dedicated server will be launched

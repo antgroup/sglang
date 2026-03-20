@@ -66,20 +66,29 @@ class Scheduler:
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
         endpoint = server_args.scheduler_endpoint
+        notification_endpoint = server_args.notification_endpoint
         if gpu_id == 0:
             # router allocates identify (envelope) for each connection
             self.receiver, actual_endpoint = get_zmq_socket(
                 self.context, zmq.ROUTER, endpoint, True
             )
             logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
+
+            # Notification channel: GPU worker -> Callback -> ZMQ PUSH -> Scheduler Client
+            self.notifier, notify_actual_enpoint = get_zmq_socket(
+                self.context, zmq.PUSH, notification_endpoint, True
+            )
+            logger.info(f"Notification socket bound at {notify_actual_enpoint}")
         else:
             self.receiver = None
+            self.notifier = None
 
         worker = GPUWorker(
             local_rank=gpu_id,
             master_port=port_args.master_port,
             rank=gpu_id,
             server_args=server_args,
+            notify_callback=self._send_notification if gpu_id == 0 else None,
         )
         self.worker = worker
         self.task_pipes_to_slaves = task_pipes_to_slaves
@@ -184,6 +193,18 @@ class Scheduler:
         """
         if not is_warmup and self.receiver is not None and identity is not None:
             self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
+
+    def _send_notification(self, notification: dict):
+        """Send notification directly via ZMQ PUSH socket.
+
+        This is called from ThreadPoolExecutor's worker thread (max_workers=1),
+        so it's safe to use ZMQ socket directly without additional synchronization.
+        """
+        if self.notifier is not None:
+            try:
+                self.notifier.send(pickle.dumps(notification))
+            except Exception as e:
+                logger.error(f"Error sending notification: {e}")
 
     def get_next_batch_to_run(self) -> list[tuple[bytes, Req]] | None:
         """pull a req from waiting_queue"""
@@ -421,6 +442,8 @@ class Scheduler:
                 logger.error(f"ZMQ error sending reply: {e}")
                 continue
 
+        if self.notifier is not None:
+            self.notifier.close()
         if self.receiver is not None:
             self.receiver.close()
         self.context.destroy(linger=0)

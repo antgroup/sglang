@@ -30,7 +30,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    FileReadyNotification,
+    save_outputs,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.loader.weights_updater import (
     WeightsUpdater,
@@ -77,6 +80,7 @@ class GPUWorker:
         rank: int,
         master_port: int,
         server_args: ServerArgs,
+        notify_callback: callable | None = None,
     ):
         self.local_rank = local_rank
         self.rank = rank
@@ -84,6 +88,7 @@ class GPUWorker:
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
+        self.notify_callback = notify_callback
 
         self.init_device_and_model()
         self.sp_group = get_sp_group()
@@ -96,7 +101,7 @@ class GPUWorker:
         self._realtime_session_cache: OrderedDict[str, RealtimeSession] = OrderedDict()
         self._max_realtime_sessions = 128
 
-        self._save_file_executor = ThreadPoolExecutor(max_workers=10)
+        self._save_file_executor = ThreadPoolExecutor(max_workers=1)
 
     def _dispose_realtime_session(
         self, session_id: str, session: RealtimeSession | None
@@ -360,6 +365,7 @@ class GPUWorker:
 
             if req.save_output and req.return_file_paths_only and self.rank == 0:
                 if output_batch.output is not None:
+                    # handle sync save file
                     output_batch.output_file_paths = _save_output_file(
                         output_batch.output, req, output_batch
                     )
@@ -369,24 +375,28 @@ class GPUWorker:
                     and req.session
                     and req.request_id in req.session.output_futures
                 ):
+                    # handle async save file and notify callback
                     _req = req
                     _output_batch = output_batch
                     _future = req.session.output_futures.pop(req.request_id)
+                    _notify_callback = self.notify_callback
 
-                    def _async_save_with_postprocess(_future, _req, _output_batch):
+                    def _async_save_with_postprocess(
+                        _future, _req, _output_batch, _notify_callback
+                    ):
                         _output = _future.result()
-                        return _save_output_file(_output, _req, _output_batch)
+                        saved_paths = _save_output_file(_output, _req, _output_batch)
+                        _notify_callback(
+                            FileReadyNotification(_req.request_id, saved_paths)
+                        )
 
                     self._save_file_executor.submit(
                         _async_save_with_postprocess,
                         _future,
                         _req,
                         _output_batch,
+                        _notify_callback,
                     )
-                    output_file_paths = []
-                    for idx in range(output_batch.output_size):
-                        output_file_paths.append(req.output_file_path(output_idx=idx))
-                    output_batch.output_file_paths = output_file_paths
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
