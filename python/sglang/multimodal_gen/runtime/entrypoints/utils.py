@@ -75,7 +75,12 @@ class ReleaseRealtimeSessionReq:
 
 
 @dataclass
-class FileReadyNotification:
+class Notification:
+    dispatch_id: str
+
+
+@dataclass
+class FileReadyNotification(Notification):
     request_id: str
     file_paths: list[str]
 

@@ -5,6 +5,7 @@ from typing import Any
 import zmq
 import zmq.asyncio
 
+from sglang.multimodal_gen.runtime.entrypoints.utils import Notification
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -14,29 +15,29 @@ logger = init_logger(__name__)
 _notification_registry: dict[str, asyncio.Queue] = {}
 
 
-def register_notification_listener(session_id: str) -> asyncio.Queue:
+def register_notification_listener(dispatch_id: str) -> asyncio.Queue:
     """Register a per-session asyncio.Queue to receive file-ready notifications."""
     q: asyncio.Queue = asyncio.Queue()
-    _notification_registry[session_id] = q
-    logger.debug(f"Registered notification listener for session {session_id}")
+    _notification_registry[dispatch_id] = q
+    logger.debug(f"Registered notification listener for session {dispatch_id}")
     return q
 
 
-def unregister_notification_listener(session_id: str) -> None:
+def unregister_notification_listener(dispatch_id: str) -> None:
     """Remove the per-session notification queue."""
-    _notification_registry.pop(session_id, None)
-    logger.debug(f"Unregistered notification listener for session {session_id}")
+    _notification_registry.pop(dispatch_id, None)
+    logger.debug(f"Unregistered notification listener for dispatch_id={dispatch_id}")
 
 
-def _dispatch_notification(notification: dict) -> None:
+def _dispatch_notification(notification: Notification) -> None:
     """Dispatch a notification to the matching session's asyncio.Queue."""
-    session_id = notification.get("session_id", "")
-    q = _notification_registry.get(session_id)
+    dispatch_id = notification.dispatch_id
+    q = _notification_registry.get(dispatch_id)
     if q is not None:
         q.put_nowait(notification)
     else:
         logger.warning(
-            f"No listener for notification session_id={session_id}, dropping"
+            f"No listener for notification dispatch_id={dispatch_id}, dropping"
         )
 
 

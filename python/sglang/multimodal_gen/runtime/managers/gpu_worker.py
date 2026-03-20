@@ -387,7 +387,11 @@ class GPUWorker:
                         _output = _future.result()
                         saved_paths = _save_output_file(_output, _req, _output_batch)
                         _notify_callback(
-                            FileReadyNotification(_req.request_id, saved_paths)
+                            FileReadyNotification(
+                                dispatch_id=_req.session.session_id,
+                                request_id=_req.request_id,
+                                file_paths=saved_paths,
+                            )
                         )
 
                     self._save_file_executor.submit(
