@@ -560,7 +560,7 @@ class KreaRealtimeVideoDenoisingStage(PipelineStage):
             dtype=vae_dtype,
         ).view(1, self.vae.config.z_dim, 1, 1, 1)
         self._maybe_enable_torch_compile()
-        self._postprocess_executor = ThreadPoolExecutor(max_workers=10)
+        self._postprocess_executor = ThreadPoolExecutor(max_workers=1)
 
     def _maybe_enable_torch_compile(self) -> None:
         _maybe_compile_module(

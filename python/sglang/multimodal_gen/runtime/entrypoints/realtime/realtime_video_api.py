@@ -230,12 +230,12 @@ async def generate(websocket: WebSocket):
         # listen for user actions
         listen_task = asyncio.create_task(_listen_actions(websocket, session))
         # send video chunk back to client
-        sned_task = asyncio.create_task(
+        send_task = asyncio.create_task(
             _recv_notify_and_send(websocket, notification_queue)
         )
 
         await asyncio.wait(
-            [generate_task, listen_task, sned_task], return_when=asyncio.FIRST_COMPLETED
+            [generate_task, listen_task, send_task], return_when=asyncio.FIRST_COMPLETED
         )
 
     except WebSocketDisconnect:
