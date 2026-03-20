@@ -143,11 +143,6 @@ class OneDRotaryEmbedding(torch.nn.Module):
         This method converts the input tensor to a hashable representation
         and calls a cached helper method to perform the computation.
         """
-        # Avoid GPU -> CPU synchronization from tolist() on CUDA path.
-        if pos.is_cuda:
-            pos = pos.to(self.dtype)
-            return self.build_freqs_outer(pos, pos.device)
-
         pos_tuple = tuple(pos.tolist())
         device_str = str(pos.device)
         return self._forward_cached(pos_tuple, device_str)
@@ -244,14 +239,16 @@ class NDRotaryEmbedding(torch.nn.Module):
         Returns:
             A tuple of (cos, sin) tensors.
         """
-        # Avoid GPU -> CPU synchronization from tolist() on CUDA path.
-        if positions.is_cuda:
-            return self.forward_uncached(pos=positions)
-
         # Caching wrapper: convert tensor to a hashable tuple of tuples.
         pos_tuple = tuple(map(tuple, positions.tolist()))
         device_str = str(positions.device)
         return self._forward_cached(pos_tuple, device_str)
+
+    def forward_cuda(
+        self, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Avoid GPU -> CPU synchronization from tolist() on CUDA path.
+        return self.forward_uncached(pos=positions)
 
     @functools.lru_cache(maxsize=16)
     def _forward_cached(

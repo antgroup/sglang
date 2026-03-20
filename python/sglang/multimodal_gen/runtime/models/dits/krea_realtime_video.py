@@ -208,9 +208,7 @@ class KreaCausalWanTransformer3DModel(BaseCausalWanTransformer3DModel):
         h_idx = rem // post_patch_width
         w_idx = rem % post_patch_width
         positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
-        freqs_cos, freqs_sin = self._get_nd_rotary_embedder().forward_uncached(
-            positions
-        )
+        freqs_cos, freqs_sin = self._get_nd_rotary_embedder().forward_cuda(positions)
         return freqs_cos.float(), freqs_sin.float()
 
     def _forward_inference(
