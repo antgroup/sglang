@@ -7,7 +7,7 @@ import os
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, List, Sequence, Union
+from typing import Any, Callable, List, Sequence, Union
 
 import torch
 from setproctitle import setproctitle
@@ -80,7 +80,7 @@ class GPUWorker:
         rank: int,
         master_port: int,
         server_args: ServerArgs,
-        notify_callback: callable | None = None,
+        notify_callback: Callable | None = None,
     ):
         self.local_rank = local_rank
         self.rank = rank
