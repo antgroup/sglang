@@ -280,6 +280,7 @@ async def process_generation_batch(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
 
+        save_file_path_list = []
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths
         elif result.output:
