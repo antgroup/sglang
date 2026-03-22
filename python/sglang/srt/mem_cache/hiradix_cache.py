@@ -26,15 +26,25 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
+    HostPoolGroup,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
-    NSATokenToKVPoolHost,
+    NSAIndexerPoolHost,
+    PoolEntry,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -52,6 +62,83 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _build_nsa_hybrid_stack(
+    radix_cache: "HiRadixCache",
+    params: "CacheInitParams",
+    server_args: "ServerArgs",
+    *,
+    extra_config: dict,
+    prefetch_threshold: int,
+    enable_storage_metrics: bool,
+    load_cache_event,
+) -> None:
+    """HostPoolGroup (KV + indexer) + HybridCacheController for NSA (DSA)."""
+    kv = radix_cache.kv_cache
+    mla_host = MLATokenToKVPoolHost(
+        kv,
+        server_args.hicache_ratio,
+        server_args.hicache_size,
+        radix_cache.page_size,
+        server_args.hicache_mem_layout,
+        allocator_type=server_args.hicache_storage_backend,
+        override_kv_cache_dim=kv.kv_cache_dim,
+    )
+    indexer_host = NSAIndexerPoolHost(
+        kv,
+        mla_host,
+        server_args.hicache_mem_layout,
+        allocator_type=server_args.hicache_storage_backend,
+    )
+    layer_num = kv.layer_num
+
+    def layer_mapper(layer_id: int):
+        if 0 <= layer_id < layer_num:
+            return layer_id
+        return None
+
+    host_pool_group = HostPoolGroup(
+        [
+            PoolEntry(
+                name=PoolName.KV,
+                host_pool=mla_host,
+                device_pool=kv,
+                layer_mapper=layer_mapper,
+                is_primary_index_anchor=True,
+            ),
+            PoolEntry(
+                name=PoolName.INDEXER,
+                host_pool=indexer_host,
+                device_pool=kv,
+                layer_mapper=layer_mapper,
+                share_indices_with_anchor=True,
+            ),
+        ]
+    )
+    radix_cache.token_to_kv_pool_host = host_pool_group
+    radix_cache.cache_controller = HybridCacheController(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        radix_cache.page_size,
+        radix_cache.tp_group,
+        load_cache_event=load_cache_event,
+        write_policy=server_args.hicache_write_policy,
+        io_backend=server_args.hicache_io_backend,
+        storage_backend=server_args.hicache_storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=server_args.served_model_name,
+        storage_backend_extra_config=extra_config,
+        pp_rank=radix_cache.pp_rank,
+        pp_size=radix_cache.pp_size,
+        transfer_layer_num=layer_num,
+        enable_storage_metrics=enable_storage_metrics,
+    )
+    logger.info(
+        "NSA hierarchical cache: HostPoolGroup(KV + INDEXER), HybridCacheController, "
+        "transfer_layer_num=%s",
+        layer_num,
+    )
 
 
 class HiRadixCache(RadixCache):
@@ -82,14 +169,8 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
-            self.token_to_kv_pool_host = NSATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
-            )
+            # Filled by _build_nsa_hybrid_stack after storage extra_config is parsed.
+            self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
@@ -100,7 +181,9 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         else:
-            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+            raise ValueError(
+                "HiRadixCache only supports MHA, MLA, and NSA (DSA) models"
+            )
 
         self.tp_group = params.tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -124,22 +207,33 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        self.cache_controller = HiCacheController(
-            params.token_to_kv_pool_allocator,
-            self.token_to_kv_pool_host,
-            self.page_size,
-            self.tp_group,
-            load_cache_event=self.load_cache_event,
-            write_policy=server_args.hicache_write_policy,
-            io_backend=server_args.hicache_io_backend,
-            storage_backend=server_args.hicache_storage_backend,
-            prefetch_threshold=prefetch_threshold,
-            model_name=server_args.served_model_name,
-            storage_backend_extra_config=extra_config,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
-            enable_storage_metrics=self.enable_storage_metrics,
-        )
+        if isinstance(self.kv_cache, NSATokenToKVPool):
+            _build_nsa_hybrid_stack(
+                self,
+                params,
+                server_args,
+                extra_config=extra_config,
+                prefetch_threshold=prefetch_threshold,
+                enable_storage_metrics=self.enable_storage_metrics,
+                load_cache_event=self.load_cache_event,
+            )
+        else:
+            self.cache_controller = HiCacheController(
+                params.token_to_kv_pool_allocator,
+                self.token_to_kv_pool_host,
+                self.page_size,
+                self.tp_group,
+                load_cache_event=self.load_cache_event,
+                write_policy=server_args.hicache_write_policy,
+                io_backend=server_args.hicache_io_backend,
+                storage_backend=server_args.hicache_storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=extra_config,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                enable_storage_metrics=self.enable_storage_metrics,
+            )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
             prefetch_threshold=prefetch_threshold,
@@ -339,12 +433,21 @@ class HiRadixCache(RadixCache):
             )
 
         try:
-            self.cache_controller.attach_storage_backend(
-                storage_backend=storage_backend,
-                prefetch_threshold=prefetch_threshold,
-                model_name=served_model_name,
-                storage_backend_extra_config=extra_config,
-            )
+            if isinstance(self.cache_controller, HybridCacheController):
+                self.cache_controller.attach_storage_backend(
+                    storage_backend=storage_backend,
+                    prefetch_threshold=prefetch_threshold,
+                    model_name=served_model_name,
+                    storage_backend_extra_config=extra_config,
+                    host_pools=self.cache_controller.mem_pool_host.entries,
+                )
+            else:
+                self.cache_controller.attach_storage_backend(
+                    storage_backend=storage_backend,
+                    prefetch_threshold=prefetch_threshold,
+                    model_name=served_model_name,
+                    storage_backend_extra_config=extra_config,
+                )
         except Exception as e:
             logger.exception(
                 f"Failed to attach storage backend '{storage_backend}': {e}"
@@ -610,6 +713,22 @@ class HiRadixCache(RadixCache):
             height += 1
         return height
 
+    def _hybrid_pools_kw(self, host_indices: Optional[torch.Tensor]=None) -> dict:
+        if not isinstance(
+            self.cache_controller, HybridCacheController
+        ):
+            return {}
+        if isinstance(self.kv_cache, NSATokenToKVPool):
+            pool =  PoolTransfer(
+                name=PoolName.INDEXER,
+                host_indices=host_indices,
+                device_indices=None,
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+            )
+            return {"extra_pools": [pool]}
+        else:
+            return {}
+
     def clear_storage_backend(self) -> bool:
         if self.enable_storage:
             try:
@@ -633,15 +752,18 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False):
+        write_kw = self._hybrid_pools_kw()
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
+            **write_kw,
         )
         if host_indices is None:
             self.evict_host(len(node.value))
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
+                **write_kw,
             )
         if host_indices is not None:
             node.host_value = host_indices
@@ -662,8 +784,9 @@ class HiRadixCache(RadixCache):
             else None
         )
 
+        storage_kw = self._hybrid_pools_kw(host_indices=node.host_value)
         operation_id = self.cache_controller.write_storage(
-            node.host_value, node.key, node.hash_value, prefix_keys
+            node.host_value, node.key, node.hash_value, prefix_keys, **storage_kw
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
@@ -1030,12 +1153,16 @@ class HiRadixCache(RadixCache):
             return None
 
         device_indices = self.cache_controller.load(
-            host_indices=host_indices, node_id=last_hit_node.id
+            host_indices=host_indices,
+            node_id=last_hit_node.id,
+            **self._hybrid_pools_kw(host_indices=host_indices),
         )
         if device_indices is None:
             self.evict(EvictParams(num_tokens=len(host_indices)))
             device_indices = self.cache_controller.load(
-                host_indices=host_indices, node_id=last_hit_node.id
+                host_indices=host_indices,
+                node_id=last_hit_node.id,
+                **self._hybrid_pools_kw(host_indices=host_indices),
             )
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
@@ -1336,7 +1463,12 @@ class HiRadixCache(RadixCache):
             # no sufficient host memory for prefetch
             return
         operation = self.cache_controller.prefetch(
-            req_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            req_id,
+            host_indices,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            **self._hybrid_pools_kw(host_indices=host_indices),
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
