@@ -760,12 +760,9 @@ class CudaGraphRunner:
             logger.info(f"Pre-allocating symmetric memory pool for dcp")
             with use_symmetric_memory(get_dcp_group()):
                 [
-                    torch.empty(2 * 1024 * 1024, dtype=torch.uint8, device=self.device)
-                    for i in range(5)
-                ]
-                [
-                    torch.empty(20 * 1024 * 1024, dtype=torch.uint8, device=self.device)
-                    for i in range(5)
+                    torch.empty(size, dtype=torch.uint8, device=self.device)
+                    for j in range(8)
+                    for size in [3 * 512 * 1024, 20 * 1024 * 1024]
                 ]
 
     def capture(self) -> None:
