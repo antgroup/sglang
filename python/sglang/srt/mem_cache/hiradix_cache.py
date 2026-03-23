@@ -713,7 +713,7 @@ class HiRadixCache(RadixCache):
             height += 1
         return height
 
-    def _hybrid_pools_kw(self, host_indices: Optional[torch.Tensor]=None) -> dict:
+    def _get_extra_pools_kw(self) -> dict:
         if not isinstance(
             self.cache_controller, HybridCacheController
         ):
@@ -721,8 +721,6 @@ class HiRadixCache(RadixCache):
         if isinstance(self.kv_cache, NSATokenToKVPool):
             pool =  PoolTransfer(
                 name=PoolName.INDEXER,
-                host_indices=host_indices,
-                device_indices=None,
                 hit_policy=PoolHitPolicy.ALL_PAGES,
             )
             return {"extra_pools": [pool]}
@@ -752,7 +750,7 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False):
-        write_kw = self._hybrid_pools_kw()
+        write_kw = self._get_extra_pools_kw()
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -784,7 +782,7 @@ class HiRadixCache(RadixCache):
             else None
         )
 
-        storage_kw = self._hybrid_pools_kw(host_indices=node.host_value)
+        storage_kw = self._get_extra_pools_kw()
         operation_id = self.cache_controller.write_storage(
             node.host_value, node.key, node.hash_value, prefix_keys, **storage_kw
         )
@@ -1155,14 +1153,14 @@ class HiRadixCache(RadixCache):
         device_indices = self.cache_controller.load(
             host_indices=host_indices,
             node_id=last_hit_node.id,
-            **self._hybrid_pools_kw(host_indices=host_indices),
+            **self._get_extra_pools_kw(),
         )
         if device_indices is None:
             self.evict(EvictParams(num_tokens=len(host_indices)))
             device_indices = self.cache_controller.load(
                 host_indices=host_indices,
                 node_id=last_hit_node.id,
-                **self._hybrid_pools_kw(host_indices=host_indices),
+                **self._get_extra_pools_kw(),
             )
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
@@ -1468,7 +1466,7 @@ class HiRadixCache(RadixCache):
             new_input_tokens,
             last_hash,
             prefix_keys,
-            **self._hybrid_pools_kw(host_indices=host_indices),
+            **self._get_extra_pools_kw(),
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,

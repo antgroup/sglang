@@ -1766,7 +1766,7 @@ class NSAIndexerPoolHost(HostKVCache):
             requested_bytes / 1e9,
             layout,
         )
-        self.kv_buffer = self.init_kv_buffer()
+        self.init_kv_buffer()
         self.lock = threading.RLock()
         self.clear()
 
@@ -1778,7 +1778,7 @@ class NSAIndexerPoolHost(HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
-    def _init_indexer_buffers(self):
+    def init_kv_buffer(self):
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         self.index_k_device_ptrs = torch.tensor(
             [x.data_ptr() for x in self.device_pool.index_k_with_scale_buffer],
