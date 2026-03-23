@@ -530,16 +530,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # - MAMBA  : one temporal key + N conv keys per page
         # key_multiplier records how many component keys are generated per page,
         # so post-processing can fold component results back to page-level booleans.
-        name = str(transfer.name)
+        name = transfer.name
         component_keys = []
         key_multiplier = 0
         for page_key in page_keys:
-            if name == PoolName.INDEXER.value:
+            if name == PoolName.INDEXER:
                 key_multiplier = 1
                 component_keys.append(
                     f"{page_key}_{self.mla_suffix}_{PoolName.INDEXER}"
                 )
-            elif name == PoolName.MAMBA.value:
+            elif name == PoolName.MAMBA:
                 base_key = f"{page_key}_{self.mha_suffix}"
                 mamba_pool = getattr(self, "registered_pools", {}).get(PoolName.MAMBA)
                 conv_num = len(getattr(mamba_pool, "conv_buffer", []) or [])
@@ -564,8 +564,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         def has_component(exist_results: List[int], page_idx: int, key_multiplier: int):
             # Group component existence by page, then require all components hit.
+            if key_multiplier <= 0:
+                return False
             result_groups = exist_results[
-                (page_idx - 1) * key_multiplier : page_idx * key_multiplier
+                page_idx * key_multiplier : (page_idx + 1) * key_multiplier
             ]
             return all(result == 1 for result in result_groups)
 
@@ -611,7 +613,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             page_size = getattr(host_pool, "page_size", 1) or 1
             host_indices = transfer.host_indices
             assert len(keys) > 0
-            assert len(keys) == host_indices // page_size
+            assert len(keys) == len(host_indices) // page_size
 
             ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(

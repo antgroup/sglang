@@ -1112,6 +1112,10 @@ class MambaPoolHost(HostKVCache):
             conv_state.shape[2:] for conv_state in device_pool.mamba_cache.conv
         ]
         self.temporal_state_shape = device_pool.mamba_cache.temporal.shape[2:]
+        self.temporal_state_elem_size = int(np.prod(self.temporal_state_shape))
+        self.conv_state_elem_sizes = [
+            int(np.prod(conv_shape)) for conv_shape in self.conv_state_shapes
+        ]
         self.conv_dtype = device_pool.mamba_cache.conv[0].dtype
         self.temporal_dtype = device_pool.mamba_cache.temporal.dtype
         self.dtype = self.conv_dtype
@@ -1250,12 +1254,10 @@ class MambaPoolHost(HostKVCache):
         return len(indices)
 
     def get_size_per_token(self):
-        conv_total_size = 0
-        for conv_shape in self.conv_state_shapes:
-            conv_total_size += int(np.prod(conv_shape)) * self.conv_dtype.itemsize
-        temporal_size = (
-            int(np.prod(self.temporal_state_shape)) * self.temporal_dtype.itemsize
+        conv_total_size = sum(
+            conv_elem_size * self.conv_dtype.itemsize for conv_elem_size in self.conv_state_elem_sizes
         )
+        temporal_size = self.temporal_state_elem_size * self.temporal_dtype.itemsize
         return (conv_total_size + temporal_size) * self.num_mamba_layers
 
     def get_ksize_per_token(self):
@@ -1514,16 +1516,16 @@ class MambaPoolHost(HostKVCache):
             self.page_size
             * self.num_mamba_layers
             * self.temporal_dtype.itemsize
-            * self.temporal_state_shape
+            * self.temporal_state_elem_size
         )
         conv_element_sizes = [
             (
                 self.page_size
                 * self.num_mamba_layers
                 * self.conv_dtype.itemsize
-                * conv_shape
+                * self.conv_state_elem_sizes[i]
             )
-            for conv_shape in self.conv_state_shapes
+            for i in range(len(self.conv_state_shapes))
         ]
 
         for i in range(0, len(indices), self.page_size):
@@ -1533,7 +1535,7 @@ class MambaPoolHost(HostKVCache):
                 temporal_base_ptr
                 + indices[i]
                 * self.num_mamba_layers
-                * self.temporal_state_shape
+                * self.temporal_state_elem_size
                 * self.temporal_dtype.itemsize
             )
             ptr_list.append(temporal_ptr)
@@ -1543,7 +1545,7 @@ class MambaPoolHost(HostKVCache):
                     conv_base_ptrs[j]
                     + indices[i]
                     * self.num_mamba_layers
-                    * self.conv_state_shapes[j]
+                    * self.conv_state_elem_sizes[j]
                     * self.conv_dtype.itemsize
                 )
                 ptr_list.append(conv_ptr)
