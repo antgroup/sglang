@@ -714,12 +714,10 @@ class HiRadixCache(RadixCache):
         return height
 
     def _get_extra_pools_kw(self) -> dict:
-        if not isinstance(
-            self.cache_controller, HybridCacheController
-        ):
+        if not isinstance(self.cache_controller, HybridCacheController):
             return {}
         if isinstance(self.kv_cache, NSATokenToKVPool):
-            pool =  PoolTransfer(
+            pool = PoolTransfer(
                 name=PoolName.INDEXER,
                 hit_policy=PoolHitPolicy.ALL_PAGES,
             )

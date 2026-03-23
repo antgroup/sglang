@@ -235,7 +235,7 @@ class HybridCacheController(BaseHiCacheController):
             extra_pools,
             alloc_host=True,
             kv_device_indices=device_indices,
-            kv_host_indices=host_indices
+            kv_host_indices=host_indices,
         )
         if pool_transfers is None and extra_pools:
             self.mem_pool_host.free(host_indices)
@@ -297,7 +297,7 @@ class HybridCacheController(BaseHiCacheController):
             extra_pools,
             alloc_host=False,
             kv_device_indices=device_indices,
-            kv_host_indices=host_indices
+            kv_host_indices=host_indices,
         )
         if pool_transfers is None and extra_pools:
             if need_load_kv:

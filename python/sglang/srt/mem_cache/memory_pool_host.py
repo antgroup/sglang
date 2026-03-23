@@ -1255,7 +1255,8 @@ class MambaPoolHost(HostKVCache):
 
     def get_size_per_token(self):
         conv_total_size = sum(
-            conv_elem_size * self.conv_dtype.itemsize for conv_elem_size in self.conv_state_elem_sizes
+            conv_elem_size * self.conv_dtype.itemsize
+            for conv_elem_size in self.conv_state_elem_sizes
         )
         temporal_size = self.temporal_state_elem_size * self.temporal_dtype.itemsize
         return (conv_total_size + temporal_size) * self.num_mamba_layers
