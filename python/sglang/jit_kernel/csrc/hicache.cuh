@@ -14,6 +14,11 @@ namespace device {
 
 namespace details {
 
+template <typename T, uint32_t N>
+struct LocalStorage {
+  T data[N];
+};
+
 template <int kUnit>
 inline constexpr auto get_mem_package() {
   if constexpr (kUnit == 16) {
@@ -78,7 +83,7 @@ SGL_DEVICE auto load_vec(const void* __restrict__ src) {
   static_assert(128 % kNumThreads == 0, "kNumThreads must divide 128 bytes");
   constexpr uint32_t kLoopCount = kBytes / 128;
   using Package = details::PackageType<128 / kNumThreads>;
-  using Storage = AlignedStorage<Package, kLoopCount>;
+  using Storage = details::LocalStorage<Package, kLoopCount>;
 
   const auto src_packed = static_cast<const Package*>(src);
   const auto lane_id = threadIdx.x % kNumThreads;
