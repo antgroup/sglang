@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 import os
 import pprint
-from collections import deque
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import Any, Optional
@@ -335,22 +334,10 @@ class Req:
 @dataclass
 class RealtimeSession:
     def __init__(self):
-        self.kv_cache: Any = None
-        self.crossattn_cache: Any = None
-        self.current_denoised_latents: torch.Tensor = None
-        self.frame_cache_context: deque = None
-        self.decoder_cache: Any = None
-        self.input_frames_cache: deque = None
+        self.state: dict[str, Any] = {}
 
     def dispose(self):
-        self.kv_cache = None
-        self.crossattn_cache = None
-        self.current_denoised_latents = None
-        if self.frame_cache_context:
-            self.frame_cache_context.clear()
-        self.decoder_cache = None
-        if self.input_frames_cache:
-            self.input_frames_cache.clear()
+        self.state.clear()
 
 
 @dataclass
