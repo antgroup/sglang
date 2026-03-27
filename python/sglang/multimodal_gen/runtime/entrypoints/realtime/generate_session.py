@@ -108,6 +108,7 @@ class GenerateSession:
             # only support prompt action
             if realtime_action.type == "prompt":
                 prompt = realtime_action.action_content
+                self.request.prompt = prompt
         else:
             # TODO(@puf147): generate with empty action
             prompt = self.request.prompt
