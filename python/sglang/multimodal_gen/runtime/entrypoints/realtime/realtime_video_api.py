@@ -218,7 +218,7 @@ async def generate(websocket: WebSocket):
         logger.info(f"terminating session, session_id: {session.id}")
         if generate_task and not generate_task.done():
             generate_task.cancel()
-        if listen_task and not generate_task.done():
+        if listen_task and not listen_task.done():
             listen_task.cancel()
         try:
             await async_scheduler_client.forward(
