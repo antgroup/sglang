@@ -93,7 +93,7 @@ class GPUWorker:
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
-        self._realtime_sessions = RealtimeSessionCache(max_sessions=32)
+        self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         if not session_id:
