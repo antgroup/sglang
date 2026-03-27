@@ -22,6 +22,9 @@ import PIL.Image
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
+    RealtimeSession,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     _sanitize_for_logging,
@@ -329,15 +332,6 @@ class Req:
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
         logger.info(debug_str)
-
-
-@dataclass
-class RealtimeSession:
-    def __init__(self):
-        self.state: dict[str, Any] = {}
-
-    def dispose(self):
-        self.state.clear()
 
 
 @dataclass

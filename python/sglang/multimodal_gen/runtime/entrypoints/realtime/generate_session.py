@@ -9,7 +9,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeVideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import RealtimeSession
+from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
+    RealtimeSession,
+)
 
 
 class RealtimeVideoMode(str, Enum):
