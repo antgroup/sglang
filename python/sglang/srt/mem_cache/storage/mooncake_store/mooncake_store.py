@@ -615,36 +615,23 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
             if is_set:
                 exist_result = self._batch_exist(key_strs)
-                set_keys = []
-                set_ptrs = []
-                set_sizes = []
-                set_idx = []
-                set_results = [-1] * len(key_strs)
-                for i in range(len(key_strs)):
-                    if exist_result[i] != 1:
-                        set_keys.append(key_strs[i])
-                        set_ptrs.append(ptr_list[i])
-                        set_sizes.append(element_size_list[i])
-                        set_idx.append(i)
-                    else:
-                        set_results[i] = 0
-                if set_keys:
+                io_results = [0 if state == 1 else -1 for state in exist_result]
+                missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
+                if missing_idx:
                     put_results = self._put_batch_zero_copy_impl(
-                        set_keys, set_ptrs, set_sizes
+                        [key_strs[i] for i in missing_idx],
+                        [ptr_list[i] for i in missing_idx],
+                        [element_size_list[i] for i in missing_idx],
                     )
-                    for j, orig_i in enumerate(set_idx):
-                        set_results[orig_i] = put_results[j]
-                ok = self._batch_postprocess(
-                    set_results, is_set_operate=True, key_multiplier=key_multiplier
-                )
+                    for i, res in zip(missing_idx, put_results):
+                        io_results[i] = res
             else:
-                get_results = self._get_batch_zero_copy_impl(
+                io_results = self._get_batch_zero_copy_impl(
                     key_strs, ptr_list, element_size_list
                 )
-                ok = self._batch_postprocess(
-                    get_results, is_set_operate=False, key_multiplier=key_multiplier
-                )
-            results[transfer.name] = ok
+            results[transfer.name] = self._batch_postprocess(
+                io_results, is_set_operate=is_set, key_multiplier=key_multiplier
+            )
         return results
 
     def batch_get_v2(
