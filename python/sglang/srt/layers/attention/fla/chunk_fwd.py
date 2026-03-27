@@ -6,17 +6,11 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
-from sglang.srt.layers.attention.fla.op import exp
+from sglang.srt.layers.attention.fla.op import safe_exp
 from sglang.srt.layers.attention.fla.utils import (
     autotune_cache_kwargs,
-    is_tf32_supported,
 )
 from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd
-
-if is_tf32_supported:
-    SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
-else:
-    SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
 
 
 @triton.heuristics(
@@ -31,7 +25,7 @@ else:
         for BK in [32, 64]
         for num_warps in [1, 2, 4]
     ],
-    key=["H", "K", "BC"],
+    key=["H", "Hg", "K", "BC"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -44,6 +38,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     chunk_indices,
     T,
     H: tl.constexpr,
+    Hg: tl.constexpr,
     K: tl.constexpr,
     BT: tl.constexpr,
     BC: tl.constexpr,
@@ -86,7 +81,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     i_tc2 = i_t * BT + 2 * BC
     i_tc3 = i_t * BT + 3 * BC
 
-    k += (bos * H + i_h) * K
+    k += (bos * Hg + i_h // (H // Hg)) * K
     A += (bos * H + i_h) * BT
 
     o_i = tl.arange(0, BC)
@@ -137,7 +132,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
 
     for i_k in range(tl.cdiv(K, BK)):
         p_k0 = tl.make_block_ptr(
-            k, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0)
+            k, (T, K), (Hg * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0)
         )
         b_k0 = tl.load(p_k0, boundary_check=(0, 1))
         # diagonal block 0
@@ -145,7 +140,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
 
         if i_tc1 < T:
             p_k1 = tl.make_block_ptr(
-                k, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0)
+                k, (T, K), (Hg * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0)
             )
             b_k1 = tl.load(p_k1, boundary_check=(0, 1))
             # diagonal block 1
@@ -155,7 +150,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
 
             if i_tc2 < T:
                 p_k2 = tl.make_block_ptr(
-                    k, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0)
+                    k, (T, K), (Hg * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0)
                 )
                 b_k2 = tl.load(p_k2, boundary_check=(0, 1))
                 # diagonal block 2
@@ -166,7 +161,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
 
                 if i_tc3 < T:
                     p_k3 = tl.make_block_ptr(
-                        k, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0)
+                        k, (T, K), (Hg * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0)
                     )
                     b_k3 = tl.load(p_k3, boundary_check=(0, 1))
                     # diagonal block 3
@@ -182,18 +177,18 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
 
     if USE_G:
         # diagonal blocks: g_diff = g_i - g_j within sub-chunk
-        b_A00 *= exp(b_g0[:, None] - b_g0[None, :])
-        b_A11 *= exp(b_g1[:, None] - b_g1[None, :])
-        b_A22 *= exp(b_g2[:, None] - b_g2[None, :])
-        b_A33 *= exp(b_g3[:, None] - b_g3[None, :])
+        b_A00 *= safe_exp(b_g0[:, None] - b_g0[None, :])
+        b_A11 *= safe_exp(b_g1[:, None] - b_g1[None, :])
+        b_A22 *= safe_exp(b_g2[:, None] - b_g2[None, :])
+        b_A33 *= safe_exp(b_g3[:, None] - b_g3[None, :])
 
         # off-diagonal blocks: g_diff = g_row - g_col (cross sub-chunk)
-        b_A10 *= exp(b_g1[:, None] - b_g0[None, :])
-        b_A20 *= exp(b_g2[:, None] - b_g0[None, :])
-        b_A21 *= exp(b_g2[:, None] - b_g1[None, :])
-        b_A30 *= exp(b_g3[:, None] - b_g0[None, :])
-        b_A31 *= exp(b_g3[:, None] - b_g1[None, :])
-        b_A32 *= exp(b_g3[:, None] - b_g2[None, :])
+        b_A10 *= safe_exp(b_g1[:, None] - b_g0[None, :])
+        b_A20 *= safe_exp(b_g2[:, None] - b_g0[None, :])
+        b_A21 *= safe_exp(b_g2[:, None] - b_g1[None, :])
+        b_A30 *= safe_exp(b_g3[:, None] - b_g0[None, :])
+        b_A31 *= safe_exp(b_g3[:, None] - b_g1[None, :])
+        b_A32 *= safe_exp(b_g3[:, None] - b_g2[None, :])
 
     # apply beta to row dimension and mask
     m_d = o_i[:, None] > o_i[None, :]
@@ -265,39 +260,39 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     ############################################################################
 
     b_Ai10 = -tl.dot(
-        tl.dot(b_Ai11, b_A10, input_precision=SOLVE_TRIL_DOT_PRECISION),
+        tl.dot(b_Ai11, b_A10, input_precision="ieee"),
         b_Ai00,
-        input_precision=SOLVE_TRIL_DOT_PRECISION,
+        input_precision="ieee",
     )
     b_Ai21 = -tl.dot(
-        tl.dot(b_Ai22, b_A21, input_precision=SOLVE_TRIL_DOT_PRECISION),
+        tl.dot(b_Ai22, b_A21, input_precision="ieee"),
         b_Ai11,
-        input_precision=SOLVE_TRIL_DOT_PRECISION,
+        input_precision="ieee",
     )
     b_Ai32 = -tl.dot(
-        tl.dot(b_Ai33, b_A32, input_precision=SOLVE_TRIL_DOT_PRECISION),
+        tl.dot(b_Ai33, b_A32, input_precision="ieee"),
         b_Ai22,
-        input_precision=SOLVE_TRIL_DOT_PRECISION,
+        input_precision="ieee",
     )
 
     b_Ai20 = -tl.dot(
         b_Ai22,
-        tl.dot(b_A20, b_Ai00, input_precision=SOLVE_TRIL_DOT_PRECISION)
-        + tl.dot(b_A21, b_Ai10, input_precision=SOLVE_TRIL_DOT_PRECISION),
-        input_precision=SOLVE_TRIL_DOT_PRECISION,
+        tl.dot(b_A20, b_Ai00, input_precision="ieee")
+        + tl.dot(b_A21, b_Ai10, input_precision="ieee"),
+        input_precision="ieee",
     )
     b_Ai31 = -tl.dot(
         b_Ai33,
-        tl.dot(b_A31, b_Ai11, input_precision=SOLVE_TRIL_DOT_PRECISION)
-        + tl.dot(b_A32, b_Ai21, input_precision=SOLVE_TRIL_DOT_PRECISION),
-        input_precision=SOLVE_TRIL_DOT_PRECISION,
+        tl.dot(b_A31, b_Ai11, input_precision="ieee")
+        + tl.dot(b_A32, b_Ai21, input_precision="ieee"),
+        input_precision="ieee",
     )
     b_Ai30 = -tl.dot(
         b_Ai33,
-        tl.dot(b_A30, b_Ai00, input_precision=SOLVE_TRIL_DOT_PRECISION)
-        + tl.dot(b_A31, b_Ai10, input_precision=SOLVE_TRIL_DOT_PRECISION)
-        + tl.dot(b_A32, b_Ai20, input_precision=SOLVE_TRIL_DOT_PRECISION),
-        input_precision=SOLVE_TRIL_DOT_PRECISION,
+        tl.dot(b_A30, b_Ai00, input_precision="ieee")
+        + tl.dot(b_A31, b_Ai10, input_precision="ieee")
+        + tl.dot(b_A32, b_Ai20, input_precision="ieee"),
+        input_precision="ieee",
     )
 
     ############################################################################
@@ -374,7 +369,8 @@ def chunk_gated_delta_rule_fwd_intra(
         u (torch.Tensor): shape `[B, T, H, V]`
         A (torch.Tensor): shape `[B, T, H, BT]`, the solved (I+A)^{-1} matrix
     """
-    B, T, H, K = k.shape
+    B, T, Hg, K = k.shape
+    H = beta.shape[-1]
     BT = chunk_size
     BC = 16
 
@@ -393,6 +389,7 @@ def chunk_gated_delta_rule_fwd_intra(
         chunk_indices=chunk_indices,
         T=T,
         H=H,
+        Hg=Hg,
         K=K,
         BT=BT,
         BC=BC,
