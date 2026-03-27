@@ -9,8 +9,16 @@ from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.op import safe_exp
 from sglang.srt.layers.attention.fla.utils import (
     autotune_cache_kwargs,
+    is_tf32_supported,
 )
 from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd
+
+# TF32 for the block-merge dot products (16x16 matmuls) is safe and ~2x faster on SM90.
+# The numerically sensitive forward-substitution uses scalar ops, not tl.dot.
+if is_tf32_supported:
+    _MERGE_DOT_PRECISION = tl.constexpr("tf32")
+else:
+    _MERGE_DOT_PRECISION = tl.constexpr("ieee")
 
 
 @triton.heuristics(
@@ -260,39 +268,39 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     ############################################################################
 
     b_Ai10 = -tl.dot(
-        tl.dot(b_Ai11, b_A10, input_precision="ieee"),
+        tl.dot(b_Ai11, b_A10, input_precision=_MERGE_DOT_PRECISION),
         b_Ai00,
-        input_precision="ieee",
+        input_precision=_MERGE_DOT_PRECISION,
     )
     b_Ai21 = -tl.dot(
-        tl.dot(b_Ai22, b_A21, input_precision="ieee"),
+        tl.dot(b_Ai22, b_A21, input_precision=_MERGE_DOT_PRECISION),
         b_Ai11,
-        input_precision="ieee",
+        input_precision=_MERGE_DOT_PRECISION,
     )
     b_Ai32 = -tl.dot(
-        tl.dot(b_Ai33, b_A32, input_precision="ieee"),
+        tl.dot(b_Ai33, b_A32, input_precision=_MERGE_DOT_PRECISION),
         b_Ai22,
-        input_precision="ieee",
+        input_precision=_MERGE_DOT_PRECISION,
     )
 
     b_Ai20 = -tl.dot(
         b_Ai22,
-        tl.dot(b_A20, b_Ai00, input_precision="ieee")
-        + tl.dot(b_A21, b_Ai10, input_precision="ieee"),
-        input_precision="ieee",
+        tl.dot(b_A20, b_Ai00, input_precision=_MERGE_DOT_PRECISION)
+        + tl.dot(b_A21, b_Ai10, input_precision=_MERGE_DOT_PRECISION),
+        input_precision=_MERGE_DOT_PRECISION,
     )
     b_Ai31 = -tl.dot(
         b_Ai33,
-        tl.dot(b_A31, b_Ai11, input_precision="ieee")
-        + tl.dot(b_A32, b_Ai21, input_precision="ieee"),
-        input_precision="ieee",
+        tl.dot(b_A31, b_Ai11, input_precision=_MERGE_DOT_PRECISION)
+        + tl.dot(b_A32, b_Ai21, input_precision=_MERGE_DOT_PRECISION),
+        input_precision=_MERGE_DOT_PRECISION,
     )
     b_Ai30 = -tl.dot(
         b_Ai33,
-        tl.dot(b_A30, b_Ai00, input_precision="ieee")
-        + tl.dot(b_A31, b_Ai10, input_precision="ieee")
-        + tl.dot(b_A32, b_Ai20, input_precision="ieee"),
-        input_precision="ieee",
+        tl.dot(b_A30, b_Ai00, input_precision=_MERGE_DOT_PRECISION)
+        + tl.dot(b_A31, b_Ai10, input_precision=_MERGE_DOT_PRECISION)
+        + tl.dot(b_A32, b_Ai20, input_precision=_MERGE_DOT_PRECISION),
+        input_precision=_MERGE_DOT_PRECISION,
     )
 
     ############################################################################
