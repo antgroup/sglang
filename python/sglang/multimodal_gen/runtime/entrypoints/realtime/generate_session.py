@@ -94,7 +94,7 @@ class GenerateSession:
         if len(pending_frames) == required:
             return pending_frames
 
-        # Match official krea-ai/realtime-video sampling strategy.
+        # TODO more sampling strategy.
         indices = np.round(np.linspace(0, len(pending_frames) - 1, required)).astype(
             int
         )
@@ -105,12 +105,12 @@ class GenerateSession:
             prompt = self.request.prompt
         elif len(self.action_queue) > 0:
             realtime_action = self.sample_action()
-            # only support prompt action
+            # TODO more sampling strategy.
+            # only support prompt action now
             if realtime_action.type == "prompt":
                 prompt = realtime_action.action_content
                 self.request.prompt = prompt
         else:
-            # TODO(@puf147): generate with empty action
             prompt = self.request.prompt
 
         return build_sampling_params(
