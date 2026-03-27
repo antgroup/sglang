@@ -11,13 +11,13 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeAction,
     RealtimeVideoGenerationsRequest,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
+    GenerateSession,
+    RealtimeVideoMode,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
     save_image_to_path,
-)
-from sglang.multimodal_gen.runtime.entrypoints.realtime.generate_session import (
-    GenerateSession,
-    RealtimeVideoMode,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ReleaseRealtimeSessionReq,

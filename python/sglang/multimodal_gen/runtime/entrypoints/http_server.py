@@ -19,9 +19,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
+    realtime_video_api,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
 from sglang.multimodal_gen.runtime.entrypoints.post_training import weights_api
-from sglang.multimodal_gen.runtime.entrypoints.realtime import realtime_video_api
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
