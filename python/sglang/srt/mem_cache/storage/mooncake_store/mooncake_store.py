@@ -5,7 +5,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import requests
 import torch
@@ -501,17 +501,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self.gb_per_page = bytes_per_page / (1 << 30)
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
-        # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
-        # the corresponding host pool implementation at runtime.
-        self.registered_pools[host_pool_name] = host_pool
         # KV anchor memory is already registered via register_mem_pool_host().
         # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
             return
+        # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
+        # the corresponding host pool implementation at runtime.
+        self.registered_pools[host_pool_name] = host_pool
 
         # Hybrid pools expose the tensors that Mooncake needs for zero-copy I/O.
         # The storage backend only depends on this accessor, not concrete fields.
-        assert getattr(host_pool, "get_hybrid_pool_buffer") is not None
         buf_list = host_pool.get_hybrid_pool_buffer()
         for buf in buf_list:
             super().register_buffer(buf)
@@ -519,35 +518,31 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.extra_backend_tag is None:
             return keys
-        prefix = self.extra_backend_tag
-        return [f"{prefix}_{key}" for key in keys]
+        return [f"{ self.extra_backend_tag}_{key}" for key in keys]
 
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
-    ):
+    ) -> Tuple[List[str], int]:
         # A logical "page" may map to multiple physical objects in storage.
         # - INDEXER: one key per page
         # - MAMBA  : one temporal key + N conv keys per page
-        # key_multiplier records how many component keys are generated per page,
-        # so post-processing can fold component results back to page-level booleans.
+        # key_multiplier records how many component keys are generated per page.
         name = transfer.name
-        component_keys = []
-        key_multiplier = 0
-        for page_key in page_keys:
-            if name == PoolName.INDEXER:
-                key_multiplier = 1
-                component_keys.append(
-                    f"{page_key}_{self.mla_suffix}_{PoolName.INDEXER}"
-                )
-            elif name == PoolName.MAMBA:
-                base_key = f"{page_key}_{self.mha_suffix}"
-                mamba_pool = getattr(self, "registered_pools", {}).get(PoolName.MAMBA)
-                conv_num = len(getattr(mamba_pool, "conv_buffer", []) or [])
-                key_multiplier = conv_num + 1
-                component_keys.extend(
-                    [f"{base_key}_temporal"]
-                    + [f"{base_key}_conv_{i}" for i in range(conv_num)]
-                )
+        suffixes = []
+        if name == PoolName.INDEXER:
+            suffixes = [f"_{self.mla_suffix}_{PoolName.INDEXER}"]
+        elif name == PoolName.MAMBA:
+            pools = getattr(self, "registered_pools", {})
+            mamba_pool = pools.get(PoolName.MAMBA)
+            conv_num = len(getattr(mamba_pool, "conv_buffer", None) or [])
+            base_suffix = f"_{self.mha_suffix}"
+            suffixes = [f"{base_suffix}_temporal"] + [
+                f"{base_suffix}_conv_{i}" for i in range(conv_num)
+            ]
+        key_multiplier = len(suffixes)
+        component_keys = [
+            f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
+        ]
         return component_keys, key_multiplier
 
     def batch_exists_v2(
@@ -562,15 +557,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
 
-        def has_component(exist_results: List[int], page_idx: int, key_multiplier: int):
-            # Group component existence by page, then require all components hit.
-            if key_multiplier <= 0:
-                return False
-            result_groups = exist_results[
-                page_idx * key_multiplier : (page_idx + 1) * key_multiplier
-            ]
-            return all(result == 1 for result in result_groups)
-
         for transfer in pool_transfers or []:
             if final_pages == 0:
                 break
@@ -578,21 +564,27 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 qkeys, transfer
             )
             ex = self._batch_exist(component_keys)
+            if key_multiplier > 0:
+                page_exists = [
+                    all(
+                        r == 1
+                        for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
+                    )
+                    for i in range(kv_pages)
+                ]
+            else:
+                page_exists = [False] * kv_pages
             boundary = 0
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                boundary = next(
-                    (
-                        i
-                        for i in range(kv_pages)
-                        if not has_component(ex, i, key_multiplier)
-                    ),
-                    kv_pages,
-                )
+                try:
+                    boundary = page_exists.index(False)
+                except ValueError:
+                    boundary = kv_pages
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
                 for prefix_len in range(kv_pages, 0, -1):
                     if all(
-                        has_component(ex, i, key_multiplier)
+                        page_exists[i]
                         for i in range(max(0, prefix_len - trailing), prefix_len)
                     ):
                         boundary = prefix_len
@@ -609,7 +601,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         results: dict = {}
         for transfer in transfers:
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
-            keys = transfer.keys or []
+            keys = transfer.keys
             page_size = getattr(host_pool, "page_size", 1) or 1
             host_indices = transfer.host_indices
             assert len(keys) > 0
