@@ -66,6 +66,39 @@ def _bench(fn) -> float:
     return float(ms)
 
 
+def _validate_mha_correctness(
+    baseline,
+    staged,
+    dst_k_baseline: torch.Tensor,
+    dst_v_baseline: torch.Tensor,
+    dst_k_staged: torch.Tensor,
+    dst_v_staged: torch.Tensor,
+) -> None:
+    dst_k_baseline.zero_()
+    dst_v_baseline.zero_()
+    dst_k_staged.zero_()
+    dst_v_staged.zero_()
+    baseline()
+    staged()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(dst_k_staged, dst_k_baseline)
+    torch.testing.assert_close(dst_v_staged, dst_v_baseline)
+
+
+def _validate_mla_correctness(
+    baseline,
+    staged,
+    dst_baseline: torch.Tensor,
+    dst_staged: torch.Tensor,
+) -> None:
+    dst_baseline.zero_()
+    dst_staged.zero_()
+    baseline()
+    staged()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(dst_staged, dst_baseline)
+
+
 def _bench_mha(num_layers: int, element_dim: int, batch_pages: int) -> BenchRow:
     item_bytes = element_dim * torch.tensor([], dtype=DTYPE).element_size()
     assert can_use_hicache_jit_kernel(element_size=item_bytes)
@@ -78,11 +111,11 @@ def _bench_mha(num_layers: int, element_dim: int, batch_pages: int) -> BenchRow:
     dst_indices = _make_token_indices(dst_page_starts, PAGE_SIZE, device="cuda")
 
     src_k_layers = [
-        torch.empty(total_tokens, element_dim, dtype=DTYPE, device="cuda")
+        torch.randn(total_tokens, element_dim, dtype=DTYPE, device="cuda")
         for _ in range(num_layers)
     ]
     src_v_layers = [
-        torch.empty(total_tokens, element_dim, dtype=DTYPE, device="cuda")
+        torch.randn(total_tokens, element_dim, dtype=DTYPE, device="cuda")
         for _ in range(num_layers)
     ]
     src_k_ptrs = torch.tensor(
@@ -126,9 +159,14 @@ def _bench_mha(num_layers: int, element_dim: int, batch_pages: int) -> BenchRow:
         page_size=PAGE_SIZE,
     )
 
-    baseline()
-    staged()
-    torch.cuda.synchronize()
+    _validate_mha_correctness(
+        baseline,
+        staged,
+        dst_k_baseline,
+        dst_v_baseline,
+        dst_k_staged,
+        dst_v_staged,
+    )
 
     moved_bytes = chunk_tokens * num_layers * item_bytes * 2
     baseline_ms = _bench(baseline)
@@ -159,7 +197,7 @@ def _bench_mla(num_layers: int, element_dim: int, batch_pages: int) -> BenchRow:
     dst_indices = _make_token_indices(dst_page_starts, PAGE_SIZE, device="cuda")
 
     src_layers = [
-        torch.empty(total_tokens, element_dim, dtype=DTYPE, device="cuda")
+        torch.randn(total_tokens, element_dim, dtype=DTYPE, device="cuda")
         for _ in range(num_layers)
     ]
     src_ptrs = torch.tensor(
@@ -191,9 +229,12 @@ def _bench_mla(num_layers: int, element_dim: int, batch_pages: int) -> BenchRow:
         page_size=PAGE_SIZE,
     )
 
-    baseline()
-    staged()
-    torch.cuda.synchronize()
+    _validate_mla_correctness(
+        baseline,
+        staged,
+        dst_baseline,
+        dst_staged,
+    )
 
     moved_bytes = chunk_tokens * num_layers * item_bytes
     baseline_ms = _bench(baseline)
