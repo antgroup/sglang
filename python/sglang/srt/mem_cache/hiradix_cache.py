@@ -116,6 +116,7 @@ def _build_nsa_hybrid_stack(
             ),
         ]
     )
+    radix_cache.full_kv_pool_host = mla_host
     radix_cache.token_to_kv_pool_host = host_pool_group
     radix_cache.cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
