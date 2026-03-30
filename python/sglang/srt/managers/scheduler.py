@@ -142,7 +142,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
+from sglang.srt.managers.mm_utils import (
+    has_shm_features,
+    init_mm_embedding_cache,
+    unwrap_shm_features,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
@@ -1528,7 +1532,12 @@ class Scheduler(
             # deserializations (steps 1-2, which call shm_open) before any
             # rank returns from step 3.  POSIX guarantees shm_unlink only
             # removes the name; already-open handles stay valid.
-            if not self.server_args.enable_dp_attention and self.tp_size > 1:
+            if (
+                not self.server_args.enable_dp_attention
+                and self.tp_size > 1
+                and self.model_config.is_multimodal
+                and has_shm_features(recv_reqs)
+            ):
                 barrier(group=self.tp_cpu_group)
             for req in recv_reqs:
                 unwrap_shm_features(req)
