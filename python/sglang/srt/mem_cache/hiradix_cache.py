@@ -1375,7 +1375,7 @@ class HiRadixCache(RadixCache):
             new_input_tokens,
             last_hash,
             prefix_keys,
-            **self._extra_pools_kw(),
+            **self._get_extra_pools(),
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
