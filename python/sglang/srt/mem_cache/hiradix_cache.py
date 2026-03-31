@@ -34,17 +34,17 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    build_nsa_hybrid_stack,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
-    HostPoolGroup,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
-    NSAIndexerPoolHost,
-    PoolEntry,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -61,84 +61,6 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
-
-
-def _build_nsa_hybrid_stack(
-    radix_cache: "HiRadixCache",
-    params: "CacheInitParams",
-    server_args: "ServerArgs",
-    *,
-    extra_config: dict,
-    prefetch_threshold: int,
-    enable_storage_metrics: bool,
-    load_cache_event,
-) -> None:
-    """HostPoolGroup (KV + indexer) + HybridCacheController for NSA (DSA)."""
-    kv = radix_cache.kv_cache
-    mla_host = MLATokenToKVPoolHost(
-        kv,
-        server_args.hicache_ratio,
-        server_args.hicache_size,
-        radix_cache.page_size,
-        server_args.hicache_mem_layout,
-        allocator_type=server_args.hicache_storage_backend,
-        override_kv_cache_dim=kv.kv_cache_dim,
-    )
-    indexer_host = NSAIndexerPoolHost(
-        kv,
-        mla_host,
-        server_args.hicache_mem_layout,
-        allocator_type=server_args.hicache_storage_backend,
-    )
-    layer_num = kv.layer_num
-
-    def layer_mapper(layer_id: int):
-        if 0 <= layer_id < layer_num:
-            return layer_id
-        return None
-
-    host_pool_group = HostPoolGroup(
-        [
-            PoolEntry(
-                name=PoolName.KV,
-                host_pool=mla_host,
-                device_pool=kv,
-                layer_mapper=layer_mapper,
-                is_primary_index_anchor=True,
-            ),
-            PoolEntry(
-                name=PoolName.INDEXER,
-                host_pool=indexer_host,
-                device_pool=kv,
-                layer_mapper=layer_mapper,
-                share_indices_with_anchor=True,
-            ),
-        ]
-    )
-    radix_cache.full_kv_pool_host = mla_host
-    radix_cache.token_to_kv_pool_host = host_pool_group
-    radix_cache.cache_controller = HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        radix_cache.page_size,
-        radix_cache.tp_group,
-        load_cache_event=load_cache_event,
-        write_policy=server_args.hicache_write_policy,
-        io_backend=server_args.hicache_io_backend,
-        storage_backend=server_args.hicache_storage_backend,
-        prefetch_threshold=prefetch_threshold,
-        model_name=server_args.served_model_name,
-        storage_backend_extra_config=extra_config,
-        pp_rank=radix_cache.pp_rank,
-        pp_size=radix_cache.pp_size,
-        transfer_layer_num=layer_num,
-        enable_storage_metrics=enable_storage_metrics,
-    )
-    logger.info(
-        "NSA hierarchical cache: HostPoolGroup(KV + INDEXER), HybridCacheController, "
-        "transfer_layer_num=%s",
-        layer_num,
-    )
 
 
 class HiRadixCache(RadixCache):
@@ -159,7 +81,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
-            # Filled by _build_nsa_hybrid_stack after storage extra_config is parsed.
+            # Filled by build_nsa_hybrid_stack after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -198,7 +120,7 @@ class HiRadixCache(RadixCache):
 
         self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, NSATokenToKVPool):
-            _build_nsa_hybrid_stack(
+            build_nsa_hybrid_stack(
                 self,
                 params,
                 server_args,
@@ -703,7 +625,7 @@ class HiRadixCache(RadixCache):
             height += 1
         return height
 
-    def _get_extra_pools_kw(self) -> dict:
+    def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
         if isinstance(self.kv_cache, NSATokenToKVPool):
@@ -738,18 +660,17 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False):
-        write_kw = self._get_extra_pools_kw()
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
-            **write_kw,
+            **self._get_extra_pools(),
         )
         if host_indices is None:
             self.evict_host(len(node.value))
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
-                **write_kw,
+                **self._get_extra_pools(),
             )
         if host_indices is not None:
             node.host_value = host_indices
@@ -770,9 +691,9 @@ class HiRadixCache(RadixCache):
             else None
         )
 
-        storage_kw = self._get_extra_pools_kw()
         operation_id = self.cache_controller.write_storage(
-            node.host_value, node.key, node.hash_value, prefix_keys, **storage_kw
+            node.host_value, node.key, node.hash_value, prefix_keys,
+            **self._get_extra_pools(),
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
@@ -1141,14 +1062,14 @@ class HiRadixCache(RadixCache):
         device_indices = self.cache_controller.load(
             host_indices=host_indices,
             node_id=last_hit_node.id,
-            **self._get_extra_pools_kw(),
+            **self._get_extra_pools(),
         )
         if device_indices is None:
             self.evict(EvictParams(num_tokens=len(host_indices)))
             device_indices = self.cache_controller.load(
                 host_indices=host_indices,
                 node_id=last_hit_node.id,
-                **self._get_extra_pools_kw(),
+                **self._get_extra_pools(),
             )
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
@@ -1454,7 +1375,7 @@ class HiRadixCache(RadixCache):
             new_input_tokens,
             last_hash,
             prefix_keys,
-            **self._get_extra_pools_kw(),
+            **self._extra_pools_kw(),
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
