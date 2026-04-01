@@ -59,21 +59,19 @@ class SchedulerOutputProcessorMixin:
             - {"device": X, "host": Y} without storage breakdown
             - {"device": X, "host": Y, "storage": Z} with storage breakdown
         """
-        has_breakdown = (
+        if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
             or req.cached_tokens_storage > 0
-        )
-
-        if has_breakdown:
+        ):
             details = {
                 "device": req.cached_tokens_device,
                 "host": req.cached_tokens_host,
             }
-            if req.cached_tokens_storage > 0 or getattr(
-                self, "enable_hicache_storage", False
-            ):
+            # Only include storage fields if L3 storage is enabled
+            if getattr(self, "enable_hicache_storage", False):
                 details["storage"] = req.cached_tokens_storage
+                details["storage_backend"] = self._get_storage_backend_type()
             return details
 
         if req.cached_tokens > 0:
