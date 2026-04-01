@@ -4,12 +4,12 @@
 import asyncio
 import os
 import pickle
+import tempfile
 from collections import deque
 from typing import Any, List
 
 import zmq
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed import get_world_group
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
@@ -201,13 +201,7 @@ class Scheduler:
             self._warmup_processed = 0
             task_type = self.server_args.pipeline_config.task_type
 
-            warmup_task_types = (
-                ModelTaskType.I2I,
-                ModelTaskType.TI2I,
-                ModelTaskType.I2V,
-                ModelTaskType.TI2V,
-            )
-            requires_warmup_image = task_type in warmup_task_types
+            requires_warmup_image = task_type.accepts_image_input()
             warmup_input_path = None
             if requires_warmup_image:
                 warmup_input_path = self._prepare_shared_warmup_image_path()
@@ -237,16 +231,18 @@ class Scheduler:
             self.warmed_up = True
 
     def _prepare_shared_warmup_image_path(self) -> str:
-        uploads_dir = os.path.join("outputs", "uploads")
-        os.makedirs(uploads_dir, exist_ok=True)
-        warmup_image_base = os.path.join(uploads_dir, "warmup_image")
-
         world_group = get_world_group()
         src_rank = world_group.ranks[0]
 
         warmup_sync: dict[str, str | None]
         if world_group.rank == src_rank:
             try:
+                if self.server_args.input_save_path is not None:
+                    uploads_dir = self.server_args.input_save_path
+                    os.makedirs(uploads_dir, exist_ok=True)
+                else:
+                    uploads_dir = tempfile.mkdtemp(prefix="sglang_input_")
+                warmup_image_base = os.path.join(uploads_dir, "warmup_image")
                 input_path = asyncio.run(
                     save_image_to_path(
                         MINIMUM_PICTURE_BASE64_FOR_WARMUP,
