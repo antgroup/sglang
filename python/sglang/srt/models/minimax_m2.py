@@ -247,29 +247,35 @@ def rms_apply_serial(
 class MiniMaxM2RMSNormTP(nn.Module):
     """RMSNorm with Tensor Parallel support for QK normalization."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6, repeat_n: int = 1) -> None:
+    def __init__(self, hidden_size: int, num_heads: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.tp_world = get_tensor_model_parallel_world_size()
+        tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
+        # Align with QKVParallelLinear pattern
+        if tp_size >= num_heads:
+            self.num_heads = 1
+            self.num_head_replicas = tp_size // num_heads
+        else:
+            self.num_heads = num_heads // tp_size
+            self.num_head_replicas = 1
+
+        self.head_dim = hidden_size // num_heads
+
         # Weight parameter is sharded across TP ranks
-        self.weight = nn.Parameter(torch.ones(int(hidden_size / self.tp_world) * repeat_n))
+        self.weight = nn.Parameter(torch.ones(self.num_heads * self.head_dim))
         self.weight.weight_loader = self.weight_loader
         self.variance_epsilon = eps
 
-    @staticmethod
     def weight_loader(
+        self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
     ) -> None:
         """Custom weight loader that handles TP sharding."""
-        tp_world = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-
-        repeat_n = param.data.shape[0] // (loaded_weight.shape[0] // tp_world)
-        shard_size = repeat_n*(loaded_weight.shape[0] // tp_world)
-        tp_rank = tp_rank // repeat_n
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        shard_id = self.tp_rank // self.num_head_replicas
+        shard_size = param.data.shape[0]
+        shard = slice(shard_id * shard_size, (shard_id + 1) * shard_size)
         param.data.copy_(loaded_weight[shard])
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -287,9 +293,11 @@ class MiniMaxM2RMSNormTP(nn.Module):
         # Compute variance across the full dimension (not just local shard)
         variance = x.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32)
 
-        if self.tp_world > 1:
-            # All-reduce variance across TP ranks to get global variance
-            variance = tensor_model_parallel_all_reduce(variance) / self.tp_world
+        if self.num_head_replicas > 1:
+            # All-reduce variance across TP ranks that share the same KV head
+            variance = (
+                tensor_model_parallel_all_reduce(variance) / self.num_head_replicas
+            )
 
         # Normalize and apply local weight shard
         x = x * torch.rsqrt(variance + self.variance_epsilon)
@@ -617,17 +625,15 @@ class MiniMaxM2Attention(nn.Module):
                 # Use RMSNormTP for proper tensor parallel support
                 # Use total dimensions (before TP sharding) for correct normalization
                 self.q_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_heads * self.head_dim, eps=config.rms_norm_eps
+                    self.total_num_heads * self.head_dim,
+                    num_heads=self.total_num_heads,
+                    eps=config.rms_norm_eps,
                 )
-                if self.total_num_kv_heads >= tp_size:
-                    self.k_norm = MiniMaxM2RMSNormTP(
-                        self.total_num_kv_heads * self.head_dim, eps=config.rms_norm_eps
-                    )
-                else:
-                    repeat_n = tp_size // self.total_num_kv_heads
-                    self.k_norm = MiniMaxM2RMSNormTP(
-                        self.total_num_kv_heads * self.head_dim, eps=config.rms_norm_eps, repeat_n=repeat_n
-                    )
+                self.k_norm = MiniMaxM2RMSNormTP(
+                    self.total_num_kv_heads * self.head_dim,
+                    num_heads=self.total_num_kv_heads,
+                    eps=config.rms_norm_eps,
+                )
             else:
                 raise ValueError(f"Unsupported qk_norm_type: {self.qk_norm_type}")
 
