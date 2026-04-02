@@ -7,12 +7,12 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
-from sglang.srt.environ import envs
 from sglang.srt.distributed.parallel_state import (
     get_dcp_rank,
     get_dcp_world_size,
     get_world_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
     DcpTokenToKVPoolAllocator,
