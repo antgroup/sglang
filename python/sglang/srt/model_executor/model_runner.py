@@ -2693,12 +2693,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.graph_runner.can_run(forward_batch)
         )
 
+        if (
+            self.hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_decode()
+        ):
+            self.hisparse_coordinator.wait_for_pending_backup()
+
         if can_run_graph:
             ret = self.graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if (
+                self.hisparse_coordinator is not None
+                and forward_batch.forward_mode.is_decode()
+            ):
+                self.hisparse_coordinator.note_decode_forward_done()
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
@@ -2748,6 +2759,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+
+        if (
+            self.hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_decode()
+        ):
+            self.hisparse_coordinator.note_decode_forward_done()
 
         if (
             forward_batch.global_num_tokens_cpu is not None

@@ -78,8 +78,12 @@ class HiSparseCoordinator:
         )
 
         self.write_staging_stream = device_module.Stream()
+        self.decode_backup_stream = device_module.Stream()
         self.ack_staging_queue: List[HiSparseAct] = []
         self.decode_producer_stream = None
+        self.decode_forward_done_event = None
+        self.pending_backup_done_event = None
+        self.next_backup_done_event = None
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -115,12 +119,73 @@ class HiSparseCoordinator:
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
 
-        # CPU flag: True means "skip backup on the next decode step" because
-        # staging already backed up all prefill tokens.  Cleared after one step.
+        # CPU flag kept for compatibility with the staging lifecycle.
         self._skip_first_backup = [False] * max_num_reqs
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
+
+    def _launch_decode_backup(
+        self,
+        req_indices: torch.Tensor,
+        token_positions: torch.Tensor,
+        device_locs: torch.Tensor,
+    ) -> None:
+        if len(device_locs) == 0:
+            return
+        if (
+            self.decode_forward_done_event is not None
+            or self.next_backup_done_event is not None
+        ):
+            raise RuntimeError("HiSparse decode backup events were not consumed")
+
+        host_locs = self.mem_pool_host.alloc(len(device_locs))
+        if host_locs is None:
+            logger.error(
+                "HiSparse: host mem pool alloc failed for %d decode backup tokens",
+                len(device_locs),
+            )
+            raise RuntimeError(
+                f"HiSparse host mem pool alloc failed for {len(device_locs)} decode backup tokens"
+            )
+
+        forward_done_event = device_module.Event()
+        backup_done_event = device_module.Event()
+        self.decode_forward_done_event = forward_done_event
+        self.next_backup_done_event = backup_done_event
+        with device_module.stream(self.decode_backup_stream):
+            forward_done_event.wait(self.decode_backup_stream)
+            host_locs = host_locs.to(device=self.device)
+            self.req_to_host_pool[req_indices, token_positions] = host_locs
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs,
+                io_backend="kernel",
+            )
+            backup_done_event.record()
+            if host_locs.is_cuda:
+                host_locs.record_stream(self.decode_backup_stream)
+            if req_indices.is_cuda:
+                req_indices.record_stream(self.decode_backup_stream)
+            if token_positions.is_cuda:
+                token_positions.record_stream(self.decode_backup_stream)
+            if device_locs.is_cuda:
+                device_locs.record_stream(self.decode_backup_stream)
+
+    def note_decode_forward_done(self) -> None:
+        if self.decode_forward_done_event is None:
+            return
+        self.decode_forward_done_event.record()
+        self.decode_forward_done_event = None
+        self.pending_backup_done_event = self.next_backup_done_event
+        self.next_backup_done_event = None
+
+    def wait_for_pending_backup(self) -> None:
+        if self.pending_backup_done_event is None:
+            return
+        self.pending_backup_done_event.wait(device_module.current_stream())
+        self.pending_backup_done_event = None
 
     def admit_request_into_staging(self, req: Req) -> None:
         req.staging = True
@@ -309,12 +374,14 @@ class HiSparseCoordinator:
         out_cache_loc: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        req_pool_indices_cpu = req_pool_indices.cpu()
-
-        self._eager_backup_previous_token(
+        decode_backup = self._prepare_eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
+        if decode_backup is not None:
+            self._launch_decode_backup(*decode_backup)
+
         # Grow device buffers if needed and resolve the latest-token slot.
         reserved_buffer_loc = self._grow_device_buffers(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
@@ -329,26 +396,13 @@ class HiSparseCoordinator:
             reserved_buffer_loc
         )
 
-    def _eager_backup_previous_token(
+    def _prepare_eager_backup_previous_token(
         self,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
-    ) -> None:
-        """Back up the previous decode token to host memory.
-
-        Every decode step, the token written in the *previous* step must be
-        backed up to host so the swap-in kernel can later recover it.
-
-        The only exception is the first decode step right after staging: all
-        prefill tokens were already backed up during staging, so there is nothing new to save yet.
-        """
-        if self.decode_producer_stream is not None:
-            device_module.current_stream().wait_stream(self.decode_producer_stream)
-
-        # Build the list of batch positions that need a host backup.
-        # Skip the first decode step after staging (prefill already backed up).
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         backup_indices = []
         for i in range(len(seq_lens_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
@@ -358,38 +412,16 @@ class HiSparseCoordinator:
             backup_indices.append(i)
 
         if not backup_indices:
-            return
+            return None
 
         backup_indices_gpu = torch.tensor(
             backup_indices, dtype=torch.int64, device=self.device
         )
-        # The previous token's position and its device buffer slot:
-        #  - short seq: slot = seq_len - 2  (within the regular buffer)
-        #  - long seq:  slot = device_buffer_size  (the reserved slot)
-        actual_token_pos = seq_lens[backup_indices_gpu] - 2
-        buffer_slot = actual_token_pos.clamp(max=self.device_buffer_size)
-
-        backup_req_indices = req_pool_indices[backup_indices_gpu]
-        device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
-
-        host_locs = self.mem_pool_host.alloc(len(device_locs))
-        if host_locs is None:
-            logger.error(
-                "HiSparse: host mem pool alloc failed for %d decode backup tokens",
-                len(device_locs),
-            )
-            raise RuntimeError(
-                f"HiSparse host mem pool alloc failed for {len(device_locs)} decode backup tokens"
-            )
-        host_locs = host_locs.to(device=self.device)
-        self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
-
-        self.mem_pool_host.backup_from_device_all_layer(
-            self.mem_pool_device,
-            host_locs,
-            device_locs.contiguous(),
-            io_backend="kernel",
-        )
+        token_positions = seq_lens[backup_indices_gpu] - 2
+        buffer_slot = token_positions.clamp(max=self.device_buffer_size)
+        req_indices = req_pool_indices[backup_indices_gpu]
+        device_locs = self.req_to_device_buffer[req_indices, buffer_slot]
+        return req_indices, token_positions, device_locs
 
     def get_front_topk_tokens(
         self,
@@ -522,6 +554,8 @@ class HiSparseCoordinator:
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
+        if self.pending_backup_done_event is not None:
+            self.pending_backup_done_event.wait(device_module.current_stream())
 
         # release memory — only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
