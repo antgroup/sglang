@@ -2,6 +2,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.utils import is_cuda
 
@@ -1490,7 +1493,11 @@ class CPTritonContext:
 
 
 def correct_attn_out(
-    out: torch.Tensor, lses: torch.Tensor, cp_rank: int, ctx: CPTritonContext
+    out: torch.Tensor,
+    lses: torch.Tensor,
+    cp_rank: int,
+    ctx: CPTritonContext,
+    new_output: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -1540,7 +1547,7 @@ def correct_attn_out(
 
     regular_args = (
         out,
-        out,
+        new_output if new_output is not None else out,
         lses,
         lse,
         o_sB,
@@ -1576,6 +1583,10 @@ def cp_lse_ag_out_rs(
     lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
-    out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, ctx)
+    with use_symmetric_memory(cp_group):
+        new_output = torch.empty_like(cp_attn_out)
+    out, _ = correct_attn_out(
+        cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
+    )
     out = cp_group.reduce_scatter_along_dim(out, dim=1)
     return out
