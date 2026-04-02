@@ -466,10 +466,10 @@ class DeepseekMLAForwardMixin:
         if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
             # Note(wh): make sure input tensors use nccl allocator
             with use_symmetric_memory(get_dcp_group()):
-                attn_output = attn_output.view(
-                    -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
-                ).clone(memory_format=torch.contiguous_format)
                 lse = lse.clone(memory_format=torch.contiguous_format)
+            attn_output = attn_output.view(
+                -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
+            )
             attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
