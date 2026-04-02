@@ -227,9 +227,10 @@ class DeepseekMLAForwardMixin:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
             )
-            q_nope_out = q_nope.new_empty(
-                (self.num_local_heads, aligned_m, self.kv_lora_rank)
-            )
+            with use_symmetric_memory(get_dcp_group()):
+                q_nope_out = q_nope.new_empty(
+                    (self.num_local_heads, aligned_m, self.kv_lora_rank)
+                )
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
                 (q_nope_val, q_nope_scale),
                 (self.w_kc, self.w_scale_k),
@@ -237,7 +238,8 @@ class DeepseekMLAForwardMixin:
                 masked_m,
                 expected_m,
             )
-            q_nope_out = q_nope_out[:, :expected_m, :]
+            with use_symmetric_memory(get_dcp_group()):
+                q_nope_out = q_nope_out[:, :expected_m, :]
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
             if _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
@@ -299,7 +301,8 @@ class DeepseekMLAForwardMixin:
                     q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
                 )
         else:
-            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+            with use_symmetric_memory(get_dcp_group()):
+                q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
@@ -308,7 +311,8 @@ class DeepseekMLAForwardMixin:
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
             and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
         ):
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            with use_symmetric_memory(get_dcp_group()):
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         if nsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -320,12 +324,8 @@ class DeepseekMLAForwardMixin:
         if get_dcp_world_size() > 1:
             if forward_batch.forward_mode.is_decode():
                 # if forward_batch.forward_mode is decode, gather q
-                with use_symmetric_memory(get_dcp_group()):
-                    combined = torch.cat([q_pe, q_nope_out], dim=-1)
-                gathered = get_dcp_group().all_gather(combined, dim=-2)
-                d_pe = q_pe.size(-1)
-                d_nope = q_nope_out.size(-1)
-                q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
+                q_nope_out = get_dcp_group().all_gather(q_nope_out, dim=-2)
+                q_pe = get_dcp_group().all_gather(q_pe, dim=-2)
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
                 cache_k_nope, cache_k_rope = (
