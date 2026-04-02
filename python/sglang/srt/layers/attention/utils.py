@@ -1393,6 +1393,7 @@ def fused_qk_rope_reshape_and_cache(
         return q_out.view(-1, qh * d), k_out, key_cache, value_cache, zeros_out
     return q_out.view(-1, qh * d), k_out, key_cache, value_cache
 
+
 @triton.jit
 def _correct_attn_cp_out_kernel(
     outputs_ptr,
