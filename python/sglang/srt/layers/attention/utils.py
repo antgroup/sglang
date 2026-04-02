@@ -1561,7 +1561,7 @@ def correct_attn_out(
     const_args = {"HEAD_DIM": D, "N_ROUNDED": N}
 
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
-    return out, lse
+    return new_output if new_output is not None else out, lse
 
 
 def cp_lse_ag_out_rs(
