@@ -138,6 +138,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_gfx95_supported,
     _is_hip,
     _is_npu,
+    _is_xpu,
     _use_aiter,
     _use_aiter_gfx95,
 )
@@ -153,9 +154,11 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 
+if _use_aiter:
+    from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
+
 if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import (
-        aiter_dsv3_router_gemm,
         get_dsv3_gemm_output_zero_allocator_size,
     )
 
@@ -327,14 +330,8 @@ class MoEGate(nn.Module):
                 logits = dsv3_router_gemm(
                     hidden_states, self.weight, out_dtype=torch.float32
                 )
-            elif (
-                _use_aiter_gfx95
-                and hidden_states.shape[0] <= 256
-                and self.weight.shape[0] <= 256
-            ):
-                logits = aiter_dsv3_router_gemm(
-                    hidden_states, self.weight, gemm_output_zero_allocator
-                )
+            elif _use_aiter:
+                logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             else:
                 logits = F.linear(hidden_states, self.weight, None)
 
@@ -678,6 +675,7 @@ class DeepseekV2MoE(nn.Module):
         )
         if (
             not _is_cuda
+            and not _is_xpu
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
