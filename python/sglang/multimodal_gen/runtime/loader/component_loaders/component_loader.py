@@ -48,8 +48,9 @@ class ComponentLoader(ABC):
         for component_name in cls.component_names:
             component_name_to_loader_cls[component_name] = cls
 
-    def __init__(self, device=None) -> None:
+    def __init__(self, device=None, architecture: str | None = None) -> None:
         self.device = device
+        self.architecture = architecture
 
     def should_offload(
         self, server_args: ServerArgs, model_config: ModelConfig | None = None
@@ -208,7 +209,10 @@ class ComponentLoader(ABC):
 
     @classmethod
     def for_component_type(
-        cls, component_name: str, transformers_or_diffusers: str
+        cls,
+        component_name: str,
+        transformers_or_diffusers: str,
+        architecture: str | None = None,
     ) -> "ComponentLoader":
         """
         Factory method to create a component loader for a specific component type.
@@ -251,14 +255,16 @@ class ComponentLoader(ABC):
             assert (
                 transformers_or_diffusers == expected_library
             ), f"{component_name} must be loaded from {expected_library}, got {transformers_or_diffusers}"
-            return loader_cls()
+            return loader_cls(architecture=architecture)
 
         # For unknown component types, use a generic loader
         logger.warning(
             "No specific loader found for component type: %s. Using generic loader.",
             component_name,
         )
-        return GenericComponentLoader(transformers_or_diffusers)
+        return GenericComponentLoader(
+            transformers_or_diffusers, architecture=architecture
+        )
 
 
 class ImageProcessorLoader(ComponentLoader):
@@ -294,6 +300,13 @@ class TokenizerLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
+        if self.architecture and self.architecture.endswith("Processor"):
+            logger.info(
+                "Tokenizer component %s declares processor architecture %s; loading via AutoProcessor",
+                component_name,
+                self.architecture,
+            )
+            return AutoProcessor.from_pretrained(component_model_path)
         return AutoTokenizer.from_pretrained(
             component_model_path,
             padding_size="right",
@@ -318,6 +331,7 @@ class PipelineComponentLoader:
         component_name: str,
         component_model_path: str,
         transformers_or_diffusers: str,
+        architecture: str,
         server_args: ServerArgs,
     ):
         """
@@ -332,7 +346,7 @@ class PipelineComponentLoader:
 
         # Get the appropriate loader for this component type
         loader = ComponentLoader.for_component_type(
-            component_name, transformers_or_diffusers
+            component_name, transformers_or_diffusers, architecture=architecture
         )
 
         try:
