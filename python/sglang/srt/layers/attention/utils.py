@@ -1594,5 +1594,5 @@ def cp_lse_ag_out_rs(
     out, _ = correct_attn_out(
         cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
     )
-    out = cp_group.reduce_scatter_along_dim(out, dim=1)
+    out = cp_group.reduce_scatter_along_dim(out, dim=0)
     return out
