@@ -1010,8 +1010,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
         # 1. Calculate timestep embedding and modulation parameters
         timestep = timestep.to(hidden_states.dtype)
         if guidance is not None:
-            # Reference https://github.com/huggingface/diffusers/blob/v0.37.0/src/diffusers/models/transformers/transformer_flux2.py
-            guidance = guidance.to(hidden_states.dtype) * 1000
+            guidance = guidance.to(hidden_states.dtype)
 
         temb = self.time_guidance_embed(timestep, guidance)
 
