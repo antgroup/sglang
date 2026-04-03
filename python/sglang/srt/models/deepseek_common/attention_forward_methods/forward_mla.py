@@ -469,7 +469,7 @@ class DeepseekMLAForwardMixin:
                 lse = lse.clone(memory_format=torch.contiguous_format)
             attn_output = attn_output.view(
                 -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
-            ).contiguous()
+            )
             attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
