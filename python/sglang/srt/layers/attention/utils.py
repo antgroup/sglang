@@ -1424,7 +1424,7 @@ def _correct_attn_cp_out_kernel(
         lses_ptr (triton.PointerType):
             Pointer to input tensor of shape [ N, B, H ]
         new_output_ptr (triton.PointerType):
-            Pointer to output tensor of shape [ B, H, D ]
+            Pointer to output tensor of shape [ H, B, D ]
         vlse_ptr (triton.PointerType):
             Pointer to output tensor of shape [ B, H ]
     """
@@ -1461,6 +1461,11 @@ def _correct_attn_cp_out_kernel(
         + d_offsets * outputs_stride_D
     )
 
+    new_output_offsets = (
+        head_idx * outputs_stride_B
+        + batch_idx * outputs_stride_H
+        + d_offsets * outputs_stride_D
+    )
     # correct output
     lse_offset = (
         lse_idx * lses_stride_N + batch_idx * lses_stride_B + head_idx * lses_stride_H
@@ -1476,7 +1481,7 @@ def _correct_attn_cp_out_kernel(
     output = tl.load(outputs_ptr + output_offsets)
     output = output * factor
 
-    tl.store(new_output_ptr + output_offsets, output)
+    tl.store(new_output_ptr + new_output_offsets, output)
 
 
 class CPTritonContext:
@@ -1547,7 +1552,7 @@ def correct_attn_out(
 
     regular_args = (
         out,
-        new_output if new_output is not None else out,
+        new_output,
         lses,
         lse,
         o_sB,
@@ -1561,7 +1566,7 @@ def correct_attn_out(
     const_args = {"HEAD_DIM": D, "N_ROUNDED": N}
 
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
-    return new_output if new_output is not None else out, lse
+    return new_output, lse
 
 
 def cp_lse_ag_out_rs(
@@ -1584,7 +1589,8 @@ def cp_lse_ag_out_rs(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
     with use_symmetric_memory(cp_group):
-        new_output = torch.empty_like(cp_attn_out)
+        # cp_attn_out is [B,H,D], we want to transpose it to [H,B,D] for the kernel, and then transpose back after correction.
+        new_output = torch.empty_like(cp_attn_out.transpose(0, 1))
     out, _ = correct_attn_out(
         cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
     )
