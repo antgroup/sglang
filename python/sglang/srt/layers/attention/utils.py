@@ -1409,6 +1409,9 @@ def _correct_attn_cp_out_kernel(
     lses_stride_N,
     lses_stride_B,
     lses_stride_H,
+    new_outputs_stride_H,
+    new_outputs_stride_B,
+    new_outputs_stride_D,
     lse_idx,
     HEAD_DIM: tl.constexpr,
     N_ROUNDED: tl.constexpr,
@@ -1462,9 +1465,9 @@ def _correct_attn_cp_out_kernel(
     )
 
     new_output_offsets = (
-        head_idx * outputs_stride_B
-        + batch_idx * outputs_stride_H
-        + d_offsets * outputs_stride_D
+        head_idx * new_outputs_stride_H
+        + batch_idx * new_outputs_stride_B
+        + d_offsets * new_outputs_stride_D
     )
     # correct output
     lse_offset = (
@@ -1540,7 +1543,7 @@ def correct_attn_out(
     # have the same B/H stride layout as a slice of `lses`.
     o_sB, o_sH, o_sD = out.stride()
     l_sN, l_sB, l_sH = lses.stride()
-
+    no_sH, no_sB, no_sD = new_output.stride()
     # Allocate LSE with the same B/H strides as `lses` so writes land correctly
     # even when `lses` is a non-contiguous view (e.g., 4-D to 3-D squeeze).
     lse = torch.empty_strided(
@@ -1561,6 +1564,9 @@ def correct_attn_out(
         l_sN,
         l_sB,
         l_sH,
+        no_sH,
+        no_sB,
+        no_sD,
         cp_rank,
     )
     const_args = {"HEAD_DIM": D, "N_ROUNDED": N}
