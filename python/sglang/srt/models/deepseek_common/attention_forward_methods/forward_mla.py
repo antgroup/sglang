@@ -471,6 +471,7 @@ class DeepseekMLAForwardMixin:
                 -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
             )
             attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
+            attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
