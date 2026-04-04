@@ -19,6 +19,7 @@
 #include <cute/numeric/numeric_types.hpp>
 
 #include "kda/sm90/prefill_kernel.hpp"
+#include "sgl_flash_kernel_ops.h"
 
 using OptionalTensor = std::optional<torch::Tensor>;
 
@@ -33,7 +34,7 @@ std::tuple<torch::Tensor, torch::Tensor> kda_fwd_prefill(
     OptionalTensor beta_,
     torch::Tensor const& cu_seqlens,
     torch::Tensor workspace_buffer,
-    float scale,
+    double scale,
     bool safe_gate) {
   // Q, K, V: [packed_seq, H, D] (already packed by Python layer)
   auto packed_seq = q.size(0);
@@ -103,8 +104,9 @@ std::tuple<torch::Tensor, torch::Tensor> kda_fwd_prefill(
   }
 
   // Auto-compute scale if 0
-  if (scale == 0.0f) {
-    scale = 1.0f / std::sqrt(static_cast<float>(head_size));
+  float scale_f = static_cast<float>(scale);
+  if (scale_f == 0.0f) {
+    scale_f = 1.0f / std::sqrt(static_cast<float>(head_size));
   }
 
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -129,7 +131,7 @@ std::tuple<torch::Tensor, torch::Tensor> kda_fwd_prefill(
       static_cast<int32_t>(num_heads),
       static_cast<int32_t>(head_size),
       static_cast<int64_t>(packed_seq),
-      scale,
+      scale_f,
       safe_gate,
       static_cast<int32_t>(sm_count));
 
@@ -154,3 +156,5 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       ") -> (Tensor, Tensor)");
   m.impl("kda_fwd_prefill", &kda_fwd_prefill);
 }
+
+REGISTER_EXTENSION(cula_kda_ops)

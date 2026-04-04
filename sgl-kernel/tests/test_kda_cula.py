@@ -3,8 +3,14 @@
 Compares cuLA kernel output against Triton chunk_kda reference.
 """
 
+import math
+
 import pytest
 import torch
+import torch.nn.functional as F
+
+# cuLA kernel uses exp2() internally, gates must be in log-base-2 space.
+RCP_LN2 = 1.0 / math.log(2.0)
 
 # Skip all tests if not on SM90 GPU
 pytestmark = pytest.mark.skipif(
@@ -54,9 +60,13 @@ def _run_cula_vs_triton(B, T, H, D, device="cuda"):
     q = torch.randn(1, packed_seq, H, D, dtype=torch.bfloat16, device=device)
     k = torch.randn(1, packed_seq, H, D, dtype=torch.bfloat16, device=device)
     v = torch.randn(1, packed_seq, H, D, dtype=torch.bfloat16, device=device)
-    # Gate values in safe range [-5, 0)
-    g = torch.rand(1, packed_seq, H, D, dtype=torch.bfloat16, device=device) * (-4.9)
-    beta = torch.randn(1, packed_seq, H, dtype=torch.bfloat16, device=device)
+    # Gate values: logsigmoid produces values in (-inf, 0), clamp to safe range [-5, 0]
+    g = F.logsigmoid(
+        torch.randn(1, packed_seq, H, D, dtype=torch.float32, device=device)
+    )
+    g = g.clamp(-5, 0).to(torch.bfloat16)
+    # Beta: sigmoid constrains to (0, 1) range (matches model behavior)
+    beta = torch.randn(1, packed_seq, H, dtype=torch.float32, device=device).sigmoid()
 
     # Initial state in KV layout [N, H, K, V] for cuLA
     initial_state_kv = (
@@ -68,6 +78,7 @@ def _run_cula_vs_triton(B, T, H, D, device="cuda"):
     cu_seqlens = _make_cu_seqlens(B, T, device)
 
     # --- Triton reference ---
+    # chunk_kda does its own cumsum internally (base-e, no scale)
     triton_out = chunk_kda(
         q=q.clone(),
         k=k.clone(),
@@ -85,8 +96,10 @@ def _run_cula_vs_triton(B, T, H, D, device="cuda"):
     q_norm = l2norm_fwd(q.clone().contiguous())
     k_norm = l2norm_fwd(k.clone().contiguous())
 
-    # Gate cumsum
-    g_cum = chunk_local_cumsum(g.clone(), chunk_size=64, cu_seqlens=cu_seqlens.long())
+    # Gate cumsum with RCP_LN2 scale (cuLA uses exp2 internally)
+    g_cum = chunk_local_cumsum(
+        g.clone(), chunk_size=64, scale=RCP_LN2, cu_seqlens=cu_seqlens.long()
+    )
 
     # Reshape for C++ kernel: [packed_seq, H, D]
     q_packed = q_norm.reshape(packed_seq, H, D).contiguous()
@@ -151,11 +164,20 @@ def test_cula_varlen():
     for i, l in enumerate(seqlens):
         cu_seqlens[i + 1] = cu_seqlens[i] + l
 
-    q = torch.randn(packed_seq, H, D, dtype=torch.bfloat16, device=device)
-    k = torch.randn(packed_seq, H, D, dtype=torch.bfloat16, device=device)
+    # L2-normalize Q, K (required for numerical stability, matches model usage)
+    q = F.normalize(
+        torch.randn(packed_seq, H, D, dtype=torch.float32, device=device), p=2, dim=-1
+    ).bfloat16()
+    k = F.normalize(
+        torch.randn(packed_seq, H, D, dtype=torch.float32, device=device), p=2, dim=-1
+    ).bfloat16()
     v = torch.randn(packed_seq, H, D, dtype=torch.bfloat16, device=device)
-    g = torch.rand(packed_seq, H, D, dtype=torch.float32, device=device) * (-4.9)
-    beta = torch.randn(packed_seq, H, dtype=torch.float32, device=device)
+    # Gate values in safe range [-5, 0) (pre-cumsum'd for direct kernel call)
+    g = F.logsigmoid(
+        torch.randn(packed_seq, H, D, dtype=torch.float32, device=device)
+    ).clamp(-5, 0)
+    # Beta must be in (0, 1) via sigmoid (matches model behavior)
+    beta = torch.randn(packed_seq, H, dtype=torch.float32, device=device).sigmoid()
     initial_state = torch.randn(B, H, D, D, dtype=torch.float32, device=device) * 0.01
 
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
@@ -193,11 +215,20 @@ def test_cula_no_initial_state():
     packed_seq = B * T
 
     cu_seqlens = _make_cu_seqlens(B, T, device)
-    q = torch.randn(packed_seq, H, D, dtype=torch.bfloat16, device=device)
-    k = torch.randn(packed_seq, H, D, dtype=torch.bfloat16, device=device)
+    # L2-normalize Q, K (required for numerical stability, matches model usage)
+    q = F.normalize(
+        torch.randn(packed_seq, H, D, dtype=torch.float32, device=device), p=2, dim=-1
+    ).bfloat16()
+    k = F.normalize(
+        torch.randn(packed_seq, H, D, dtype=torch.float32, device=device), p=2, dim=-1
+    ).bfloat16()
     v = torch.randn(packed_seq, H, D, dtype=torch.bfloat16, device=device)
-    g = torch.rand(packed_seq, H, D, dtype=torch.float32, device=device) * (-4.9)
-    beta = torch.randn(packed_seq, H, dtype=torch.float32, device=device)
+    # Gate values in safe range [-5, 0)
+    g = F.logsigmoid(
+        torch.randn(packed_seq, H, D, dtype=torch.float32, device=device)
+    ).clamp(-5, 0)
+    # Beta must be in (0, 1) via sigmoid
+    beta = torch.randn(packed_seq, H, dtype=torch.float32, device=device).sigmoid()
 
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     workspace = torch.zeros(sm_count * 128, dtype=torch.uint8, device=device)
