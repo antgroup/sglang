@@ -83,7 +83,6 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self.decode_forward_done_event = None
         self.pending_backup_done_event = None
-        self.next_backup_done_event = None
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -135,7 +134,7 @@ class HiSparseCoordinator:
             return
         if (
             self.decode_forward_done_event is not None
-            or self.next_backup_done_event is not None
+            or self.pending_backup_done_event is not None
         ):
             raise RuntimeError("HiSparse decode backup events were not consumed")
 
@@ -152,7 +151,7 @@ class HiSparseCoordinator:
         forward_done_event = device_module.Event()
         backup_done_event = device_module.Event()
         self.decode_forward_done_event = forward_done_event
-        self.next_backup_done_event = backup_done_event
+        self.pending_backup_done_event = backup_done_event
         with device_module.stream(self.decode_backup_stream):
             forward_done_event.wait(self.decode_backup_stream)
             host_locs = host_locs.to(device=self.device)
@@ -178,8 +177,6 @@ class HiSparseCoordinator:
             return
         self.decode_forward_done_event.record()
         self.decode_forward_done_event = None
-        self.pending_backup_done_event = self.next_backup_done_event
-        self.next_backup_done_event = None
 
     def wait_for_pending_backup(self) -> None:
         if self.pending_backup_done_event is None:
