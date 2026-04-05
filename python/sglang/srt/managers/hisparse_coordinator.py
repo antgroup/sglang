@@ -81,8 +81,6 @@ class HiSparseCoordinator:
         self.decode_backup_stream = device_module.Stream()
         self.ack_staging_queue: List[HiSparseAct] = []
         self.decode_producer_stream = None
-        self.decode_forward_done_event = None
-        self.next_backup_done_event = None
         self.pending_backup_done_event = None
 
         self.tp_group = tp_group
@@ -133,10 +131,7 @@ class HiSparseCoordinator:
     ) -> None:
         if len(device_locs) == 0:
             return
-        if (
-            self.decode_forward_done_event is not None
-            or self.next_backup_done_event is not None
-        ):
+        if self.pending_backup_done_event is not None:
             raise RuntimeError("HiSparse decode backup events were not consumed")
 
         host_locs = self.mem_pool_host.alloc(len(device_locs))
@@ -149,13 +144,14 @@ class HiSparseCoordinator:
                 f"HiSparse host mem pool alloc failed for {len(device_locs)} decode backup tokens"
             )
 
-        forward_done_event = device_module.Event()
         backup_done_event = device_module.Event()
-        self.decode_forward_done_event = forward_done_event
-        self.next_backup_done_event = backup_done_event
+        self.pending_backup_done_event = backup_done_event
+        schedule_stream = device_module.current_stream()
+        host_locs = host_locs.to(device=self.device)
         with device_module.stream(self.decode_backup_stream):
-            forward_done_event.wait(self.decode_backup_stream)
-            host_locs = host_locs.to(device=self.device)
+            self.decode_backup_stream.wait_stream(schedule_stream)
+            if self.decode_producer_stream is not None:
+                self.decode_backup_stream.wait_stream(self.decode_producer_stream)
             self.req_to_host_pool[req_indices, token_positions] = host_locs
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device,
@@ -172,14 +168,6 @@ class HiSparseCoordinator:
                 token_positions.record_stream(self.decode_backup_stream)
             if device_locs.is_cuda:
                 device_locs.record_stream(self.decode_backup_stream)
-
-    def note_decode_forward_done(self) -> None:
-        if self.decode_forward_done_event is None:
-            return
-        self.decode_forward_done_event.record()
-        self.decode_forward_done_event = None
-        self.pending_backup_done_event = self.next_backup_done_event
-        self.next_backup_done_event = None
 
     def wait_for_pending_backup(self) -> None:
         if self.pending_backup_done_event is None:
@@ -556,6 +544,7 @@ class HiSparseCoordinator:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         if self.pending_backup_done_event is not None:
             self.pending_backup_done_event.wait(device_module.current_stream())
+            self.pending_backup_done_event = None
 
         # release memory — only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
