@@ -10,7 +10,6 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.hisparse_radix_cache import HiSparseRadixCache
 from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module
 
@@ -120,8 +119,9 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_reqs
 
-        # CPU host radix tree for prefix sharing across requests
-        self.host_radix_cache = HiSparseRadixCache(self.mem_pool_host)
+        # Host radix cache reference; set via set_host_radix_cache() after the
+        # scheduler creates the shared HiSparseRadixCache as tree_cache.
+        self.host_radix_cache = None
         # Per-request tracking: req_pool_idx -> (tree_node, prefix_len_at_staging)
         self._req_radix_node: Dict[int, object] = {}
         self._req_radix_prefix_len: Dict[int, int] = {}
@@ -129,12 +129,16 @@ class HiSparseCoordinator:
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
+    def set_host_radix_cache(self, cache) -> None:
+        """Attach the shared HiSparseRadixCache (scheduler's tree_cache)."""
+        self.host_radix_cache = cache
+
     def _try_alloc_host(self, need: int) -> Optional[torch.Tensor]:
         """Allocate from host pool, evicting from host radix tree if necessary."""
         if self.mem_pool_host.available_size() < need:
             deficit = need - self.mem_pool_host.available_size()
-            if self.host_radix_cache.evictable_size() >= deficit:
-                self.host_radix_cache.evict(deficit)
+            if self.host_radix_cache.host_evictable_size() >= deficit:
+                self.host_radix_cache.host_evict(deficit)
         return self.mem_pool_host.alloc(need)
 
     def admit_request_into_staging(self, req: Req) -> None:
@@ -149,22 +153,27 @@ class HiSparseCoordinator:
         prefill_len = len(device_indices)
         token_ids = list(req.fill_ids[:prefill_len])
 
-        # Match prefix against host radix cache
-        host_prefix, radix_node, radix_prefix_len = self.host_radix_cache.match_prefix(
-            token_ids, req.extra_key
-        )
+        # The scheduler's match_prefix already identified how much prefix KV
+        # exists on the host (req.host_hit_length) and loaded it to GPU via
+        # init_load_back.  Use that to determine which portion is already on CPU.
+        radix_prefix_len = getattr(req, "host_hit_length", 0)
+        radix_node = getattr(req, "last_host_node", None)
 
-        # Reuse matched prefix host indices
-        if radix_prefix_len > 0:
-            self.host_radix_cache.inc_lock_ref(radix_node)
+        # Populate host pool mapping for the prefix (already in tree)
+        # and lock the node to prevent eviction during staging/decode.
+        if radix_prefix_len > 0 and radix_node is not None:
+            self.host_radix_cache.host_inc_lock_ref(radix_node)
+            host_prefix, _, _ = self.host_radix_cache.host_match_prefix(
+                token_ids, req.extra_key
+            )
             self.req_to_host_pool[req.req_pool_idx, :radix_prefix_len] = (
-                host_prefix.to(device=self.device)
+                host_prefix[:radix_prefix_len].to(device=self.device)
             )
 
         self._req_radix_node[req.req_pool_idx] = radix_node
         self._req_radix_prefix_len[req.req_pool_idx] = radix_prefix_len
 
-        # Allocate and copy only the suffix
+        # Allocate and copy only the suffix (newly computed tokens) to CPU
         suffix_len = prefill_len - radix_prefix_len
         if suffix_len > 0:
             suffix_host_indices = self._try_alloc_host(suffix_len)
@@ -205,7 +214,6 @@ class HiSparseCoordinator:
             )
         else:
             # Entire prefill was a cache hit -- no DMA needed.
-            # Create an already-signaled event so collect_ready_reqs proceeds.
             start_event = device_module.Event()
             finish_event = device_module.Event()
             start_event.record()
@@ -244,7 +252,7 @@ class HiSparseCoordinator:
 
         # RDMA path: host indices are externally managed. Initialize radix tracking
         # with root/0 so request_finished can insert into tree on completion.
-        self._req_radix_node[req.req_pool_idx] = self.host_radix_cache.root_node
+        self._req_radix_node[req.req_pool_idx] = self.host_radix_cache.root_node if self.host_radix_cache else None
         self._req_radix_prefix_len[req.req_pool_idx] = 0
 
         req.staging = False
@@ -309,7 +317,7 @@ class HiSparseCoordinator:
         token_ids = list(req.fill_ids[:prefill_len])
         host_indices = self.req_to_host_pool[req.req_pool_idx, :prefill_len].cpu()
 
-        new_prefix_len = self.host_radix_cache.insert(token_ids, host_indices, req.extra_key)
+        new_prefix_len = self.host_radix_cache.host_insert(token_ids, host_indices, req.extra_key)
 
         # Free duplicate host indices that overlap with existing tree entries.
         # Indices in [old_radix_prefix_len, new_prefix_len) were freshly allocated
@@ -323,7 +331,7 @@ class HiSparseCoordinator:
                 self.mem_pool_host.free(dup)
                 # Re-read the canonical tree indices for the duplicated range
                 # so req_to_host_pool points to the tree-owned slots.
-                canonical, _, _ = self.host_radix_cache.match_prefix(token_ids, req.extra_key)
+                canonical, _, _ = self.host_radix_cache.host_match_prefix(token_ids, req.extra_key)
                 self.req_to_host_pool[
                     req.req_pool_idx, old_radix_prefix_len:new_prefix_len
                 ] = canonical[old_radix_prefix_len:new_prefix_len].to(device=self.device)
@@ -331,10 +339,10 @@ class HiSparseCoordinator:
         # Transfer lock: release match node, lock the inserted last node
         old_node = self._req_radix_node.get(req.req_pool_idx)
         if old_node is not None and old_node is not self.host_radix_cache.root_node:
-            self.host_radix_cache.dec_lock_ref(old_node)
+            self.host_radix_cache.host_dec_lock_ref(old_node)
 
-        _, new_node, _ = self.host_radix_cache.match_prefix(token_ids, req.extra_key)
-        self.host_radix_cache.inc_lock_ref(new_node)
+        _, new_node, _ = self.host_radix_cache.host_match_prefix(token_ids, req.extra_key)
+        self.host_radix_cache.host_inc_lock_ref(new_node)
         self._req_radix_node[req.req_pool_idx] = new_node
         self._req_radix_prefix_len[req.req_pool_idx] = prefill_len
 
@@ -657,7 +665,7 @@ class HiSparseCoordinator:
         # Release radix tree lock
         radix_node = self._req_radix_node.pop(req.req_pool_idx, None)
         if radix_node is not None and radix_node is not self.host_radix_cache.root_node:
-            self.host_radix_cache.dec_lock_ref(radix_node)
+            self.host_radix_cache.host_dec_lock_ref(radix_node)
         self._req_radix_prefix_len.pop(req.req_pool_idx, None)
 
         self.req_to_host_pool[req.req_pool_idx, :] = -1
@@ -700,7 +708,7 @@ class HiSparseCoordinator:
             )
             host_indices_cpu = host_indices.cpu()
             old_protected = self._req_radix_prefix_len.get(req.req_pool_idx, 0)
-            new_prefix_len = self.host_radix_cache.insert(
+            new_prefix_len = self.host_radix_cache.host_insert(
                 token_ids, host_indices_cpu, req.extra_key
             )
             # Free host indices that were independently allocated but now overlap
@@ -719,7 +727,7 @@ class HiSparseCoordinator:
         # Release radix tree lock
         radix_node = self._req_radix_node.pop(req.req_pool_idx, None)
         if radix_node is not None and radix_node is not self.host_radix_cache.root_node:
-            self.host_radix_cache.dec_lock_ref(radix_node)
+            self.host_radix_cache.host_dec_lock_ref(radix_node)
         self._req_radix_prefix_len.pop(req.req_pool_idx, None)
 
         # clear req info

@@ -722,9 +722,10 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
-        self.disable_radix_cache = server_args.disable_radix_cache or (
-            self.model_config.is_multimodal and uses_transformers_backend
-        )
+        self.disable_radix_cache = (
+            server_args.disable_radix_cache
+            or (self.model_config.is_multimodal and uses_transformers_backend)
+        ) and not self.enable_hisparse
         if self.disable_radix_cache and not server_args.disable_radix_cache:
             logger.warning(
                 "Radix cache is disabled for multimodal models with the "
@@ -756,7 +757,11 @@ class Scheduler(
             sliding_window_size=self.sliding_window_size,
         )
 
-        if effective_chunked_prefill_size is not None and self.disable_radix_cache:
+        if self.enable_hisparse:
+            from sglang.srt.mem_cache.hisparse_radix_cache import HiSparseRadixCache
+
+            self.tree_cache = HiSparseRadixCache(params)
+        elif effective_chunked_prefill_size is not None and self.disable_radix_cache:
             if not self.is_hybrid_swa:
                 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
@@ -821,6 +826,10 @@ class Scheduler(
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+            # Finish lazy initialisation: connect the shared HiSparseRadixCache
+            # (scheduler's tree_cache) with the coordinator's host pool.
+            self.tree_cache.set_host_pool(self.hisparse_coordinator.mem_pool_host)
+            self.hisparse_coordinator.set_host_radix_cache(self.tree_cache)
 
         if (
             server_args.disaggregation_mode == "decode"
