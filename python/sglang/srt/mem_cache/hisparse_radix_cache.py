@@ -9,6 +9,7 @@ before prefill, reducing redundant GPU computation.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
@@ -28,6 +29,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+
+from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -51,35 +54,49 @@ class HiSparseRadixCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
+        self.tp_cache_group = params.tp_cache_group
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
         else:
             self.device = torch.device("cpu")
 
-        # Host pool and internal radix tree are set up lazily via set_host_pool()
-        # because the hisparse coordinator (which owns the host pool) is created
-        # after the scheduler's tree_cache.
+        # Host pool, internal radix tree, and cache controller are set up
+        # lazily via set_host_pool() because the hisparse coordinator (which
+        # owns the host pool) is created after the scheduler's tree_cache.
         self.host_pool: Optional[HostKVCache] = None
         self._host_cache: Optional[RadixCache] = None
+        self.cache_controller: Optional[HiCacheController] = None
+
+        # Cached host indices from the last match_prefix call, keyed by
+        # the matched host node id.  Used by init_load_back to avoid a
+        # fragile bottom-up tree walk.
+        self._last_match_host_indices: dict = {}
 
     # -- Lazy initialisation of the host-side radix tree --
 
     def set_host_pool(self, host_pool: HostKVCache) -> None:
-        """Attach the host memory pool and create the internal radix tree.
+        """Attach the host memory pool, create the internal radix tree,
+        and set up the HiCacheController for async overlap DMA.
 
         Must be called once after the HiSparseCoordinator is available.
         """
         self.host_pool = host_pool
         host_params = CacheInitParams(
             disable=False,
-            # Only tree primitives (match/insert/evict/lock) are used on the
-            # host cache; the high-level cache_finished_req / cache_unfinished_req
-            # are handled by HiSparseRadixCache itself.
             req_to_token_pool=None,
             token_to_kv_pool_allocator=host_pool,
             page_size=host_pool.page_size,
         )
         self._host_cache = RadixCache(host_params)
+
+        self.cache_controller = HiCacheController(
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            mem_pool_host=host_pool,
+            page_size=self.page_size,
+            tp_group=self.tp_cache_group,
+            load_cache_event=threading.Event(),
+            io_backend="kernel",
+        )
 
     @property
     def _cache(self) -> RadixCache:
@@ -113,14 +130,17 @@ class HiSparseRadixCache(BasePrefixCache):
             token_ids=params.key.token_ids, extra_key=params.key.extra_key
         )
         result = self._cache.match_prefix(MatchPrefixParams(key=key))
-        host_hit_len = len(result.device_indices)
+        raw_host_hit_len = len(result.device_indices)
+        host_hit_len = (raw_host_hit_len // self.page_size) * self.page_size
 
-        # device_indices is empty because the KV is only on the CPU host pool.
-        # host_hit_length tells the scheduler how many tokens can be loaded back.
+        last_node = result.last_device_node
+        if host_hit_len > 0 and last_node is not None:
+            self._last_match_host_indices[id(last_node)] = result.device_indices
+
         return MatchResult(
             device_indices=empty,
             last_device_node=None,
-            last_host_node=result.last_device_node,
+            last_host_node=last_node,
             host_hit_length=host_hit_len,
         )
 
@@ -129,71 +149,65 @@ class HiSparseRadixCache(BasePrefixCache):
     ) -> Tuple[torch.Tensor, Any]:
         """Load prefix KV from CPU host pool to GPU device pool.
 
-        Allocates device KV pool slots and performs a synchronous per-layer
-        CPU->GPU DMA transfer.  Returns (device_indices, last_node).
+        HiSparse uses a dual-allocator model (logical pool + device buffer)
+        with a mapping between them.  This method performs the full three-step
+        allocation so that attention kernels can translate logical indices to
+        valid device buffer locations.
         """
         last_node = params.last_host_node
         host_hit_length = params.host_hit_length
+        empty = torch.empty((0,), dtype=torch.int64, device=self.device)
 
         if last_node is None or host_hit_length <= 0 or self.host_pool is None:
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
-            )
+            return empty, last_node
 
-        # Collect host indices by walking from root to last_node
-        host_indices = self._collect_host_indices(last_node, host_hit_length)
+        host_indices = self._last_match_host_indices.pop(id(last_node), None)
         if host_indices is None or host_indices.numel() == 0:
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
-            )
+            return empty, last_node
 
-        num_tokens = host_indices.numel()
+        page_aligned_len = (host_hit_length // self.page_size) * self.page_size
+        if page_aligned_len <= 0:
+            return empty, last_node
+        host_indices = host_indices[:page_aligned_len]
 
-        # Allocate device pool slots
-        device_indices = self.token_to_kv_pool_allocator.alloc(num_tokens)
-        if device_indices is None:
+        allocator = self.token_to_kv_pool_allocator
+        logical_alloc = getattr(allocator, "logical_attn_allocator", None)
+        hisparse_alloc = getattr(allocator, "hisparse_attn_allocator", None)
+
+        if logical_alloc is None or hisparse_alloc is None:
+            return empty, last_node
+
+        # Step 1: allocate logical indices
+        logical_indices = logical_alloc.alloc(page_aligned_len)
+        if logical_indices is None:
             logger.warning(
-                "HiSparseRadixCache: init_load_back failed to allocate %d device slots",
-                num_tokens,
+                "init_load_back: failed to allocate %d logical slots",
+                page_aligned_len,
             )
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
+            return empty, last_node
+
+        # Step 2: allocate hisparse device buffer indices
+        hisparse_indices = hisparse_alloc.alloc(page_aligned_len)
+        if hisparse_indices is None:
+            logical_alloc.free(logical_indices)
+            logger.warning(
+                "init_load_back: failed to allocate %d hisparse device slots",
+                page_aligned_len,
             )
+            return empty, last_node
 
-        # Synchronous per-layer CPU->GPU transfer
-        device_pool = self.token_to_kv_pool_allocator.get_kvcache()
-        host_indices_dev = host_indices.to(device=self.device)
-        for layer_id in range(self.host_pool.start_layer, self.host_pool.end_layer):
-            self.host_pool.load_to_device_per_layer(
-                device_pool,
-                host_indices_dev,
-                device_indices,
-                layer_id,
-                io_backend="kernel",
-            )
+        # Step 3: set up logical → hisparse device mapping
+        allocator.full_to_hisparse_device_index_mapping[logical_indices] = (
+            hisparse_indices
+        )
 
-        # Locking is managed by the coordinator (via _req_radix_node tracking),
-        # not here, to avoid interference with _lock_node in schedule_policy.
-        return device_indices, last_node
+        # Queue async DMA instead of synchronous per-layer copy.
+        # start_loading() will move host_indices to GPU via move_indices().
+        self.cache_controller.load_queue.append(
+            CacheOperation(host_indices, hisparse_indices, node_id=-1)
+        )
 
-    def _collect_host_indices(
-        self, node: TreeNode, expected_len: int
-    ) -> Optional[torch.Tensor]:
-        """Walk from root to *node* and concatenate the host pool indices."""
-        segments = []
-        cur = node
-        while cur is not None and cur.key is not None:
-            if cur.value is not None:
-                segments.append(cur.value)
-            cur = cur.parent
-        if not segments:
-            return None
-        segments.reverse()
-        indices = torch.cat(segments)
-        return indices[:expected_len]
+        return logical_indices, last_node
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Release device KV pool slots.  Host indices are managed by the
@@ -230,14 +244,28 @@ class HiSparseRadixCache(BasePrefixCache):
         return self._cache.dec_lock_ref(node, params)
 
     def evictable_size(self) -> int:
-        if self._host_cache is None:
-            return 0
-        return self._cache.evictable_size()
+        # Device-side evictable size is 0: HiSparseRadixCache does not retain
+        # device KV slots in the tree (they are freed in cache_finished_req).
+        # The host tree's evictable size is exposed via host_evictable_size().
+        return 0
 
     def protected_size(self):
-        if self._host_cache is None:
-            return 0
-        return self._cache.protected_size()
+        return 0
+
+    def ready_to_load_host_cache(self) -> int:
+        if self.cache_controller is None:
+            return -1
+        return self.cache_controller.start_loading()
+
+    def check_hicache_events(self):
+        if self.cache_controller is None:
+            return
+        finish_count = 0
+        for _, finish_event, _ in self.cache_controller.ack_load_queue:
+            if not finish_event.query():
+                break
+            finish_count += 1
+        del self.cache_controller.ack_load_queue[:finish_count]
 
     def pretty_print(self):
         if self._host_cache is None:
@@ -246,10 +274,10 @@ class HiSparseRadixCache(BasePrefixCache):
 
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.evictable_size()
+        host_evictable = self.host_evictable_size() if self._host_cache else 0
         return (
-            f"Available tokens: {available_size + evictable_size} "
-            f"({available_size=} + {evictable_size=})\n"
+            f"Available device tokens: {available_size}, "
+            f"host evictable: {host_evictable}\n"
         )
 
     # -- Convenience methods for the coordinator --

@@ -830,6 +830,9 @@ class Scheduler(
             # (scheduler's tree_cache) with the coordinator's host pool.
             self.tree_cache.set_host_pool(self.hisparse_coordinator.mem_pool_host)
             self.hisparse_coordinator.set_host_radix_cache(self.tree_cache)
+            self.tp_worker.register_hicache_layer_transfer_counter(
+                self.tree_cache.cache_controller.layer_done_counter
+            )
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -2336,7 +2339,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hisparse:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption:
@@ -2515,7 +2518,7 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hisparse:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()

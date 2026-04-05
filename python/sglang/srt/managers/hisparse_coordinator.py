@@ -154,18 +154,15 @@ class HiSparseCoordinator:
         token_ids = list(req.fill_ids[:prefill_len])
 
         # The scheduler's match_prefix already identified how much prefix KV
-        # exists on the host (req.host_hit_length) and loaded it to GPU via
-        # init_load_back.  Use that to determine which portion is already on CPU.
-        radix_prefix_len = getattr(req, "host_hit_length", 0)
-        radix_node = getattr(req, "last_host_node", None)
+        # exists on the host and loaded it to GPU via init_load_back.
+        # Re-match to get host indices for req_to_host_pool bookkeeping.
+        host_prefix, radix_node, raw_match_len = self.host_radix_cache.host_match_prefix(
+            token_ids, req.extra_key
+        )
+        radix_prefix_len = min(raw_match_len, prefill_len)
 
-        # Populate host pool mapping for the prefix (already in tree)
-        # and lock the node to prevent eviction during staging/decode.
         if radix_prefix_len > 0 and radix_node is not None:
             self.host_radix_cache.host_inc_lock_ref(radix_node)
-            host_prefix, _, _ = self.host_radix_cache.host_match_prefix(
-                token_ids, req.extra_key
-            )
             self.req_to_host_pool[req.req_pool_idx, :radix_prefix_len] = (
                 host_prefix[:radix_prefix_len].to(device=self.device)
             )
