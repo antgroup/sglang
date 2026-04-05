@@ -153,11 +153,9 @@ class CulaKDAKernel(LinearAttnKernelBase):
         g = g.reshape(packed_seq, num_heads, head_dim).contiguous()
         beta = beta.reshape(packed_seq, num_heads).contiguous()
 
-        # 4. State gather: get per-batch states from the pool
-        input_state = ssm_states[cache_indices]  # [N, H, V, K] (SGLang VK layout)
-
-        # 5. State layout conversion: [N, H, V, K] -> [N, H, K, V] (cuLA KV layout)
-        input_state = input_state.transpose(-1, -2).contiguous()
+        # 4. State gather: get per-batch states from the pool (VK layout [N, H, V, K])
+        # The kernel natively uses VK layout via CuTe LayoutLeft (K, V, H, N).
+        input_state = ssm_states[cache_indices].contiguous()
 
         # 6. cu_seqlens
         cu_seqlens = query_start_loc.to(torch.int32)
@@ -182,8 +180,8 @@ class CulaKDAKernel(LinearAttnKernelBase):
             beta=beta,
         )
 
-        # 10. Write output state back: [N, H, K, V] -> [N, H, V, K] (back to SGLang VK layout)
-        ssm_states[cache_indices] = output_state.transpose(-1, -2)
+        # 10. Write output state back (already in VK layout from C++ API)
+        ssm_states[cache_indices] = output_state
 
         # 11. Reshape output: [packed_seq, H, D] -> [1, packed_seq, H, D]
         output = output.reshape(batch_size, packed_seq, num_heads, head_dim)

@@ -68,12 +68,10 @@ def _run_cula_vs_triton(B, T, H, D, device="cuda"):
     # Beta: sigmoid constrains to (0, 1) range (matches model behavior)
     beta = torch.randn(1, packed_seq, H, dtype=torch.float32, device=device).sigmoid()
 
-    # Initial state in KV layout [N, H, K, V] for cuLA
-    initial_state_kv = (
+    # Initial state in VK layout [N, H, V, K] (SGLang convention, used by both paths)
+    initial_state_vk = (
         torch.randn(B, H, D, D, dtype=torch.float32, device=device) * 0.01
     )
-    # Same state in VK layout [N, H, V, K] for Triton
-    initial_state_vk = initial_state_kv.transpose(-1, -2).contiguous()
 
     cu_seqlens = _make_cu_seqlens(B, T, device)
 
@@ -121,7 +119,7 @@ def _run_cula_vs_triton(B, T, H, D, device="cuda"):
         workspace_buffer=workspace,
         scale=scale,
         safe_gate=True,
-        input_state=initial_state_kv.clone(),
+        input_state=initial_state_vk.clone(),
         alpha=g_packed,
         beta=beta_packed,
     )

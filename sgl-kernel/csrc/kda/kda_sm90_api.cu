@@ -96,6 +96,8 @@ std::tuple<torch::Tensor, torch::Tensor> kda_fwd_prefill(
     TORCH_CHECK(beta.size(0) == packed_seq && beta.size(1) == num_heads, "beta shape must be [packed_seq, num_heads]");
     beta_ptr = beta.data_ptr<float>();
   }
+  // input_state is in SGLang VK layout [N, H, V, K], which matches the kernel's
+  // native LayoutLeft (K, V, H, N) — K is the contiguous dimension in both.
   if (input_state_.has_value()) {
     auto& input_state = input_state_.value();
     TORCH_CHECK(input_state.dtype() == torch::kFloat32, "input_state must be float32");
@@ -135,6 +137,8 @@ std::tuple<torch::Tensor, torch::Tensor> kda_fwd_prefill(
       safe_gate,
       static_cast<int32_t>(sm_count));
 
+  // output_state uses CuTe LayoutLeft (K, V, H, N), which maps to
+  // PyTorch contiguous [N, H, V, K] — already in SGLang VK layout.
   return {output, output_state};
 }
 
