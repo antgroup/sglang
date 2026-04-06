@@ -123,14 +123,31 @@ class HiSparseCoordinator:
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
-    def _launch_decode_backup(
+    def _eager_backup_previous_token(
         self,
-        req_indices: torch.Tensor,
-        token_positions: torch.Tensor,
-        device_locs: torch.Tensor,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        if len(device_locs) == 0:
+        backup_indices = []
+        for i in range(len(seq_lens_cpu)):
+            req_idx = int(req_pool_indices_cpu[i])
+            if self._skip_first_backup[req_idx]:
+                self._skip_first_backup[req_idx] = False
+                continue
+            backup_indices.append(i)
+
+        if not backup_indices:
             return
+
+        backup_indices_gpu = torch.tensor(
+            backup_indices, dtype=torch.int64, device=self.device
+        )
+        token_positions = seq_lens[backup_indices_gpu] - 2
+        buffer_slot = token_positions.clamp(max=self.device_buffer_size)
+        req_indices = req_pool_indices[backup_indices_gpu]
+        device_locs = self.req_to_device_buffer[req_indices, buffer_slot]
         if self.pending_backup_done_event is not None:
             raise RuntimeError("HiSparse decode backup events were not consumed")
 
@@ -364,11 +381,9 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        decode_backup = self._prepare_eager_backup_previous_token(
+        self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
-        if decode_backup is not None:
-            self._launch_decode_backup(*decode_backup)
 
         # Grow device buffers if needed and resolve the latest-token slot.
         reserved_buffer_loc = self._grow_device_buffers(
@@ -383,33 +398,6 @@ class HiSparseCoordinator:
         self.mem_pool_device.full_to_hisparse_device_index_mapping[out_cache_loc] = (
             reserved_buffer_loc
         )
-
-    def _prepare_eager_backup_previous_token(
-        self,
-        seq_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        req_pool_indices_cpu: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        backup_indices = []
-        for i in range(len(seq_lens_cpu)):
-            req_idx = int(req_pool_indices_cpu[i])
-            if self._skip_first_backup[req_idx]:
-                self._skip_first_backup[req_idx] = False
-                continue
-            backup_indices.append(i)
-
-        if not backup_indices:
-            return None
-
-        backup_indices_gpu = torch.tensor(
-            backup_indices, dtype=torch.int64, device=self.device
-        )
-        token_positions = seq_lens[backup_indices_gpu] - 2
-        buffer_slot = token_positions.clamp(max=self.device_buffer_size)
-        req_indices = req_pool_indices[backup_indices_gpu]
-        device_locs = self.req_to_device_buffer[req_indices, buffer_slot]
-        return req_indices, token_positions, device_locs
 
     def get_front_topk_tokens(
         self,
