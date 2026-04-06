@@ -381,6 +381,7 @@ class HiSparseCoordinator:
                 f"HiSparse host mem pool alloc failed for {len(device_locs)} decode backup tokens"
             )
         host_locs = host_locs.to(device=self.device)
+        self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
 
         if self.pending_backup_done_event is not None:
             raise RuntimeError("HiSparse decode backup events were not consumed")
@@ -391,7 +392,6 @@ class HiSparseCoordinator:
             self.decode_backup_stream.wait_stream(schedule_stream)
             if self.decode_producer_stream is not None:
                 self.decode_backup_stream.wait_stream(self.decode_producer_stream)
-            self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device,
                 host_locs,
