@@ -123,75 +123,6 @@ class HiSparseCoordinator:
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
-    def _eager_backup_previous_token(
-        self,
-        seq_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        req_pool_indices_cpu: torch.Tensor,
-    ) -> None:
-        backup_indices = []
-        for i in range(len(seq_lens_cpu)):
-            req_idx = int(req_pool_indices_cpu[i])
-            if self._skip_first_backup[req_idx]:
-                self._skip_first_backup[req_idx] = False
-                continue
-            backup_indices.append(i)
-
-        if not backup_indices:
-            return
-
-        backup_indices_gpu = torch.tensor(
-            backup_indices, dtype=torch.int64, device=self.device
-        )
-        token_positions = seq_lens[backup_indices_gpu] - 2
-        buffer_slot = token_positions.clamp(max=self.device_buffer_size)
-        req_indices = req_pool_indices[backup_indices_gpu]
-        device_locs = self.req_to_device_buffer[req_indices, buffer_slot]
-        if self.pending_backup_done_event is not None:
-            raise RuntimeError("HiSparse decode backup events were not consumed")
-
-        host_locs = self.mem_pool_host.alloc(len(device_locs))
-        if host_locs is None:
-            logger.error(
-                "HiSparse: host mem pool alloc failed for %d decode backup tokens",
-                len(device_locs),
-            )
-            raise RuntimeError(
-                f"HiSparse host mem pool alloc failed for {len(device_locs)} decode backup tokens"
-            )
-
-        backup_done_event = device_module.Event()
-        self.pending_backup_done_event = backup_done_event
-        schedule_stream = device_module.current_stream()
-        host_locs = host_locs.to(device=self.device)
-        with device_module.stream(self.decode_backup_stream):
-            self.decode_backup_stream.wait_stream(schedule_stream)
-            if self.decode_producer_stream is not None:
-                self.decode_backup_stream.wait_stream(self.decode_producer_stream)
-            self.req_to_host_pool[req_indices, token_positions] = host_locs
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_locs,
-                device_locs,
-                io_backend="kernel",
-            )
-            backup_done_event.record()
-            if host_locs.is_cuda:
-                host_locs.record_stream(self.decode_backup_stream)
-            if req_indices.is_cuda:
-                req_indices.record_stream(self.decode_backup_stream)
-            if token_positions.is_cuda:
-                token_positions.record_stream(self.decode_backup_stream)
-            if device_locs.is_cuda:
-                device_locs.record_stream(self.decode_backup_stream)
-
-    def wait_for_pending_backup(self) -> None:
-        if self.pending_backup_done_event is None:
-            return
-        self.pending_backup_done_event.wait(device_module.current_stream())
-        self.pending_backup_done_event = None
-
     def admit_request_into_staging(self, req: Req) -> None:
         req.staging = True
         logical_indices = self.req_to_token_pool.req_to_token[
@@ -384,7 +315,6 @@ class HiSparseCoordinator:
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
-
         # Grow device buffers if needed and resolve the latest-token slot.
         reserved_buffer_loc = self._grow_device_buffers(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
@@ -398,6 +328,75 @@ class HiSparseCoordinator:
         self.mem_pool_device.full_to_hisparse_device_index_mapping[out_cache_loc] = (
             reserved_buffer_loc
         )
+
+    def _eager_backup_previous_token(
+        self,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> None:
+        backup_indices = []
+        for i in range(len(seq_lens_cpu)):
+            req_idx = int(req_pool_indices_cpu[i])
+            if self._skip_first_backup[req_idx]:
+                self._skip_first_backup[req_idx] = False
+                continue
+            backup_indices.append(i)
+
+        if not backup_indices:
+            return
+
+        backup_indices_gpu = torch.tensor(
+            backup_indices, dtype=torch.int64, device=self.device
+        )
+        token_positions = seq_lens[backup_indices_gpu] - 2
+        buffer_slot = token_positions.clamp(max=self.device_buffer_size)
+        req_indices = req_pool_indices[backup_indices_gpu]
+        device_locs = self.req_to_device_buffer[req_indices, buffer_slot]
+        if self.pending_backup_done_event is not None:
+            raise RuntimeError("HiSparse decode backup events were not consumed")
+
+        host_locs = self.mem_pool_host.alloc(len(device_locs))
+        if host_locs is None:
+            logger.error(
+                "HiSparse: host mem pool alloc failed for %d decode backup tokens",
+                len(device_locs),
+            )
+            raise RuntimeError(
+                f"HiSparse host mem pool alloc failed for {len(device_locs)} decode backup tokens"
+            )
+
+        backup_done_event = device_module.Event()
+        self.pending_backup_done_event = backup_done_event
+        schedule_stream = device_module.current_stream()
+        host_locs = host_locs.to(device=self.device)
+        with device_module.stream(self.decode_backup_stream):
+            self.decode_backup_stream.wait_stream(schedule_stream)
+            if self.decode_producer_stream is not None:
+                self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+            self.req_to_host_pool[req_indices, token_positions] = host_locs
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs,
+                io_backend="kernel",
+            )
+            backup_done_event.record()
+            if host_locs.is_cuda:
+                host_locs.record_stream(self.decode_backup_stream)
+            if req_indices.is_cuda:
+                req_indices.record_stream(self.decode_backup_stream)
+            if token_positions.is_cuda:
+                token_positions.record_stream(self.decode_backup_stream)
+            if device_locs.is_cuda:
+                device_locs.record_stream(self.decode_backup_stream)
+
+    def wait_for_pending_backup(self) -> None:
+        if self.pending_backup_done_event is None:
+            return
+        self.pending_backup_done_event.wait(device_module.current_stream())
+        self.pending_backup_done_event = None
 
     def get_front_topk_tokens(
         self,
