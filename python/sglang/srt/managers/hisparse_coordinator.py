@@ -117,7 +117,8 @@ class HiSparseCoordinator:
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
 
-        # CPU flag kept for compatibility with the staging lifecycle.
+        # CPU flag: True means "skip backup on the next decode step" because
+        # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_reqs
 
     def set_decode_producer_stream(self, stream) -> None:
@@ -365,6 +366,7 @@ class HiSparseCoordinator:
         #  - long seq:  slot = device_buffer_size  (the reserved slot)
         actual_token_pos = seq_lens[backup_indices_gpu] - 2
         buffer_slot = actual_token_pos.clamp(max=self.device_buffer_size)
+
         backup_req_indices = req_pool_indices[backup_indices_gpu]
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
