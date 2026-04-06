@@ -2093,15 +2093,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum += bs
 
         if self.hisparse_coordinator is not None:
-            req_pool_indices_cpu = torch.tensor(
-                [req.req_pool_idx for req in self.reqs], dtype=torch.int64
-            )
             self.hisparse_coordinator.map_last_loc_to_buffer(
                 self.seq_lens,
                 self.out_cache_loc,
                 self.req_pool_indices,
                 self.seq_lens_cpu,
-                req_pool_indices_cpu,
             )
 
         if get_global_server_args().enable_mamba_extra_buffer():
