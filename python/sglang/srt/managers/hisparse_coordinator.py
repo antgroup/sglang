@@ -695,10 +695,7 @@ class HiSparseCoordinator:
         # The tree takes ownership of all host indices; do NOT free them directly.
         total_len = req.kv_allocated_len
         host_indices = self.req_to_host_pool[req.req_pool_idx, :total_len]
-        valid_mask = host_indices >= 0
-        valid_count = int(valid_mask.sum().item())
-
-        if self.host_radix_cache is not None and valid_count == total_len:
+        if self.host_radix_cache is not None:
             token_ids = list((req.origin_input_ids + req.output_ids)[:total_len])
             host_indices_cpu = host_indices.cpu()
             old_protected = self._req_radix_prefix_len.get(req.req_pool_idx, 0)
@@ -710,9 +707,7 @@ class HiSparseCoordinator:
                 if dup.numel() > 0:
                     self.mem_pool_host.free(dup)
         else:
-            valid_indices = host_indices[valid_mask]
-            if valid_indices.numel() > 0:
-                self.mem_pool_host.free(valid_indices)
+            self.mem_pool_host.free(host_indices)
 
         # Release radix tree lock
         radix_node = self._req_radix_node.pop(req.req_pool_idx, None)
