@@ -81,7 +81,8 @@ class HiSparseCoordinator:
         self.decode_backup_stream = device_module.Stream()
         self.ack_staging_queue: List[HiSparseAct] = []
         self.decode_producer_stream = None
-        self.pending_backup_done_event = None
+        self._backup_done_event = device_module.Event()
+        self._has_pending_backup = False
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -430,10 +431,9 @@ class HiSparseCoordinator:
         host_locs = host_locs.to(device=self.device)
         self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
 
-        if self.pending_backup_done_event is not None:
-            raise RuntimeError("HiSparse decode backup events were not consumed")
-        backup_done_event = device_module.Event()
-        self.pending_backup_done_event = backup_done_event
+        if self._has_pending_backup:
+            self._backup_done_event.wait(device_module.current_stream())
+            self._has_pending_backup = False
         schedule_stream = device_module.current_stream()
         with device_module.stream(self.decode_backup_stream):
             self.decode_backup_stream.wait_stream(schedule_stream)
@@ -445,7 +445,7 @@ class HiSparseCoordinator:
                 device_locs,
                 io_backend="kernel",
             )
-            backup_done_event.record()
+            self._backup_done_event.record()
             if host_locs.is_cuda:
                 host_locs.record_stream(self.decode_backup_stream)
             if backup_req_indices.is_cuda:
@@ -454,12 +454,13 @@ class HiSparseCoordinator:
                 actual_token_pos.record_stream(self.decode_backup_stream)
             if device_locs.is_cuda:
                 device_locs.record_stream(self.decode_backup_stream)
+        self._has_pending_backup = True
 
     def wait_for_pending_backup(self) -> None:
-        if self.pending_backup_done_event is None:
+        if not self._has_pending_backup:
             return
-        self.pending_backup_done_event.wait(device_module.current_stream())
-        self.pending_backup_done_event = None
+        self._backup_done_event.wait(device_module.current_stream())
+        self._has_pending_backup = False
 
     def get_front_topk_tokens(
         self,
@@ -592,9 +593,9 @@ class HiSparseCoordinator:
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
-        if self.pending_backup_done_event is not None:
-            self.pending_backup_done_event.wait(device_module.current_stream())
-            self.pending_backup_done_event = None
+        if self._has_pending_backup:
+            self._backup_done_event.wait(device_module.current_stream())
+            self._has_pending_backup = False
 
         # release memory — only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
