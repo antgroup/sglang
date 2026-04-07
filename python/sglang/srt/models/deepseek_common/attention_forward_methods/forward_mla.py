@@ -325,7 +325,8 @@ class DeepseekMLAForwardMixin:
                 gathered = get_dcp_group().all_gather(combined, dim=-2)
                 d_pe = q_pe.size(-1)
                 d_nope = q_nope_out.size(-1)
-                q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
+                with use_symmetric_memory(get_dcp_group()):
+                    q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
                 cache_k_nope, cache_k_rope = (
