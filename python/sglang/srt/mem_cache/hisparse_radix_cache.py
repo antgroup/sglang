@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 
+from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -23,14 +24,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     InitLoadBackParams,
     InsertParams,
-    InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-
-from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -100,9 +98,9 @@ class HiSparseRadixCache(BasePrefixCache):
 
     @property
     def _cache(self) -> RadixCache:
-        assert self._host_cache is not None, (
-            "HiSparseRadixCache: host pool not set yet — call set_host_pool() first"
-        )
+        assert (
+            self._host_cache is not None
+        ), "HiSparseRadixCache: host pool not set yet — call set_host_pool() first"
         return self._host_cache
 
     # -- BasePrefixCache required properties --
@@ -126,9 +124,7 @@ class HiSparseRadixCache(BasePrefixCache):
                 host_hit_length=0,
             )
 
-        key = RadixKey(
-            token_ids=params.key.token_ids, extra_key=params.key.extra_key
-        )
+        key = RadixKey(token_ids=params.key.token_ids, extra_key=params.key.extra_key)
         result = self._cache.match_prefix(MatchPrefixParams(key=key))
         raw_host_hit_len = len(result.device_indices)
         host_hit_len = (raw_host_hit_len // self.page_size) * self.page_size
@@ -144,9 +140,7 @@ class HiSparseRadixCache(BasePrefixCache):
             host_hit_length=host_hit_len,
         )
 
-    def init_load_back(
-        self, params: InitLoadBackParams
-    ) -> Tuple[torch.Tensor, Any]:
+    def init_load_back(self, params: InitLoadBackParams) -> Tuple[torch.Tensor, Any]:
         """Load prefix KV from CPU host pool to GPU device pool.
 
         HiSparse uses a dual-allocator model (logical pool + device buffer)
@@ -290,7 +284,11 @@ class HiSparseRadixCache(BasePrefixCache):
         """Direct host-tree match returning (host_indices, last_node, matched_len)."""
         key = RadixKey(token_ids=token_ids, extra_key=extra_key)
         result = self._cache.match_prefix(MatchPrefixParams(key=key))
-        return result.device_indices, result.last_device_node, len(result.device_indices)
+        return (
+            result.device_indices,
+            result.last_device_node,
+            len(result.device_indices),
+        )
 
     def host_insert(
         self,

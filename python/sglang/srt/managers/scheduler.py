@@ -722,9 +722,8 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
-        self.disable_radix_cache = (
-            server_args.disable_radix_cache
-            or (self.model_config.is_multimodal and uses_transformers_backend)
+        self.disable_radix_cache = server_args.disable_radix_cache or (
+            self.model_config.is_multimodal and uses_transformers_backend
         )
         self.enable_hisparse_radix_cache = (
             self.enable_hisparse and not self.disable_radix_cache
