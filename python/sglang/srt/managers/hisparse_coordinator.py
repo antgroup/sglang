@@ -135,7 +135,7 @@ class HiSparseCoordinator:
 
     def _try_alloc_host(self, need: int) -> Optional[torch.Tensor]:
         """Allocate from host pool, evicting from host radix tree if necessary."""
-        if self.mem_pool_host.available_size() < need:
+        if self.mem_pool_host.available_size() < need and self.host_radix_cache is not None:
             deficit = need - self.mem_pool_host.available_size()
             if self.host_radix_cache.host_evictable_size() >= deficit:
                 self.host_radix_cache.host_evict(deficit)
@@ -153,19 +153,18 @@ class HiSparseCoordinator:
         prefill_len = len(device_indices)
         token_ids = list(req.fill_ids[:prefill_len])
 
-        # The scheduler's match_prefix already identified how much prefix KV
-        # exists on the host and loaded it to GPU via init_load_back.
-        # Re-match to get host indices for req_to_host_pool bookkeeping.
-        host_prefix, radix_node, raw_match_len = self.host_radix_cache.host_match_prefix(
-            token_ids, req.extra_key
-        )
-        radix_prefix_len = min(raw_match_len, prefill_len)
-
-        if radix_prefix_len > 0 and radix_node is not None:
-            self.host_radix_cache.host_inc_lock_ref(radix_node)
-            self.req_to_host_pool[req.req_pool_idx, :radix_prefix_len] = (
-                host_prefix[:radix_prefix_len].to(device=self.device)
+        radix_prefix_len = 0
+        radix_node = None
+        if self.host_radix_cache is not None:
+            host_prefix, radix_node, raw_match_len = self.host_radix_cache.host_match_prefix(
+                token_ids, req.extra_key
             )
+            radix_prefix_len = min(raw_match_len, prefill_len)
+            if radix_prefix_len > 0 and radix_node is not None:
+                self.host_radix_cache.host_inc_lock_ref(radix_node)
+                self.req_to_host_pool[req.req_pool_idx, :radix_prefix_len] = (
+                    host_prefix[:radix_prefix_len].to(device=self.device)
+                )
 
         self._req_radix_node[req.req_pool_idx] = radix_node
         self._req_radix_prefix_len[req.req_pool_idx] = radix_prefix_len
@@ -310,30 +309,25 @@ class HiSparseCoordinator:
 
     def _insert_prefill_into_radix_cache(self, req: Req) -> None:
         """Insert prefill tokens into host radix tree after staging completes."""
+        if self.host_radix_cache is None:
+            return
+
         prefill_len = len(req.fill_ids)
         token_ids = list(req.fill_ids[:prefill_len])
         host_indices = self.req_to_host_pool[req.req_pool_idx, :prefill_len].cpu()
 
         new_prefix_len = self.host_radix_cache.host_insert(token_ids, host_indices, req.extra_key)
 
-        # Free duplicate host indices that overlap with existing tree entries.
-        # Indices in [old_radix_prefix_len, new_prefix_len) were freshly allocated
-        # during staging but the tree already owns equivalent slots from a prior
-        # request. The tree's insert does NOT store the caller's values for the
-        # matched portion, so these slots are truly redundant.
         old_radix_prefix_len = self._req_radix_prefix_len.get(req.req_pool_idx, 0)
         if new_prefix_len > old_radix_prefix_len:
             dup = host_indices[old_radix_prefix_len:new_prefix_len]
             if dup.numel() > 0:
                 self.mem_pool_host.free(dup)
-                # Re-read the canonical tree indices for the duplicated range
-                # so req_to_host_pool points to the tree-owned slots.
                 canonical, _, _ = self.host_radix_cache.host_match_prefix(token_ids, req.extra_key)
                 self.req_to_host_pool[
                     req.req_pool_idx, old_radix_prefix_len:new_prefix_len
                 ] = canonical[old_radix_prefix_len:new_prefix_len].to(device=self.device)
 
-        # Transfer lock: release match node, lock the inserted last node
         old_node = self._req_radix_node.get(req.req_pool_idx)
         if old_node is not None and old_node is not self.host_radix_cache.root_node:
             self.host_radix_cache.host_dec_lock_ref(old_node)
@@ -661,7 +655,7 @@ class HiSparseCoordinator:
 
         # Release radix tree lock
         radix_node = self._req_radix_node.pop(req.req_pool_idx, None)
-        if radix_node is not None and radix_node is not self.host_radix_cache.root_node:
+        if radix_node is not None and self.host_radix_cache is not None and radix_node is not self.host_radix_cache.root_node:
             self.host_radix_cache.host_dec_lock_ref(radix_node)
         self._req_radix_prefix_len.pop(req.req_pool_idx, None)
 
@@ -699,7 +693,7 @@ class HiSparseCoordinator:
         valid_mask = host_indices >= 0
         valid_count = int(valid_mask.sum().item())
 
-        if valid_count == total_len:
+        if self.host_radix_cache is not None and valid_count == total_len:
             token_ids = list(
                 (req.origin_input_ids + req.output_ids)[:total_len]
             )
@@ -708,22 +702,18 @@ class HiSparseCoordinator:
             new_prefix_len = self.host_radix_cache.host_insert(
                 token_ids, host_indices_cpu, req.extra_key
             )
-            # Free host indices that were independently allocated but now overlap
-            # with existing tree entries. Range [old_protected, new_prefix_len)
-            # are slots the tree already owns from a previous insert.
             if new_prefix_len > old_protected:
                 dup = host_indices_cpu[old_protected:new_prefix_len]
                 if dup.numel() > 0:
                     self.mem_pool_host.free(dup)
         else:
-            # Partial host data -- fall back to freeing everything not in tree.
             valid_indices = host_indices[valid_mask]
             if valid_indices.numel() > 0:
                 self.mem_pool_host.free(valid_indices)
 
         # Release radix tree lock
         radix_node = self._req_radix_node.pop(req.req_pool_idx, None)
-        if radix_node is not None and radix_node is not self.host_radix_cache.root_node:
+        if radix_node is not None and self.host_radix_cache is not None and radix_node is not self.host_radix_cache.root_node:
             self.host_radix_cache.host_dec_lock_ref(radix_node)
         self._req_radix_prefix_len.pop(req.req_pool_idx, None)
 
