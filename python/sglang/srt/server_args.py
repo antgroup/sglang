@@ -3262,8 +3262,14 @@ class ServerArgs:
 
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
-            self.disable_radix_cache = True
-            logger.warning("KV cache is forced as chunk cache for decode server")
+            if not self.disable_radix_cache:
+                logger.info(
+                    "Decode server using RadixCache for incremental KV transfer. "
+                    "Prefix matching on the decode side enables transferring only "
+                    "the incremental KV delta from prefill."
+                )
+            else:
+                logger.info("Decode server using ChunkCache (radix cache disabled).")
 
         elif self.disaggregation_mode == "prefill":
             assert (

@@ -335,8 +335,28 @@ class PrefillBootstrapQueue:
             )
             assert req.metadata_buffer_index is not None
 
-            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
-            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+            page_size = self.token_to_kv_pool.page_size
+            total_pages = kv_to_page_num(num_kv_indices, page_size)
+
+            # Read decode_prefix_pages from the bootstrap message to skip
+            # transferring KV that the decode side already has cached.
+            decode_prefix_pages = self.kv_manager.get_decode_prefix_pages(
+                req.bootstrap_room
+            )
+            logger.info(
+                f"Prefill bootstrap for {req.rid}: "
+                f"decode_prefix_pages={decode_prefix_pages}, total_pages={total_pages}, "
+                f"bootstrap_room={req.bootstrap_room}"
+            )
+            if decode_prefix_pages > 0:
+                skip_tokens = decode_prefix_pages * page_size
+                req.start_send_idx = skip_tokens
+                req.disagg_prefill_skip_tokens = skip_tokens
+                incremental_pages = total_pages - decode_prefix_pages
+            else:
+                incremental_pages = total_pages
+
+            req.disagg_kv_sender.init(incremental_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
@@ -666,8 +686,10 @@ class SchedulerDisaggregationPrefillMixin:
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
                 continue
+            # Use actual transferred tokens (excluding decode-side cached prefix)
+            actual_transfer_tokens = len(req.origin_input_ids) - req.disagg_prefill_skip_tokens
             metrics = req.time_stats.compute_and_observe_kv_transfer_metrics(
-                num_tokens=len(req.origin_input_ids),
+                num_tokens=actual_transfer_tokens,
                 page_size=page_size,
                 bytes_per_page_all_layers=bytes_per_page_all_layers,
             )
@@ -767,7 +789,6 @@ class SchedulerDisaggregationPrefillMixin:
             .cpu()
             .numpy()
         )
-        req.start_send_idx = end_idx
         state_indices = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
@@ -819,4 +840,5 @@ class SchedulerDisaggregationPrefillMixin:
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
+        req.start_send_idx = end_idx
         req.disagg_kv_sender.send(page_indices, state_indices)
