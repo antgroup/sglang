@@ -394,20 +394,21 @@ class DeepseekMLAForwardMixin:
 
             # TODO(augusto.yjh) 返回lse, correct attn_output
             if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
-                attn_output, lse = self.attn_mqa_for_dcp_decode(
-                    q_nope_out,
-                    k_nope,
-                    k_nope,
-                    forward_batch,
-                    q_rope=q_pe,
-                    k_rope=k_pe,
-                    **extra_args,
-                    **(
-                        dict(topk_indices=topk_indices)
-                        if topk_indices is not None
-                        else {}
-                    ),
-                )
+                with use_symmetric_memory(get_dcp_group()):
+                    attn_output, lse = self.attn_mqa_for_dcp_decode(
+                        q_nope_out,
+                        k_nope,
+                        k_nope,
+                        forward_batch,
+                        q_rope=q_pe,
+                        k_rope=k_pe,
+                        **extra_args,
+                        **(
+                            dict(topk_indices=topk_indices)
+                            if topk_indices is not None
+                            else {}
+                        ),
+                    )
             else:
                 attn_output = self.attn_mqa(
                     q_nope_out,
@@ -469,9 +470,6 @@ class DeepseekMLAForwardMixin:
         # TODO(augusto.yjh) all gather lse，订正attn_output
         # TODO(augusto.yjh) 执行reduce scatter, 先reduce拿到正确的 attn_output, 再按local_num_heads scatter attn_output
         if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
-            # Note(wh): make sure input tensors use nccl allocator
-            with use_symmetric_memory(get_dcp_group()):
-                lse = lse.clone(memory_format=torch.contiguous_format)
             attn_output = attn_output.view(
                 -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
             )
