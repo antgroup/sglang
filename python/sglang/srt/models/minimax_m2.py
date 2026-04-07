@@ -260,15 +260,15 @@ class MiniMaxM2RMSNormTP(nn.Module):
 
         # Align with QKVParallelLinear pattern
         if self.attn_tp_size >= num_heads:
-            assert self.attn_tp_size % num_heads == 0, (
-                f"attn_tp_size ({self.attn_tp_size}) must be divisible by num_heads ({num_heads})"
-            )
+            assert (
+                self.attn_tp_size % num_heads == 0
+            ), f"attn_tp_size ({self.attn_tp_size}) must be divisible by num_heads ({num_heads})"
             self.num_heads = 1
             self.num_head_replicas = self.attn_tp_size // num_heads
         else:
-            assert num_heads % self.attn_tp_size == 0, (
-                f"num_heads ({num_heads}) must be divisible by attn_tp_size ({self.attn_tp_size})"
-            )
+            assert (
+                num_heads % self.attn_tp_size == 0
+            ), f"num_heads ({num_heads}) must be divisible by attn_tp_size ({self.attn_tp_size})"
             self.num_heads = num_heads // self.attn_tp_size
             self.num_head_replicas = 1
 
