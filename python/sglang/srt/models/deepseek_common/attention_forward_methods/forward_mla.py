@@ -321,11 +321,16 @@ class DeepseekMLAForwardMixin:
             if forward_batch.forward_mode.is_decode():
                 # if forward_batch.forward_mode is decode, gather q
                 with use_symmetric_memory(get_dcp_group()):
-                    combined = torch.cat([q_pe, q_nope_out], dim=-1)
-                gathered = get_dcp_group().all_gather(combined, dim=-2)
+                    # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
+                    combined = torch.cat(
+                        [q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1
+                    )
+                gathered = get_dcp_group().all_gather(combined, dim=0)
                 d_pe = q_pe.size(-1)
                 d_nope = q_nope_out.size(-1)
                 q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
+                q_pe = q_pe.transpose(0, 1)
+                q_nope_out = q_nope_out.transpose(0, 1)
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
                 cache_k_nope, cache_k_rope = (
