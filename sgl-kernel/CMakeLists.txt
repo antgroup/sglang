@@ -100,8 +100,8 @@ FetchContent_Populate(repo-flash-attention)
 # cuLA (CUDA Linear Attention)
 FetchContent_Declare(
     repo-cula
-    GIT_REPOSITORY https://github.com/yuan-luo/cuLA
-    GIT_TAG        sgl-kernel
+    GIT_REPOSITORY https://github.com/inclusionAI/cuLA
+    GIT_TAG        93cc9aa592321909b232cd73b0090b0fafad8b79
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cula)
