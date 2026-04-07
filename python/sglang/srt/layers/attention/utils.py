@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -1433,31 +1435,37 @@ def _correct_attn_cp_out_kernel(
     """
     batch_idx = tl.program_id(axis=0).to(tl.int64)
     head_idx = tl.program_id(axis=1).to(tl.int64)
-    d_offsets = tl.arange(0, HEAD_DIM)
-    num_n_offsets = tl.arange(0, N_ROUNDED)
 
-    # shape = [N]
+    # Use int32 for offsets where possible to reduce register pressure
+    b_i32 = batch_idx.to(tl.int32)
+    h_i32 = head_idx.to(tl.int32)
+
+    # Vectorized load of LSE values: shape = [N]
+    num_n_offsets = tl.arange(0, N_ROUNDED)
     lse_offsets = (
-        num_n_offsets * lses_stride_N
-        + batch_idx * lses_stride_B
-        + head_idx * lses_stride_H
+        num_n_offsets * lses_stride_N + b_i32 * lses_stride_B + h_i32 * lses_stride_H
     )
 
-    # calc final lse
+    # Compute final LSE using online softmax algorithm (more numerically stable)
     lse = tl.load(lses_ptr + lse_offsets)
-    lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
+
+    # Replace NaN and inf with -inf for numerical stability
+    neg_inf = float("-inf")
+    lse = tl.where((lse != lse) | (lse == float("inf")), neg_inf, lse)
+
+    # Online softmax: find max, subtract, exp, sum, log
     lse_max = tl.max(lse, axis=0)
-    lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
-    lse -= lse_max
+    lse_max = tl.where(lse_max == neg_inf, 0.0, lse_max)
+    lse = lse - lse_max
     lse_exp = tl.exp2(lse)
     lse_acc = tl.sum(lse_exp, axis=0)
-    lse = tl.log2(lse_acc)
-    lse += lse_max
+    final_lse = tl.log2(lse_acc) + lse_max
 
-    lse_offsets = batch_idx * lses_stride_B + head_idx * lses_stride_H
-    tl.store(vlse_ptr + lse_offsets, lse)
+    # Store final LSE
+    tl.store(vlse_ptr + b_i32 * lses_stride_B + h_i32 * lses_stride_H, final_lse)
 
-    # shape = [D]
+    # Load output with vectorized access: shape = [D]
+    d_offsets = tl.arange(0, HEAD_DIM)
     output_offsets = (
         batch_idx * outputs_stride_B
         + head_idx * outputs_stride_H
@@ -1469,21 +1477,21 @@ def _correct_attn_cp_out_kernel(
         + batch_idx * new_outputs_stride_B
         + d_offsets * new_outputs_stride_D
     )
-    # correct output
-    lse_offset = (
-        lse_idx * lses_stride_N + batch_idx * lses_stride_B + head_idx * lses_stride_H
+
+    # Compute correction factor
+    lse_offset = lse_idx * lses_stride_N + b_i32 * lses_stride_B + h_i32 * lses_stride_H
+    local_lse = tl.load(lses_ptr + lse_offset)
+    lse_diff = local_lse - final_lse
+    lse_diff = tl.where(
+        (lse_diff != lse_diff) | (lse_diff == float("inf")),
+        neg_inf,
+        lse_diff,
     )
-    lse_tmp = tl.load(lses_ptr + lse_offset)
-    lse_finally = lse_tmp - lse
-    lse_finally = tl.where(
-        (lse_finally != lse_finally) | (lse_finally == float("inf")),
-        -float("inf"),
-        lse_finally,
-    )
-    factor = tl.exp2(lse_finally)
+    factor = tl.exp2(lse_diff)
+
+    # Apply correction and store
     output = tl.load(outputs_ptr + output_offsets)
     output = output * factor
-
     tl.store(new_output_ptr + new_output_offsets, output)
 
 
@@ -1504,7 +1512,7 @@ def correct_attn_out(
     out: torch.Tensor,
     lses: torch.Tensor,
     cp_rank: int,
-    ctx: CPTritonContext,
+    ctx: Optional[CPTritonContext],
     new_output: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
@@ -1579,7 +1587,7 @@ def cp_lse_ag_out_rs(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
-    ctx: CPTritonContext = None,
+    ctx: Optional[CPTritonContext] = None,
 ):
     """
     cp_attn_out: [ B, H, D ]
