@@ -244,14 +244,6 @@ class HiSparseCoordinator:
             self.req_device_buffer_tokens[
                 :, req.req_pool_idx, : self.device_buffer_size
             ] = -1
-
-        # RDMA path: host indices are externally managed. Initialize radix tracking
-        # with root/0 so request_finished can insert into tree on completion.
-        self._req_radix_node[req.req_pool_idx] = (
-            self.host_radix_cache.root_node if self.host_radix_cache else None
-        )
-        self._req_radix_prefix_len[req.req_pool_idx] = 0
-
         req.staging = False
         self._skip_first_backup[req.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
