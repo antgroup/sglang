@@ -1461,6 +1461,17 @@ def _correct_attn_cp_out_kernel(
     lse_acc = tl.sum(lse_exp, axis=0)
     final_lse = tl.log2(lse_acc) + lse_max
 
+    # Compute correction factor
+    lse_offset = lse_idx * lses_stride_N + b_i32 * lses_stride_B + h_i32 * lses_stride_H
+    local_lse = tl.load(lses_ptr + lse_offset)
+    lse_diff = local_lse - final_lse
+    lse_diff = tl.where(
+        (lse_diff != lse_diff) | (lse_diff == float("inf")),
+        neg_inf,
+        lse_diff,
+    )
+    factor = tl.exp2(lse_diff)
+
     # Store final LSE
     tl.store(vlse_ptr + b_i32 * lses_stride_B + h_i32 * lses_stride_H, final_lse)
 
@@ -1477,18 +1488,6 @@ def _correct_attn_cp_out_kernel(
         + batch_idx * new_outputs_stride_B
         + d_offsets * new_outputs_stride_D
     )
-
-    # Compute correction factor
-    lse_offset = lse_idx * lses_stride_N + b_i32 * lses_stride_B + h_i32 * lses_stride_H
-    local_lse = tl.load(lses_ptr + lse_offset)
-    lse_diff = local_lse - final_lse
-    lse_diff = tl.where(
-        (lse_diff != lse_diff) | (lse_diff == float("inf")),
-        neg_inf,
-        lse_diff,
-    )
-    factor = tl.exp2(lse_diff)
-
     # Apply correction and store
     output = tl.load(outputs_ptr + output_offsets)
     output = output * factor
