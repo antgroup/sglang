@@ -593,10 +593,10 @@ class SchedulerMetricsMixin:
             if self.enable_hisparse:
                 hisparse_stats = self.hisparse_coordinator.get_token_stats()
                 msg_parts += [
-                    f"#gpu-token: {hisparse_stats.gpu_tokens}",
-                    f"gpu token usage: {hisparse_stats.gpu_usage:.2f}",
-                    f"#cpu-token: {hisparse_stats.cpu_tokens}",
-                    f"cpu token usage: {hisparse_stats.cpu_usage:.2f}",
+                    f"#gpu token: {hisparse_stats.device_tokens}",
+                    f"gpu token usage: {hisparse_stats.device_token_usage:.2f}",
+                    f"#cpu token: {hisparse_stats.host_tokens}",
+                    f"cpu token usage: {hisparse_stats.host_token_usage:.2f}",
                 ]
             else:
                 msg_parts.append(f"#token: {num_used}, token usage: {tok:.2f}")

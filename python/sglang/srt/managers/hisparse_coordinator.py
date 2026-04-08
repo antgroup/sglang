@@ -28,10 +28,10 @@ class HiSparseAct(NamedTuple):
 
 
 class HiSparseTokenStats(NamedTuple):
-    gpu_tokens: int
-    gpu_usage: float
-    cpu_tokens: int
-    cpu_usage: float
+    device_tokens: int
+    device_token_usage: float
+    host_tokens: int
+    host_token_usage: float
 
 
 class HiSparseCoordinator:
@@ -130,16 +130,20 @@ class HiSparseCoordinator:
         self.decode_producer_stream = stream
 
     def get_token_stats(self) -> HiSparseTokenStats:
-        gpu_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
-        gpu_capacity = gpu_allocator.size
-        gpu_tokens = gpu_capacity - gpu_allocator.available_size()
-        cpu_capacity = self.mem_pool_host.size
-        cpu_tokens = cpu_capacity - self.mem_pool_host.available_size()
+        device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        device_capacity = device_allocator.size
+        device_tokens = device_capacity - device_allocator.available_size()
+        host_capacity = self.mem_pool_host.size
+        host_tokens = host_capacity - self.mem_pool_host.available_size()
         return HiSparseTokenStats(
-            gpu_tokens=gpu_tokens,
-            gpu_usage=gpu_tokens / gpu_capacity if gpu_capacity > 0 else 0.0,
-            cpu_tokens=cpu_tokens,
-            cpu_usage=cpu_tokens / cpu_capacity if cpu_capacity > 0 else 0.0,
+            device_tokens=device_tokens,
+            device_token_usage=(
+                device_tokens / device_capacity if device_capacity > 0 else 0.0
+            ),
+            host_tokens=host_tokens,
+            host_token_usage=(
+                host_tokens / host_capacity if host_capacity > 0 else 0.0
+            ),
         )
 
     def admit_request_into_staging(self, req: Req) -> None:
