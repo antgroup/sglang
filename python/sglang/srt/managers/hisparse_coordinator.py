@@ -27,6 +27,13 @@ class HiSparseAct(NamedTuple):
     req: Req
 
 
+class HiSparseTokenStats(NamedTuple):
+    gpu_tokens: int
+    gpu_usage: float
+    cpu_tokens: int
+    cpu_usage: float
+
+
 class HiSparseCoordinator:
     def __init__(
         self,
@@ -121,6 +128,19 @@ class HiSparseCoordinator:
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
+
+    def get_token_stats(self) -> HiSparseTokenStats:
+        gpu_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        gpu_capacity = gpu_allocator.size
+        gpu_tokens = gpu_capacity - gpu_allocator.available_size()
+        cpu_capacity = self.mem_pool_host.size
+        cpu_tokens = cpu_capacity - self.mem_pool_host.available_size()
+        return HiSparseTokenStats(
+            gpu_tokens=gpu_tokens,
+            gpu_usage=gpu_tokens / gpu_capacity if gpu_capacity > 0 else 0.0,
+            cpu_tokens=cpu_tokens,
+            cpu_usage=cpu_tokens / cpu_capacity if cpu_capacity > 0 else 0.0,
+        )
 
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True

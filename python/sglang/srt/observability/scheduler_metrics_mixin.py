@@ -590,7 +590,16 @@ class SchedulerMetricsMixin:
             num_used, tok, _, _ = self._get_token_info()
             full_token_usage = tok
             token_usage = tok
-            msg_parts.append(f"#token: {num_used}, token usage: {tok:.2f}")
+            if self.enable_hisparse:
+                hisparse_stats = self.hisparse_coordinator.get_token_stats()
+                msg_parts += [
+                    f"#gpu-token: {hisparse_stats.gpu_tokens}",
+                    f"gpu token usage: {hisparse_stats.gpu_usage:.2f}",
+                    f"#cpu-token: {hisparse_stats.cpu_tokens}",
+                    f"cpu token usage: {hisparse_stats.cpu_usage:.2f}",
+                ]
+            else:
+                msg_parts.append(f"#token: {num_used}, token usage: {tok:.2f}")
 
         assert (
             num_used is not None
