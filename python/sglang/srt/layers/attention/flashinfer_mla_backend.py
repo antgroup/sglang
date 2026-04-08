@@ -748,10 +748,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 local_kv_lens = (
                     (kv_lens - get_dcp_rank() - 1) // get_dcp_world_size() + 1
                 ).clamp_(min=0)
-                local_kv_lens_cumsum = kv_indptr.new_zeros((bs + 1,))
-                local_kv_lens_cumsum[1 : bs + 1] = torch.cumsum(local_kv_lens, dim=0)
-                local_kv_indices = torch.empty_like(kv_indices)
-                BLOCK_SIZE = 128
+
                 if not init_metadata_replay:
                     max_local_len = (
                         int(local_kv_lens.max().item())
@@ -774,6 +771,10 @@ class FlashInferMLAIndicesUpdaterDecode:
                         if fast_decode_kwargs["kv_len_arr_cpu"].numel() > 0
                         else 0
                     )
+                local_kv_lens_cumsum = kv_indptr.new_zeros((bs + 1,))
+                local_kv_lens_cumsum[1 : bs + 1] = torch.cumsum(local_kv_lens, dim=0)
+                local_kv_indices = kv_indices.new_empty(total_local_len)
+                BLOCK_SIZE = 128
                 num_blocks = (
                     (max_local_len + BLOCK_SIZE - 1) // BLOCK_SIZE
                     if max_local_len > 0
@@ -791,7 +792,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                     dcp_world_size=get_dcp_world_size(),
                     BLOCK_SIZE=BLOCK_SIZE,
                 )
-                kv_indices = local_kv_indices[:total_local_len]
+                kv_indices[:total_local_len] = local_kv_indices[:total_local_len]
                 kv_lens = local_kv_lens
                 kv_indptr[: bs + 1] = local_kv_lens_cumsum[: bs + 1]
         else:
