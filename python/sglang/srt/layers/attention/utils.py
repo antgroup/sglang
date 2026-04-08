@@ -1609,3 +1609,38 @@ def cp_lse_ag_out_rs(
     )
     out = cp_group.reduce_scatter_along_dim(out, dim=0)
     return out
+
+
+@triton.jit
+def update_kv_lens_and_indices(
+    kv_lens: torch.Tensor,
+    kv_lens_cumsum: torch.Tensor,
+    kv_indices: torch.Tensor,
+    local_kv_lens: torch.Tensor,
+    local_kv_lens_cumsum: torch.Tensor,
+    local_kv_indices: torch.Tensor,
+    dcp_rank: tl.constexpr,
+    dcp_world_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    bs_idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
+
+    local_kv_len = tl.load(local_kv_lens + bs_idx)
+    local_kv_indices_start = tl.load(local_kv_lens_cumsum + bs_idx)
+    kv_indices_start = tl.load(kv_lens_cumsum + bs_idx)
+
+    block_start = block_idx * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    mask = offsets < local_kv_len
+
+    kv_indice_offsets = offsets * dcp_world_size + dcp_rank + kv_indices_start
+    local_kv_indices_offsets = local_kv_indices_start + offsets
+
+    kv_values = tl.load(kv_indices + kv_indice_offsets, mask=mask)
+    tl.store(
+        local_kv_indices + local_kv_indices_offsets,
+        kv_values // dcp_world_size,
+        mask=mask,
+    )
