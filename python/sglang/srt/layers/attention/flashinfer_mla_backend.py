@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.layers.attention.utils import update_kv_lens_and_indices
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
@@ -743,50 +744,46 @@ class FlashInferMLAIndicesUpdaterDecode:
                 self.req_to_token.shape[1],
             )
 
-            # TODO(augusto.yjh) 更新kv_indices
-            def filter_seq_indices(
-                paged_kernel_lens: torch.Tensor,
-                paged_kernel_lens_cumsum: torch.Tensor,
-                dcp_rank: int,
-                dcp_world_size: int,
-            ):
-                device = paged_kernel_lens.device
-                lens = paged_kernel_lens.to(torch.int64)
-                starts = paged_kernel_lens_cumsum[:-1].to(torch.int64)
-                paged_kernel_lens_split = ((lens - dcp_rank - 1) // dcp_world_size) + 1
-                paged_kernel_lens_split.clamp_(min=0)
-                total_local = int(paged_kernel_lens_split.sum().item())
-                if total_local == 0:
-                    return paged_kernel_lens_split, torch.empty(
-                        0, dtype=torch.int64, device="cuda"
-                    )
-                max_split = int(paged_kernel_lens_split.max().item())
-                j = torch.arange(max_split, device=device, dtype=torch.int64)
-                starts_ = starts.view(-1, 1)
-                j_ = j.view(1, -1)
-                ids = starts_ + dcp_rank + j_ * dcp_world_size
-                mask = j_ < paged_kernel_lens_split.view(-1, 1)
-                filter_kv_indices = ids[mask].to(device="cuda")
-                return paged_kernel_lens_split, filter_kv_indices
-
             if get_dcp_world_size() > 1:
-                filtered_paged_kernel_lens, filterd_kv_indices = filter_seq_indices(
-                    paged_kernel_lens, kv_indptr, get_dcp_rank(), get_dcp_world_size()
-                )
-                if init_metadata_replay:
-                    # For cuda graph replay, we must pack the DCP-filtered indices
-                    # back into the shared kv_indices buffer so that the FlashInfer
-                    # kernel reads a contiguous prefix of valid entries.
-                    local_kv_indices = (
-                        kv_indices[filterd_kv_indices] // get_dcp_world_size()
+                local_kv_lens = (
+                    (paged_kernel_lens - get_dcp_rank() - 1) // get_dcp_world_size() + 1
+                ).clamp(min=0)
+                local_kv_lens_cumsum = kv_indptr.new_zeros((bs + 1,))
+                local_kv_lens_cumsum[1 : bs + 1] = torch.cumsum(local_kv_lens, dim=0)
+                local_kv_indices = torch.empty_like(kv_indices)
+                BLOCK_SIZE = 128
+                if not init_metadata_replay:
+                    max_local_len = (
+                        int(local_kv_lens.max().item())
+                        if local_kv_lens.numel() > 0
+                        else 0
                     )
-                    kv_indices[: local_kv_indices.numel()] = local_kv_indices
                 else:
-                    # Non-replay path can keep using a shrunk tensor.
-                    kv_indices = kv_indices[filterd_kv_indices] // get_dcp_world_size()
-                kv_lens = filtered_paged_kernel_lens.to(torch.int32)
-                kv_indptr[1 : bs + 1] = torch.cumsum(filtered_paged_kernel_lens, dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
+                    max_local_len = (
+                        int(fast_decode_kwargs["kv_len_arr"].max().item())
+                        if fast_decode_kwargs["kv_len_arr"].numel() > 0
+                        else 0
+                    )
+                num_blocks = (
+                    (max_local_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+                    if max_local_len > 0
+                    else 1
+                )
+                grid = (bs, num_blocks)
+                update_kv_lens_and_indices[grid](
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_indices,
+                    local_kv_lens,
+                    local_kv_lens_cumsum,
+                    local_kv_indices,
+                    dcp_rank=get_dcp_rank(),
+                    dcp_world_size=get_dcp_world_size(),
+                    BLOCK_SIZE=BLOCK_SIZE,
+                )
+                kv_indices = local_kv_indices
+                kv_lens = local_kv_lens
+                kv_indptr[: bs + 1] = local_kv_lens_cumsum[: bs + 1]
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
