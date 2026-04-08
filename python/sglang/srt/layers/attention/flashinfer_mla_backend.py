@@ -746,8 +746,8 @@ class FlashInferMLAIndicesUpdaterDecode:
 
             if get_dcp_world_size() > 1:
                 local_kv_lens = (
-                    (paged_kernel_lens - get_dcp_rank() - 1) // get_dcp_world_size() + 1
-                ).clamp(min=0)
+                    (kv_lens - get_dcp_rank() - 1) // get_dcp_world_size() + 1
+                ).clamp_(min=0)
                 local_kv_lens_cumsum = kv_indptr.new_zeros((bs + 1,))
                 local_kv_lens_cumsum[1 : bs + 1] = torch.cumsum(local_kv_lens, dim=0)
                 local_kv_indices = torch.empty_like(kv_indices)
@@ -771,7 +771,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 )
                 grid = (bs, num_blocks)
                 update_kv_lens_and_indices[grid](
-                    paged_kernel_lens,
+                    kv_lens,
                     kv_indptr,
                     kv_indices,
                     local_kv_lens,
