@@ -760,8 +760,8 @@ class FlashInferMLAIndicesUpdaterDecode:
                     )
                 else:
                     max_local_len = (
-                        int(fast_decode_kwargs["kv_len_arr"].max().item())
-                        if fast_decode_kwargs["kv_len_arr"].numel() > 0
+                        int(fast_decode_kwargs["kv_len_arr_cpu"].max().item())
+                        if fast_decode_kwargs["kv_len_arr_cpu"].numel() > 0
                         else 0
                     )
                 num_blocks = (
