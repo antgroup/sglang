@@ -14,20 +14,6 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 
-# Cache workspace buffers per CUDA device
-_workspace_cache: Dict[int, torch.Tensor] = {}
-
-
-def _get_workspace_buffer(device: torch.device) -> torch.Tensor:
-    """Get or create a workspace buffer for the given device."""
-    device_idx = device.index if device.index is not None else 0
-    if device_idx not in _workspace_cache:
-        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-        _workspace_cache[device_idx] = torch.zeros(
-            sm_count * 128, dtype=torch.uint8, device=device
-        )
-    return _workspace_cache[device_idx]
-
 
 def _triton_fallback(q, k, v, g, beta, ssm_states, cache_indices, query_start_loc):
     """Fall back to the Triton chunk_kda kernel (handles all preprocessing)."""
@@ -52,6 +38,21 @@ class CulaKDAKernel(LinearAttnKernelBase):
     cuLA only supports safe_gate=True mode, where gating values are clamped
     to > -5.  Sequences shorter than the chunk size (64) fall back to Triton.
     """
+
+    def __init__(self):
+        super().__init__()
+        # Cache workspace buffers per CUDA device
+        self._workspace_cache: Dict[int, torch.Tensor] = {}
+
+    def _get_workspace_buffer(self, device: torch.device) -> torch.Tensor:
+        """Get or create a workspace buffer for the given device."""
+        device_idx = device.index if device.index is not None else 0
+        if device_idx not in self._workspace_cache:
+            sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+            self._workspace_cache[device_idx] = torch.zeros(
+                sm_count * 128, dtype=torch.uint8, device=device
+            )
+        return self._workspace_cache[device_idx]
 
     def decode(
         self,
@@ -154,7 +155,7 @@ class CulaKDAKernel(LinearAttnKernelBase):
         cu_seqlens = query_start_loc.to(torch.int32)
 
         # 7. Workspace buffer
-        workspace_buffer = _get_workspace_buffer(q.device)
+        workspace_buffer = self._get_workspace_buffer(q.device)
 
         # 8. Scale
         scale = head_dim**-0.5

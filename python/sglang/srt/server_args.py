@@ -2641,7 +2641,17 @@ class ServerArgs:
         ):
             self.linear_attn_decode_backend = "triton"
 
+        # Validate CUDA-only backends early.
+        prefill = self.linear_attn_prefill_backend or self.linear_attn_backend
+        decode = self.linear_attn_decode_backend or self.linear_attn_backend
+        if prefill == "cula" and not is_cuda():
+            raise ValueError("--linear-attn-prefill-backend cula requires CUDA")
+        if decode == "cutedsl" and not is_cuda():
+            raise ValueError("--linear-attn-decode-backend cutedsl requires CUDA")
+
         # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
+        import torch
+
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
         if (
             decode == "flashinfer"
