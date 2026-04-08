@@ -758,9 +758,19 @@ class FlashInferMLAIndicesUpdaterDecode:
                         if local_kv_lens.numel() > 0
                         else 0
                     )
+                    total_local_len = (
+                        int(local_kv_lens.sum().item())
+                        if local_kv_lens.numel() > 0
+                        else 0
+                    )
                 else:
                     max_local_len = (
                         int(fast_decode_kwargs["kv_len_arr_cpu"].max().item())
+                        if fast_decode_kwargs["kv_len_arr_cpu"].numel() > 0
+                        else 0
+                    )
+                    total_local_len = (
+                        int(fast_decode_kwargs["kv_len_arr_cpu"].sum().item())
                         if fast_decode_kwargs["kv_len_arr_cpu"].numel() > 0
                         else 0
                     )
@@ -781,7 +791,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                     dcp_world_size=get_dcp_world_size(),
                     BLOCK_SIZE=BLOCK_SIZE,
                 )
-                kv_indices = local_kv_indices
+                kv_indices = local_kv_indices[:total_local_len]
                 kv_lens = local_kv_lens
                 kv_indptr[: bs + 1] = local_kv_lens_cumsum[: bs + 1]
         else:
