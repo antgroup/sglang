@@ -39,6 +39,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     get_dcp_group,
+    get_dcp_world_size,
     graph_capture,
     set_pdmux_status,
 )
@@ -756,6 +757,8 @@ class CudaGraphRunner:
         logger.info(log_message)
 
     def _prealloc_symmetric_memory_pool(self):
+        if get_dcp_world_size() < 2:
+            return
         with torch.get_device_module(self.device).stream(self.stream):
             logger.info(f"Pre-allocating symmetric memory pool for dcp")
             with use_symmetric_memory(get_dcp_group()):
