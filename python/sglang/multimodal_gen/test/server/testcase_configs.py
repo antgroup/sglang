@@ -356,6 +356,7 @@ T2I_sampling_params = DiffusionSamplingParams(
 TI2I_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
     image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+    extras={"seed": 42},
 )
 
 MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
