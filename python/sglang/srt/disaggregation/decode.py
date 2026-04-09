@@ -56,7 +56,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams, MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.common import evict_from_tree_cache, release_kv_cache
 from sglang.srt.mem_cache.memory_pool import (
@@ -200,18 +200,29 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
+        # Each request needs 1 main mamba slot + ping-pong slots when extra_buffer is enabled.
+        # Cap the pool at max concurrent requests * slots_per_req to avoid OOM.
+        # Tree cache mamba entries are evicted on demand in _pre_alloc when pool is low.
+        slots_per_req = 1 + (
+            self.mamba_ping_pong_track_buffer_size
+            if enable_mamba_extra_buffer
+            else 0
+        )
+        max_slots_needed = (size + pre_alloc_size) * slots_per_req
         if mamba_size is not None:
-            effective_mamba_size = min(mamba_size, size + pre_alloc_size)
-            if mamba_size > size + pre_alloc_size:
+            effective_mamba_size = min(mamba_size, max_slots_needed)
+            if mamba_size > max_slots_needed:
                 logger.warning(
-                    "mamba_size (%d) exceeds size + pre_alloc_size (%d), "
+                    "mamba_size (%d) exceeds max_slots_needed (%d = %d reqs * %d slots/req), "
                     "capping effective_mamba_size to %d",
                     mamba_size,
+                    max_slots_needed,
                     size + pre_alloc_size,
+                    slots_per_req,
                     effective_mamba_size,
                 )
         else:
-            effective_mamba_size = size + pre_alloc_size
+            effective_mamba_size = max_slots_needed
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self._init_mamba_pool(
@@ -690,6 +701,16 @@ class DecodePreallocQueue:
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
+        # Pre-compute mamba pool constants (fixed after model startup)
+        has_mamba = self.tree_cache.supports_mamba()
+        if has_mamba:
+            mamba_pool = self.req_to_token_pool.mamba_pool
+            mamba_slots_per_req = 1 + (
+                self.req_to_token_pool.mamba_ping_pong_track_buffer_size
+                if self.req_to_token_pool.enable_mamba_extra_buffer
+                else 0
+            )
+
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -706,6 +727,17 @@ class DecodePreallocQueue:
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
+
+            # Mamba pool capacity check: evict tree cache entries first to
+            # free slots, break only if eviction cannot reclaim enough.
+            if has_mamba:
+                deficit = mamba_slots_per_req - mamba_pool.available_size()
+                if deficit > 0:
+                    result = self.tree_cache.evict(
+                        EvictParams(num_tokens=0, mamba_num=deficit)
+                    )
+                    if result.mamba_num_evicted < deficit:
+                        break
 
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
@@ -752,29 +784,34 @@ class DecodePreallocQueue:
                 prefix_indices = None
                 decode_prefix_len = 0
                 last_node = None
-                token_ids_for_match = req.origin_input_ids[: origin_input_len - 1]
-                if len(token_ids_for_match) > 0:
-                    match_result = self.tree_cache.match_prefix(
-                        MatchPrefixParams(
-                            key=RadixKey(
-                                token_ids=token_ids_for_match,
-                                extra_key=req.extra_key,
-                            ),
-                            req=req,
+                if self.scheduler.server_args.disaggregation_enable_decode_radix_cache:
+                    token_ids_for_match = req.origin_input_ids[: origin_input_len - 1]
+                    if len(token_ids_for_match) > 0:
+                        match_result = self.tree_cache.match_prefix(
+                            MatchPrefixParams(
+                                key=RadixKey(
+                                    token_ids=token_ids_for_match,
+                                    extra_key=req.extra_key,
+                                ),
+                                req=req,
+                                # For hybrid models (MambaRadixCache), skip mamba-based
+                                # truncation — SSM state comes from prefill transfer,
+                                # not from decode tree cache.
+                                skip_mamba_truncation=self.tree_cache.supports_mamba(),
+                            )
                         )
-                    )
-                    raw_prefix_len = len(match_result.device_indices)
-                    # Page-align the prefix length
-                    decode_prefix_len = (raw_prefix_len // page_size) * page_size
-                    if decode_prefix_len > 0:
-                        prefix_indices = match_result.device_indices[
-                            :decode_prefix_len
-                        ]
-                        last_node = match_result.last_device_node
-                        # Lock the prefix nodes to prevent eviction during transfer
-                        self.tree_cache.inc_lock_ref(last_node)
-                        req.prefix_indices = prefix_indices
-                        req.last_node = last_node
+                        raw_prefix_len = len(match_result.device_indices)
+                        # Page-align the prefix length
+                        decode_prefix_len = (raw_prefix_len // page_size) * page_size
+                        if decode_prefix_len > 0:
+                            prefix_indices = match_result.device_indices[
+                                :decode_prefix_len
+                            ]
+                            last_node = match_result.last_device_node
+                            # Lock the prefix nodes to prevent eviction during transfer
+                            self.tree_cache.inc_lock_ref(last_node)
+                            req.prefix_indices = prefix_indices
+                            req.last_node = last_node
 
                 req.disagg_decode_prefix_len = decode_prefix_len
                 self._pre_alloc(
@@ -838,18 +875,17 @@ class DecodePreallocQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            decode_prefix_pages = kv_to_page_num(decode_prefix_len, page_size) if decode_prefix_len > 0 else 0
             page_indices = kv_to_page_indices(kv_indices, page_size)
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
-                decode_prefix_pages=decode_prefix_pages,
+                decode_prefix_len=decode_prefix_len,
             )
             logger.info(
                 f"Decode prealloc for {req.rid}: "
                 f"decode_prefix_len={decode_prefix_len}, "
-                f"decode_prefix_pages={decode_prefix_pages}, "
+                f"decode_prefix_pages={kv_to_page_num(decode_prefix_len, page_size)}, "
                 f"total_pages={kv_to_page_num(total_len, page_size)}, "
                 f"bootstrap_room={req.bootstrap_room}"
             )
@@ -894,7 +930,10 @@ class DecodePreallocQueue:
             else 0
         )
         available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.tree_cache.evictable_size()
+        if self.tree_cache.supports_mamba():
+            evictable_size = self.tree_cache.full_evictable_size()
+        else:
+            evictable_size = self.tree_cache.evictable_size()
         allocatable_tokens = available_size + evictable_size - max(
             # preserve some space for future decode
             self.num_reserved_decode_tokens
@@ -978,7 +1017,7 @@ class DecodePreallocQueue:
         else:
             # Non-hisparse path: evict tree cache if needed, then allocate.
             alloc_need = fill_len - prefix_len
-            if alloc_need > 0:
+            if alloc_need > 0 and self.scheduler.server_args.disaggregation_enable_decode_radix_cache:
                 evict_from_tree_cache(self.tree_cache, alloc_need)
                 # Merge freed pages back into the sorted free pool so that
                 # alloc() returns ordered indices, improving RDMA coalescing
@@ -1444,29 +1483,32 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                if req.disagg_decode_prefix_len > 0:
-                    # Prefix info (prefix_indices, last_node) was set and locked
-                    # in pop_preallocated; skip match_prefix to preserve them.
-                    req.init_next_round_input(tree_cache=None)
-                    # Protect tree-owned prefix pages in req_to_token[0:prefix_len].
-                    req.cache_protected_len = req.disagg_decode_prefix_len
+                if self.server_args.disaggregation_enable_decode_radix_cache:
+                    if req.disagg_decode_prefix_len > 0:
+                        # Prefix info (prefix_indices, last_node) was set and locked
+                        # in pop_preallocated; skip match_prefix to preserve them.
+                        req.init_next_round_input(tree_cache=None)
+                        # Protect tree-owned prefix pages in req_to_token[0:prefix_len].
+                        req.cache_protected_len = req.disagg_decode_prefix_len
+                    else:
+                        req.init_next_round_input(self.tree_cache)
+                        # Balance the dec_lock_ref in cache_unfinished/finished_req
+                        # (mirrors PrefillAdder._req_inc_lock_ref).
+                        self.tree_cache.inc_lock_ref(req.last_node)
+                        # req_to_token holds _pre_alloc pages, not tree pages;
+                        # allow cache_unfinished_req to free duplicates.
+                        req.cache_protected_len = 0
+
+                    # pop_transferred appended the first output token after
+                    # _pre_alloc, making fill_ids 1 longer than kv_committed_len.
+                    # Truncate to avoid reading uninitialized req_to_token slots.
+                    if len(req.fill_ids) > req.kv_committed_len:
+                        req.fill_ids = req.fill_ids[: req.kv_committed_len]
+                        req.set_extend_input_len(
+                            len(req.fill_ids) - len(req.prefix_indices)
+                        )
                 else:
                     req.init_next_round_input(self.tree_cache)
-                    # Balance the dec_lock_ref in cache_unfinished/finished_req
-                    # (mirrors PrefillAdder._req_inc_lock_ref).
-                    self.tree_cache.inc_lock_ref(req.last_node)
-                    # req_to_token holds _pre_alloc pages, not tree pages;
-                    # allow cache_unfinished_req to free duplicates.
-                    req.cache_protected_len = 0
-
-                # pop_transferred appended the first output token after
-                # _pre_alloc, making fill_ids 1 longer than kv_committed_len.
-                # Truncate to avoid reading uninitialized req_to_token slots.
-                if len(req.fill_ids) > req.kv_committed_len:
-                    req.fill_ids = req.fill_ids[: req.kv_committed_len]
-                    req.set_extend_input_len(
-                        len(req.fill_ids) - len(req.prefix_indices)
-                    )
             else:
                 waiting_queue.append(req)
 

@@ -81,9 +81,9 @@ class TransferInfo:
     dst_state_indices: List[int]
     required_dst_info_num: int
     is_dummy: bool
+    decode_prefix_len: int = 0
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
-    decode_prefix_pages: int = 0
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -100,8 +100,8 @@ class TransferInfo:
             else:
                 dst_state_indices = list(np.frombuffer(msg[6], dtype=np.int32))
             is_dummy = False
-        # decode_prefix_pages: backward compatible, default 0 if not present
-        decode_prefix_pages = (
+        # decode_prefix_len: backward compatible, default 0 if not present
+        decode_prefix_len = (
             int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else 0
         )
         return cls(
@@ -114,7 +114,7 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
-            decode_prefix_pages=decode_prefix_pages,
+            decode_prefix_len=decode_prefix_len,
         )
 
 
@@ -1828,7 +1828,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
-        decode_prefix_pages: int = 0,
+        decode_prefix_len: int = 0,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -1869,7 +1869,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             else b""
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
-                        str(decode_prefix_pages).encode("ascii"),
+                        str(decode_prefix_len).encode("ascii"),
                     ]
                 )
         self.init_time = time.time()

@@ -338,20 +338,20 @@ class PrefillBootstrapQueue:
             page_size = self.token_to_kv_pool.page_size
             total_pages = kv_to_page_num(num_kv_indices, page_size)
 
-            # Read decode_prefix_pages from the bootstrap message to skip
+            # Read decode_prefix_len from the bootstrap message to skip
             # transferring KV that the decode side already has cached.
-            decode_prefix_pages = self.kv_manager.get_decode_prefix_pages(
+            decode_prefix_len = self.kv_manager.get_decode_prefix_len(
                 req.bootstrap_room
             )
             logger.info(
                 f"Prefill bootstrap for {req.rid}: "
-                f"decode_prefix_pages={decode_prefix_pages}, total_pages={total_pages}, "
+                f"decode_prefix_len={decode_prefix_len}, total_pages={total_pages}, "
                 f"bootstrap_room={req.bootstrap_room}"
             )
-            if decode_prefix_pages > 0:
-                skip_tokens = decode_prefix_pages * page_size
-                req.start_send_idx = skip_tokens
-                req.disagg_prefill_skip_tokens = skip_tokens
+            if decode_prefix_len > 0:
+                req.start_send_idx = decode_prefix_len
+                req.disagg_prefill_skip_tokens = decode_prefix_len
+                decode_prefix_pages = kv_to_page_num(decode_prefix_len, page_size)
                 incremental_pages = total_pages - decode_prefix_pages
             else:
                 incremental_pages = total_pages
@@ -678,10 +678,9 @@ class SchedulerDisaggregationPrefillMixin:
             req.time_stats.set_completion_time()
 
         page_size = self.token_to_kv_pool_allocator.page_size
-        kv_item_lens = (
-            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.kv_item_lens
-        )
-        bytes_per_page_all_layers = sum(kv_item_lens)
+        kv_args = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args
+        bytes_per_page_all_layers = sum(kv_args.kv_item_lens)
+        state_bytes_per_req = sum(kv_args.state_item_lens) if kv_args.state_item_lens else 0
 
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
@@ -692,6 +691,7 @@ class SchedulerDisaggregationPrefillMixin:
                 num_tokens=actual_transfer_tokens,
                 page_size=page_size,
                 bytes_per_page_all_layers=bytes_per_page_all_layers,
+                state_bytes_per_req=state_bytes_per_req,
             )
             if metrics:
                 # Update last-value for REST API

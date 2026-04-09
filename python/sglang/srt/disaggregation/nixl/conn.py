@@ -44,7 +44,7 @@ class TransferInfo:
     dst_aux_index: int
     required_dst_info_num: int
     dst_state_indices: List[int]
-    decode_prefix_pages: int = 0
+    decode_prefix_len: int = 0
 
     def is_dummy(self):
         return self.dst_kv_indices.size == 0
@@ -57,8 +57,8 @@ class TransferInfo:
         else:
             dst_state_indices = []
 
-        # decode_prefix_pages: backward compatible, default 0 if not present
-        decode_prefix_pages = (
+        # decode_prefix_len: backward compatible, default 0 if not present
+        decode_prefix_len = (
             int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else 0
         )
 
@@ -71,7 +71,7 @@ class TransferInfo:
             dst_aux_index=int(msg[5].decode("ascii")),
             required_dst_info_num=int(msg[6].decode("ascii")),
             dst_state_indices=dst_state_indices,
-            decode_prefix_pages=decode_prefix_pages,
+            decode_prefix_len=decode_prefix_len,
         )
 
 
@@ -1120,7 +1120,7 @@ class NixlKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
-        decode_prefix_pages: int = 0,
+        decode_prefix_len: int = 0,
     ):
         if self.bootstrap_infos is None:
             logger.error(
@@ -1154,7 +1154,7 @@ class NixlKVReceiver(CommonKVReceiver):
                             if not is_dummy and state_indices is not None
                             else b""
                         ),
-                        str(decode_prefix_pages).encode("ascii"),
+                        str(decode_prefix_len).encode("ascii"),
                     ]
                 )
 
