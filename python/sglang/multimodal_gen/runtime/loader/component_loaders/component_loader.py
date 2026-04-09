@@ -322,8 +322,7 @@ class TokenizerLoader(ComponentLoader):
 
         return AutoTokenizer.from_pretrained(
             component_model_path,
-            padding_side="right",
-            use_fast=True,
+            padding_size="right",
         )
 
 
