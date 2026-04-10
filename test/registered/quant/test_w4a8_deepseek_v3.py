@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=520, suite="stage-c-test-8-gpu-h20")
+register_cuda_ci(est_time=700, suite="stage-c-test-8-gpu-h20")
 
 
 class TestDeepseekV3W4afp8(CustomTestCase):
@@ -106,7 +106,7 @@ class TestDeepseekV3W4Afp8Mtp(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]

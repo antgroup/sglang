@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=1200, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=610, suite="stage-c-test-4-gpu-b200")
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3.2-NVFP4"
 SERVER_LAUNCH_TIMEOUT = 1200
@@ -84,7 +84,7 @@ class TestDeepseekV32FP4DPSpecV2(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -175,7 +175,7 @@ class TestDeepseekV32FP4TPSpecV2(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
