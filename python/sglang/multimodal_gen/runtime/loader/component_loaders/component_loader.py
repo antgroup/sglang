@@ -48,7 +48,7 @@ class ComponentLoader(ABC):
         for component_name in cls.component_names:
             component_name_to_loader_cls[component_name] = cls
 
-    def __init__(self, device=None, architecture: str | None = None) -> None:
+    def __init__(self, device=None) -> None:
         self.device = device
         self.component_architecture: str | None = None
 
@@ -322,7 +322,8 @@ class TokenizerLoader(ComponentLoader):
 
         return AutoTokenizer.from_pretrained(
             component_model_path,
-            padding_size="right",
+            padding_side="right",
+            use_fast=True,
         )
 
 
