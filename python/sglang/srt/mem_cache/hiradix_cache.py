@@ -682,7 +682,10 @@ class HiRadixCache(RadixCache):
         )
 
         operation_id = self.cache_controller.write_storage(
-            node.host_value, node.key, node.hash_value, prefix_keys,
+            node.host_value,
+            node.key,
+            node.hash_value,
+            prefix_keys,
             **self._get_extra_pools(),
         )
         self.ongoing_backup[operation_id] = node

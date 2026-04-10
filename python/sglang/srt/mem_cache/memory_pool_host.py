@@ -64,6 +64,9 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
+# Host RAM to leave free when sizing HiCache pools (OS, other processes).
+HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
+
 
 def synchronized(func):
     @wraps(func)
@@ -187,9 +190,7 @@ class HostKVCache(abc.ABC):
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        # preserve at least 10GB for other usage
-        ten_gb = 10 * (1024**3)
-        available_bytes = host_mem.available - ten_gb
+        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -1236,8 +1237,7 @@ class MambaPoolHost(HostKVCache):
 
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        ten_gb = 10 * (1024**3)
-        available_bytes = host_mem.available - ten_gb
+        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -1858,8 +1858,7 @@ class NSAIndexerPoolHost(HostKVCache):
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
         host_mem = psutil.virtual_memory()
-        ten_gb = 10 * (1024**3)
-        available_bytes = host_mem.available - ten_gb
+        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for NSA indexer hierarchical cache. "
