@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init
 logger = init_logger(__name__)
 
 MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
+WARMUP_PROMPT = "warmup"
 
 
 class Scheduler:
@@ -214,8 +215,8 @@ class Scheduler:
                         data_type=task_type.data_type(),
                         width=width,
                         height=height,
-                        prompt="",
-                        negative_prompt="",
+                        prompt=WARMUP_PROMPT,
+                        negative_prompt=WARMUP_PROMPT,
                         image_path=[warmup_input_path],
                     )
                 else:
@@ -223,7 +224,7 @@ class Scheduler:
                         data_type=task_type.data_type(),
                         width=width,
                         height=height,
-                        prompt="",
+                        prompt=WARMUP_PROMPT,
                     )
                 req.set_as_warmup(self.server_args.warmup_steps)
                 self.waiting_queue.append((None, req))
