@@ -8,6 +8,14 @@ from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderConfig,
 )
 
+_NESTED_MM_TOKEN_ATTRS = (
+    "vision_start_token_id",
+    "vision_end_token_id",
+    "vision_token_id",
+    "image_token_id",
+    "video_token_id",
+)
+
 
 def _is_transformer_layer(n: str, m) -> bool:
     return "layers" in n and str.isdigit(n.split(".")[-1])
@@ -65,6 +73,26 @@ class QwenImageArchConfig(TextEncoderArchConfig):
     _fsdp_shard_conditions: list = field(
         default_factory=lambda: [_is_transformer_layer, _is_embeddings, _is_final_norm]
     )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        text_config = getattr(self, "text_config", None)
+        if text_config is None:
+            return
+
+        for attr in _NESTED_MM_TOKEN_ATTRS:
+            if isinstance(text_config, dict):
+                nested_value = text_config.get(attr)
+            else:
+                nested_value = getattr(text_config, attr, None)
+            if nested_value is None:
+                continue
+
+            current_value = getattr(self, attr, None)
+            default_value = type(self).__dataclass_fields__[attr].default
+            if current_value is None or current_value == default_value:
+                setattr(self, attr, nested_value)
 
 
 @dataclass
