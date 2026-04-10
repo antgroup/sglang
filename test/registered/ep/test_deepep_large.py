@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=563, suite="stage-c-test-deepep-8-gpu-h200")
+register_cuda_ci(est_time=490, suite="stage-c-test-deepep-8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -148,7 +148,7 @@ class TestDeepseekMTP(CustomTestCase):
 
         self.assertGreater(metrics["score"], 0.92)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]

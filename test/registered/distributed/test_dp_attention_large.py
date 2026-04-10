@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=350, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=230, suite="stage-c-test-4-gpu-h100")
 register_amd_ci(est_time=350, suite="stage-c-test-4-gpu-amd")
 
 
@@ -56,11 +56,11 @@ class TestDPAttentionDP2TP4(
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mgsm_en(self):
+    def test_gsm8k(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
-            eval_name="mgsm_en",
+            eval_name="gsm8k",
             num_examples=None,
             num_threads=1024,
         )
@@ -127,7 +127,7 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(
 
         self.assertGreater(metrics["score"], 0.60)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]

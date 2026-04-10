@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 )
 
 # DeepSeek-V3 INT8 quantization tests (channel and block INT8)
-register_cuda_ci(est_time=341, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=290, suite="stage-b-test-1-gpu-large")
 
 
 class TestMLADeepseekV3ChannelInt8(CustomTestCase):
@@ -117,7 +117,7 @@ class TestDeepseekV3MTPChannelInt8(CustomTestCase):
 
         self.assertGreater(metrics["score"], 0.60)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -221,7 +221,7 @@ class TestDeepseekV3MTPBlockInt8(CustomTestCase):
 
         self.assertGreater(metrics["score"], 0.60)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]

@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=531, suite="stage-c-test-deepep-4-gpu-h100")
+register_cuda_ci(est_time=430, suite="stage-c-test-deepep-4-gpu-h100")
 
 
 class TestPureDP(CustomTestCase):
@@ -412,7 +412,7 @@ class TestMTP(CustomTestCase):
 
         self.assertGreater(metrics["score"], 0.60)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -486,7 +486,7 @@ class TestMTPWithTBO(CustomTestCase):
 
         self.assertGreater(metrics["score"], 0.60)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -562,7 +562,7 @@ class TestMTPWithTPAttnAndTBO(CustomTestCase):
 
         self.assertGreater(metrics["score"], 0.60)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]

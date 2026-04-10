@@ -197,6 +197,7 @@ def _get_quantization_config(
     model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     remap_prefix = getattr(model_class, "remap_prefix", None)
+    # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
     if _is_npu:
         packed_modules_mapping.update(
             {
@@ -479,7 +480,7 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
-        use_multithread = extra_config.get("enable_multithread_load", False)
+        use_multithread = extra_config.get("enable_multithread_load", True)
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
