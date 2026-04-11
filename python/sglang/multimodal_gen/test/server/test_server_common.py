@@ -51,14 +51,6 @@ from sglang.multimodal_gen.test.test_utils import (
 logger = init_logger(__name__)
 
 
-def _is_lora_case(case: DiffusionTestCase) -> bool:
-    return bool(
-        case.server_args.lora_path
-        or case.server_args.dynamic_lora_path
-        or case.server_args.second_lora_path
-    )
-
-
 @pytest.fixture
 def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
@@ -80,11 +72,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
     sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
-
-    # Keep LoRA GT on the normal backend path so adapter state matches CI.
-    if os.environ.get("SGLANG_GEN_GT", "0") == "1":
-        if not _is_lora_case(case) and "--backend" not in extra_args:
-            extra_args = "--backend diffusers " + extra_args.strip()
 
     extra_args += f" --num-gpus {server_args.num_gpus}"
 
@@ -235,18 +222,21 @@ Consider updating perf_baselines.json with the snippets below:
         ctx: ServerContext,
         case_id: str,
         generate_fn: Callable[[str, openai.Client], tuple[str, bytes]],
-    ) -> tuple[RequestPerfRecord, bytes]:
-        """Run generation and collect performance records.
+        collect_perf: bool = True,
+    ) -> tuple[RequestPerfRecord | None, bytes]:
+        """Run generation and optionally collect performance records.
 
         Returns:
             Tuple of (performance_record, content_bytes)
         """
-        log_path = ctx.perf_log_path
-        log_wait_timeout = 30
-
         client = self._client(ctx)
         rid, content = generate_fn(case_id, client)
 
+        if not collect_perf:
+            return None, content
+
+        log_path = ctx.perf_log_path
+        log_wait_timeout = 30
         req_perf_record = wait_for_req_perf_record(
             rid,
             log_path,
@@ -536,17 +526,15 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
 
         if not result.passed:
             failed_frames = []
-            video_gt_info = ""
-            if is_video:
-                gt_remote_files = get_consistency_gt_remote_files(
-                    case.id,
-                    num_gpus,
-                    is_video=True,
-                    output_format=output_format,
-                )
-                video_gt_info = "\n".join(
-                    f"    - {filename}: {url}" for filename, url in gt_remote_files
-                )
+            gt_remote_files = get_consistency_gt_remote_files(
+                case.id,
+                num_gpus,
+                is_video=is_video,
+                output_format=output_format,
+            )
+            gt_remote_info = "\n".join(
+                f"    - {filename}: {url}" for filename, url in gt_remote_files
+            )
             for metric in result.frame_metrics:
                 failed_metrics = []
                 if not metric.clip_passed:
@@ -578,11 +566,7 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
                 f"mean_abs_diff<={result.thresholds.mean_abs_diff_threshold}\n"
                 f"  Failed frames:\n"
                 + "\n".join(failed_frames)
-                + (
-                    f"\n  Compared GT frame files and links:\n{video_gt_info}"
-                    if video_gt_info
-                    else ""
-                )
+                + f"\n  Compared GT files and links:\n{gt_remote_info}"
             )
 
         logger.info(
@@ -1024,6 +1008,7 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
             diffusion_server,
             case.id,
             generate_fn,
+            collect_perf=not is_gt_gen_mode,
         )
 
         if is_gt_gen_mode:
