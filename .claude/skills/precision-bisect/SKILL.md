@@ -1,29 +1,14 @@
 ---
 name: precision-bisect
-description: Automated kernel precision bisection — compare baseline vs target dumps, align inputs, drill into intermediate ops to find the root cause of precision divergence. Use when debugging numerical differences between two implementations (e.g., FP16 vs BF16, custom kernel vs reference, different GPU architectures, or before/after a code change).
+description: Automated kernel precision bisection — instrument kernel call sites, dump baseline, run level-4 align to find root cause of precision divergence. Use when debugging numerical differences between two implementations (e.g., FP16 vs BF16, custom kernel vs reference, different GPU architectures, or before/after a code change).
 ---
 
 # Precision Bisect: Automated Kernel Accuracy Comparison
 
-This skill guides you through an automated, iterative precision bisection workflow.
-The goal is to find **which specific operator** and **which specific invocation** first
-introduces a significant numerical difference between a baseline and a target run.
-
-## Prerequisites
-
-The precision debug decorator must already be applied to the kernel functions you want
-to inspect. See `python/sglang/kernel_precision_debug.py` for the decorator and its
-environment variable documentation.
-
-```python
-from sglang.kernel_precision_debug import precision_debug
-
-@precision_debug
-def my_kernel(input, weight, ...):
-    ...
-```
-
-When `SGLANG_PRECISION_DEBUG=0` (default), the decorator is a no-op with zero overhead.
+This skill guides you through an automated precision bisection workflow:
+1. **Instrument** — add `@precision_debug` to kernel call sites (auto or manual)
+2. **Dump baseline** — run with level 3
+3. **Align & compare** — run target with level 4 against baseline → root cause in one pass
 
 ## Quick Reference: Environment Variables
 
@@ -42,412 +27,544 @@ When `SGLANG_PRECISION_DEBUG=0` (default), the decorator is a no-op with zero ov
 | `SGLANG_PRECISION_ALIGN_DIR` | `""` | Level 4: path to baseline dump tag dir |
 | `SGLANG_PRECISION_ALIGN_THRESHOLD` | `1e-3` | Level 4: rel_diff PASS/FAIL threshold |
 
-## Workflow Overview
+---
+
+## Phase 0: Instrument Kernel Call Sites
+
+Before dumping or comparing, the kernel functions must be wrapped with `@precision_debug`.
+When `SGLANG_PRECISION_DEBUG=0` (default), the decorator is a no-op with zero overhead.
+
+### Auto-Instrumentation (recommended for this skill)
+
+When the user asks to debug precision, **you should automatically add instrumentation** to
+the relevant kernel call sites. The key principle: **wrap the lowest-level kernel functions,
+not the model forward methods**. All layers share the same kernel function, so the per-op
+call counter naturally distinguishes layers (call #0 = layer 0, call #1 = layer 1, ...).
+
+#### Two instrumentation patterns
+
+The decorator supports both standalone functions and `nn.Module` methods. It automatically
+detects and skips `self`/`cls` parameters — only tensor arguments are logged/dumped.
+
+**Pattern A: Standalone wrapper** — for bare kernel calls (e.g., `sgl_kernel.rmsnorm`):
+```python
+from sglang.kernel_precision_debug import precision_debug
+
+@precision_debug(op_name="sgl_kernel.rmsnorm")
+def _traced_rmsnorm(x, weight, eps):
+    return rmsnorm(x, weight, eps)
+
+# Replace call site: rmsnorm(x, ...) → _traced_rmsnorm(x, ...)
+```
+
+**Pattern B: Direct method decoration** — for `nn.Module` methods (e.g., `forward_normal`):
+```python
+class DeepseekV2MoE(nn.Module):
+    @precision_debug(op_name="moe.forward_normal")
+    def forward_normal(self, hidden_states, ...):
+        # self is automatically skipped — only hidden_states etc. are captured
+        router_logits = self.gate(hidden_states)
+        ...
+```
+
+Both patterns produce identical dump structure. Use Pattern A for wrapping external
+kernel calls (sgl_kernel, triton), Pattern B for instrumenting existing class methods.
+
+#### Instrumentation targets
+
+**Normalization** — `python/sglang/srt/layers/layernorm.py` (Pattern A, shared by all models):
+```python
+from sglang.kernel_precision_debug import precision_debug
+
+@precision_debug(op_name="sgl_kernel.rmsnorm")
+def _traced_rmsnorm(x, weight, eps):
+    return rmsnorm(x, weight, eps)
+
+@precision_debug(op_name="sgl_kernel.fused_add_rmsnorm")
+def _traced_fused_add_rmsnorm(x, residual, weight, eps):
+    fused_add_rmsnorm(x, residual, weight, eps)
+    return x  # inplace — decorator captures inputs_after.pt automatically
+
+# Replace in RMSNorm.forward_cuda():
+#   rmsnorm(x, ...) → _traced_rmsnorm(x, ...)
+#   fused_add_rmsnorm(x, ...) → _traced_fused_add_rmsnorm(x, ...)
+```
+
+**Attention** — `python/sglang/srt/layers/attention/` (Pattern A):
+```python
+@precision_debug(op_name="attn.extend")
+def _traced_attn_extend(q, k, v, ...):
+    return original_extend(q, k, v, ...)
+
+@precision_debug(op_name="attn.decode")
+def _traced_attn_decode(q, k, v, ...):
+    return original_decode(q, k, v, ...)
+```
+
+**Linear / GEMM** — `python/sglang/srt/layers/linear.py` (Pattern A, shared by all models):
+```python
+@precision_debug(op_name="qkv_proj")
+def _traced_qkv(x, weight, bias): ...
+
+@precision_debug(op_name="o_proj")
+def _traced_o_proj(x, weight, bias): ...
+
+@precision_debug(op_name="gate_up_proj")
+def _traced_gate_up(x, weight, bias): ...
+
+@precision_debug(op_name="down_proj")
+def _traced_down_proj(x, weight, bias): ...
+```
+
+**Activation** — `python/sglang/srt/layers/activation.py` (Pattern A):
+```python
+@precision_debug(op_name="silu_and_mul")
+def _traced_silu_and_mul(x):
+    return SiluAndMul.forward(x)
+```
+
+**ROPE** — `python/sglang/srt/layers/rotary_embedding.py` (Pattern A):
+```python
+@precision_debug(op_name="rotary_emb")
+def _traced_rope(positions, q, k):
+    return original_rope(positions, q, k)
+```
+
+#### Model-specific instrumentation
+
+The three primary target models share the common layer ops above, plus model-specific ops:
+
+**Qwen** (`python/sglang/srt/models/qwen.py`) — Dense model:
+```
+QWenBlock.forward():
+  ln_1 (RMSNorm) → attn [qkv_proj → rope → attn → o_proj] → residual add
+  ln_2 (RMSNorm) → mlp  [gate_up_proj → silu_and_mul → down_proj] → residual add
+```
+- Standard dense architecture, no extra ops. Uses the common instrumentation above.
+- Note: Qwen uses explicit `residual + hidden_states` (not fused_add_rmsnorm).
+
+**DeepSeek V2** (`python/sglang/srt/models/deepseek_v2.py`) — MoE model:
+```
+DeepseekV2DecoderLayer.forward():
+  input_layernorm (RMSNorm) → self_attn (MLA) → post_attention_layernorm (RMSNorm)
+  → MoE: gate → topk → experts (FusedMoE) → shared_experts → combine
+```
+Use **Pattern B** — directly decorate the `nn.Module` methods in `DeepseekV2MoE`:
+```python
+class DeepseekV2MoE(nn.Module):
+    @precision_debug(op_name="moe.forward_normal")
+    def forward_normal(self, hidden_states, ...):
+        # self is skipped — only hidden_states etc. captured
+        router_logits = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
+        ...
+```
+For finer granularity, also wrap sub-components inside `forward_normal`:
+```python
+class DeepseekV2MoE(nn.Module):
+    @precision_debug(op_name="moe.gate")
+    def _traced_gate(self, hidden_states):
+        return self.gate(hidden_states)
+
+    @precision_debug(op_name="moe.topk")
+    def _traced_topk(self, hidden_states, router_logits):
+        return self.topk(hidden_states, router_logits)
+
+    @precision_debug(op_name="moe.experts")
+    def _traced_experts(self, hidden_states, topk_output):
+        return self.experts(hidden_states, topk_output)
+
+    @precision_debug(op_name="moe.shared_experts")
+    def _traced_shared_experts(self, hidden_states):
+        return self._forward_shared_experts(hidden_states)
+
+    def forward_normal(self, hidden_states, ...):
+        router_logits = self._traced_gate(hidden_states)
+        topk_output = self._traced_topk(hidden_states, router_logits)
+        final = self._traced_experts(hidden_states, topk_output)
+        shared = self._traced_shared_experts(hidden_states)
+        return final + shared
+```
+- MLA attention: also wrap `kv_a_proj_with_mqa` and `kv_b_proj` for compressed KV precision.
+- DeepEP path: decorate `forward_deepep(self, ...)` with Pattern B for A2A dispatch tracking.
+- `dsv3_router_gemm` / `dsv3_fused_a_gemm`: wrap with Pattern A if investigating router kernel precision.
+
+**Bailing MoE** (`python/sglang/srt/models/bailing_moe.py`) — MoE model:
+```
+BailingMoEBlock.forward():
+  input_layernorm (RMSNorm) → attention [qkv_proj → rope → attn → o_proj]
+  → post_attention_layernorm (RMSNorm)
+  → MoE: gate → topk → experts (FusedMoE) → shared_experts → combine
+```
+Same Pattern B approach as DeepSeek V2:
+```python
+class BailingMoESparseMoeBlock(nn.Module):
+    @precision_debug(op_name="moe.forward_normal")
+    def forward_normal(self, hidden_states, ...):
+        ...
+
+    # Or finer-grained:
+    @precision_debug(op_name="moe.gate")      # BailingMoEGate (F.linear)
+    def _traced_gate(self, hidden_states): ...
+
+    @precision_debug(op_name="moe.experts")   # FusedMoE dispatch+GEMM+combine
+    def _traced_experts(self, hidden_states, topk_output): ...
+```
+- Optional QK norm: decorate `self.q_norm` / `self.k_norm` methods in `BailingMoEAttention`.
+- DeepEP path: decorate `forward_deepep(self, ...)` with Pattern B.
+
+#### How call counter maps to layers
+
+Example: DeepSeek V2 with 60 layers (some dense, some MoE):
 
 ```
-Phase 1: Collect dumps (baseline + target)
-    ↓
-Phase 2: Global comparison — find which ops diverge
-    ↓
-Phase 3: Input alignment — verify inputs match
-    ↓  (if inputs match but outputs don't → this op is the culprit)
-    ↓  (if inputs don't match → trace back to the upstream op)
-    ↓
-Phase 4: Narrow down — re-dump with finer filters
-    ↓
-Phase 5: Root cause — identify the exact op + invocation
+sgl_kernel.rmsnorm       #0~#59  → layer 0~59 input_layernorm
+sgl_kernel.fused_add_rmsnorm #0~#59 → layer 0~59 post_attn_layernorm
+qkv_proj / kv_a_proj     #0~#59  → layer 0~59 attention projections
+attn.decode               #0~#59  → layer 0~59 attention
+o_proj                    #0~#59  → layer 0~59 output projection
+moe.gate                  #0~#N   → MoE layers only (counter only for MoE layers)
+moe.topk                  #0~#N   → MoE layers only
+moe.experts               #0~#N   → MoE layers only
+gate_up_proj              #0~#M   → dense layers only (if model has dense+MoE mix)
 ```
+
+Note: MoE ops (`moe.gate`, `moe.experts`) have their own counter, separate from dense
+ops (`gate_up_proj`). The counter only increments for layers that actually call that op.
+
+Use `INDEX_FILTER` to select layers: `INDEX_FILTER="10-15"` = only layer 10~15.
+Use `RANGE_START/END` for cross-op windows: `RANGE_START="qkv_proj#5"` to `RANGE_END="down_proj#5"` = all ops in layer 5.
+
+#### Instrumentation checklist
+
+Before running, verify instrumentation with level 1 (zero-overhead shape logging):
+
+```bash
+SGLANG_PRECISION_DEBUG=1 python -m sglang.bench_one_batch \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --batch-size 1 --input-len 128 --output-len 1 2>&1 | head -50
+```
+
+Expected: one `[IN]`/`[OUT]` pair per op per layer. If ops are missing, add more wrappers.
 
 ---
 
-## Phase 1: Collect Dumps
+## Phase 1: Dump Baseline (Level 3)
 
-Run the same workload twice — once for baseline, once for target — with tensor dumping enabled.
-
-### Step 1a: Baseline run
+Run the baseline workload with tensor dumping. Use `bench_one_batch` for a single
+forward pass (no server needed), or run the full server for end-to-end scenarios.
 
 ```bash
 SGLANG_PRECISION_DEBUG=3 \
 SGLANG_PRECISION_TAG=baseline \
 SGLANG_PRECISION_DUMP_DIR=/path/to/dumps \
-SGLANG_PRECISION_RANK_FILTER=0 \
-SGLANG_PRECISION_INDEX_FILTER="<=10" \
-python your_script.py [baseline args...]
+SGLANG_PRECISION_INDEX_FILTER="<10" \
+python -m sglang.bench_one_batch \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --batch-size 1 --input-len 128 --output-len 1 \
+    --dtype float32
 ```
 
-### Step 1b: Target run
+Verify dump structure:
 
 ```bash
-SGLANG_PRECISION_DEBUG=3 \
-SGLANG_PRECISION_TAG=target \
-SGLANG_PRECISION_DUMP_DIR=/path/to/dumps \
-SGLANG_PRECISION_RANK_FILTER=0 \
-SGLANG_PRECISION_INDEX_FILTER="<=10" \
-python your_script.py [target args...]
-```
-
-### Step 1c: Verify dump structure
-
-```bash
-# Check that both sides have matching ops
 ls /path/to/dumps/baseline/rank0/
-ls /path/to/dumps/target/rank0/
+# Expected: sgl_kernel.rmsnorm/  qkv_proj/  attn.decode/  o_proj/  ...
+ls /path/to/dumps/baseline/rank0/sgl_kernel.rmsnorm/
+# Expected: call_000000/  call_000001/  ... call_000031/
 ```
 
-Expected structure:
+Dump layout:
 ```
-/path/to/dumps/
-  baseline/rank0/{op_name}/call_000001/{inputs,outputs,inputs_after}.pt + meta.json
-  target/rank0/{op_name}/call_000001/{inputs,outputs,inputs_after}.pt + meta.json
+/path/to/dumps/baseline/rank0/
+  {op_name}/call_{idx:06d}/
+    inputs.pt        ← named tensor dict
+    outputs.pt       ← return value(s)
+    inputs_after.pt  ← tensor state after execution (for inplace ops)
+    meta.json        ← shapes, dtypes, stats, timestamp
 ```
 
 ---
 
-## Phase 2: Global Comparison
+## Phase 2: Align & Compare (Level 4) — One-Pass Root Cause Detection
 
-Run the comparison CLI to get an overview of which ops diverge.
+Run the target workload with level 4, pointing `ALIGN_DIR` to the baseline dumps.
+This **replaces Phase 1b + Phase 2 + Phase 3** of the old workflow — no need to
+dump target separately or run the compare CLI.
 
 ```bash
-python -m sglang.kernel_precision_debug compare \
-    --baseline /path/to/dumps/baseline \
-    --target /path/to/dumps/target \
-    --rank 0 \
-    --diff-threshold 1e-3
+SGLANG_PRECISION_DEBUG=4 \
+SGLANG_PRECISION_ALIGN_DIR=/path/to/dumps/baseline \
+SGLANG_PRECISION_ALIGN_THRESHOLD=1e-3 \
+SGLANG_PRECISION_INDEX_FILTER="<10" \
+python -m sglang.bench_one_batch \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --batch-size 1 --input-len 128 --output-len 1 \
+    --dtype bfloat16 2>&1 | tee align_report.txt
 ```
 
 ### Reading the output
 
+For each op call, the decorator prints three comparison sections:
+
 ```
-[PASS] call_000001/inputs.pt/input: shape=[4, 128] rel_diff=1.2e-7 ...
-[PASS] call_000001/inputs.pt/weight: shape=[128] rel_diff=0 ...
-[FAIL] call_000001/outputs.pt/return: shape=[4, 128] rel_diff=0.015 ...
+[ALIGN] sgl_kernel.rmsnorm #0 — replacing inputs from .../baseline/rank0/sgl_kernel.rmsnorm/call_000000
+  [ALIGN PASS] #0 input_diff/x:       rel_diff=0          ← actual vs baseline inputs
+  [ALIGN PASS] #0 input_diff/weight:   rel_diff=0
+  [ALIGN FAIL] #0 output_aligned/return: rel_diff=3.2e-3   ← target(baseline_inputs) vs baseline_outputs
+  [ALIGN PASS] #0 inplace_aligned/x:   rel_diff=1e-8       ← post-exec state vs baseline
 ```
 
-- **PASS**: rel_diff ≤ threshold — tensors match
-- **FAIL**: rel_diff > threshold — tensors diverge
+| Section | Compares | Purpose |
+|---------|----------|---------|
+| `input_diff` | actual inputs vs baseline inputs | Shows upstream divergence |
+| `output_aligned` | target(baseline_inputs) vs baseline_outputs | **Root cause judgment** |
+| `inplace_aligned` | post-exec tensors vs baseline `inputs_after.pt` | For inplace ops |
 
-### Key insight
+### Root cause judgment
 
-For each op, look at this pattern:
-- **Inputs PASS, Outputs FAIL** → This op itself introduces the divergence. It is a
-  **root cause candidate**.
-- **Inputs FAIL, Outputs FAIL** → Divergence is inherited from upstream. Trace back.
-- **Inputs FAIL, Outputs PASS** → This op is somehow convergent (rare, e.g. argmax).
-- **All PASS** → This op is not involved.
+- **`output_aligned` FAIL** → This op itself produces different results with identical inputs.
+  **Root cause confirmed.** Investigate: different kernel? wrong dtype? numerical instability?
+- **`output_aligned` PASS** → This op works correctly; divergence comes from upstream.
 
-### Filter to specific ops
+### Why level 4 is sufficient
+
+Level 4 replaces each op's inputs with baseline data before executing. This means:
+- Each op is tested independently — upstream errors don't propagate
+- `input_diff` shows what the natural input divergence would be (for reference)
+- `output_aligned` is the definitive per-op verdict
+
+Extract all root causes in one command:
 
 ```bash
-python -m sglang.kernel_precision_debug compare \
-    --baseline /path/to/dumps/baseline \
-    --target /path/to/dumps/target \
-    --op-filter "rmsnorm*,*attention*" \
-    --diff-threshold 1e-3
+grep "ALIGN FAIL.*output_aligned" align_report.txt
 ```
+
+### Behavior note: input replacement chain
+
+```
+Op0: inject baseline inputs → execute → aligned output → passed to Op1
+Op1: inject baseline inputs → execute → aligned output → passed to Op2
+...
+```
+
+Each op gets baseline inputs regardless of what upstream produced. The `input_diff`
+section still reports the actual vs baseline input difference (before replacement),
+so you can see the natural error propagation if needed.
 
 ---
 
-## Phase 3: Input Alignment (Level 4 — Align Mode)
+## Phase 3: Narrow Down (Optional)
 
-When you find an op where **outputs diverge but you're not sure about inputs**, use
-**level 4** to automatically load baseline inputs, replace the actual call inputs, execute,
-and compare outputs — all inline, no separate script needed.
+If too many ops show as FAIL, or you want to focus on specific layers:
 
-### Step 3a: Run target with align mode
-
-First, you need baseline dumps from Phase 1. Then run the target with level 4:
+### Filter by op name
 
 ```bash
-# Step 1 was: dump baseline with level 3
-# Step 2: run target with level 4, pointing ALIGN_DIR to the baseline dumps
-SGLANG_PRECISION_DEBUG=4 \
-SGLANG_PRECISION_ALIGN_DIR=/path/to/dumps/baseline \
-SGLANG_PRECISION_ALIGN_THRESHOLD=1e-3 \
-SGLANG_PRECISION_INDEX_FILTER="<=10" \
-python your_script.py [target args...]
+SGLANG_PRECISION_OP_FILTER="sgl_kernel.rmsnorm,qkv_proj" \
+SGLANG_PRECISION_DEBUG=4 ...
 ```
 
-### Step 3b: Read the output
-
-For each decorated op call, the decorator prints three comparison sections:
-
-```
-[ALIGN] my_op #1 — replacing inputs from /path/to/dumps/baseline/rank0/my_op/call_000001
-  [ALIGN FAIL] my_op #1 input_diff/input: rel_diff=0.95 ...    ← inputs were different
-  [ALIGN PASS] my_op #1 input_diff/weight: rel_diff=0 ...      ← weights matched
-  [ALIGN PASS] my_op #1 output_aligned/return: rel_diff=1e-8 ... ← outputs match with aligned inputs!
-  [ALIGN PASS] my_op #1 inplace_aligned/input: rel_diff=0 ...  ← inplace state matches
-```
-
-**What each section means:**
-
-| Section | What it compares |
-|---------|-----------------|
-| `input_diff` | Actual inputs vs baseline inputs (shows how much inputs diverged) |
-| `output_aligned` | Output from target(baseline_inputs) vs baseline_outputs |
-| `inplace_aligned` | Inplace-modified tensors from target vs baseline `inputs_after.pt` |
-
-### Step 3c: Interpret results
-
-- **`output_aligned` PASS** → The op produces the same results given the same inputs.
-  The divergence comes from **upstream**. Trace back to find which earlier op diverged.
-- **`output_aligned` FAIL** → The op itself behaves differently even with identical inputs.
-  This is the **root cause**. Investigate: different kernel? wrong dtype? numerical instability?
-- **`input_diff` PASS + `output_aligned` FAIL** → Inputs were already aligned naturally,
-  yet outputs differ. Confirms this op is the culprit without needing replacement.
-
-### Step 3d: Align mode also dumps (for chaining)
-
-When `SGLANG_PRECISION_DUMP_DIR` and `SGLANG_PRECISION_TAG` are set, level 4 also saves
-the aligned outputs to disk. This lets you chain: run op A aligned, then use its aligned
-outputs as the new baseline for op B.
+### Filter by layer (call index)
 
 ```bash
-SGLANG_PRECISION_DEBUG=4 \
-SGLANG_PRECISION_ALIGN_DIR=/path/to/dumps/baseline \
-SGLANG_PRECISION_DUMP_DIR=/path/to/dumps \
-SGLANG_PRECISION_TAG=aligned_target \
-python your_script.py [target args...]
+# Only check layers 10-15
+SGLANG_PRECISION_INDEX_FILTER="10-15" \
+SGLANG_PRECISION_DEBUG=4 ...
 ```
 
-### Fallback: Manual alignment script
-
-For cases where level 4 cannot be used (e.g., the op is not decorated, or you need custom
-preprocessing), you can still write a manual alignment script:
-
-```python
-import torch
-
-baseline_inputs = torch.load(
-    "/path/to/dumps/baseline/rank0/my_op/call_000001/inputs.pt",
-    weights_only=True, map_location="cuda"
-)
-baseline_outputs = torch.load(
-    "/path/to/dumps/baseline/rank0/my_op/call_000001/outputs.pt",
-    weights_only=True, map_location="cuda"
-)
-
-# Run target implementation with baseline inputs
-result = target_my_op(baseline_inputs["input"], baseline_inputs["weight"])
-
-diff = (result.float() - baseline_outputs["return"].float()).abs()
-print(f"max_abs_diff={diff.max().item():.6g}")
-```
-
----
-
-## Phase 4: Narrow Down with Finer Filters
-
-Once you identify a suspect op, re-dump with more invocations or specific shape filters
-to get a detailed view.
-
-### Dump more invocations of a specific op
+### Filter by layer range (cross-op window)
 
 ```bash
+# All ops in layer 5 only
+SGLANG_PRECISION_RANGE_START="sgl_kernel.rmsnorm#5" \
+SGLANG_PRECISION_RANGE_END="down_proj#5" \
+SGLANG_PRECISION_DEBUG=4 ...
+```
+
+The `#N` matches the per-op call counter (same as `INDEX_FILTER`).
+Filter order: rank → op_name → shape → (increment counter) → range → index_filter.
+
+### Filter by input shape
+
+```bash
+# Only capture when dim0 >= 1024 (long sequences)
+SGLANG_PRECISION_SHAPE_FILTER="dim0>=1024" \
+SGLANG_PRECISION_DEBUG=4 ...
+```
+
+### Re-dump with finer granularity
+
+```bash
+# Dump more invocations of a specific suspect op
 SGLANG_PRECISION_DEBUG=3 \
 SGLANG_PRECISION_TAG=baseline_detailed \
 SGLANG_PRECISION_DUMP_DIR=/path/to/dumps \
-SGLANG_PRECISION_OP_FILTER="jit_kernel.norm.rmsnorm" \
-SGLANG_PRECISION_INDEX_FILTER="1-100" \
-python your_script.py [baseline args...]
-```
-
-### Dump only a range of ops (between two anchors)
-
-```bash
-# Only capture ops between the 2nd attention call and 2nd mlp call
-SGLANG_PRECISION_DEBUG=3 \
-SGLANG_PRECISION_TAG=baseline_range \
-SGLANG_PRECISION_DUMP_DIR=/path/to/dumps \
-SGLANG_PRECISION_RANGE_START="*attention*#2" \
-SGLANG_PRECISION_RANGE_END="*mlp*#2" \
-python your_script.py [baseline args...]
-```
-
-The `#N` uses the same per-op call counter as `INDEX_FILTER`. Filter order:
-rank → op_name → shape → (increment counter) → range start/end → index_filter.
-
-### Dump only for large inputs
-
-```bash
-SGLANG_PRECISION_DEBUG=3 \
-SGLANG_PRECISION_TAG=baseline_large \
-SGLANG_PRECISION_DUMP_DIR=/path/to/dumps \
-SGLANG_PRECISION_SHAPE_FILTER="dim0>=1024" \
-python your_script.py [baseline args...]
-```
-
-### Compare with per-side slicing
-
-When baseline and target have different batch sizes or sequence lengths on dim0:
-
-```bash
-# Baseline has batch_size=8, target has batch_size=4
-# Compare the first 4 samples from baseline against all of target
-python -m sglang.kernel_precision_debug compare \
-    --baseline /path/to/dumps/baseline \
-    --target /path/to/dumps/target \
-    --baseline-slice "0:4"
-
-# Compare specific token positions
-python -m sglang.kernel_precision_debug compare \
-    --baseline /path/to/dumps/baseline \
-    --target /path/to/dumps/target \
-    --baseline-index "0,5,10,15" \
-    --target-index "0,5,10,15"
-
-# Different ranges for each side
-python -m sglang.kernel_precision_debug compare \
-    --baseline /path/to/dumps/baseline \
-    --target /path/to/dumps/target \
-    --baseline-slice "100:200" \
-    --target-slice "50:150"
+SGLANG_PRECISION_OP_FILTER="sgl_kernel.rmsnorm" \
+SGLANG_PRECISION_INDEX_FILTER="0-100" \
+python -m sglang.bench_one_batch ...
 ```
 
 ---
 
-## Phase 5: Root Cause Analysis
+## Phase 4: Root Cause Analysis
 
-Once you've identified the divergent op and invocation, investigate further.
-
-### Check for numerical issues
+### Quick stats check (level 2, no dump)
 
 ```bash
-# Quick stats check (level 2, no dump)
 SGLANG_PRECISION_DEBUG=2 \
 SGLANG_PRECISION_OP_FILTER="the_divergent_op" \
-SGLANG_PRECISION_INDEX_FILTER="<=5" \
-python your_script.py
+SGLANG_PRECISION_INDEX_FILTER="<5" \
+python -m sglang.bench_one_batch ...
 ```
 
-Look for:
-- `nan>0` or `inf>0` in input stats → bad upstream values
-- Very large `max` or very small `min` → potential overflow/underflow
-- `mean` wildly different between baseline and target
+Look for: `nan>0`, `inf>0`, very large `max`, very small `min`.
 
 ### Common root causes
 
 | Symptom | Likely Cause |
 |---------|-------------|
-| Inputs match, outputs differ by ~1e-3 | Different CUDA kernel implementation (e.g., FlashAttention v2 vs v3) |
-| Inputs match, outputs differ by ~1e-1 | Wrong dtype (FP16 vs BF16) or wrong eps value |
+| Inputs match, outputs differ by ~1e-3 | Different CUDA kernel (e.g., FlashAttention v2 vs v3) |
+| Inputs match, outputs differ by ~1e-1 | Wrong dtype (FP16 vs BF16) or wrong eps |
 | Inputs match, outputs completely different | Wrong kernel selected, or index/offset bug |
 | First op diverges | Weight loading or initialization difference |
 | Divergence grows layer-by-layer | Numerical accumulation; check residual connections |
-| Only specific invocations diverge | Shape-dependent code path (e.g., warp vs block kernel) |
+| Only specific layers diverge | Shape-dependent code path (warp vs block kernel) |
 
 ### Inplace ops
 
-For inplace ops (e.g., `fused_add_rmsnorm` which modifies `input` and `residual` in place),
-compare `inputs_after.pt` instead of `outputs.pt`:
+For inplace ops (e.g., `fused_add_rmsnorm`), check `inplace_aligned` instead of
+`output_aligned`. The decorator captures tensor state after execution in `inputs_after.pt`.
 
-```bash
-python -m sglang.kernel_precision_debug compare \
-    --baseline /path/to/dumps/baseline \
-    --target /path/to/dumps/target \
-    --op-filter "*fused_add_rmsnorm*"
-```
+### Compound/fused ops
 
-The comparison automatically includes `inputs_after.pt` alongside `inputs.pt` and `outputs.pt`.
+If the root cause op is a fused op:
+1. Temporarily replace the fused op with its unfused equivalent
+2. Re-instrument the sub-operations with `@precision_debug`
+3. Re-run the bisection on sub-operations
+4. Recursively narrow down to the atomic divergent operation
 
 ---
 
-## Automated Bisection Recipe
+## Optional: Offline Comparison (dump both sides)
 
-For a systematic layer-by-layer bisection, follow this recipe:
-
-### 1. Broad sweep: dump all ops, first few calls
+For cases where you want to see **natural error propagation** (without input replacement),
+or when level 4 cannot be used, fall back to the 3-step dump+compare workflow:
 
 ```bash
-# Both runs: capture first 5 calls of every op
-SGLANG_PRECISION_INDEX_FILTER="<=5"
-SGLANG_PRECISION_DEBUG=3
+# Step 1: Dump baseline (level 3)
+SGLANG_PRECISION_DEBUG=3 SGLANG_PRECISION_TAG=baseline ...
+
+# Step 2: Dump target (level 3)
+SGLANG_PRECISION_DEBUG=3 SGLANG_PRECISION_TAG=target ...
+
+# Step 3: Compare offline
+python -m sglang.kernel_precision_debug compare \
+    --baseline /path/to/dumps/baseline \
+    --target /path/to/dumps/target \
+    --rank 0 --diff-threshold 1e-3
 ```
 
-### 2. Global compare: find first divergent op
+### Reading compare output
+
+```
+[PASS] call_000000/inputs.pt/x: shape=[1,128,4096] rel_diff=0
+[FAIL] call_000000/outputs.pt/return: shape=[1,128,4096] rel_diff=0.015
+```
+
+Key pattern: **inputs PASS + outputs FAIL** = root cause candidate (but needs level 4 to confirm).
+
+### Per-side dim0 slicing
+
+When baseline and target have different batch/seq lengths:
 
 ```bash
 python -m sglang.kernel_precision_debug compare \
     --baseline .../baseline --target .../target \
-    --diff-threshold 1e-3
+    --baseline-slice "0:4" --target-slice "0:4"
+
+# Or pick specific dim0 indices
+    --baseline-index "0,5,10" --target-index "0,5,10"
 ```
-
-Scan the output **top-to-bottom** (ops are sorted by name, calls by index). The first
-`FAIL` on `outputs.pt` where `inputs.pt` is `PASS` is your **primary suspect**.
-
-### 3. Confirm with level-4 align mode
-
-Re-run the target with `SGLANG_PRECISION_DEBUG=4` and `SGLANG_PRECISION_ALIGN_DIR`
-pointing to the baseline dumps. For each op, the decorator replaces inputs with baseline
-data and compares outputs. If `output_aligned` is FAIL, you've confirmed the root cause.
-
-### 4. If the root cause op is a compound/fused op
-
-- Temporarily replace the fused op with its unfused equivalent
-- Re-instrument the sub-operations with `@precision_debug`
-- Re-run the bisection on the sub-operations
-- This recursively narrows down to the atomic operation that diverges
-
-### 5. Document findings
-
-Record:
-- Which op diverges
-- At which invocation index
-- Input shapes and dtypes
-- The magnitude of divergence (rel_diff, max_abs_diff)
-- The root cause (wrong kernel, dtype mismatch, numerical instability, etc.)
 
 ---
 
 ## Multi-Rank Comparison
 
-For distributed inference, compare the same rank across baseline and target:
+For distributed inference (TP/PP):
 
 ```bash
-# Compare rank 0
-python -m sglang.kernel_precision_debug compare \
-    --baseline .../baseline --target .../target --rank 0
+# Dump all ranks
+SGLANG_PRECISION_RANK_FILTER="" \
+SGLANG_PRECISION_DEBUG=3 ...
 
-# Compare rank 1
-python -m sglang.kernel_precision_debug compare \
-    --baseline .../baseline --target .../target --rank 1
+# Level 4 align per rank
+SGLANG_PRECISION_RANK_FILTER="0" \
+SGLANG_PRECISION_DEBUG=4 ...
+
+# Or compare offline per rank
+for RANK in 0 1 2 3; do
+  python -m sglang.kernel_precision_debug compare \
+      --baseline .../baseline --target .../target --rank $RANK
+done
 ```
 
-To dump all ranks:
+---
 
-```bash
-SGLANG_PRECISION_RANK_FILTER="" \  # empty = all ranks
-SGLANG_PRECISION_DEBUG=3 \
-...
-```
+## Typical Scenarios
+
+| Scenario | Baseline | Target | Focus |
+|----------|----------|--------|-------|
+| FP32 vs BF16 | `--dtype float32` | `--dtype bfloat16` | Which kernel is most precision-sensitive |
+| FlashInfer vs Triton | `SGLANG_ATTENTION_BACKEND=flashinfer` | `=triton` | Attention output diff |
+| New vs old kernel | Old code branch | New code branch | Regression detection |
+| Cross-GPU | H100 dump | H20 dump | Architecture-induced drift |
+| Quantization | FP16 weights | INT8/FP8 quantized | Per-layer quantization loss |
+| MoE routing | Reference TopK | Fused TopK | Router precision affects expert selection |
+| DeepEP vs normal | `forward_normal()` | `forward_deepep()` | A2A dispatch precision |
+
+### Model-specific notes
+
+- **Qwen**: Dense model, standard flow. Focus on rmsnorm + linear precision.
+- **DeepSeek V2**: MoE + MLA attention. Key areas: `moe.gate` routing precision
+  (affects expert selection), `kv_a_proj`/`kv_b_proj` compressed KV precision,
+  `moe.experts` FusedMoE GEMM. MoE layers and dense layers have separate counters.
+- **Bailing MoE**: MoE + standard MHA. Key areas: `moe.gate` (uses `F.linear`),
+  `moe.experts` (FusedMoE or DeepEP), optional QK norm precision.
 
 ---
 
 ## Tips
 
-1. **Start with level 1** (`SGLANG_PRECISION_DEBUG=1`) to quickly see which ops are
-   called and in what order — no GPU sync overhead.
+1. **Start with level 1** to see which ops are called and in what order — no GPU sync overhead.
 
-2. **Use level 2** (`SGLANG_PRECISION_DEBUG=2`) to spot NaN/Inf without generating
-   dump files.
+2. **Use level 2** to spot NaN/Inf without generating dump files.
 
-3. **Only use level 3** when you need to compare actual tensor values offline.
+3. **Prefer the 2-step flow** (dump baseline + level 4) over the 3-step flow. Level 4
+   gives per-op root cause judgment directly, without dumping target separately.
 
-4. **Use level 4** for automated input alignment — it loads baseline inputs, replaces
-   actual inputs, executes, and compares outputs inline. No separate script needed.
+4. **Default `INDEX_FILTER=<10`** captures the first 10 invocations per op (0-based: indices
+   0–9). For a 32-layer model, set `INDEX_FILTER="<32"` or `""` (all) to cover every layer.
 
-5. **Default `INDEX_FILTER=<=10`** means only the first 10 invocations per op are
-   captured. Increase this if the divergence only appears later.
+5. **Default `RANK_FILTER=""`** captures all ranks. Set to `"0"` for rank 0 only.
 
-5. **Default `RANK_FILTER=0`** means only rank 0 is captured. Set to `""` for all ranks.
-
-6. **For inplace ops**, always check `inputs_after.pt` — it captures the tensor state
-   after the op modifies its inputs.
+6. **For inplace ops**, check `inplace_aligned` — it captures tensor state after the op
+   modifies its inputs.
 
 7. **Torch compile**: The decorator automatically skips during `torch.compile` tracing.
 
-8. **CUDA graph capture**: Disable CUDA graph for the debug run to ensure tensors are
-   accessible for dumping.
+8. **CUDA graph**: Disable CUDA graph for the debug run to ensure tensors are accessible.
+
+9. **`align_transform` callback**: For custom preprocessing of baseline tensors (dtype
+   conversion, reshape, slice) in level 4:
+   ```python
+   def my_transform(tensors, category):
+       # category: "inputs", "outputs", or "inputs_after"
+       return {k: v.to(torch.bfloat16) for k, v in tensors.items()}
+
+   @precision_debug(align_transform=my_transform)
+   def my_kernel(...): ...
+   ```
 
 ---
 
@@ -455,15 +572,15 @@ SGLANG_PRECISION_DEBUG=3 \
 
 ```bash
 python -m sglang.kernel_precision_debug compare \
-    --baseline <path>           # Baseline dump directory (required)
-    --target <path>             # Target dump directory (required)
-    --rank <int>                # Rank to compare (default: 0)
-    --op-filter <patterns>      # fnmatch op filter (default: all)
-    --diff-threshold <float>    # PASS/FAIL threshold (default: 1e-3)
-    --slice <start:stop>        # Dim0 slice for both sides
+    --baseline <path>              # Baseline dump directory (required)
+    --target <path>                # Target dump directory (required)
+    --rank <int>                   # Rank to compare (default: 0)
+    --op-filter <patterns>         # fnmatch op filter (default: all)
+    --diff-threshold <float>       # PASS/FAIL threshold (default: 1e-3)
+    --slice <start:stop>           # Dim0 slice for both sides
     --baseline-slice <start:stop>  # Dim0 slice for baseline only
     --target-slice <start:stop>    # Dim0 slice for target only
-    --index <i,j,k>             # Dim0 indices for both sides
-    --baseline-index <i,j,k>    # Dim0 indices for baseline only
-    --target-index <i,j,k>      # Dim0 indices for target only
+    --index <i,j,k>                # Dim0 indices for both sides
+    --baseline-index <i,j,k>       # Dim0 indices for baseline only
+    --target-index <i,j,k>         # Dim0 indices for target only
 ```
