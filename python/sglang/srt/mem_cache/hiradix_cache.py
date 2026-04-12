@@ -338,21 +338,13 @@ class HiRadixCache(RadixCache):
             )
 
         try:
-            if isinstance(self.cache_controller, HybridCacheController):
-                self.cache_controller.attach_storage_backend(
-                    storage_backend=storage_backend,
-                    prefetch_threshold=prefetch_threshold,
-                    model_name=served_model_name,
-                    storage_backend_extra_config=extra_config,
-                    host_pools=self.cache_controller.mem_pool_host.entries,
-                )
-            else:
-                self.cache_controller.attach_storage_backend(
-                    storage_backend=storage_backend,
-                    prefetch_threshold=prefetch_threshold,
-                    model_name=served_model_name,
-                    storage_backend_extra_config=extra_config,
-                )
+            self.cache_controller.attach_storage_backend(
+                storage_backend=storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=served_model_name,
+                storage_backend_extra_config=extra_config,
+                **self._get_hybrid_storage_attach_kwargs(),
+            )
         except Exception as e:
             logger.exception(
                 f"Failed to attach storage backend '{storage_backend}': {e}"
@@ -628,6 +620,12 @@ class HiRadixCache(RadixCache):
             return {"extra_pools": [pool]}
         else:
             return {}
+
+    def _get_hybrid_storage_attach_kwargs(self) -> dict:
+        """Extra kwargs for attach_storage_backend when controller is HybridCacheController."""
+        if isinstance(self.cache_controller, HybridCacheController):
+            return {"host_pools": self.cache_controller.mem_pool_host.entries}
+        return {}
 
     def clear_storage_backend(self) -> bool:
         if self.enable_storage:
