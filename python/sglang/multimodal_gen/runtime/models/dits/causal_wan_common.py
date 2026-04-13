@@ -268,6 +268,7 @@ class BaseCausalWanTransformerBlock(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_q" if prefix else "to_q",
         )
         self.to_k = ColumnParallelLinear(
             dim,
@@ -275,6 +276,7 @@ class BaseCausalWanTransformerBlock(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_k" if prefix else "to_k",
         )
         self.to_v = ColumnParallelLinear(
             dim,
@@ -282,6 +284,7 @@ class BaseCausalWanTransformerBlock(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_v" if prefix else "to_v",
         )
 
         self.to_out = RowParallelLinear(
@@ -291,6 +294,7 @@ class BaseCausalWanTransformerBlock(nn.Module):
             input_is_parallel=True,
             reduce_results=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_out" if prefix else "to_out",
         )
         self.attn1 = self.self_attn_cls(
             dim,
@@ -332,6 +336,7 @@ class BaseCausalWanTransformerBlock(nn.Module):
             eps=eps,
             supported_attention_backends=cross_attn_backends,
             quant_config=quant_config,
+            prefix=f"{prefix}.attn2" if prefix else "attn2",
         )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim, eps=eps, elementwise_affine=False, dtype=torch.float32
@@ -339,7 +344,11 @@ class BaseCausalWanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         self.ffn = MLP(
-            dim, ffn_dim, act_type="gelu_pytorch_tanh", quant_config=quant_config
+            dim,
+            ffn_dim,
+            act_type="gelu_pytorch_tanh",
+            quant_config=quant_config,
+            prefix=f"{prefix}.ffn" if prefix else "ffn",
         )
         self.mlp_residual = MulAdd()
 
@@ -529,6 +538,7 @@ class BaseCausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
+            prefix=f"{config.prefix}.proj_out" if config.prefix else "proj_out",
         )
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 2, inner_dim) / inner_dim**0.5

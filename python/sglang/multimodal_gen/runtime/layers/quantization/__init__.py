@@ -8,7 +8,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelslim import ModelSlimConfig
 
-QuantizationMethods = Literal["fp8", "modelslim"]
+QuantizationMethods = Literal["fp8", "modelslim", "compressed-tensors"]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -51,11 +51,13 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
-    method_to_config: dict[str, type[QuantizationConfig]] = {}
-    # Update the `method_to_config` with customized quantization methods.
-    method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
+    if quantization == "compressed-tensors":
+        from sglang.multimodal_gen.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsConfig,
+        )
 
-    return method_to_config[quantization]
+        return CompressedTensorsConfig
+    return _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization]
 
 
 __all__ = [
