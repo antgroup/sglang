@@ -2023,7 +2023,7 @@ class NSAIndexerPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=device_pool.index_k_with_scale_buffer,
-                    dst_layers=self.index_k_with_scale_buffer,
+                    dst_layers=self.index_k_data_refs,
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,
                     page_size=1,
