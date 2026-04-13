@@ -33,7 +33,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.compressed_tensors.scheme
     WNA16_SUPPORTED_BITS,
     CompressedTensorsLinearScheme,
     CompressedTensorsW8A8Fp8,
-    CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
 )
@@ -539,20 +538,6 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return CompressedTensorsW8A16Fp8(
                     strategy=weight_quant.strategy,
                     is_static_input_scheme=is_static_input_scheme,
-                )
-
-            if self._is_static_tensor_w8a8(weight_quant, input_quant):
-                return CompressedTensorsW8A8Int8(
-                    strategy=weight_quant.strategy,
-                    is_static_input_scheme=True,
-                    input_symmetric=input_quant.symmetric,
-                )
-
-            if self._is_dynamic_token_w8a8(weight_quant, input_quant):
-                return CompressedTensorsW8A8Int8(
-                    strategy=weight_quant.strategy,
-                    is_static_input_scheme=False,
-                    input_symmetric=input_quant.symmetric,
                 )
 
         raise NotImplementedError("No compressed-tensors compatible scheme was found.")
