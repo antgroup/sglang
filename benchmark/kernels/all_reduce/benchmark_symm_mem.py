@@ -139,94 +139,6 @@ def pynccl_allreduce(
     return pynccl_input
 
 
-# def _bench_graph_time(func, inp_randn, warmup_loop=2, graph_loop=10, test_loop=10):
-#     graph_input = inp_randn.clone()
-#     with graph_capture() as graph_capture_context:
-#         graph = torch.cuda.CUDAGraph()
-#         with torch.cuda.graph(graph, stream=graph_capture_context.stream):
-#             for _ in range(graph_loop):
-#                 graph_out = func(graph_input)
-
-#     graph.replay()
-#     func_output = graph_out.clone()
-
-#     for _ in range(warmup_loop):
-#         graph.replay()
-#     torch.cuda.synchronize()
-
-#     start_event = torch.cuda.Event(enable_timing=True)
-#     end_event = torch.cuda.Event(enable_timing=True)
-
-#     latencies: List[float] = []
-#     for _ in range(test_loop):
-#         torch.cuda.synchronize()
-#         dist.barrier()
-#         start_event.record()
-#         graph.replay()
-#         end_event.record()
-#         end_event.synchronize()
-#         latencies.append(start_event.elapsed_time(end_event))
-#     func_cost_us = sum(latencies) / len(latencies) / graph_loop * 1000
-#     graph.reset()
-#     return func_output, func_cost_us
-
-
-# def _bench_graph_time_symm(func, inp_randn, warmup_loop=2, graph_loop=10, test_loop=10):
-#     with SymmetricMemoryContext(get_tensor_model_parallel_group()):
-#         graph_input = inp_randn.clone()
-
-#     with graph_capture() as graph_capture_context:
-#         graph = torch.cuda.CUDAGraph()
-#         with torch.cuda.graph(graph, stream=graph_capture_context.stream):
-#             for _ in range(graph_loop):
-#                 graph_out = func(graph_input)
-
-#     graph.replay()
-#     func_output = graph_out.clone()
-
-#     for _ in range(warmup_loop):
-#         graph.replay()
-#     torch.cuda.synchronize()
-
-#     start_event = torch.cuda.Event(enable_timing=True)
-#     end_event = torch.cuda.Event(enable_timing=True)
-
-#     latencies: List[float] = []
-#     for _ in range(test_loop):
-#         torch.cuda.synchronize()
-#         dist.barrier()
-#         start_event.record()
-#         graph.replay()
-#         end_event.record()
-#         end_event.synchronize()
-#         latencies.append(start_event.elapsed_time(end_event))
-#     func_cost_us = sum(latencies) / len(latencies) / graph_loop * 1000
-#     graph.reset()
-#     return func_output, func_cost_us
-
-
-# def _bench_eager_time(func, inp_randn, warmup_loop=2, test_loop=10):
-#     eager_input = inp_randn.clone()
-#     eager_output = func(eager_input)
-#     func_output = eager_output.clone()
-
-#     for _ in range(warmup_loop):
-#         func(eager_input)
-#     torch.cuda.synchronize()
-
-#     start_event = torch.cuda.Event(enable_timing=True)
-#     end_event = torch.cuda.Event(enable_timing=True)
-#     torch.cuda.synchronize()
-#     start_event.record()
-#     for _ in range(test_loop):
-#         func(eager_input)
-#     end_event.record()
-#     torch.cuda.synchronize()
-#     func_cost_us = start_event.elapsed_time(end_event) / test_loop * 1000
-
-#     return func_output, func_cost_us
-
-
 def get_torch_prof_ctx(do_prof: bool):
     ctx = (
         torch.profiler.profile(
@@ -355,35 +267,6 @@ if __name__ == "__main__":
                 )
             )
             torch.testing.assert_close(torch_eager_rs_output, pynccl_symm_rs_output)
-
-            #         torch_eager_output, torch_eager_time = _bench_eager_time(
-            #             lambda inp: torch_allreduce(inp, group), inp_randn
-            #         )
-            #         symm_mem_eager_output, symm_mem_eager_time = _bench_eager_time(
-            #             lambda inp: torch_symm_mem_allreduce(inp, torch_symm_mem_comm),
-            #             inp_randn,
-            #         )
-            #         symm_mem_graph_output, symm_mem_graph_time = _bench_graph_time(
-            #             lambda inp: torch_symm_mem_allreduce(inp, torch_symm_mem_comm),
-            #             inp_randn,
-            #         )
-            #         # since pynccl is inplace op, this return result is not correct if graph loop > 1
-            #         pynccl_ar_output, pynccl_graph_time = _bench_graph_time(
-            #             lambda inp: pynccl_allreduce(inp, pynccl_comm), inp_randn
-            #         )
-
-            #         pynccl_symm_ar_output, pynccl_symm_graph_time = _bench_graph_time_symm(
-            #             lambda inp: pynccl_allreduce(inp, pynccl_comm), inp_randn
-            #         )
-
-            #         # print(f"{torch_eager_output=}", flush=True)
-            #         # print(f"{symm_mem_graph_output=}", flush=True)
-            #         # print(f"{pynccl_ar_output=}", flush=True)
-            #         # print(f"{pynccl_symm_ar_output=}", flush=True)
-            #         torch.testing.assert_close(torch_eager_output, symm_mem_graph_output)
-            #         torch.testing.assert_close(torch_eager_output, symm_mem_eager_output)
-            #         # torch.testing.assert_close(torch_eager_output, pynccl_ar_output)
-            #         # torch.testing.assert_close(torch_eager_output, pynccl_symm_ar_output)
 
             result.append(
                 {

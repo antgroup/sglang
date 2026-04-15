@@ -736,6 +736,7 @@ class GroupCoordinator:
             dim += input_.dim()
 
         with self.use_symmetric_memory(self):
+            # TODO: make sure whether tensor layout affects nccl reduce_scatter
             # Note: This will produce an incorrect answer if we don't make
             # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
             input_tensor = input_.movedim(0, dim).contiguous()
@@ -2345,9 +2346,11 @@ def destroy_model_parallel():
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
         _PDMUX_PREFILL_TP_GROUP.destroy()
     _PDMUX_PREFILL_TP_GROUP = None
+
     global _DCP
     if _DCP:
         _DCP.destroy()
+    _DCP = None
 
 
 def destroy_distributed_environment():
