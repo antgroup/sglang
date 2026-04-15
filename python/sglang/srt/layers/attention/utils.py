@@ -1605,9 +1605,6 @@ def cp_lse_ag_out_rs(
     lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
-    with use_symmetric_memory(cp_group):
-        # cp_attn_out is [B,H,D], we want to transpose it to [H,B,D] for the kernel, and then transpose back after correction.
-        new_output = cp_attn_out.new_empty(cp_attn_out.transpose(0, 1).shape)
     out, _ = correct_attn_out(
         cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
     )
