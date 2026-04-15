@@ -418,8 +418,8 @@ class DeepseekMHAForwardMixin:
                 kv_indices, q.dtype, forward_batch
             )
             if get_dcp_world_size() > 1:
-                kv_a_normed = self._all_gather_dcp_kv_cache(kv_a_normed)
-                k_pe = self._all_gather_dcp_kv_cache(k_pe)
+                kv_a_normed = self._all_gather_dcp_kv_cache(kv_a_normed).contiguous()
+                k_pe = self._all_gather_dcp_kv_cache(k_pe).contiguous()
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -450,17 +450,17 @@ class DeepseekMHAForwardMixin:
 
     def _all_gather_dcp_kv_cache(self, kv_a):
         dcp_world_size = get_dcp_world_size()
-        dcp_rank = get_dcp_rank()
         # not use symmetric_memory unless torch mem_pool updated, see https://github.com/pytorch/pytorch/issues/178138
-        gathered_kv_a = torch.zeros(
-            (kv_a.shape[0] * get_dcp_world_size(), *kv_a.shape[1:]),
-            dtype=kv_a.dtype,
-            device=kv_a.device,
+        gathered_kv_a = kv_a.new_empty(
+            (kv_a.shape[0] * dcp_world_size, *kv_a.shape[1:]),
         )
-        idxs = torch.arange(kv_a.shape[0] * dcp_world_size)
-        mask = idxs % dcp_world_size == dcp_rank
-        gathered_kv_a[mask] = kv_a
-        return get_dcp_group().all_reduce(gathered_kv_a)
+        get_dcp_group().all_gather_into_tensor(gathered_kv_a, kv_a)
+        gathered_kv_a = (
+            gathered_kv_a.reshape((dcp_world_size,) + kv_a.shape)
+            .transpose(0, 1)
+            .reshape(-1, *kv_a.shape[1:])
+        )
+        return gathered_kv_a
 
     def _set_mla_kv_buffer(
         self: DeepseekV2AttentionMLA,
