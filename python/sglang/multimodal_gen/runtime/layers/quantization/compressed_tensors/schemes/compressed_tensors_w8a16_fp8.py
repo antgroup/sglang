@@ -89,13 +89,6 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
         )
         layer.register_parameter("weight", weight)
 
-        print(
-            "Created weight with shape:",
-            layer.weight.shape,
-            "and dtype:",
-            layer.weight.dtype,
-        )
-
         # WEIGHT SCALE
         if self.strategy == QuantizationStrategy.CHANNEL:
             weight_scale = ChannelQuantScaleParameter(
