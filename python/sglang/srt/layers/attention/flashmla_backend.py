@@ -4,6 +4,7 @@ Support attention backend for FlashMLA.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
@@ -17,6 +18,8 @@ from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -90,8 +93,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.dcp_world_size = get_dcp_world_size()
             self.dcp_rank = get_dcp_rank()
         except Exception as e:
-            print(
-                f"dcp disabled or not initialized, dcp world size and rank will be set to 1 and 0"
+            logger.error(
+                "dcp disabled or not initialized, dcp world size and rank will be set to 1 and 0"
             )
             self.dcp_world_size = 1
             self.dcp_rank = 0

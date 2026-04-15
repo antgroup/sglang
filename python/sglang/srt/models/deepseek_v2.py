@@ -1318,7 +1318,7 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
-        # TODO(augusto.yjh) 这里要改逻辑， local_heads是all heads, 而且还要返回lse，用来修正attn_out
+        # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
         if get_dcp_world_size() > 1:
             self.attn_mqa_for_dcp_decode = RadixAttention(
                 self.num_local_heads * get_dcp_world_size(),

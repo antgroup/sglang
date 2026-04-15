@@ -364,7 +364,9 @@ class DeepseekMLAForwardMixin:
                     forward_batch.dcp_extend_prefix_lens_sum :, ..., self.kv_lora_rank :
                 ] = k_pe
             else:
-                logger.warn(f"not supported forward_mode {forward_batch.forward_mode}")
+                logger.warning(
+                    f"not supported forward_mode {forward_batch.forward_mode}"
+                )
 
         return (
             q_pe,
