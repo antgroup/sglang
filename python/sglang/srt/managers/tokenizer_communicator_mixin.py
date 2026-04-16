@@ -473,10 +473,12 @@ class TokenizerCommunicatorMixin:
             ListExternalCorporaReqInput()
         )
         all_success, all_message = _Communicator.merge_results(results)
-        # Merge corpus IDs from all DP ranks (each rank loads the same set).
-        corpus_ids = results[0].corpus_ids if all_success else []
+        # Merge corpus token counts from all DP ranks (each rank loads the same set).
+        corpus_token_counts = results[0].corpus_token_counts if all_success else {}
         return ListExternalCorporaReqOutput(
-            success=all_success, corpus_ids=corpus_ids, message=all_message
+            success=all_success,
+            corpus_token_counts=corpus_token_counts,
+            message=all_message,
         )
 
     async def flush_cache(
@@ -1073,27 +1075,20 @@ class TokenizerCommunicatorMixin:
                     "Streaming sessions are disabled. "
                     "Please relaunch with --enable-streaming-session."
                 )
-            if (
-                self.server_args.speculative_algorithm is not None
-                and not self.server_args.disable_overlap_schedule
-            ):
-                raise ValueError(
-                    "Streaming sessions are incompatible with speculative decoding v2 "
-                    "(overlap + speculative). Use --disable-overlap-schedule or "
-                    "disable speculative decoding."
-                )
 
         if obj.session_id is None:
             obj.session_id = uuid.uuid4().hex
         elif obj.session_id in self.session_futures:
             return None
 
+        future = asyncio.Future()
+        self.session_futures[obj.session_id] = future
         self.send_to_scheduler.send_pyobj(obj)
 
-        self.session_futures[obj.session_id] = asyncio.Future()
-        session_id = await self.session_futures[obj.session_id]
-        del self.session_futures[obj.session_id]
-        return session_id
+        try:
+            return await future
+        finally:
+            self.session_futures.pop(obj.session_id, None)
 
     async def close_session(
         self: TokenizerManager,
