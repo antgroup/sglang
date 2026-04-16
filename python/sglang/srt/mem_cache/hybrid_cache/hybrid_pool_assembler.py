@@ -167,7 +167,7 @@ def build_mamba_hybrid_stack(
                     device_pool=kvcache,
                     layer_mapper=kv_layer_mapper,
                     is_primary_index_anchor=True,
-                    tp_redundant=True if hybrid_kv.use_mla else False
+                    tp_redundant=True if hybrid_kv.use_mla else False,
                 ),
                 PoolEntry(
                     name=PoolName.MAMBA,
