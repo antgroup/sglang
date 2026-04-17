@@ -1,0 +1,68 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
+# SPDX-License-Identifier: Apache-2.0
+"""
+LingBot-World offline image-to-video pipeline.
+"""
+
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
+    FlowUniPCMultistepScheduler,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
+    ComposedPipelineBase,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    ImageEncodingStage,
+    ImageVAEEncodingStage,
+    InputValidationStage,
+    WorldConditioningStage,
+)
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+class LingBotWorldImageToVideoPipeline(LoRAPipeline, ComposedPipelineBase):
+    pipeline_name = "LingBotWorldImageToVideoPipeline"
+
+    _required_config_modules = [
+        "text_encoder",
+        "tokenizer",
+        "vae",
+        "transformer",
+        "scheduler",
+        "image_encoder",
+        "image_processor",
+    ]
+
+    def initialize_pipeline(self, server_args: ServerArgs):
+        self.modules["scheduler"] = FlowUniPCMultistepScheduler(
+            shift=server_args.pipeline_config.flow_shift
+        )
+
+    def create_pipeline_stages(self, server_args: ServerArgs):
+        self.add_stage(InputValidationStage())
+        self.add_standard_text_encoding_stage()
+
+        image_encoder = self.get_module("image_encoder", None)
+        image_processor = self.get_module("image_processor", None)
+        self.add_stage_if(
+            image_encoder is not None and image_processor is not None,
+            ImageEncodingStage(
+                image_encoder=image_encoder,
+                image_processor=image_processor,
+            ),
+        )
+
+        self.add_stage(WorldConditioningStage())
+        self.add_stage(
+            ImageVAEEncodingStage(
+                vae=self.get_module("vae"),
+            )
+        )
+        self.add_standard_latent_preparation_stage()
+        self.add_standard_timestep_preparation_stage()
+        self.add_standard_denoising_stage()
+        self.add_standard_decoding_stage()
+
+
+EntryClass = LingBotWorldImageToVideoPipeline

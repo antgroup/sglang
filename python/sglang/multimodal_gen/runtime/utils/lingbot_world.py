@@ -1,0 +1,387 @@
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import torch
+
+from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
+    BaseRealtimeState,
+)
+
+
+def se3_inverse(T: torch.Tensor) -> torch.Tensor:
+    rot = T[:, :3, :3]
+    trans = T[:, :3, 3:]
+    r_inv = rot.transpose(-1, -2)
+    t_inv = -torch.bmm(r_inv, trans)
+    T_inv = torch.eye(4, device=T.device, dtype=T.dtype)[None, :, :].repeat(
+        T.shape[0], 1, 1
+    )
+    T_inv[:, :3, :3] = r_inv
+    T_inv[:, :3, 3:] = t_inv
+    return T_inv
+
+
+def compute_relative_poses(
+    c2ws_mat: torch.Tensor,
+    framewise: bool = False,
+    normalize_trans: bool = True,
+) -> torch.Tensor:
+    ref_w2cs = se3_inverse(c2ws_mat[0:1])
+    relative_poses = torch.matmul(ref_w2cs, c2ws_mat)
+    relative_poses[0] = torch.eye(4, device=c2ws_mat.device, dtype=c2ws_mat.dtype)
+    if framewise and len(relative_poses) > 1:
+        relative_poses_framewise = torch.bmm(
+            se3_inverse(relative_poses[:-1]), relative_poses[1:]
+        )
+        relative_poses[1:] = relative_poses_framewise
+    if normalize_trans:
+        translations = relative_poses[:, :3, 3]
+        max_norm = torch.norm(translations, dim=-1).max()
+        if max_norm > 0:
+            relative_poses[:, :3, 3] = translations / max_norm
+    return relative_poses
+
+
+@torch.no_grad()
+def create_meshgrid(
+    n_frames: int,
+    height: int,
+    width: int,
+    *,
+    bias: float = 0.5,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    x_range = torch.arange(width, device=device, dtype=dtype)
+    y_range = torch.arange(height, device=device, dtype=dtype)
+    grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing="ij")
+    grid_xy = torch.stack([grid_x, grid_y], dim=-1).view([-1, 2]) + bias
+    return grid_xy[None, ...].repeat(n_frames, 1, 1)
+
+
+def get_plucker_embeddings(
+    c2ws_mat: torch.Tensor,
+    Ks: torch.Tensor,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    n_frames = c2ws_mat.shape[0]
+    grid_xy = create_meshgrid(
+        n_frames, height, width, device=c2ws_mat.device, dtype=c2ws_mat.dtype
+    )
+    fx, fy, cx, cy = Ks.chunk(4, dim=-1)
+    i = grid_xy[..., 0]
+    j = grid_xy[..., 1]
+    zs = torch.ones_like(i)
+    xs = (i - cx) / fx * zs
+    ys = (j - cy) / fy * zs
+    directions = torch.stack([xs, ys, zs], dim=-1)
+    directions = directions / directions.norm(dim=-1, keepdim=True)
+    rays_d = directions @ c2ws_mat[:, :3, :3].transpose(-1, -2)
+    rays_o = c2ws_mat[:, :3, 3][:, None, :].expand_as(rays_d)
+    plucker_embeddings = torch.cat([rays_o, rays_d], dim=-1)
+    return plucker_embeddings.view([n_frames, height, width, 6])
+
+
+def get_rotation_matrix(axis: str, angle_rad: float) -> np.ndarray:
+    c, s = np.cos(angle_rad), np.sin(angle_rad)
+    if axis == "x":
+        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+    if axis == "y":
+        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+    if axis == "z":
+        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+    return np.eye(3)
+
+
+def actions_to_c2ws(action_history: list[list[str]]) -> list[np.ndarray]:
+    move_speed = 0.05
+    rotate_speed_rad_ik = np.deg2rad(4.0)
+    rotate_speed_rad_jl = np.deg2rad(6.0)
+
+    current_c2w = np.eye(4)
+    current_pitch = 0.0
+    pitch_limit = np.deg2rad(85)
+    all_matrices = [current_c2w]
+
+    for frame_keys in action_history:
+        R = current_c2w[:3, :3]
+        T = current_c2w[:3, 3]
+
+        pitch_delta = 0.0
+        if "i" in frame_keys:
+            pitch_delta += rotate_speed_rad_ik
+        if "k" in frame_keys:
+            pitch_delta -= rotate_speed_rad_ik
+
+        new_pitch = current_pitch + pitch_delta
+        if -pitch_limit <= new_pitch <= pitch_limit:
+            current_pitch = new_pitch
+        else:
+            pitch_delta = 0.0
+
+        yaw_delta = 0.0
+        if "j" in frame_keys:
+            yaw_delta -= rotate_speed_rad_jl
+        if "l" in frame_keys:
+            yaw_delta += rotate_speed_rad_jl
+
+        R_pitch = get_rotation_matrix("x", pitch_delta)
+        R_yaw = get_rotation_matrix("y", yaw_delta)
+        R_new = R_yaw @ R @ R_pitch
+
+        vec_right = R_new[:, 0]
+        vec_forward = R_new[:, 2]
+        forward_flat = np.array([vec_forward[0], 0, vec_forward[2]])
+        right_flat = np.array([vec_right[0], 0, vec_right[2]])
+
+        f_norm = np.linalg.norm(forward_flat)
+        r_norm = np.linalg.norm(right_flat)
+        if f_norm > 0:
+            forward_flat = forward_flat / (f_norm + 1e-6)
+        if r_norm > 0:
+            right_flat = right_flat / (r_norm + 1e-6)
+
+        move_vec = np.zeros(3)
+        if "w" in frame_keys:
+            move_vec += forward_flat * move_speed
+        if "s" in frame_keys:
+            move_vec -= forward_flat * move_speed
+        if "d" in frame_keys:
+            move_vec += right_flat * move_speed
+        if "a" in frame_keys:
+            move_vec -= right_flat * move_speed
+
+        T_new = T + move_vec
+        current_c2w = np.eye(4)
+        current_c2w[:3, :3] = R_new
+        current_c2w[:3, 3] = T_new
+        all_matrices.append(current_c2w)
+
+    return all_matrices
+
+
+def get_camera_control(
+    action_history: list[list[str]],
+    *,
+    width: int,
+    height: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    c2ws_list = actions_to_c2ws(action_history)
+    c2ws_np = np.stack(c2ws_list[1:])
+    c2ws = torch.from_numpy(c2ws_np).to(device=device, dtype=dtype)
+    Ks = torch.tensor(
+        [[500.0, 500.0, width / 2, height / 2]],
+        device=device,
+        dtype=dtype,
+    ).repeat(len(action_history), 1)
+    return c2ws, Ks
+
+
+def camera_poses_to_plucker(
+    *,
+    c2ws: torch.Tensor,
+    Ks: torch.Tensor,
+    height: int,
+    width: int,
+    spatial_scale: int = 8,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    plucker = get_plucker_embeddings(c2ws, Ks, height, width)
+    latent_height = height // spatial_scale
+    latent_width = width // spatial_scale
+    plucker = plucker.view(
+        c2ws.shape[0],
+        latent_height,
+        spatial_scale,
+        latent_width,
+        spatial_scale,
+        6,
+    )
+    plucker = plucker.permute(0, 1, 3, 5, 2, 4).contiguous()
+    plucker = plucker.view(
+        c2ws.shape[0],
+        latent_height,
+        latent_width,
+        6 * spatial_scale * spatial_scale,
+    )
+    return (
+        plucker.permute(3, 0, 1, 2)
+        .contiguous()
+        .unsqueeze(0)
+        .to(device=device, dtype=dtype)
+    )
+
+
+class LingBotWorldRealtimeState(BaseRealtimeState):
+    def __init__(self):
+        super().__init__()
+        self.action_history: list[list[str]] = []
+        self.last_actions: list[str] = []
+
+    def reset_controls(self):
+        self.action_history.clear()
+        self.last_actions = []
+
+    def append_control_chunk(self, control_chunk: list[list[str]]) -> None:
+        for actions in control_chunk:
+            normalized = list(actions)
+            self.action_history.append(normalized)
+            self.last_actions = normalized
+
+    def dispose(self):
+        super().dispose()
+        self.reset_controls()
+
+
+def _get_diffusers_kwargs(batch) -> dict[str, Any]:
+    diffusers_kwargs = batch.extra.get("diffusers_kwargs", {})
+    if not isinstance(diffusers_kwargs, dict):
+        return {}
+    lingbot_kwargs = diffusers_kwargs.get("lingbot_world")
+    if isinstance(lingbot_kwargs, dict):
+        merged = dict(diffusers_kwargs)
+        merged.update(lingbot_kwargs)
+        return merged
+    return diffusers_kwargs
+
+
+def resolve_lingbot_world_chunk_size(
+    pipeline_config, diffusers_kwargs: dict[str, Any]
+) -> int:
+    chunk_size = diffusers_kwargs.get("chunk_size")
+    if chunk_size is None:
+        chunk_size = diffusers_kwargs.get("control_chunk_size")
+    if chunk_size is not None:
+        return max(1, int(chunk_size))
+    return max(1, int(pipeline_config.dit_config.arch_config.num_frames_per_block))
+
+
+def _normalize_action_sequence(
+    actions: Any,
+    *,
+    field_name: str,
+) -> list[list[str]]:
+    if not isinstance(actions, list):
+        raise TypeError(f"{field_name} must be a list[list[str]]")
+    normalized_actions: list[list[str]] = []
+    for frame_actions in actions:
+        if not isinstance(frame_actions, list):
+            raise TypeError(f"{field_name} must be a list[list[str]]")
+        normalized_actions.append(list(frame_actions))
+    return normalized_actions
+
+
+def _build_camera_condition(
+    *,
+    action_history: list[list[str]],
+    width: int,
+    height: int,
+    spatial_scale: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    tail_chunk_size: int | None = None,
+) -> torch.Tensor:
+    c2ws_prefix, Ks = get_camera_control(
+        action_history,
+        width=width,
+        height=height,
+        device=device,
+        dtype=dtype,
+    )
+    c2ws_prefix = compute_relative_poses(c2ws_prefix, framewise=True)
+    if tail_chunk_size is not None:
+        c2ws_prefix = c2ws_prefix[-tail_chunk_size:]
+        Ks = Ks[-tail_chunk_size:]
+    return camera_poses_to_plucker(
+        c2ws=c2ws_prefix,
+        Ks=Ks,
+        height=height,
+        width=width,
+        spatial_scale=spatial_scale,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def prepare_lingbot_world_condition(
+    *,
+    batch,
+    pipeline_config,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor | None, int | None]:
+    if batch.c2ws_plucker_emb is not None:
+        return batch.c2ws_plucker_emb.to(device=device, dtype=dtype), None
+
+    diffusers_kwargs = _get_diffusers_kwargs(batch)
+    spatial_scale = pipeline_config.vae_config.arch_config.spatial_compression_ratio
+    offline_action_field = "actions"
+    offline_actions = diffusers_kwargs.get("actions")
+    if offline_actions is None:
+        offline_actions = diffusers_kwargs.get("action_sequence")
+        offline_action_field = "action_sequence"
+    if offline_actions is not None:
+        normalized_actions = _normalize_action_sequence(
+            offline_actions,
+            field_name=offline_action_field,
+        )
+        if len(normalized_actions) == 0:
+            return None, None
+        # Offline actions use the same latent-frame granularity as realtime control chunks.
+        temporal_ratio = (
+            pipeline_config.vae_config.arch_config.temporal_compression_ratio
+        )
+        resolved_num_frames = (len(normalized_actions) - 1) * temporal_ratio + 1
+        return (
+            _build_camera_condition(
+                action_history=normalized_actions,
+                width=int(batch.width),
+                height=int(batch.height),
+                spatial_scale=spatial_scale,
+                device=device,
+                dtype=dtype,
+            ),
+            resolved_num_frames,
+        )
+
+    control_chunk = batch.extra.get("control_chunk")
+    # Realtime per-chunk control input.
+    if control_chunk is None:
+        return None, None
+    normalized_chunk = _normalize_action_sequence(
+        control_chunk,
+        field_name="control_chunk",
+    )
+    chunk_size = resolve_lingbot_world_chunk_size(pipeline_config, diffusers_kwargs)
+
+    if batch.session is not None:
+        # Extend the cumulative control history for this session.
+        state = batch.session.get_or_create_state(LingBotWorldRealtimeState)
+        if batch.block_idx == 0:
+            state.reset_controls()
+        state.append_control_chunk(normalized_chunk)
+        action_history = state.action_history
+    else:
+        action_history = normalized_chunk
+
+    if len(action_history) == 0:
+        return None, None
+
+    return (
+        _build_camera_condition(
+            action_history=action_history,
+            width=int(batch.width),
+            height=int(batch.height),
+            spatial_scale=spatial_scale,
+            device=device,
+            dtype=dtype,
+            tail_chunk_size=chunk_size,
+        ),
+        None,
+    )

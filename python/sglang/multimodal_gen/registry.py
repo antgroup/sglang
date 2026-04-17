@@ -35,6 +35,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     HeliosMidConfig,
     HeliosT2VConfig,
     HunyuanConfig,
+    LingBotWorldI2VConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -90,6 +91,9 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
+from sglang.multimodal_gen.configs.sample.lingbot_world import (
+    LingBotWorldSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
     LTX23SamplingParams,
@@ -723,6 +727,15 @@ def _register_configs():
         sampling_param_cls=Wan2_2_I2V_A14B_SamplingParam,
         pipeline_config_cls=Wan2_2_I2V_A14B_Config,
         hf_model_paths=["Wan-AI/Wan2.2-I2V-A14B-Diffusers"],
+    )
+    register_configs(
+        sampling_param_cls=LingBotWorldSamplingParams,
+        pipeline_config_cls=LingBotWorldI2VConfig,
+        hf_model_paths=["FastVideo/LingBot-World-Base-Cam-Diffusers"],
+        model_detectors=[
+            lambda hf_id: "lingbotworld" in hf_id.lower()
+            or "lingbot-world" in hf_id.lower()
+        ],
     )
     register_configs(
         sampling_param_cls=FastWanT2V480PConfig,

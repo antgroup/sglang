@@ -32,7 +32,6 @@ router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 
 
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
-
     while True:
         try:
             # For stream-driven v2v (no first_frame),
@@ -48,13 +47,34 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             session.new_request()
 
             # send to scheduler and generate video chunk
+            server_args = get_global_server_args()
+            sampling_params = session.build_sampling_params()
             batch = prepare_request(
-                server_args=get_global_server_args(),
-                sampling_params=session.build_sampling_params(),
+                server_args=server_args,
+                sampling_params=sampling_params,
             )
             batch.session = session.realtime_session
             batch.extra["realtime_session_id"] = session.id
             batch.block_idx = session.generate_chunk_cnt
+            raw_diffusers_kwargs = (
+                session.request.diffusers_kwargs
+                if session.request is not None
+                else None
+            )
+            if hasattr(sampling_params, "normalize_diffusers_kwargs"):
+                diffusers_kwargs = sampling_params.normalize_diffusers_kwargs(
+                    server_args, raw_diffusers_kwargs
+                )
+            elif isinstance(raw_diffusers_kwargs, dict):
+                diffusers_kwargs = raw_diffusers_kwargs
+            else:
+                diffusers_kwargs = {}
+            if diffusers_kwargs:
+                batch.extra["diffusers_kwargs"] = diffusers_kwargs
+            chunk_size = max(1, int(diffusers_kwargs.get("chunk_size", 1)))
+            control_chunk = session.sample_control_chunk(chunk_size)
+            if control_chunk is not None:
+                batch.extra["control_chunk"] = control_chunk
             batch.input_video = (
                 session.sample_video_frames() if session.is_v2v_enabled() else None
             )
@@ -126,6 +146,15 @@ async def _listen_actions(ws: WebSocket, session: GenerateSession):
                     f"type=video, num_frames={len(encoded_frames)}, "
                     f"total_bytes={total_bytes}"
                 )
+            elif realtime_action.type == "control":
+                control_chunk = realtime_action.control_chunk
+                if control_chunk is not None:
+                    session.append_control_chunk(control_chunk)
+                    action_log = (
+                        f"type=control, mode=chunk, chunk_len={len(control_chunk)}"
+                    )
+                else:
+                    raise ValueError("control action requires control_chunk")
             else:
                 if not realtime_action.action_content:
                     raise ValueError("prompt action requires action_content")

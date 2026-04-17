@@ -20,7 +20,8 @@ class BaseRealtimeState:
 
 class RealtimeSession:
     def __init__(self):
-        self.state: BaseRealtimeState | None = None
+        # Store independent per-session state objects by type.
+        self._states: dict[type[BaseRealtimeState], BaseRealtimeState] = {}
 
     @staticmethod
     def resolve_session_id(req: Any) -> str | None:
@@ -44,19 +45,19 @@ class RealtimeSession:
     def get_or_create_state(
         self, state_cls: type[BaseRealtimeState]
     ) -> BaseRealtimeState:
-        if self.state is None:
-            self.state = state_cls()
-        elif not isinstance(self.state, state_cls):
-            raise TypeError(
-                f"Expected realtime state {state_cls.__name__}, "
-                f"got {type(self.state).__name__}"
-            )
-        return self.state
+        state = self._states.get(state_cls)
+        if state is None:
+            state = state_cls()
+            self._states[state_cls] = state
+        return state
+
+    def get_state(self, state_cls: type[BaseRealtimeState]) -> BaseRealtimeState | None:
+        return self._states.get(state_cls)
 
     def dispose(self):
-        if self.state is not None:
-            self.state.dispose()
-            self.state = None
+        for state in self._states.values():
+            state.dispose()
+        self._states.clear()
 
 
 class RealtimeSessionCache:

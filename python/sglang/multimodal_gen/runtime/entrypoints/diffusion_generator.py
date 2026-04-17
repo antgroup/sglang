@@ -218,6 +218,16 @@ class DiffGenerator:
                 server_args=self.server_args,
                 sampling_params=sampling_params,
             )
+            diffusers_kwargs = sampling_params_kwargs.get("diffusers_kwargs")
+            if diffusers_kwargs:
+                if hasattr(sampling_params, "normalize_diffusers_kwargs"):
+                    req.extra["diffusers_kwargs"] = (
+                        sampling_params.normalize_diffusers_kwargs(
+                            self.server_args, diffusers_kwargs
+                        )
+                    )
+                else:
+                    req.extra["diffusers_kwargs"] = diffusers_kwargs
             requests.append(req)
 
         results: list[GenerationResult] = []
