@@ -343,7 +343,7 @@ class GroupCoordinator:
         )
         from sglang.srt.layers.dp_attention import is_allocation_symmetric
 
-        if envs.SGLANG_DCP_SYMM_ONLY:
+        if envs.SGLANG_DCP_SYMM_ONLY.get():
             self.is_symmetric_memory_enabled = (
                 lambda: group_name == "dcp" and is_symmetric_memory_enabled()
             )
@@ -1484,7 +1484,7 @@ decode_context_parallel_size: Optional[int] = None
 def get_dcp_size_from_env():
     global decode_context_parallel_size
     if decode_context_parallel_size is None:
-        decode_context_parallel_size = envs.SGLANG_DCP_WORLD_SIZE
+        decode_context_parallel_size = envs.SGLANG_DCP_WORLD_SIZE.get()
     return decode_context_parallel_size
 
 
