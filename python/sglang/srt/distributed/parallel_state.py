@@ -69,9 +69,6 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
-# check whether only enable symmetric_memory for dcp group
-_DCP_ENABLE_SYMM_ONLY = get_bool_env_var("SGLANG_DCP_SYMM_ONLY", "false")
-
 
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
@@ -346,7 +343,7 @@ class GroupCoordinator:
         )
         from sglang.srt.layers.dp_attention import is_allocation_symmetric
 
-        if _DCP_ENABLE_SYMM_ONLY:
+        if envs.SGLANG_DCP_SYMM_ONLY:
             self.is_symmetric_memory_enabled = (
                 lambda: group_name == "dcp" and is_symmetric_memory_enabled()
             )
@@ -1487,7 +1484,7 @@ decode_context_parallel_size: Optional[int] = None
 def get_dcp_size_from_env():
     global decode_context_parallel_size
     if decode_context_parallel_size is None:
-        decode_context_parallel_size = int(os.getenv("SGLANG_DCP", 1))
+        decode_context_parallel_size = envs.SGLANG_DCP_WORLD_SIZE
     return decode_context_parallel_size
 
 

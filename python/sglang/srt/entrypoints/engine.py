@@ -1117,7 +1117,7 @@ def _set_envs_and_config(server_args: ServerArgs):
             int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
         )
     if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or server_args.enable_symm_mem:
-        dcp_size = int(os.getenv("SGLANG_DCP", "1") or "1")
+        dcp_size = int(os.getenv("SGLANG_DCP_WORLD_SIZE", "1") or "1")
         # Note(wh): NCCL_GRAPH_MIXING_SUPPORT=0 can help improve performance for symmetric kernels.
         # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
         if dcp_size > 1:
