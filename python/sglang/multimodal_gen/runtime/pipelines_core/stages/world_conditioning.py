@@ -9,16 +9,23 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.lingbot_world import (
+    prepare_lingbot_world_condition,
+)
 
 
 class WorldConditioningStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        prepare_world_condition = getattr(
-            server_args.pipeline_config, "prepare_world_condition", None
+        c2ws_plucker_emb, resolved_num_frames = prepare_lingbot_world_condition(
+            batch=batch,
+            pipeline_config=server_args.pipeline_config,
+            device=self.device,
+            dtype=torch.float32,
         )
-        if callable(prepare_world_condition):
-            # Map request-specific world inputs to the transformer conditioning tensor.
-            prepare_world_condition(batch, self.device, torch.float32)
+        if resolved_num_frames is not None:
+            batch.num_frames = resolved_num_frames
+        if c2ws_plucker_emb is not None:
+            batch.c2ws_plucker_emb = c2ws_plucker_emb
         return batch
 
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
