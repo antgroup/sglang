@@ -35,6 +35,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     HeliosMidConfig,
     HeliosT2VConfig,
     HunyuanConfig,
+    LingBotWorldCausalDMDConfig,
     LingBotWorldI2VConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
@@ -730,7 +731,7 @@ def _register_configs():
     )
     register_configs(
         sampling_param_cls=LingBotWorldSamplingParams,
-        pipeline_config_cls=LingBotWorldI2VConfig,
+        pipeline_config_cls=LingBotWorldCausalDMDConfig,
         hf_model_paths=["FastVideo/lingbot-world-fast-diffusers"],
         model_detectors=[
             lambda hf_id: "lingbot-world-fast" in hf_id.lower()

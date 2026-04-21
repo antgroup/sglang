@@ -21,3 +21,12 @@ class LingBotWorldI2VConfig(Wan2_2_I2V_A14B_Config):
                 device=device, dtype=dtype
             )
         return kwargs
+
+
+@dataclass
+class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
+    is_causal: bool = True
+    dmd_denoising_steps: list[int] | None = field(
+        default_factory=lambda: [1000, 821, 642, 321]
+    )
+    warp_denoising_step: bool = True
