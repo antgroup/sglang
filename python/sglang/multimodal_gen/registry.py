@@ -731,10 +731,22 @@ def _register_configs():
     register_configs(
         sampling_param_cls=LingBotWorldSamplingParams,
         pipeline_config_cls=LingBotWorldI2VConfig,
+        hf_model_paths=["FastVideo/lingbot-world-fast-diffusers"],
+        model_detectors=[
+            lambda hf_id: "lingbot-world-fast" in hf_id.lower()
+            or "lingbotworld-fast" in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LingBotWorldSamplingParams,
+        pipeline_config_cls=LingBotWorldI2VConfig,
         hf_model_paths=["FastVideo/LingBot-World-Base-Cam-Diffusers"],
         model_detectors=[
-            lambda hf_id: "lingbotworld" in hf_id.lower()
-            or "lingbot-world" in hf_id.lower()
+            lambda hf_id: (
+                "lingbotworld" in hf_id.lower()
+                or "lingbot-world" in hf_id.lower()
+            )
+            and "fast" not in hf_id.lower()
         ],
     )
     register_configs(

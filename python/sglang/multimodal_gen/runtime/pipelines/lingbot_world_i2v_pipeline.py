@@ -54,12 +54,12 @@ class LingBotWorldImageToVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
         self.add_stage(WorldConditioningStage())
+        self.add_standard_latent_preparation_stage()
         self.add_stage(
             ImageVAEEncodingStage(
                 vae=self.get_module("vae"),
             )
         )
-        self.add_standard_latent_preparation_stage()
         self.add_standard_timestep_preparation_stage()
         self.add_standard_denoising_stage()
         self.add_standard_decoding_stage()

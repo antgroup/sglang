@@ -56,25 +56,10 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             batch.session = session.realtime_session
             batch.extra["realtime_session_id"] = session.id
             batch.block_idx = session.generate_chunk_cnt
-            raw_diffusers_kwargs = (
-                session.request.diffusers_kwargs
-                if session.request is not None
-                else None
-            )
-            if hasattr(sampling_params, "normalize_diffusers_kwargs"):
-                diffusers_kwargs = sampling_params.normalize_diffusers_kwargs(
-                    server_args, raw_diffusers_kwargs
-                )
-            elif isinstance(raw_diffusers_kwargs, dict):
-                diffusers_kwargs = raw_diffusers_kwargs
-            else:
-                diffusers_kwargs = {}
-            if diffusers_kwargs:
-                batch.extra["diffusers_kwargs"] = diffusers_kwargs
-            chunk_size = max(1, int(diffusers_kwargs.get("chunk_size", 1)))
+            chunk_size = batch.extra.get("chunk_size", 1)
             control_chunk = session.sample_control_chunk(chunk_size)
             if control_chunk is not None:
-                batch.extra["control_chunk"] = control_chunk
+                batch.extra["actions"] = control_chunk
             batch.input_video = (
                 session.sample_video_frames() if session.is_v2v_enabled() else None
             )

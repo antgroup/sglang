@@ -239,42 +239,15 @@ class LingBotWorldRealtimeState(BaseRealtimeState):
         self.reset_controls()
 
 
-def _get_diffusers_kwargs(batch) -> dict[str, Any]:
-    diffusers_kwargs = batch.extra.get("diffusers_kwargs", {})
-    if not isinstance(diffusers_kwargs, dict):
-        return {}
-    lingbot_kwargs = diffusers_kwargs.get("lingbot_world")
-    if isinstance(lingbot_kwargs, dict):
-        merged = dict(diffusers_kwargs)
-        merged.update(lingbot_kwargs)
-        return merged
-    return diffusers_kwargs
-
-
-def resolve_lingbot_world_chunk_size(
-    pipeline_config, diffusers_kwargs: dict[str, Any]
-) -> int:
-    chunk_size = diffusers_kwargs.get("chunk_size")
-    if chunk_size is None:
-        chunk_size = diffusers_kwargs.get("control_chunk_size")
-    if chunk_size is not None:
-        return max(1, int(chunk_size))
-    return max(1, int(pipeline_config.dit_config.arch_config.num_frames_per_block))
-
-
-def _normalize_action_sequence(
-    actions: Any,
-    *,
-    field_name: str,
-) -> list[list[str]]:
+def _validate_actions(actions: Any) -> list[list[str]]:
     if not isinstance(actions, list):
-        raise TypeError(f"{field_name} must be a list[list[str]]")
-    normalized_actions: list[list[str]] = []
+        raise TypeError("actions must be a list[list[str]]")
+    result: list[list[str]] = []
     for frame_actions in actions:
         if not isinstance(frame_actions, list):
-            raise TypeError(f"{field_name} must be a list[list[str]]")
-        normalized_actions.append(list(frame_actions))
-    return normalized_actions
+            raise TypeError("actions must be a list[list[str]]")
+        result.append(list(frame_actions))
+    return result
 
 
 def _build_camera_condition(
@@ -319,21 +292,45 @@ def prepare_lingbot_world_condition(
     if batch.c2ws_plucker_emb is not None:
         return batch.c2ws_plucker_emb.to(device=device, dtype=dtype), None
 
-    diffusers_kwargs = _get_diffusers_kwargs(batch)
+    actions = batch.extra.get("actions")
+    if actions is None:
+        return None, None
+
     spatial_scale = pipeline_config.vae_config.arch_config.spatial_compression_ratio
-    offline_action_field = "actions"
-    offline_actions = diffusers_kwargs.get("actions")
-    if offline_actions is None:
-        offline_actions = diffusers_kwargs.get("action_sequence")
-        offline_action_field = "action_sequence"
-    if offline_actions is not None:
-        normalized_actions = _normalize_action_sequence(
-            offline_actions,
-            field_name=offline_action_field,
-        )
-        if len(normalized_actions) == 0:
+    chunk_size = batch.extra.get(
+        "chunk_size",
+        max(1, int(pipeline_config.dit_config.arch_config.num_frames_per_block)),
+    )
+
+    normalized_actions = _validate_actions(actions)
+    if len(normalized_actions) == 0:
+        return None, None
+
+    if batch.session is not None:
+        # Realtime: accumulate actions in session state.
+        state = batch.session.get_or_create_state(LingBotWorldRealtimeState)
+        if batch.block_idx == 0:
+            state.reset_controls()
+        state.append_control_chunk(normalized_actions)
+        action_history = state.action_history
+
+        if len(action_history) == 0:
             return None, None
-        # Offline actions use the same latent-frame granularity as realtime control chunks.
+
+        return (
+            _build_camera_condition(
+                action_history=action_history,
+                width=int(batch.width),
+                height=int(batch.height),
+                spatial_scale=spatial_scale,
+                device=device,
+                dtype=dtype,
+                tail_chunk_size=chunk_size,
+            ),
+            None,
+        )
+    else:
+        # Offline: actions define the full trajectory.
         temporal_ratio = (
             pipeline_config.vae_config.arch_config.temporal_compression_ratio
         )
@@ -349,39 +346,3 @@ def prepare_lingbot_world_condition(
             ),
             resolved_num_frames,
         )
-
-    control_chunk = batch.extra.get("control_chunk")
-    # Realtime per-chunk control input.
-    if control_chunk is None:
-        return None, None
-    normalized_chunk = _normalize_action_sequence(
-        control_chunk,
-        field_name="control_chunk",
-    )
-    chunk_size = resolve_lingbot_world_chunk_size(pipeline_config, diffusers_kwargs)
-
-    if batch.session is not None:
-        # Extend the cumulative control history for this session.
-        state = batch.session.get_or_create_state(LingBotWorldRealtimeState)
-        if batch.block_idx == 0:
-            state.reset_controls()
-        state.append_control_chunk(normalized_chunk)
-        action_history = state.action_history
-    else:
-        action_history = normalized_chunk
-
-    if len(action_history) == 0:
-        return None, None
-
-    return (
-        _build_camera_condition(
-            action_history=action_history,
-            width=int(batch.width),
-            height=int(batch.height),
-            spatial_scale=spatial_scale,
-            device=device,
-            dtype=dtype,
-            tail_chunk_size=chunk_size,
-        ),
-        None,
-    )
