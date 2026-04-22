@@ -108,7 +108,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             (b, num_channels_latents, t, h, w),
             generator=batch.generator,
             device=device,
-            dtype=condition.dtype,
+            dtype=condition_full.dtype,
         )
 
         # --- Timesteps ---
