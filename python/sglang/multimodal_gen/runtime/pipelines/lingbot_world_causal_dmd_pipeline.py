@@ -13,10 +13,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    CausalDMDDenoisingStage,
     ImageEncodingStage,
     ImageVAEEncodingStage,
     InputValidationStage,
+    LingBotWorldCausalDMDDenoisingStage,
     WorldConditioningStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -62,7 +62,7 @@ class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
             )
         )
         self.add_stage(
-            CausalDMDDenoisingStage(
+            LingBotWorldCausalDMDDenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
             ),

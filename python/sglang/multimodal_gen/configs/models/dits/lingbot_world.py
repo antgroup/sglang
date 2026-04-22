@@ -56,7 +56,7 @@ class LingBotWorldArchConfig(DiTArchConfig):
     text_len: int = 512
     num_attention_heads: int = 40
     attention_head_dim: int = 128
-    in_channels: int = 16
+    in_channels: int = 36
     out_channels: int = 16
     text_dim: int = 4096
     freq_dim: int = 256

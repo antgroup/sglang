@@ -5,9 +5,6 @@ import torch  # type: ignore
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
-from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
-    BaseRealtimeState,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -22,13 +19,8 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import dict_to_3d_list
 
 logger = init_logger(__name__)
-
-
-class CausalDMDRealtimeState(BaseRealtimeState):
-    pass
 
 
 class CausalDMDDenoisingStage(DenoisingStage):
@@ -38,6 +30,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
     def __init__(self, transformer, scheduler) -> None:
         super().__init__(transformer, scheduler)
+        # KV and cross-attention cache state (initialized on first forward)
+        self.kv_cache1: list | None = None
+        self.crossattn_cache: list | None = None
         # Model-dependent constants (aligned with causal_inference.py assumptions)
         self.num_transformer_blocks = self.transformer.config.arch_config.num_layers
         self.num_frames_per_block = (
@@ -53,17 +48,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
             )  # type: ignore
         except Exception:
             self.local_attn_size = -1
-
-    def _get_cache_state(
-        self,
-        batch: Req,
-    ) -> tuple[CausalDMDRealtimeState, bool]:
-        if batch.session is not None:
-            # Reuse causal cache across chunks in one realtime session.
-            state = batch.session.get_or_create_state(CausalDMDRealtimeState)
-            return state, True
-        # Use an ephemeral cache holder for stateless calls.
-        return CausalDMDRealtimeState(), False
 
     def forward(
         self,
@@ -98,32 +82,15 @@ class CausalDMDDenoisingStage(DenoisingStage):
         timesteps = timesteps.to(get_local_torch_device())
         logger.info("Using timesteps: %s", timesteps)
 
-        image_embeds = batch.image_embeds
-        if len(image_embeds) > 0:
-            image_embeds = [
-                image_embed.to(target_dtype) for image_embed in image_embeds
-            ]
-
-        image_kwargs = self.prepare_extra_func_kwargs(
-            getattr(self.transformer, "forward", self.transformer),
-            {
-                "encoder_hidden_states_image": image_embeds,
-                "mask_strategy": dict_to_3d_list(None, t_max=50, l_max=60, h_max=24),
-            },
-        )
+        # Image kwargs (kept empty unless caller provides compatible args)
+        image_kwargs: dict = {}
 
         pos_cond_kwargs = self.prepare_extra_func_kwargs(
-            getattr(self.transformer, "forward", self.transformer),
+            self.transformer.forward,
             {
-                "encoder_hidden_states_2": batch.clip_embedding_pos,
+                # "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
-            }
-            | server_args.pipeline_config.prepare_pos_cond_kwargs(
-                batch,
-                self.device,
-                getattr(self.transformer, "rotary_emb", None),
-                dtype=target_dtype,
-            ),
+            },
         )
 
         # STA
@@ -134,22 +101,11 @@ class CausalDMDDenoisingStage(DenoisingStage):
         assert batch.latents is not None, "latents must be provided"
         latents = batch.latents  # [B, C, T, H, W]
         b, c, t, h, w = latents.shape
-        prompt_embeds = server_args.pipeline_config.get_pos_prompt_embeds(batch)
+        prompt_embeds = batch.prompt_embeds
         assert torch.isnan(prompt_embeds[0]).sum() == 0
 
-        cache_state, persist_cache_state = self._get_cache_state(batch)
-        kv_cache1 = cache_state.kv_cache
-        crossattn_cache = cache_state.crossattn_cache
-
-        should_reset_cache = (
-            batch.block_idx == 0
-            or kv_cache1 is None
-            or crossattn_cache is None
-            or len(kv_cache1) != self.num_transformer_blocks
-            or len(crossattn_cache) != self.num_transformer_blocks
-        )
-
-        if should_reset_cache:
+        # Initialize or reset caches
+        if self.kv_cache1 is None:
             self._initialize_kv_cache(
                 batch_size=latents.shape[0], dtype=target_dtype, device=latents.device
             )
@@ -161,15 +117,23 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 dtype=target_dtype,
                 device=latents.device,
             )
-            kv_cache1 = cache_state.kv_cache = self.kv_cache1
-            crossattn_cache = cache_state.crossattn_cache = self.crossattn_cache
         else:
+            assert self.crossattn_cache is not None
             # reset cross-attention cache
             for block_index in range(self.num_transformer_blocks):
-                crossattn_cache[block_index]["is_init"] = False  # type: ignore
-
-        assert kv_cache1 is not None
-        assert crossattn_cache is not None
+                self.crossattn_cache[block_index]["is_init"] = False  # type: ignore
+            # reset kv cache pointers
+            for block_index in range(len(self.kv_cache1)):
+                self.kv_cache1[block_index]["global_end_index"] = (
+                    torch.tensor(  # type: ignore
+                        [0], dtype=torch.long, device=latents.device
+                    )
+                )
+                self.kv_cache1[block_index]["local_end_index"] = (
+                    torch.tensor(  # type: ignore
+                        [0], dtype=torch.long, device=latents.device
+                    )
+                )
 
         # Optional: cache context features from provided image latents prior to generation
         current_start_frame = 0
@@ -183,8 +147,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
             )
             if independent_first_frame and input_frames >= 1:
                 # warm-up with the very first frame independently
-                image_first_bcthw = (
-                    image_latent[:, :, :1, :, :].to(target_dtype)
+                image_first_btchw = (
+                    image_latent[:, :, :1, :, :].to(target_dtype).permute(0, 2, 1, 3, 4)
                 )
                 with torch.autocast(
                     device_type=current_platform.device_type,
@@ -192,11 +156,11 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     enabled=autocast_enabled,
                 ):
                     _ = self.transformer(
-                        image_first_bcthw,
+                        image_first_btchw,
                         prompt_embeds,
                         t_zero,
-                        kv_cache=kv_cache1,
-                        crossattn_cache=crossattn_cache,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                         **image_kwargs,
                         **pos_cond_kwargs,
@@ -209,11 +173,12 @@ class CausalDMDDenoisingStage(DenoisingStage):
             # process remaining input frames in blocks of num_frame_per_block
             while remaining_frames > 0:
                 block = min(self.num_frames_per_block, remaining_frames)
-                ref_bcthw = (
+                ref_btchw = (
                     image_latent[
                         :, :, current_start_frame : current_start_frame + block, :, :
                     ]
                     .to(target_dtype)
+                    .permute(0, 2, 1, 3, 4)
                 )
                 with torch.autocast(
                     device_type=current_platform.device_type,
@@ -221,11 +186,11 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     enabled=autocast_enabled,
                 ):
                     _ = self.transformer(
-                        ref_bcthw,
+                        ref_btchw,
                         prompt_embeds,
                         t_zero,
-                        kv_cache=kv_cache1,
-                        crossattn_cache=crossattn_cache,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                         **image_kwargs,
                         **pos_cond_kwargs,
@@ -338,8 +303,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
                             latent_model_input,
                             prompt_embeds,
                             t_expanded_noise,
-                            kv_cache=kv_cache1,
-                            crossattn_cache=crossattn_cache,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
                             current_start=(pos_start_base + start_index)
                             * self.frame_seq_length,
                             start_frame=start_index,
@@ -410,8 +375,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
                         context_bcthw,
                         prompt_embeds,
                         t_expanded_context,
-                        kv_cache=kv_cache1,
-                        crossattn_cache=crossattn_cache,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
                         current_start=(pos_start_base + start_index)
                         * self.frame_seq_length,
                         start_frame=start_index,
@@ -421,8 +386,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 start_index += current_num_frames
 
         batch.latents = latents
-        if not persist_cache_state:
-            cache_state.dispose()
         return batch
 
     def _initialize_kv_cache(self, batch_size, dtype, device) -> None:
