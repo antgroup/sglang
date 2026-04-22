@@ -12,9 +12,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineSta
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDDenoisingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.lingbot_world_causal_denoising import (
-    LingBotWorldCausalDMDDenoisingStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.comfyui_latent_preparation import (
     ComfyUILatentPreparationStage,
 )
@@ -59,6 +56,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation impo
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation_av import (
     LTX2AVLatentPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.lingbot_world_causal_denoising import (
+    LingBotWorldCausalDMDDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.lingbot_world_realtime_vae import (
+    LingBotWorldCausalDecodingStage,
+    LingBotWorldRealtimeImageVAEEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_connector import (
     LTX2TextConnectorStage,
 )
@@ -89,6 +93,8 @@ __all__ = [
     "LTX2AVDenoisingStage",
     "CausalDMDDenoisingStage",
     "LingBotWorldCausalDMDDenoisingStage",
+    "LingBotWorldRealtimeImageVAEEncodingStage",
+    "LingBotWorldCausalDecodingStage",
     "EncodingStage",
     "DecodingStage",
     "LTX2AVDecodingStage",
