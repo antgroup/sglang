@@ -21,6 +21,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    StageValidators as V,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    VerificationResult,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -59,6 +65,16 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             )
             return state, True
         return LingBotWorldCausalDMDRealtimeState(), False
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """LingBot generates latents internally; only require image_latent."""
+        result = VerificationResult()
+        result.add_check(
+            "image_latent", batch.image_latent, [V.is_tensor, V.with_dims(5)]
+        )
+        result.add_check("prompt_embeds", batch.prompt_embeds, V.list_not_empty)
+        result.add_check("generator", batch.generator, V.generator_or_list_generators)
+        return result
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         target_dtype = torch.bfloat16
