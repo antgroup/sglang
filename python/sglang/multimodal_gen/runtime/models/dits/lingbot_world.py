@@ -47,6 +47,7 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.dits.causal_wanvideo import (
+    CausalWanSelfAttention,
     CausalWanTransformer3DModel,
     CausalWanTransformerBlock,
 )
@@ -91,6 +92,124 @@ class LingBotWorldCamConditioner(nn.Module):
         cam_scale = self.cam_scale_layer(c2ws_hidden_states)
         cam_shift = self.cam_shift_layer(c2ws_hidden_states)
         return (1.0 + cam_scale) * hidden_states + cam_shift
+
+
+class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        block_mask,
+        kv_cache: dict | None = None,
+        current_start: int = 0,
+        cache_start: int | None = None,
+    ):
+        if cache_start is None:
+            cache_start = current_start
+
+        cos, sin = freqs_cis
+        roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
+        roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
+
+        if kv_cache is None:
+            return super().forward(
+                q,
+                k,
+                v,
+                freqs_cis,
+                block_mask,
+                kv_cache,
+                current_start,
+                cache_start,
+            )
+
+        frame_seqlen = q.shape[1]
+        current_end = current_start + roped_query.shape[1]
+        sink_tokens = self.sink_size * frame_seqlen
+        kv_cache_size = kv_cache["k"].shape[1]
+        num_new_tokens = roped_query.shape[1]
+        global_end_index = kv_cache["global_end_index"].item()
+        local_end_index_prev = kv_cache["local_end_index"].item()
+        window_start = global_end_index - local_end_index_prev
+
+        if current_end <= global_end_index:
+            local_start_index = current_start - window_start
+            local_end_index = local_start_index + num_new_tokens
+            visible_local_end = local_end_index_prev
+            visible_global_end = global_end_index
+        else:
+            appended_tokens = current_end - global_end_index
+            if local_end_index_prev + appended_tokens > kv_cache_size:
+                num_evicted_tokens = (
+                    local_end_index_prev + appended_tokens - kv_cache_size
+                )
+                num_rolled_tokens = max(
+                    0,
+                    local_end_index_prev - num_evicted_tokens - sink_tokens,
+                )
+                if num_rolled_tokens > 0:
+                    kv_cache["k"][
+                        :, sink_tokens : sink_tokens + num_rolled_tokens
+                    ] = kv_cache["k"][
+                        :,
+                        sink_tokens
+                        + num_evicted_tokens : sink_tokens
+                        + num_evicted_tokens
+                        + num_rolled_tokens,
+                    ].clone()
+                    kv_cache["v"][
+                        :, sink_tokens : sink_tokens + num_rolled_tokens
+                    ] = kv_cache["v"][
+                        :,
+                        sink_tokens
+                        + num_evicted_tokens : sink_tokens
+                        + num_evicted_tokens
+                        + num_rolled_tokens,
+                    ].clone()
+                local_end_index = (
+                    local_end_index_prev + appended_tokens - num_evicted_tokens
+                )
+            else:
+                local_end_index = local_end_index_prev + appended_tokens
+            local_start_index = local_end_index - num_new_tokens
+            visible_local_end = local_end_index
+            visible_global_end = current_end
+
+        if (
+            local_start_index < 0
+            or local_end_index > kv_cache_size
+            or local_end_index - local_start_index != num_new_tokens
+        ):
+            raise RuntimeError(
+                "Invalid LingBot KV cache write range: "
+                f"local=[{local_start_index}, {local_end_index}), "
+                f"global_end={global_end_index}, "
+                f"prev_local_end={local_end_index_prev}, "
+                f"kv_cache_size={kv_cache_size}, "
+                f"num_new_tokens={num_new_tokens}, "
+                f"current_start={current_start}, current_end={current_end}"
+            )
+
+        kv_cache["k"] = kv_cache["k"].detach()
+        kv_cache["v"] = kv_cache["v"].detach()
+        kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+        kv_cache["v"][:, local_start_index:local_end_index] = v
+
+        attn_start_index = (
+            0
+            if self.local_attn_size == -1
+            else max(0, visible_local_end - self.max_attention_size)
+        )
+        x = self.attn(
+            roped_query,
+            kv_cache["k"][:, attn_start_index:visible_local_end],
+            kv_cache["v"][:, attn_start_index:visible_local_end],
+        )
+        kv_cache["global_end_index"].fill_(visible_global_end)
+        kv_cache["local_end_index"].fill_(visible_local_end)
+        return x
 
 
 class LingBotWorldTransformerBlock(nn.Module):
@@ -654,6 +773,14 @@ class LingBotWorldTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.attn1 = LingBotWorldCausalSelfAttention(
+            dim=self.hidden_dim,
+            num_heads=self.num_attention_heads,
+            local_attn_size=self.local_attn_size,
+            sink_size=self.attn1.sink_size,
+            qk_norm=self.attn1.qk_norm,
+            eps=self.attn1.eps,
+        )
         self.cam_conditioner = LingBotWorldCamConditioner(self.hidden_dim)
 
     def forward(
