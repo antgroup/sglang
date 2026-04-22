@@ -2,9 +2,10 @@
 """
 LingBot-World causal DMD denoising stage.
 
-Extends CausalDMDDenoisingStage with I2V condition concatenation:
-the transformer expects [noise_latent, condition] concatenated along
-the channel dimension, matching the lingbot_fast_server inference loop.
+Extends CausalDMDDenoisingStage with:
+- I2V condition concatenation ([noise, condition] along channel dim)
+- Per-chunk noise generation (no LatentPreparationStage needed)
+- Session-persistent KV cache with cumulative frame position tracking
 """
 
 import torch
@@ -32,19 +33,20 @@ logger = init_logger(__name__)
 
 
 class LingBotWorldCausalDMDRealtimeState(BaseRealtimeState):
-    """Persists KV cache across chunks in a realtime session."""
+    """Persists KV cache and frame position across chunks in a realtime session."""
 
-    pass
+    def __init__(self):
+        super().__init__()
+        self.current_chunk_start_frame: int = 0
+        self.chunk_idx: int = 0
 
 
 class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     """Causal DMD denoising with I2V condition concatenation for LingBot-World.
 
-    The LingBot-World transformer has ``in_channels = 36`` and expects the
-    input hidden_states to be ``[noise(16ch), condition(16ch+4ch mask)]``
-    concatenated along the channel dimension.  This stage injects that
-    concatenation before every transformer call (denoising loop + KV cache
-    context update), while reusing all other logic from the base class.
+    The LingBot-World transformer has ``in_channels = 36`` and expects
+    ``[noise(16ch), condition(20ch)]`` concatenated along channel dim.
+    Each call processes one chunk (num_frames_per_block frames).
     """
 
     def _get_cache_state(
@@ -63,15 +65,37 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         autocast_enabled = (
             target_dtype != torch.float32
         ) and not server_args.disable_autocast
+        device = get_local_torch_device()
 
-        latent_seq_length = batch.latents.shape[-1] * batch.latents.shape[-2]
+        # --- Condition from ImageVAEEncodingStage [B, C_cond, T, H, W] ---
+        condition = batch.image_latent
+        assert condition is not None, (
+            "LingBot-World causal DMD requires image_latent as condition. "
+            "Ensure ImageVAEEncodingStage runs before this stage."
+        )
+
+        b = condition.shape[0]
+        h = condition.shape[3]
+        w = condition.shape[4]
+        t = self.num_frames_per_block
+        num_channels_latents = self.transformer.config.arch_config.out_channels
+
+        # frame_seq_length from spatial dims and patch size
         patch_ratio = (
             self.transformer.config.arch_config.patch_size[-1]
             * self.transformer.config.arch_config.patch_size[-2]
         )
-        self.frame_seq_length = latent_seq_length // patch_ratio
+        self.frame_seq_length = (h * w) // patch_ratio
 
-        # Timesteps
+        # --- Generate noise latent for this chunk ---
+        latents = randn_tensor(
+            (b, num_channels_latents, t, h, w),
+            generator=batch.generator,
+            device=device,
+            dtype=condition.dtype,
+        )
+
+        # --- Timesteps ---
         timesteps = torch.tensor(
             server_args.pipeline_config.dmd_denoising_steps, dtype=torch.long
         ).cpu()
@@ -80,14 +104,13 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 (self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))
             )
             timesteps = scheduler_timesteps[1000 - timesteps]
-        timesteps = timesteps.to(get_local_torch_device())
+        timesteps = timesteps.to(device)
         logger.info("Using timesteps: %s", timesteps)
 
-        image_embeds = batch.image_embeds
+        # --- Transformer kwargs ---
+        image_embeds = getattr(batch, "image_embeds", [])
         if len(image_embeds) > 0:
-            image_embeds = [
-                image_embed.to(target_dtype) for image_embed in image_embeds
-            ]
+            image_embeds = [ie.to(target_dtype) for ie in image_embeds]
 
         image_kwargs = self.prepare_extra_func_kwargs(
             getattr(self.transformer, "forward", self.transformer),
@@ -97,11 +120,13 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             },
         )
 
+        # pos_cond_kwargs includes c2ws_plucker_emb via
+        # LingBotWorldI2VConfig.prepare_pos_cond_kwargs()
         pos_cond_kwargs = self.prepare_extra_func_kwargs(
             getattr(self.transformer, "forward", self.transformer),
             {
-                "encoder_hidden_states_2": batch.clip_embedding_pos,
-                "encoder_attention_mask": batch.prompt_attention_mask,
+                "encoder_hidden_states_2": getattr(batch, "clip_embedding_pos", None),
+                "encoder_attention_mask": getattr(batch, "prompt_attention_mask", None),
             }
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
@@ -114,34 +139,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         if self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN:
             self.prepare_sta_param(batch, server_args)
 
-        # Latents: generate noise for one chunk (chunk_size frames)
-        device = get_local_torch_device()
-        condition = batch.image_latent
-        assert condition is not None, (
-            "LingBot-World causal DMD requires image_latent as condition. "
-            "Ensure ImageVAEEncodingStage runs before this stage."
-        )
-        # condition shape: [B, C_cond, T_cond, H, W]
-        b = condition.shape[0]
-        num_channels_latents = self.transformer.config.arch_config.out_channels
-        h = condition.shape[3]
-        w = condition.shape[4]
-        t = self.num_frames_per_block
-
-        latent_shape = (b, num_channels_latents, t, h, w)
-        latents = randn_tensor(
-            latent_shape,
-            generator=batch.generator,
-            device=device,
-            dtype=condition.dtype,
-        )
-
         prompt_embeds = server_args.pipeline_config.get_pos_prompt_embeds(batch)
 
-        # Split condition into per-block chunks along temporal dim
-        condition_chunks = condition.split(self.num_frames_per_block, dim=2)
-
-        # KV cache
+        # --- KV cache from session state ---
         cache_state, persist_cache_state = self._get_cache_state(batch)
         kv_cache1 = cache_state.kv_cache
         crossattn_cache = cache_state.crossattn_cache
@@ -156,7 +156,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
         if should_reset_cache:
             self._initialize_kv_cache(
-                batch_size=b, dtype=target_dtype, device=latents.device
+                batch_size=b, dtype=target_dtype, device=device
             )
             self._initialize_crossattn_cache(
                 batch_size=b,
@@ -164,147 +164,52 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                     0
                 ].arch_config.text_len,
                 dtype=target_dtype,
-                device=latents.device,
+                device=device,
             )
             kv_cache1 = cache_state.kv_cache = self.kv_cache1
             crossattn_cache = cache_state.crossattn_cache = self.crossattn_cache
+            # Reset frame position on cache reset
+            cache_state.current_chunk_start_frame = 0
+            cache_state.chunk_idx = 0
         else:
             for block_index in range(self.num_transformer_blocks):
                 crossattn_cache[block_index]["is_init"] = False
 
-        # Single block per chunk (realtime: one chunk_size block per call)
-        num_blocks = 1
-        current_start_frame = 0
+        current_start_frame = cache_state.current_chunk_start_frame
 
-        with self.progress_bar(total=num_blocks * len(timesteps)) as progress_bar:
-            for block_idx in range(num_blocks):
-                remaining = t - current_start_frame
-                current_num_frames = min(self.num_frames_per_block, remaining)
-                current_latents = latents[
-                    :, :, current_start_frame : current_start_frame + current_num_frames, :, :
-                ]
-                cond_idx = min(block_idx, len(condition_chunks) - 1)
-                current_condition = condition_chunks[cond_idx]
+        # --- Denoising loop (single chunk) ---
+        current_latents = latents
+        noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
+        video_raw_latent_shape = noise_latents_btchw.shape
+        attn_metadata = None
 
-                # BTCHW for DMD math
-                noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
-                video_raw_latent_shape = noise_latents_btchw.shape
+        with self.progress_bar(total=len(timesteps)) as progress_bar:
+            for i, t_cur in enumerate(timesteps):
+                noise_latents = noise_latents_btchw.clone()
 
-                for i, t_cur in enumerate(timesteps):
-                    noise_latents = noise_latents_btchw.clone()
-
-                    # KEY: concat [noise, condition] along channel dim -> in_channels=36
-                    latent_model_input = torch.cat(
-                        [current_latents, current_condition], dim=1
-                    ).to(target_dtype)
-
-                    t_expand = t_cur.repeat(latent_model_input.shape[0])
-
-                    # Attention metadata
-                    if (
-                        self.attn_backend.get_enum()
-                        == AttentionBackendEnum.VIDEO_SPARSE_ATTN
-                    ):
-                        self.attn_metadata_builder_cls = (
-                            self.attn_backend.get_builder_cls()
-                        )
-                        if self.attn_metadata_builder_cls is not None:
-                            self.attn_metadata_builder = (
-                                self.attn_metadata_builder_cls()
-                            )
-                            attn_metadata = self.attn_metadata_builder.build(
-                                current_timestep=i,
-                                raw_latent_shape=(
-                                    current_num_frames, h, w,
-                                ),
-                                patch_size=server_args.pipeline_config.dit_config.patch_size,
-                                STA_param=batch.STA_param,
-                                VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
-                                device=get_local_torch_device(),
-                            )
-                        else:
-                            attn_metadata = None
-                    else:
-                        attn_metadata = None
-
-                    with (
-                        torch.autocast(
-                            device_type=current_platform.device_type,
-                            dtype=target_dtype,
-                            enabled=autocast_enabled,
-                        ),
-                        set_forward_context(
-                            current_timestep=i,
-                            attn_metadata=attn_metadata,
-                            forward_batch=batch,
-                        ),
-                    ):
-                        t_expanded = t_cur * torch.ones(
-                            (latent_model_input.shape[0], 1),
-                            device=latent_model_input.device,
-                            dtype=torch.long,
-                        )
-                        # Transformer output is [B, C_out, T, H, W]
-                        pred_noise = self.transformer(
-                            latent_model_input,
-                            prompt_embeds,
-                            t_expanded,
-                            kv_cache=kv_cache1,
-                            crossattn_cache=crossattn_cache,
-                            current_start=current_start_frame * self.frame_seq_length,
-                            start_frame=current_start_frame,
-                            **image_kwargs,
-                            **pos_cond_kwargs,
-                        )
-
-                    # Convert flow pred -> x0
-                    pred_noise_btchw = pred_noise.permute(0, 2, 1, 3, 4)
-                    pred_video_btchw = pred_noise_to_pred_video(
-                        pred_noise=pred_noise_btchw.flatten(0, 1),
-                        noise_input_latent=noise_latents.flatten(0, 1),
-                        timestep=t_expand,
-                        scheduler=self.scheduler,
-                    ).unflatten(0, pred_noise_btchw.shape[:2])
-
-                    if i < len(timesteps) - 1:
-                        next_timestep = timesteps[i + 1] * torch.ones(
-                            [1], dtype=torch.long, device=pred_video_btchw.device
-                        )
-                        noise = torch.randn(
-                            video_raw_latent_shape,
-                            dtype=pred_video_btchw.dtype,
-                            generator=(
-                                batch.generator[0]
-                                if isinstance(batch.generator, list)
-                                else batch.generator
-                            ),
-                            device=self.device,
-                        )
-                        noise_latents_btchw = self.scheduler.add_noise(
-                            pred_video_btchw.flatten(0, 1),
-                            noise.flatten(0, 1),
-                            next_timestep,
-                        ).unflatten(0, pred_video_btchw.shape[:2])
-                        current_latents = noise_latents_btchw.permute(0, 2, 1, 3, 4)
-                    else:
-                        current_latents = pred_video_btchw.permute(0, 2, 1, 3, 4)
-
-                    if progress_bar is not None:
-                        progress_bar.update()
-
-                # Write denoised result back
-                latents[:, :, current_start_frame : current_start_frame + current_num_frames, :, :] = (
-                    current_latents
-                )
-
-                # KV cache update: forward with clean context (concat x0 + condition)
-                context_noise = getattr(server_args.pipeline_config, "context_noise", 0)
-                t_context = torch.ones(
-                    [b], device=latents.device, dtype=torch.long
-                ) * int(context_noise)
-                context_input = torch.cat(
-                    [current_latents, current_condition], dim=1
+                # Concat [noise, condition] along channel dim
+                latent_model_input = torch.cat(
+                    [current_latents, condition], dim=1
                 ).to(target_dtype)
+
+                t_expand = t_cur.repeat(b)
+
+                # Attention metadata
+                if (
+                    self.attn_backend.get_enum()
+                    == AttentionBackendEnum.VIDEO_SPARSE_ATTN
+                ):
+                    builder_cls = self.attn_backend.get_builder_cls()
+                    if builder_cls is not None:
+                        attn_metadata = builder_cls().build(
+                            current_timestep=i,
+                            raw_latent_shape=(t, h, w),
+                            patch_size=server_args.pipeline_config.dit_config.patch_size,
+                            STA_param=batch.STA_param,
+                            VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
+                            device=device,
+                        )
+
                 with (
                     torch.autocast(
                         device_type=current_platform.device_type,
@@ -312,16 +217,18 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                         enabled=autocast_enabled,
                     ),
                     set_forward_context(
-                        current_timestep=0,
+                        current_timestep=i,
                         attn_metadata=attn_metadata,
                         forward_batch=batch,
                     ),
                 ):
-                    t_expanded_context = t_context.unsqueeze(1)
-                    _ = self.transformer(
-                        context_input,
+                    t_expanded = t_cur * torch.ones(
+                        (b, 1), device=device, dtype=torch.long,
+                    )
+                    pred_noise = self.transformer(
+                        latent_model_input,
                         prompt_embeds,
-                        t_expanded_context,
+                        t_expanded,
                         kv_cache=kv_cache1,
                         crossattn_cache=crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
@@ -329,10 +236,81 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                         **image_kwargs,
                         **pos_cond_kwargs,
                     )
-                current_start_frame += current_num_frames
 
-        batch.latents = latents
-        batch.raw_latent_shape = latents.shape
+                # Convert flow pred -> x0
+                pred_noise_btchw = pred_noise.permute(0, 2, 1, 3, 4)
+                x0_btchw = pred_noise_to_pred_video(
+                    pred_noise=pred_noise_btchw.flatten(0, 1),
+                    noise_input_latent=noise_latents.flatten(0, 1),
+                    timestep=t_expand,
+                    scheduler=self.scheduler,
+                ).unflatten(0, pred_noise_btchw.shape[:2])
+
+                if i < len(timesteps) - 1:
+                    next_timestep = timesteps[i + 1] * torch.ones(
+                        [1], dtype=torch.long, device=device
+                    )
+                    noise = torch.randn(
+                        video_raw_latent_shape,
+                        dtype=x0_btchw.dtype,
+                        generator=(
+                            batch.generator[0]
+                            if isinstance(batch.generator, list)
+                            else batch.generator
+                        ),
+                        device=device,
+                    )
+                    noise_latents_btchw = self.scheduler.add_noise(
+                        x0_btchw.flatten(0, 1),
+                        noise.flatten(0, 1),
+                        next_timestep,
+                    ).unflatten(0, x0_btchw.shape[:2])
+                    current_latents = noise_latents_btchw.permute(0, 2, 1, 3, 4)
+                else:
+                    current_latents = x0_btchw.permute(0, 2, 1, 3, 4)
+
+                if progress_bar is not None:
+                    progress_bar.update()
+
+        # --- KV cache update: forward with clean x0 + condition ---
+        context_noise = getattr(server_args.pipeline_config, "context_noise", 0)
+        t_context = torch.ones([b], device=device, dtype=torch.long) * int(
+            context_noise
+        )
+        context_input = torch.cat(
+            [current_latents, condition], dim=1
+        ).to(target_dtype)
+        with (
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=target_dtype,
+                enabled=autocast_enabled,
+            ),
+            set_forward_context(
+                current_timestep=0,
+                attn_metadata=attn_metadata,
+                forward_batch=batch,
+            ),
+        ):
+            _ = self.transformer(
+                context_input,
+                prompt_embeds,
+                t_context.unsqueeze(1),
+                kv_cache=kv_cache1,
+                crossattn_cache=crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length,
+                start_frame=current_start_frame,
+                **image_kwargs,
+                **pos_cond_kwargs,
+            )
+
+        # Advance cumulative frame position
+        cache_state.current_chunk_start_frame += t
+        cache_state.chunk_idx += 1
+
+        # Output denoised latents for decoder
+        batch.latents = current_latents
+        batch.raw_latent_shape = current_latents.shape
         if not persist_cache_state:
             cache_state.dispose()
         return batch
