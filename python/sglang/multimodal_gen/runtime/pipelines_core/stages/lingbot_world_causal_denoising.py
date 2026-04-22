@@ -8,6 +8,7 @@ the channel dimension, matching the lingbot_fast_server inference loop.
 """
 
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -113,18 +114,29 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         if self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN:
             self.prepare_sta_param(batch, server_args)
 
-        # Latents [B, C_noise, T, H, W] and condition [B, C_cond, T, H, W]
-        assert batch.latents is not None, "latents must be provided"
-        latents = batch.latents
-        b, c, t, h, w = latents.shape
-        prompt_embeds = server_args.pipeline_config.get_pos_prompt_embeds(batch)
-
-        # Condition from ImageVAEEncodingStage (image_latent includes image + mask channels)
+        # Latents: generate noise for one chunk (chunk_size frames)
+        device = get_local_torch_device()
         condition = batch.image_latent
         assert condition is not None, (
             "LingBot-World causal DMD requires image_latent as condition. "
             "Ensure ImageVAEEncodingStage runs before this stage."
         )
+        # condition shape: [B, C_cond, T_cond, H, W]
+        b = condition.shape[0]
+        num_channels_latents = self.transformer.config.arch_config.out_channels
+        h = condition.shape[3]
+        w = condition.shape[4]
+        t = self.num_frames_per_block
+
+        latent_shape = (b, num_channels_latents, t, h, w)
+        latents = randn_tensor(
+            latent_shape,
+            generator=batch.generator,
+            device=device,
+            dtype=condition.dtype,
+        )
+
+        prompt_embeds = server_args.pipeline_config.get_pos_prompt_embeds(batch)
 
         # Split condition into per-block chunks along temporal dim
         condition_chunks = condition.split(self.num_frames_per_block, dim=2)
@@ -160,18 +172,16 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             for block_index in range(self.num_transformer_blocks):
                 crossattn_cache[block_index]["is_init"] = False
 
-        # Block decomposition
-        if t % self.num_frames_per_block != 0:
-            raise ValueError(
-                "num_frames must be divisible by num_frames_per_block"
-            )
-        num_blocks = t // self.num_frames_per_block
+        # Single block per chunk (realtime: one chunk_size block per call)
+        num_blocks = 1
         current_start_frame = 0
 
         with self.progress_bar(total=num_blocks * len(timesteps)) as progress_bar:
             for block_idx in range(num_blocks):
+                remaining = t - current_start_frame
+                current_num_frames = min(self.num_frames_per_block, remaining)
                 current_latents = latents[
-                    :, :, current_start_frame : current_start_frame + self.num_frames_per_block, :, :
+                    :, :, current_start_frame : current_start_frame + current_num_frames, :, :
                 ]
                 cond_idx = min(block_idx, len(condition_chunks) - 1)
                 current_condition = condition_chunks[cond_idx]
@@ -205,7 +215,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                             attn_metadata = self.attn_metadata_builder.build(
                                 current_timestep=i,
                                 raw_latent_shape=(
-                                    self.num_frames_per_block, h, w,
+                                    current_num_frames, h, w,
                                 ),
                                 patch_size=server_args.pipeline_config.dit_config.patch_size,
                                 STA_param=batch.STA_param,
@@ -283,7 +293,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                         progress_bar.update()
 
                 # Write denoised result back
-                latents[:, :, current_start_frame : current_start_frame + self.num_frames_per_block, :, :] = (
+                latents[:, :, current_start_frame : current_start_frame + current_num_frames, :, :] = (
                     current_latents
                 )
 
@@ -319,9 +329,10 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                         **image_kwargs,
                         **pos_cond_kwargs,
                     )
-                current_start_frame += self.num_frames_per_block
+                current_start_frame += current_num_frames
 
         batch.latents = latents
+        batch.raw_latent_shape = latents.shape
         if not persist_cache_state:
             cache_state.dispose()
         return batch

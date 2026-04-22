@@ -55,7 +55,6 @@ class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
         self.add_stage(WorldConditioningStage())
-        self.add_standard_latent_preparation_stage()
         self.add_stage(
             ImageVAEEncodingStage(
                 vae=self.get_module("vae"),
