@@ -83,16 +83,16 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         ) and not server_args.disable_autocast
         device = get_local_torch_device()
 
-        # --- Condition from ImageVAEEncodingStage [B, C_cond, T, H, W] ---
-        condition = batch.image_latent
-        assert condition is not None, (
+        # --- Condition: take current chunk's slice ---
+        condition_full = batch.image_latent
+        assert condition_full is not None, (
             "LingBot-World causal DMD requires image_latent as condition. "
             "Ensure ImageVAEEncodingStage runs before this stage."
         )
 
-        b = condition.shape[0]
-        h = condition.shape[3]
-        w = condition.shape[4]
+        b = condition_full.shape[0]
+        h = condition_full.shape[3]
+        w = condition_full.shape[4]
         t = self.num_frames_per_block
         num_channels_latents = self.transformer.config.arch_config.out_channels
 
@@ -192,6 +192,11 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 crossattn_cache[block_index]["is_init"] = False
 
         current_start_frame = cache_state.current_chunk_start_frame
+
+        # Slice condition to current chunk
+        condition_chunks = condition_full.split(t, dim=2)
+        cond_idx = min(cache_state.chunk_idx, len(condition_chunks) - 1)
+        condition = condition_chunks[cond_idx]
 
         # --- Denoising loop (single chunk) ---
         current_latents = latents
