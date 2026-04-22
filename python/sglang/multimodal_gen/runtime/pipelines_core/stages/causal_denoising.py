@@ -183,8 +183,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
             )
             if independent_first_frame and input_frames >= 1:
                 # warm-up with the very first frame independently
-                image_first_btchw = (
-                    image_latent[:, :, :1, :, :].to(target_dtype).permute(0, 2, 1, 3, 4)
+                image_first_bcthw = (
+                    image_latent[:, :, :1, :, :].to(target_dtype)
                 )
                 with torch.autocast(
                     device_type=current_platform.device_type,
@@ -192,7 +192,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     enabled=autocast_enabled,
                 ):
                     _ = self.transformer(
-                        image_first_btchw,
+                        image_first_bcthw,
                         prompt_embeds,
                         t_zero,
                         kv_cache=kv_cache1,
@@ -209,12 +209,11 @@ class CausalDMDDenoisingStage(DenoisingStage):
             # process remaining input frames in blocks of num_frame_per_block
             while remaining_frames > 0:
                 block = min(self.num_frames_per_block, remaining_frames)
-                ref_btchw = (
+                ref_bcthw = (
                     image_latent[
                         :, :, current_start_frame : current_start_frame + block, :, :
                     ]
                     .to(target_dtype)
-                    .permute(0, 2, 1, 3, 4)
                 )
                 with torch.autocast(
                     device_type=current_platform.device_type,
@@ -222,7 +221,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     enabled=autocast_enabled,
                 ):
                     _ = self.transformer(
-                        ref_btchw,
+                        ref_bcthw,
                         prompt_embeds,
                         t_zero,
                         kv_cache=kv_cache1,

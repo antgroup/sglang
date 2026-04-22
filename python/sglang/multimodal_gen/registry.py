@@ -735,7 +735,6 @@ def _register_configs():
         hf_model_paths=["FastVideo/lingbot-world-fast-diffusers"],
         model_detectors=[
             lambda hf_id: "lingbot-world-fast" in hf_id.lower()
-            or "lingbotworld-fast" in hf_id.lower()
         ],
     )
     register_configs(
@@ -745,9 +744,7 @@ def _register_configs():
         model_detectors=[
             lambda hf_id: (
                 "lingbotworld" in hf_id.lower()
-                or "lingbot-world" in hf_id.lower()
             )
-            and "fast" not in hf_id.lower()
         ],
     )
     register_configs(
