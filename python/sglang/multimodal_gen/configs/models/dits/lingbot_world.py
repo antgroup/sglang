@@ -72,9 +72,9 @@ class LingBotWorldArchConfig(DiTArchConfig):
     exclude_lora_layers: list[str] = field(default_factory=lambda: ["embedder"])
     boundary_ratio: float | None = None
     local_attn_size: int = -1
-    sink_size: int = 0
+    sink_size: int = 3
     num_frames_per_block: int = 3
-    sliding_window_num_frames: int = 21
+    sliding_window_num_frames: int = 45
 
     def __post_init__(self):
         super().__post_init__()
