@@ -6,7 +6,10 @@ Extends CausalDMDDenoisingStage with:
 - I2V condition concatenation ([noise, condition] along channel dim)
 - Per-chunk noise generation (no LatentPreparationStage needed)
 - Session-persistent KV cache with cumulative frame position tracking
+- Optional CUDA graph acceleration after KV window warmup
 """
+
+from __future__ import annotations
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
@@ -36,6 +39,9 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.lingbot_world_cuda_graph import (
+    LingBotWorldCudaGraphRunner,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -48,6 +54,7 @@ class LingBotWorldCausalDMDRealtimeState(BaseRealtimeState):
         super().__init__()
         self.current_chunk_start_frame: int = 0
         self.chunk_idx: int = 0
+        self.cuda_graph_runner: LingBotWorldCudaGraphRunner | None = None
 
 
 class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
@@ -146,6 +153,167 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
         self.kv_cache1 = kv_cache1
 
+    def _should_use_cuda_graph(self, cache_state, server_args) -> bool:
+        """Check if CUDA graph mode should be used for this chunk."""
+        from sglang.multimodal_gen import envs
+
+        if not envs.SGLANG_LINGBOT_CUDA_GRAPH_ENABLED:
+            return False
+        # Need enough chunks for KV window to fill and indices to stabilize
+        warmup_chunks = (
+            self.transformer.config.arch_config.sliding_window_num_frames
+            // self.num_frames_per_block
+        )
+        return cache_state.chunk_idx >= warmup_chunks
+
+    def _forward_cuda_graph(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        cache_state: LingBotWorldCausalDMDRealtimeState,
+        condition: torch.Tensor,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds,
+        kv_cache1: list[dict],
+        image_embeds: list,
+        c2ws_plucker_emb: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Denoising loop using CUDA graph replay."""
+        from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
+            KVCacheSteadyStateIndices,
+        )
+
+        target_dtype = torch.bfloat16
+        device = latents.device
+        b = latents.shape[0]
+        t = self.num_frames_per_block
+        h = latents.shape[3]
+        w = latents.shape[4]
+        current_start_frame = cache_state.current_chunk_start_frame
+
+        # Lazy-init the graph runner
+        runner = cache_state.cuda_graph_runner
+        if runner is None:
+            arch = self.transformer.config.arch_config
+            kv_cache_size = kv_cache1[0]["k"].shape[1]
+            num_new_tokens = t * self.frame_seq_length
+            sink_tokens = arch.sink_size * self.frame_seq_length
+            max_attention_size = (
+                32760 if arch.local_attn_size == -1
+                else arch.local_attn_size * self.frame_seq_length
+            )
+            kv_idx = KVCacheSteadyStateIndices(
+                kv_cache_size=kv_cache_size,
+                num_new_tokens=num_new_tokens,
+                sink_tokens=sink_tokens,
+                max_attention_size=max_attention_size,
+            )
+            runner = LingBotWorldCudaGraphRunner(self.transformer, kv_idx)
+
+            # Prepare sample inputs for capture
+            sample_input = torch.cat([latents, condition], dim=1).to(target_dtype)
+            t_sample = timesteps[0] * torch.ones((b, 1), device=device, dtype=torch.long)
+            freqs_cis = self.transformer.compute_rope(
+                num_frames=t,
+                height=h,
+                width=w,
+                start_frame=current_start_frame,
+                device=device,
+            )
+            enc_hs = prompt_embeds[0] if isinstance(prompt_embeds, list) else prompt_embeds
+            enc_img = image_embeds[0] if len(image_embeds) > 0 else None
+
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=target_dtype,
+                enabled=True,
+            ):
+                runner.capture(
+                    hidden_states=sample_input,
+                    encoder_hidden_states=enc_hs,
+                    timestep=t_sample,
+                    freqs_cis=freqs_cis,
+                    kv_cache=kv_cache1,
+                    c2ws_plucker_emb=c2ws_plucker_emb,
+                    encoder_hidden_states_image=enc_img,
+                )
+            cache_state.cuda_graph_runner = runner
+            logger.info("CUDA graph runner initialized at chunk_idx=%d", cache_state.chunk_idx)
+
+        # Pre-compute ROPE for this chunk
+        freqs_cis = self.transformer.compute_rope(
+            num_frames=t,
+            height=h,
+            width=w,
+            start_frame=current_start_frame,
+            device=device,
+        )
+
+        # Denoising loop with graph replay
+        current_latents = latents
+        noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
+        video_raw_latent_shape = noise_latents_btchw.shape
+
+        for i, t_cur in enumerate(timesteps):
+            noise_latents = noise_latents_btchw.clone()
+            latent_model_input = torch.cat([current_latents, condition], dim=1).to(
+                target_dtype
+            )
+            t_expand = t_cur.repeat(b)
+            t_expanded = t_cur * torch.ones((b, 1), device=device, dtype=torch.long)
+
+            # First call per chunk rolls KV cache; subsequent calls overwrite
+            if i == 0:
+                pred_noise = runner.replay_with_roll(
+                    latent_model_input, t_expanded, freqs_cis, c2ws_plucker_emb,
+                )
+            else:
+                pred_noise = runner.replay_no_roll(
+                    latent_model_input, t_expanded, freqs_cis, c2ws_plucker_emb,
+                )
+
+            # Convert flow pred -> x0
+            pred_noise_btchw = pred_noise.permute(0, 2, 1, 3, 4)
+            x0_btchw = pred_noise_to_pred_video(
+                pred_noise=pred_noise_btchw.flatten(0, 1),
+                noise_input_latent=noise_latents.flatten(0, 1),
+                timestep=t_expand,
+                scheduler=self.scheduler,
+            ).unflatten(0, pred_noise_btchw.shape[:2])
+
+            if i < len(timesteps) - 1:
+                next_timestep = timesteps[i + 1] * torch.ones(
+                    [1], dtype=torch.long, device=device
+                )
+                noise = torch.randn(
+                    video_raw_latent_shape,
+                    dtype=x0_btchw.dtype,
+                    generator=(
+                        batch.generator[0]
+                        if isinstance(batch.generator, list)
+                        else batch.generator
+                    ),
+                    device=device,
+                )
+                noise_latents_btchw = self.scheduler.add_noise(
+                    x0_btchw.flatten(0, 1),
+                    noise.flatten(0, 1),
+                    next_timestep,
+                ).unflatten(0, x0_btchw.shape[:2])
+                current_latents = noise_latents_btchw.permute(0, 2, 1, 3, 4)
+            else:
+                current_latents = x0_btchw.permute(0, 2, 1, 3, 4)
+
+        # Context update (no roll, overwrite same positions)
+        context_noise = getattr(server_args.pipeline_config, "context_noise", 0)
+        t_context_val = int(context_noise)
+        t_context = torch.ones((b, 1), device=device, dtype=torch.long) * t_context_val
+        context_input = torch.cat([current_latents, condition], dim=1).to(target_dtype)
+        runner.replay_no_roll(context_input, t_context, freqs_cis, c2ws_plucker_emb)
+
+        return current_latents
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         target_dtype = torch.bfloat16
         autocast_enabled = (
@@ -202,20 +370,6 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         if len(image_embeds) > 0:
             image_embeds = [ie.to(target_dtype) for ie in image_embeds]
 
-        image_kwargs = {
-            "encoder_hidden_states_image": image_embeds,
-        }
-
-        pos_cond_kwargs = server_args.pipeline_config.prepare_pos_cond_kwargs(
-            batch,
-            self.device,
-            getattr(self.transformer, "rotary_emb", None),
-            dtype=target_dtype,
-        )
-
-        if self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN:
-            self.prepare_sta_param(batch, server_args)
-
         prompt_embeds = server_args.pipeline_config.get_pos_prompt_embeds(batch)
 
         # --- KV cache from session state ---
@@ -263,6 +417,10 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             # Reset frame position on cache reset
             cache_state.current_chunk_start_frame = 0
             cache_state.chunk_idx = 0
+            # Invalidate CUDA graph on session reset
+            if cache_state.cuda_graph_runner is not None:
+                cache_state.cuda_graph_runner.dispose()
+                cache_state.cuda_graph_runner = None
         else:
             for block_index in range(self.num_transformer_blocks):
                 crossattn_cache[block_index]["is_init"] = False
@@ -273,6 +431,48 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         condition_chunks = condition_full.split(t, dim=2)
         cond_idx = min(cache_state.chunk_idx, len(condition_chunks) - 1)
         condition = condition_chunks[cond_idx]
+
+        # Camera conditioning
+        c2ws_plucker_emb = getattr(batch, "c2ws_plucker_emb", None)
+
+        # ====== CUDA Graph path ======
+        if self._should_use_cuda_graph(cache_state, server_args):
+            current_latents = self._forward_cuda_graph(
+                batch=batch,
+                server_args=server_args,
+                cache_state=cache_state,
+                condition=condition,
+                latents=latents,
+                timesteps=timesteps,
+                prompt_embeds=prompt_embeds,
+                kv_cache1=kv_cache1,
+                image_embeds=image_embeds,
+                c2ws_plucker_emb=c2ws_plucker_emb,
+            )
+
+            # Advance cumulative frame position
+            cache_state.current_chunk_start_frame += t
+            cache_state.chunk_idx += 1
+
+            batch.latents = current_latents
+            batch.raw_latent_shape = current_latents.shape
+            if not persist_cache_state:
+                cache_state.dispose()
+            return batch
+
+        # ====== Eager path (original) ======
+        image_kwargs = {
+            "encoder_hidden_states_image": image_embeds,
+        }
+        pos_cond_kwargs = server_args.pipeline_config.prepare_pos_cond_kwargs(
+            batch,
+            self.device,
+            getattr(self.transformer, "rotary_emb", None),
+            dtype=target_dtype,
+        )
+
+        if self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN:
+            self.prepare_sta_param(batch, server_args)
 
         # --- Denoising loop (single chunk) ---
         current_latents = latents

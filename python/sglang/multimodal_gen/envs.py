@@ -57,6 +57,8 @@ if TYPE_CHECKING:
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
+    # CUDA graph for LingBot-World-Fast realtime pipeline
+    SGLANG_LINGBOT_CUDA_GRAPH_ENABLED: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -283,6 +285,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
+    # ================== CUDA Graph Env Vars ==================
+    # Enable CUDA graph capture/replay for LingBot-World-Fast realtime pipeline.
+    # After KV cache warmup (first ~15 chunks), the transformer forward is captured
+    # as a CUDA graph and replayed for all subsequent chunks.
+    "SGLANG_LINGBOT_CUDA_GRAPH_ENABLED": _lazy_bool(
+        "SGLANG_LINGBOT_CUDA_GRAPH_ENABLED"
+    ),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication

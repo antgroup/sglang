@@ -140,6 +140,46 @@ class LingBotWorldCamConditioner(nn.Module):
         return (1.0 + cam_scale) * hidden_states + cam_shift
 
 
+class KVCacheSteadyStateIndices:
+    """Pre-computed constant indices for KV cache ops after warmup.
+
+    After the KV cache sliding window fills up, all slice indices become
+    deterministic constants that can be derived from model config alone.
+    This allows the attention forward to run without any `.item()` calls
+    or Python conditionals, making it compatible with CUDA graph capture.
+    """
+
+    __slots__ = (
+        "roll_dst_start",
+        "roll_dst_end",
+        "roll_src_start",
+        "roll_src_end",
+        "write_start",
+        "write_end",
+        "attn_start",
+        "attn_end",
+    )
+
+    def __init__(
+        self,
+        *,
+        kv_cache_size: int,
+        num_new_tokens: int,
+        sink_tokens: int,
+        max_attention_size: int,
+    ) -> None:
+        num_evicted = num_new_tokens
+        num_rolled = kv_cache_size - sink_tokens - num_evicted
+        self.roll_dst_start = sink_tokens
+        self.roll_dst_end = sink_tokens + num_rolled
+        self.roll_src_start = sink_tokens + num_evicted
+        self.roll_src_end = sink_tokens + num_evicted + num_rolled
+        self.write_start = kv_cache_size - num_new_tokens
+        self.write_end = kv_cache_size
+        self.attn_start = max(0, kv_cache_size - max_attention_size)
+        self.attn_end = kv_cache_size
+
+
 class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -161,6 +201,61 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 AttentionBackendEnum.TORCH_SDPA,
             ),
         )
+
+    def _forward_cuda_graph_core(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: dict,
+        idx: KVCacheSteadyStateIndices,
+    ) -> torch.Tensor:
+        """Write + attend with constant slices (no roll, no .item())."""
+        cos, sin = freqs_cis
+        roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
+        roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
+
+        # Write new tokens
+        kv_cache["k"][:, idx.write_start : idx.write_end] = roped_key
+        kv_cache["v"][:, idx.write_start : idx.write_end] = v
+
+        # Attend over fixed window
+        return self.attn(
+            roped_query,
+            kv_cache["k"][:, idx.attn_start : idx.attn_end],
+            kv_cache["v"][:, idx.attn_start : idx.attn_end],
+        )
+
+    def forward_cuda_graph_with_roll(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: dict,
+        idx: KVCacheSteadyStateIndices,
+    ) -> torch.Tensor:
+        """First call per chunk: roll KV cache, then write + attend."""
+        kv_cache["k"][:, idx.roll_dst_start : idx.roll_dst_end] = kv_cache["k"][
+            :, idx.roll_src_start : idx.roll_src_end
+        ].clone()
+        kv_cache["v"][:, idx.roll_dst_start : idx.roll_dst_end] = kv_cache["v"][
+            :, idx.roll_src_start : idx.roll_src_end
+        ].clone()
+        return self._forward_cuda_graph_core(q, k, v, freqs_cis, kv_cache, idx)
+
+    def forward_cuda_graph_no_roll(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: dict,
+        idx: KVCacheSteadyStateIndices,
+    ) -> torch.Tensor:
+        """Subsequent calls per chunk: overwrite same positions, then attend."""
+        return self._forward_cuda_graph_core(q, k, v, freqs_cis, kv_cache, idx)
 
     def forward(
         self,
@@ -974,6 +1069,117 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         )
         return hidden_states.to(orig_dtype)
 
+    def _forward_cuda_graph_body(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: dict,
+        kv_idx: KVCacheSteadyStateIndices,
+        c2ws_plucker_emb: torch.Tensor | None,
+        attn_fn,
+    ) -> torch.Tensor:
+        """Shared body for graph-compatible block forward."""
+        if hidden_states.dim() == 4:
+            hidden_states = hidden_states.squeeze(1)
+        num_frames = temb.shape[1]
+        frame_seqlen = hidden_states.shape[1] // num_frames
+        orig_dtype = hidden_states.dtype
+
+        e = self.scale_shift_table + temb.float()
+        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = e.chunk(
+            6, dim=2
+        )
+        norm_hidden_states = (
+            (
+                self.norm1(hidden_states.float()).unflatten(
+                    dim=1, sizes=(num_frames, frame_seqlen)
+                )
+                * (1 + scale_msa)
+                + shift_msa
+            )
+            .flatten(1, 2)
+            .to(orig_dtype)
+        )
+        query, _ = self.to_q(norm_hidden_states)
+        key, _ = self.to_k(norm_hidden_states)
+        value, _ = self.to_v(norm_hidden_states)
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+        query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+
+        attn_output = attn_fn(query, key, value, freqs_cis, kv_cache, kv_idx)
+        attn_output = attn_output.flatten(2)
+        attn_output, _ = self.to_out(attn_output)
+        attn_output = attn_output.squeeze(1)
+
+        null_shift = torch.zeros(
+            (1,), device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        null_scale = torch.zeros(
+            (1,), device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        norm_hidden_states, hidden_states = self.self_attn_residual_norm(
+            hidden_states, attn_output, gate_msa, null_shift, null_scale
+        )
+        hidden_states = self.cam_conditioner(
+            hidden_states.to(orig_dtype), c2ws_plucker_emb
+        )
+        norm_hidden_states = self.self_attn_residual_norm.norm(hidden_states).to(
+            orig_dtype
+        )
+
+        attn_output = self.attn2(
+            norm_hidden_states,
+            context=encoder_hidden_states,
+            context_lens=None,
+        )
+        norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
+            hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
+        )
+        ff_output = self.ffn(norm_hidden_states.to(orig_dtype))
+        hidden_states = self.mlp_residual(
+            ff_output, c_gate_msa, hidden_states.to(orig_dtype)
+        )
+        return hidden_states.to(orig_dtype)
+
+    def forward_cuda_graph_with_roll(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: dict,
+        kv_idx: KVCacheSteadyStateIndices,
+        c2ws_plucker_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """First call per chunk: roll KV cache before processing."""
+        return self._forward_cuda_graph_body(
+            hidden_states, encoder_hidden_states, temb, freqs_cis,
+            kv_cache, kv_idx, c2ws_plucker_emb,
+            self.attn1.forward_cuda_graph_with_roll,
+        )
+
+    def forward_cuda_graph_no_roll(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: dict,
+        kv_idx: KVCacheSteadyStateIndices,
+        c2ws_plucker_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Subsequent calls per chunk: overwrite same KV positions."""
+        return self._forward_cuda_graph_body(
+            hidden_states, encoder_hidden_states, temb, freqs_cis,
+            kv_cache, kv_idx, c2ws_plucker_emb,
+            self.attn1.forward_cuda_graph_no_roll,
+        )
+
 
 class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
     _fsdp_shard_conditions = LingBotWorldVideoConfig()._fsdp_shard_conditions
@@ -1219,6 +1425,158 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         )
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
         return hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+    def compute_rope(
+        self,
+        num_frames: int,
+        height: int,
+        width: int,
+        start_frame: int,
+        device: torch.device | str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pre-compute ROPE embeddings for use with forward_cuda_graph.
+
+        Returns (freqs_cos, freqs_sin) on the target device.
+        """
+        p_t, p_h, p_w = self.patch_size
+        post_patch_num_frames = num_frames // p_t
+        post_patch_height = height // p_h
+        post_patch_width = width // p_w
+
+        d = self.hidden_size // self.num_attention_heads
+        rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
+        freqs_cos, freqs_sin = get_rotary_pos_embed(
+            (
+                post_patch_num_frames * get_sp_world_size(),
+                post_patch_height,
+                post_patch_width,
+            ),
+            self.hidden_size,
+            self.num_attention_heads,
+            rope_dim_list,
+            dtype=(
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
+            ),
+            rope_theta=10000,
+            start_frame=start_frame,
+        )
+        return (
+            freqs_cos.to(device).float(),
+            freqs_sin.to(device).float(),
+        )
+
+    def _prepare_c2ws_plucker_emb_cuda_graph(
+        self, hidden_states: torch.Tensor, c2ws_plucker_emb: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """Same as _prepare_c2ws_plucker_emb but without debug logging."""
+        if c2ws_plucker_emb is None:
+            return None
+        c2ws_patch_emb = self.patch_embedding_wancamctrl(
+            c2ws_plucker_emb.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        )
+        return c2ws_patch_emb + self.c2ws_mlp(c2ws_patch_emb)
+
+    def _forward_cuda_graph_body(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.LongTensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: list[dict],
+        kv_idx: KVCacheSteadyStateIndices,
+        encoder_hidden_states_image: torch.Tensor | None,
+        c2ws_plucker_emb: torch.Tensor | None,
+        block_forward_fn: str,
+    ) -> torch.Tensor:
+        batch_size, _, num_frames, height, width = hidden_states.shape
+        p_t, p_h, p_w = self.patch_size
+        post_patch_num_frames = num_frames // p_t
+        post_patch_height = height // p_h
+        post_patch_width = width // p_w
+
+        hidden_states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
+        c2ws_plucker_emb = self._prepare_c2ws_plucker_emb_cuda_graph(
+            hidden_states, c2ws_plucker_emb
+        )
+
+        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
+            self.condition_embedder(
+                timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
+            )
+        )
+        timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
+            dim=0, sizes=timestep.shape
+        )
+        if encoder_hidden_states_image is not None:
+            encoder_hidden_states = torch.concat(
+                [encoder_hidden_states_image, encoder_hidden_states], dim=1
+            )
+
+        for block_index, block in enumerate(self.blocks):
+            hidden_states = getattr(block, block_forward_fn)(
+                hidden_states,
+                encoder_hidden_states,
+                timestep_proj,
+                freqs_cis,
+                kv_cache=kv_cache[block_index],
+                kv_idx=kv_idx,
+                c2ws_plucker_emb=c2ws_plucker_emb,
+            )
+
+        temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)
+        shift, scale = (self.scale_shift_table.unsqueeze(1) + temb).chunk(2, dim=2)
+        hidden_states = self.norm_out(hidden_states, shift, scale)
+        hidden_states = self.proj_out(hidden_states)
+        hidden_states = hidden_states.reshape(
+            batch_size,
+            post_patch_num_frames,
+            post_patch_height,
+            post_patch_width,
+            p_t,
+            p_h,
+            p_w,
+            -1,
+        )
+        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        return hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+    def forward_cuda_graph_with_roll(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.LongTensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: list[dict],
+        kv_idx: KVCacheSteadyStateIndices,
+        encoder_hidden_states_image: torch.Tensor | None = None,
+        c2ws_plucker_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """First call per chunk: rolls KV cache to evict old tokens."""
+        return self._forward_cuda_graph_body(
+            hidden_states, encoder_hidden_states, timestep, freqs_cis,
+            kv_cache, kv_idx, encoder_hidden_states_image, c2ws_plucker_emb,
+            "forward_cuda_graph_with_roll",
+        )
+
+    def forward_cuda_graph_no_roll(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.LongTensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: list[dict],
+        kv_idx: KVCacheSteadyStateIndices,
+        encoder_hidden_states_image: torch.Tensor | None = None,
+        c2ws_plucker_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Subsequent calls per chunk: overwrites same KV positions."""
+        return self._forward_cuda_graph_body(
+            hidden_states, encoder_hidden_states, timestep, freqs_cis,
+            kv_cache, kv_idx, encoder_hidden_states_image, c2ws_plucker_emb,
+            "forward_cuda_graph_no_roll",
+        )
 
     def _forward_train(
         self,
