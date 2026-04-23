@@ -210,22 +210,39 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         kv_cache: dict,
         idx: KVCacheSteadyStateIndices,
+        seq_splits: list[int] | None = None,
     ) -> torch.Tensor:
         """Write + attend with constant slices (no roll, no .item())."""
         cos, sin = freqs_cis
         roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
         roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
 
+        # Ulysses: scatter heads, gather sequence
+        if seq_splits is not None:
+            roped_query = _usp_input_all_to_all_variable(
+                roped_query, seq_splits, head_dim=2
+            )
+            roped_key = _usp_input_all_to_all_variable(
+                roped_key, seq_splits, head_dim=2
+            )
+            v = _usp_input_all_to_all_variable(v, seq_splits, head_dim=2)
+
         # Write new tokens
         kv_cache["k"][:, idx.write_start : idx.write_end] = roped_key
         kv_cache["v"][:, idx.write_start : idx.write_end] = v
 
         # Attend over fixed window
-        return self.attn(
+        attn_impl = self.ulysses_attn if seq_splits is not None else self.attn
+        x = attn_impl(
             roped_query,
             kv_cache["k"][:, idx.attn_start : idx.attn_end],
             kv_cache["v"][:, idx.attn_start : idx.attn_end],
         )
+
+        # Ulysses: gather heads, scatter sequence
+        if seq_splits is not None:
+            x = _usp_output_all_to_all_variable(x, seq_splits, head_dim=2)
+        return x
 
     def forward_cuda_graph_with_roll(
         self,
@@ -235,6 +252,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         kv_cache: dict,
         idx: KVCacheSteadyStateIndices,
+        seq_splits: list[int] | None = None,
     ) -> torch.Tensor:
         """First call per chunk: roll KV cache, then write + attend."""
         kv_cache["k"][:, idx.roll_dst_start : idx.roll_dst_end] = kv_cache["k"][
@@ -243,7 +261,9 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         kv_cache["v"][:, idx.roll_dst_start : idx.roll_dst_end] = kv_cache["v"][
             :, idx.roll_src_start : idx.roll_src_end
         ].clone()
-        return self._forward_cuda_graph_core(q, k, v, freqs_cis, kv_cache, idx)
+        return self._forward_cuda_graph_core(
+            q, k, v, freqs_cis, kv_cache, idx, seq_splits
+        )
 
     def forward_cuda_graph_no_roll(
         self,
@@ -253,9 +273,12 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         kv_cache: dict,
         idx: KVCacheSteadyStateIndices,
+        seq_splits: list[int] | None = None,
     ) -> torch.Tensor:
         """Subsequent calls per chunk: overwrite same positions, then attend."""
-        return self._forward_cuda_graph_core(q, k, v, freqs_cis, kv_cache, idx)
+        return self._forward_cuda_graph_core(
+            q, k, v, freqs_cis, kv_cache, idx, seq_splits
+        )
 
     def forward(
         self,
@@ -1079,6 +1102,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         kv_idx: KVCacheSteadyStateIndices,
         c2ws_plucker_emb: torch.Tensor | None,
         attn_fn,
+        seq_splits: list[int] | None = None,
     ) -> torch.Tensor:
         """Shared body for graph-compatible block forward."""
         if hidden_states.dim() == 4:
@@ -1111,7 +1135,9 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
 
-        attn_output = attn_fn(query, key, value, freqs_cis, kv_cache, kv_idx)
+        attn_output = attn_fn(
+            query, key, value, freqs_cis, kv_cache, kv_idx, seq_splits
+        )
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -1155,12 +1181,14 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         kv_cache: dict,
         kv_idx: KVCacheSteadyStateIndices,
         c2ws_plucker_emb: torch.Tensor | None = None,
+        seq_splits: list[int] | None = None,
     ) -> torch.Tensor:
         """First call per chunk: roll KV cache before processing."""
         return self._forward_cuda_graph_body(
             hidden_states, encoder_hidden_states, temb, freqs_cis,
             kv_cache, kv_idx, c2ws_plucker_emb,
             self.attn1.forward_cuda_graph_with_roll,
+            seq_splits,
         )
 
     def forward_cuda_graph_no_roll(
@@ -1172,12 +1200,14 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         kv_cache: dict,
         kv_idx: KVCacheSteadyStateIndices,
         c2ws_plucker_emb: torch.Tensor | None = None,
+        seq_splits: list[int] | None = None,
     ) -> torch.Tensor:
         """Subsequent calls per chunk: overwrite same KV positions."""
         return self._forward_cuda_graph_body(
             hidden_states, encoder_hidden_states, temb, freqs_cis,
             kv_cache, kv_idx, c2ws_plucker_emb,
             self.attn1.forward_cuda_graph_no_roll,
+            seq_splits,
         )
 
 
@@ -1433,8 +1463,14 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         width: int,
         start_frame: int,
         device: torch.device | str,
+        *,
+        seq_shard_splits: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Pre-compute ROPE embeddings for use with forward_cuda_graph.
+
+        Args:
+            seq_shard_splits: If not None, compute local ROPE with offset
+                for ulysses sequence sharding.
 
         Returns (freqs_cos, freqs_sin) on the target device.
         """
@@ -1443,25 +1479,40 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        d = self.hidden_size // self.num_attention_heads
-        rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
-        freqs_cos, freqs_sin = get_rotary_pos_embed(
-            (
-                post_patch_num_frames * get_sp_world_size(),
-                post_patch_height,
-                post_patch_width,
-            ),
-            self.hidden_size,
-            self.num_attention_heads,
-            rope_dim_list,
-            dtype=(
-                torch.float64
-                if current_platform.is_float64_supported()
-                else torch.float32
-            ),
-            rope_theta=10000,
-            start_frame=start_frame,
-        )
+        if seq_shard_splits is not None:
+            sp_rank = get_sp_parallel_rank()
+            local_seq_len = seq_shard_splits[sp_rank]
+            frame_stride = post_patch_height * post_patch_width
+            token_start = (
+                start_frame * frame_stride + sum(seq_shard_splits[:sp_rank])
+            )
+            freqs_cos, freqs_sin = (
+                self._compute_rope_for_sequence_shard_with_offset(
+                    local_seq_len,
+                    token_start,
+                    frame_stride,
+                    post_patch_width,
+                    device,
+                )
+            )
+        else:
+            freqs_cos, freqs_sin = get_rotary_pos_embed(
+                (
+                    post_patch_num_frames * get_sp_world_size(),
+                    post_patch_height,
+                    post_patch_width,
+                ),
+                self.hidden_size,
+                self.num_attention_heads,
+                self.rope_dim_list,
+                dtype=(
+                    torch.float64
+                    if current_platform.is_float64_supported()
+                    else torch.float32
+                ),
+                rope_theta=10000,
+                start_frame=start_frame,
+            )
         return (
             freqs_cos.to(device).float(),
             freqs_sin.to(device).float(),
@@ -1489,6 +1540,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         encoder_hidden_states_image: torch.Tensor | None,
         c2ws_plucker_emb: torch.Tensor | None,
         block_forward_fn: str,
+        seq_splits: list[int] | None = None,
     ) -> torch.Tensor:
         batch_size, _, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.patch_size
@@ -1500,6 +1552,17 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         c2ws_plucker_emb = self._prepare_c2ws_plucker_emb_cuda_graph(
             hidden_states, c2ws_plucker_emb
         )
+
+        # Ulysses: shard sequence across SP ranks
+        if seq_splits is not None:
+            sp_rank = get_sp_parallel_rank()
+            hidden_states = _sequence_shard_tensor(
+                hidden_states, seq_splits, sp_rank
+            )
+            if c2ws_plucker_emb is not None:
+                c2ws_plucker_emb = _sequence_shard_tensor(
+                    c2ws_plucker_emb, seq_splits, sp_rank
+                )
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
             self.condition_embedder(
@@ -1523,6 +1586,15 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 kv_cache=kv_cache[block_index],
                 kv_idx=kv_idx,
                 c2ws_plucker_emb=c2ws_plucker_emb,
+                seq_splits=seq_splits,
+            )
+
+        # Ulysses: gather shards back to full sequence for output head
+        if seq_splits is not None:
+            hidden_states = _sequence_all_gather_variable(
+                hidden_states.contiguous(),
+                seq_splits,
+                get_sp_group().device_group,
             )
 
         temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)
@@ -1552,12 +1624,13 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         kv_idx: KVCacheSteadyStateIndices,
         encoder_hidden_states_image: torch.Tensor | None = None,
         c2ws_plucker_emb: torch.Tensor | None = None,
+        seq_splits: list[int] | None = None,
     ) -> torch.Tensor:
         """First call per chunk: rolls KV cache to evict old tokens."""
         return self._forward_cuda_graph_body(
             hidden_states, encoder_hidden_states, timestep, freqs_cis,
             kv_cache, kv_idx, encoder_hidden_states_image, c2ws_plucker_emb,
-            "forward_cuda_graph_with_roll",
+            "forward_cuda_graph_with_roll", seq_splits,
         )
 
     def forward_cuda_graph_no_roll(
@@ -1570,12 +1643,13 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         kv_idx: KVCacheSteadyStateIndices,
         encoder_hidden_states_image: torch.Tensor | None = None,
         c2ws_plucker_emb: torch.Tensor | None = None,
+        seq_splits: list[int] | None = None,
     ) -> torch.Tensor:
         """Subsequent calls per chunk: overwrites same KV positions."""
         return self._forward_cuda_graph_body(
             hidden_states, encoder_hidden_states, timestep, freqs_cis,
             kv_cache, kv_idx, encoder_hidden_states_image, c2ws_plucker_emb,
-            "forward_cuda_graph_no_roll",
+            "forward_cuda_graph_no_roll", seq_splits,
         )
 
     def _forward_train(

@@ -162,12 +162,6 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
         if not envs.SGLANG_LINGBOT_CUDA_GRAPH_ENABLED:
             return False
-        # NCCL all-to-all in CUDA graph is unreliable; disable for ulysses SP.
-        if (
-            getattr(batch, "enable_sequence_shard", False)
-            and get_ulysses_parallel_world_size() > 1
-        ):
-            return False
         return True
 
     def _compute_kv_indices(
@@ -185,12 +179,16 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         arch = self.transformer.config.arch_config
         kv_cache_size = kv_cache1[0]["k"].shape[1]
         num_new_tokens = self.num_frames_per_block * self.frame_seq_length
-        sink_tokens = arch.sink_size * self.frame_seq_length
+        # sink_tokens uses total chunk tokens, matching the original attention
+        # code where sink_tokens = self.sink_size * frame_seqlen (= total chunk tokens)
+        sink_tokens = arch.sink_size * num_new_tokens
         max_attention_size = (
             32760 if arch.local_attn_size == -1
             else arch.local_attn_size * self.frame_seq_length
         )
-        window_chunks = arch.sliding_window_num_frames // self.num_frames_per_block
+        # Use actual cache capacity, not config's sliding_window_num_frames,
+        # because local_attn_size may shrink the cache below the sliding window.
+        window_chunks = kv_cache_size // num_new_tokens
         chunk_idx = cache_state.chunk_idx
 
         if chunk_idx < window_chunks:
@@ -251,10 +249,25 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         w = latents.shape[4]
         current_start_frame = cache_state.current_chunk_start_frame
 
+        # Determine ulysses seq_splits for this session/chunk
+        seq_splits = None
+        if (
+            getattr(batch, "enable_sequence_shard", False)
+            and get_ulysses_parallel_world_size() > 1
+        ):
+            total_len = t * self.frame_seq_length
+            world_size = get_ulysses_parallel_world_size()
+            base = total_len // world_size
+            remainder = total_len % world_size
+            seq_splits = [
+                base + (1 if rank < remainder else 0)
+                for rank in range(world_size)
+            ]
+
         # Lazy-init the graph runner (shared across chunks & sessions)
         runner = cache_state.cuda_graph_runner
         if runner is None:
-            runner = LingBotWorldCudaGraphRunner(self.transformer)
+            runner = LingBotWorldCudaGraphRunner(self.transformer, seq_splits)
             cache_state.cuda_graph_runner = runner
 
         # Compute KV indices for this chunk
@@ -266,6 +279,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         freqs_cis = self.transformer.compute_rope(
             num_frames=t, height=h, width=w,
             start_frame=current_start_frame, device=device,
+            seq_shard_splits=seq_splits,
         )
 
         enc_hs = prompt_embeds[0] if isinstance(prompt_embeds, list) else prompt_embeds

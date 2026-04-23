@@ -41,8 +41,9 @@ class LingBotWorldCudaGraphRunner:
     the same signature replay instantly.
     """
 
-    def __init__(self, transformer) -> None:
+    def __init__(self, transformer, seq_splits: list[int] | None = None) -> None:
         self.transformer = transformer
+        self.seq_splits = seq_splits  # Ulysses sequence splits (None if no SP)
         self._pool = torch.cuda.graph_pool_handle()
         self._graphs: dict[tuple, _CapturedGraph] = {}
 
@@ -120,6 +121,7 @@ class LingBotWorldCudaGraphRunner:
         common = dict(
             encoder_hidden_states_image=self._s_encoder_hidden_states_image,
             c2ws_plucker_emb=self._s_c2ws_plucker_emb,
+            seq_splits=self.seq_splits,
         )
         call_args = (
             self._s_hidden_states,
