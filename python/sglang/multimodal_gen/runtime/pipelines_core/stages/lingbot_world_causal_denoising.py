@@ -8,12 +8,14 @@ Extends CausalDMDDenoisingStage with:
 - Session-persistent KV cache with cumulative frame position tracking
 """
 
-import logging
-
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+    get_ulysses_parallel_world_size,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
@@ -76,6 +78,73 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         result.add_check("prompt_embeds", batch.prompt_embeds, V.list_not_empty)
         result.add_check("generator", batch.generator, V.generator_or_list_generators)
         return result
+
+    def _initialize_kv_cache(
+        self,
+        batch_size,
+        dtype,
+        device,
+        *,
+        sequence_shard_enabled: bool = False,
+    ) -> None:
+        kv_cache1 = []
+        num_attention_heads = self.transformer.num_attention_heads
+        if sequence_shard_enabled:
+            ulysses_world_size = get_ulysses_parallel_world_size()
+            if ulysses_world_size <= 1:
+                raise ValueError(
+                    "LingBot causal sequence sharding requires ulysses_degree > 1."
+                )
+            if get_ring_parallel_world_size() > 1:
+                raise NotImplementedError(
+                    "LingBot causal sequence sharding currently supports ring_degree = 1 only."
+                )
+            if num_attention_heads % ulysses_world_size != 0:
+                raise ValueError(
+                    f"num_attention_heads ({num_attention_heads}) must be divisible by ulysses_degree ({ulysses_world_size})."
+                )
+            num_attention_heads //= ulysses_world_size
+        attention_head_dim = self.transformer.attention_head_dim
+        if self.local_attn_size != -1:
+            kv_cache_size = self.local_attn_size * self.frame_seq_length
+        else:
+            kv_cache_size = self.frame_seq_length * self.sliding_window_num_frames
+
+        for _ in range(self.num_transformer_blocks):
+            kv_cache1.append(
+                {
+                    "k": torch.zeros(
+                        [
+                            batch_size,
+                            kv_cache_size,
+                            num_attention_heads,
+                            attention_head_dim,
+                        ],
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    "v": torch.zeros(
+                        [
+                            batch_size,
+                            kv_cache_size,
+                            num_attention_heads,
+                            attention_head_dim,
+                        ],
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    "global_end_index": torch.tensor(
+                        [0], dtype=torch.long, device=device
+                    ),
+                    "local_end_index": torch.tensor(
+                        [0], dtype=torch.long, device=device
+                    ),
+                    "global_end_index_int": 0,
+                    "local_end_index_int": 0,
+                }
+            )
+
+        self.kv_cache1 = kv_cache1
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         target_dtype = torch.bfloat16
@@ -153,6 +222,17 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         cache_state, persist_cache_state = self._get_cache_state(batch)
         kv_cache1 = cache_state.kv_cache
         crossattn_cache = cache_state.crossattn_cache
+        sequence_shard_enabled = bool(
+            getattr(batch, "enable_sequence_shard", False)
+            and get_ulysses_parallel_world_size() > 1
+        )
+        expected_cache_heads = self.transformer.num_attention_heads
+        if sequence_shard_enabled:
+            if get_ring_parallel_world_size() > 1:
+                raise NotImplementedError(
+                    "LingBot causal sequence sharding currently supports ulysses_degree > 1 with ring_degree = 1 only."
+                )
+            expected_cache_heads //= get_ulysses_parallel_world_size()
 
         should_reset_cache = (
             batch.block_idx == 0
@@ -160,10 +240,16 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             or crossattn_cache is None
             or len(kv_cache1) != self.num_transformer_blocks
             or len(crossattn_cache) != self.num_transformer_blocks
+            or kv_cache1[0]["k"].shape[2] != expected_cache_heads
         )
 
         if should_reset_cache:
-            self._initialize_kv_cache(batch_size=b, dtype=target_dtype, device=device)
+            self._initialize_kv_cache(
+                batch_size=b,
+                dtype=target_dtype,
+                device=device,
+                sequence_shard_enabled=sequence_shard_enabled,
+            )
             self._initialize_crossattn_cache(
                 batch_size=b,
                 max_text_len=server_args.pipeline_config.text_encoder_configs[
@@ -187,28 +273,6 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         condition_chunks = condition_full.split(t, dim=2)
         cond_idx = min(cache_state.chunk_idx, len(condition_chunks) - 1)
         condition = condition_chunks[cond_idx]
-        c2ws_plucker_emb = getattr(batch, "c2ws_plucker_emb", None)
-        if logger.isEnabledFor(logging.DEBUG):
-            if c2ws_plucker_emb is None:
-                logger.debug(
-                    "LingBot transformer conditioning: session_id=%s, block_idx=%s, chunk_idx=%s, current_start_frame=%s, c2ws_plucker_emb=None",
-                    batch.extra.get("realtime_session_id"),
-                    batch.block_idx,
-                    cache_state.chunk_idx,
-                    current_start_frame,
-                )
-            else:
-                logger.debug(
-                    "LingBot transformer conditioning: session_id=%s, block_idx=%s, chunk_idx=%s, current_start_frame=%s, cond_idx=%s, c2ws_plucker_emb_shape=%s, abs_mean=%.6f, abs_max=%.6f",
-                    batch.extra.get("realtime_session_id"),
-                    batch.block_idx,
-                    cache_state.chunk_idx,
-                    current_start_frame,
-                    cond_idx,
-                    tuple(c2ws_plucker_emb.shape),
-                    c2ws_plucker_emb.abs().mean().item(),
-                    c2ws_plucker_emb.abs().max().item(),
-                )
 
         # --- Denoising loop (single chunk) ---
         current_latents = latents

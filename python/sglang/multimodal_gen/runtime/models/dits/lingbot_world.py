@@ -18,7 +18,11 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     sequence_model_parallel_all_gather,
 )
-from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+    get_ulysses_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
@@ -40,6 +44,10 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
     get_rotary_pos_embed,
 )
+from sglang.multimodal_gen.runtime.layers.usp import (
+    _usp_input_all_to_all,
+    _usp_output_all_to_all,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     PatchEmbed,
     WanCamControlPatchEmbedding,
@@ -58,7 +66,10 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanTransformer3DModel,
 )
 from sglang.multimodal_gen.runtime.models.utils import _use_aiter
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
@@ -95,6 +106,27 @@ class LingBotWorldCamConditioner(nn.Module):
 
 
 class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        ulysses_world_size = max(get_ulysses_parallel_world_size(), 1)
+        if self.num_heads % ulysses_world_size != 0:
+            raise ValueError(
+                f"num_heads ({self.num_heads}) must be divisible by ulysses_degree ({ulysses_world_size})."
+            )
+        self.ulysses_num_heads = self.num_heads // ulysses_world_size
+        self.ulysses_attn = LocalAttention(
+            num_heads=self.ulysses_num_heads,
+            head_size=self.head_dim,
+            dropout_rate=0,
+            softmax_scale=None,
+            causal=False,
+            supported_attention_backends=(
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.AITER,
+                AttentionBackendEnum.TORCH_SDPA,
+            ),
+        )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -112,8 +144,19 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         cos, sin = freqs_cis
         roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
         roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
+        forward_batch = get_forward_context().forward_batch
+        sequence_shard_enabled = (
+            kv_cache is not None
+            and forward_batch is not None
+            and getattr(forward_batch, "enable_sequence_shard", False)
+            and get_ulysses_parallel_world_size() > 1
+        )
 
         if kv_cache is None:
+            if sequence_shard_enabled:
+                raise NotImplementedError(
+                    "LingBot causal sequence sharding currently requires kv_cache-backed inference."
+                )
             return super().forward(
                 q,
                 k,
@@ -125,7 +168,12 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 cache_start,
             )
 
-        frame_seqlen = q.shape[1]
+        if sequence_shard_enabled:
+            roped_query = _usp_input_all_to_all(roped_query, head_dim=2)
+            roped_key = _usp_input_all_to_all(roped_key, head_dim=2)
+            v = _usp_input_all_to_all(v, head_dim=2)
+
+        frame_seqlen = roped_query.shape[1]
         current_end = current_start + roped_query.shape[1]
         sink_tokens = self.sink_size * frame_seqlen
         kv_cache_size = kv_cache["k"].shape[1]
@@ -207,11 +255,14 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             if self.local_attn_size == -1
             else max(0, visible_local_end - self.max_attention_size)
         )
-        x = self.attn(
+        attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
+        x = attn_impl(
             roped_query,
             kv_cache["k"][:, attn_start_index:visible_local_end],
             kv_cache["v"][:, attn_start_index:visible_local_end],
         )
+        if sequence_shard_enabled:
+            x = _usp_output_all_to_all(x, head_dim=2)
         kv_cache["global_end_index_int"] = visible_global_end
         kv_cache["local_end_index_int"] = visible_local_end
         kv_cache["global_end_index"].fill_(visible_global_end)
@@ -807,7 +858,6 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             hidden_states = hidden_states.squeeze(1)
         num_frames = temb.shape[1]
         frame_seqlen = hidden_states.shape[1] // num_frames
-        bs = hidden_states.shape[0]
         orig_dtype = hidden_states.dtype
         e = self.scale_shift_table + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = e.chunk(
@@ -902,6 +952,18 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             patch_size=config.patch_size,
         )
         self.c2ws_mlp = MLP(inner_dim, inner_dim, inner_dim, bias=True, act_type="silu")
+        self.sp_size = get_sp_world_size()
+        d = self.hidden_size // self.num_attention_heads
+        self.rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
+        self.rotary_emb = NDRotaryEmbedding(
+            rope_dim_list=self.rope_dim_list,
+            rope_theta=10000,
+            dtype=(
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
+            ),
+        )
         self.blocks = nn.ModuleList(
             [
                 CausalLingBotWorldTransformerBlock(
@@ -921,6 +983,28 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 for i in range(config.num_layers)
             ]
         )
+
+    @lru_cache(maxsize=8)
+    def _compute_rope_for_sequence_shard_with_offset(
+        self,
+        local_len: int,
+        token_start: int,
+        frame_stride_local: int,
+        width_local: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_indices = torch.arange(
+            token_start,
+            token_start + local_len,
+            device=device,
+            dtype=torch.long,
+        )
+        t_idx = token_indices // frame_stride_local
+        rem = token_indices % frame_stride_local
+        h_idx = rem // width_local
+        w_idx = rem % width_local
+        positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
+        return self.rotary_emb.forward_uncached(positions)
 
     def _prepare_c2ws_plucker_emb(
         self, hidden_states: torch.Tensor, c2ws_plucker_emb: torch.Tensor | None
@@ -947,6 +1031,21 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         **kwargs,
     ) -> torch.Tensor:
         del kwargs
+        forward_batch = get_forward_context().forward_batch
+        sequence_shard_enabled = (
+            forward_batch is not None
+            and getattr(forward_batch, "enable_sequence_shard", False)
+            and self.sp_size > 1
+        )
+        if sequence_shard_enabled:
+            if get_ring_parallel_world_size() > 1:
+                raise NotImplementedError(
+                    "LingBot causal sequence sharding currently supports ulysses_degree > 1 with ring_degree = 1 only."
+                )
+            if get_ulysses_parallel_world_size() <= 1:
+                raise NotImplementedError(
+                    "LingBot causal sequence sharding currently requires ulysses_degree > 1."
+                )
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
             encoder_hidden_states = encoder_hidden_states[0]
@@ -963,35 +1062,59 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
-
-        d = self.hidden_size // self.num_attention_heads
-        rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
-        freqs_cos, freqs_sin = get_rotary_pos_embed(
-            (
-                post_patch_num_frames * get_sp_world_size(),
-                post_patch_height,
-                post_patch_width,
-            ),
-            self.hidden_size,
-            self.num_attention_heads,
-            rope_dim_list,
-            dtype=(
-                torch.float64
-                if current_platform.is_float64_supported()
-                else torch.float32
-            ),
-            rope_theta=10000,
-            start_frame=start_frame,
-        )
-        freqs_cis = (
-            freqs_cos.to(hidden_states.device).float(),
-            freqs_sin.to(hidden_states.device).float(),
-        )
+        if not sequence_shard_enabled:
+            freqs_cos, freqs_sin = get_rotary_pos_embed(
+                (
+                    post_patch_num_frames * get_sp_world_size(),
+                    post_patch_height,
+                    post_patch_width,
+                ),
+                self.hidden_size,
+                self.num_attention_heads,
+                self.rope_dim_list,
+                dtype=(
+                    torch.float64
+                    if current_platform.is_float64_supported()
+                    else torch.float32
+                ),
+                rope_theta=10000,
+                start_frame=start_frame,
+            )
+            freqs_cis = (
+                freqs_cos.to(hidden_states.device).float(),
+                freqs_sin.to(hidden_states.device).float(),
+            )
 
         hidden_states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
         c2ws_plucker_emb = self._prepare_c2ws_plucker_emb(
             hidden_states, c2ws_plucker_emb
         )
+        if sequence_shard_enabled:
+            seq_len_orig = hidden_states.shape[1]
+            if seq_len_orig % self.sp_size != 0:
+                raise ValueError(
+                    "LingBot causal sequence sharding requires chunk token count to be divisible by sp_degree, "
+                    f"got seq_len={seq_len_orig}, sp_degree={self.sp_size}."
+                )
+            sp_rank = get_sp_parallel_rank()
+            local_seq_len = seq_len_orig // self.sp_size
+            hidden_states = hidden_states.view(
+                batch_size, self.sp_size, local_seq_len, hidden_states.shape[2]
+            )[:, sp_rank, :, :]
+            if c2ws_plucker_emb is not None:
+                c2ws_plucker_emb = c2ws_plucker_emb.view(
+                    batch_size, self.sp_size, local_seq_len, c2ws_plucker_emb.shape[2]
+                )[:, sp_rank, :, :]
+            frame_stride = post_patch_height * post_patch_width
+            token_start = start_frame * frame_stride + sp_rank * local_seq_len
+            freqs_cos, freqs_sin = self._compute_rope_for_sequence_shard_with_offset(
+                local_seq_len,
+                token_start,
+                frame_stride,
+                post_patch_width,
+                hidden_states.device,
+            )
+            freqs_cis = (freqs_cos.float(), freqs_sin.float())
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
             self.condition_embedder(
@@ -1023,6 +1146,11 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 current_start=current_start,
                 cache_start=cache_start,
                 c2ws_plucker_emb=c2ws_plucker_emb,
+            )
+
+        if sequence_shard_enabled:
+            hidden_states = sequence_model_parallel_all_gather(
+                hidden_states.contiguous(), dim=1
             )
 
         temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)
