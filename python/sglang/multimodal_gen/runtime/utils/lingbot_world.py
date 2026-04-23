@@ -8,6 +8,9 @@ import torch
 from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
     BaseRealtimeState,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def se3_inverse(T: torch.Tensor) -> torch.Tensor:
@@ -317,18 +320,26 @@ def prepare_lingbot_world_condition(
         if len(action_history) == 0:
             return None, None
 
-        return (
-            _build_camera_condition(
-                action_history=action_history,
-                width=int(batch.width),
-                height=int(batch.height),
-                spatial_scale=spatial_scale,
-                device=device,
-                dtype=dtype,
-                tail_chunk_size=chunk_size,
-            ),
-            None,
+        c2ws_plucker_emb = _build_camera_condition(
+            action_history=action_history,
+            width=int(batch.width),
+            height=int(batch.height),
+            spatial_scale=spatial_scale,
+            device=device,
+            dtype=dtype,
+            tail_chunk_size=chunk_size,
         )
+        logger.info(
+            "LingBot action condition prepared: session_id=%s, block_idx=%s, new_actions=%s, total_history=%s, c2ws_plucker_emb_shape=%s, abs_mean=%.6f, abs_max=%.6f",
+            batch.extra.get("realtime_session_id"),
+            batch.block_idx,
+            normalized_actions,
+            len(action_history),
+            tuple(c2ws_plucker_emb.shape),
+            c2ws_plucker_emb.abs().mean().item(),
+            c2ws_plucker_emb.abs().max().item(),
+        )
+        return c2ws_plucker_emb, None
     else:
         # Offline: actions define the full trajectory.
         temporal_ratio = (
