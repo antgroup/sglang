@@ -80,7 +80,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             )
             timesteps = scheduler_timesteps[1000 - timesteps]
         timesteps = timesteps.to(get_local_torch_device())
-        logger.info("Using timesteps: %s", timesteps)
+        logger.debug("Using timesteps: %s", timesteps)
 
         # Image kwargs (kept empty unless caller provides compatible args)
         image_kwargs: dict = {}
@@ -124,16 +124,10 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 self.crossattn_cache[block_index]["is_init"] = False  # type: ignore
             # reset kv cache pointers
             for block_index in range(len(self.kv_cache1)):
-                self.kv_cache1[block_index]["global_end_index"] = (
-                    torch.tensor(  # type: ignore
-                        [0], dtype=torch.long, device=latents.device
-                    )
-                )
-                self.kv_cache1[block_index]["local_end_index"] = (
-                    torch.tensor(  # type: ignore
-                        [0], dtype=torch.long, device=latents.device
-                    )
-                )
+                self.kv_cache1[block_index]["global_end_index"].fill_(0)  # type: ignore[index]
+                self.kv_cache1[block_index]["local_end_index"].fill_(0)  # type: ignore[index]
+                self.kv_cache1[block_index]["global_end_index_int"] = 0  # type: ignore[index]
+                self.kv_cache1[block_index]["local_end_index_int"] = 0  # type: ignore[index]
 
         # Optional: cache context features from provided image latents prior to generation
         current_start_frame = 0
@@ -233,7 +227,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
                 for i, t_cur in enumerate(timesteps):
                     # Copy for pred conversion
-                    noise_latents = noise_latents_btchw.clone()
+                    noise_latents = noise_latents_btchw
                     latent_model_input = current_latents.to(target_dtype)
 
                     if (
@@ -429,6 +423,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     "local_end_index": torch.tensor(
                         [0], dtype=torch.long, device=device
                     ),
+                    "global_end_index_int": 0,
+                    "local_end_index_int": 0,
                 }
             )
 

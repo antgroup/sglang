@@ -8,6 +8,8 @@ Extends CausalDMDDenoisingStage with:
 - Session-persistent KV cache with cumulative frame position tracking
 """
 
+import logging
+
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
@@ -120,7 +122,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             )
             timesteps = scheduler_timesteps[1000 - timesteps]
         timesteps = timesteps.to(device)
-        logger.info("Using timesteps: %s", timesteps)
+        logger.debug("Using timesteps: %s", timesteps)
 
         # --- Transformer kwargs ---
         # Note: bypass prepare_extra_func_kwargs because
@@ -186,26 +188,27 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         cond_idx = min(cache_state.chunk_idx, len(condition_chunks) - 1)
         condition = condition_chunks[cond_idx]
         c2ws_plucker_emb = getattr(batch, "c2ws_plucker_emb", None)
-        if c2ws_plucker_emb is None:
-            logger.info(
-                "LingBot transformer conditioning: session_id=%s, block_idx=%s, chunk_idx=%s, current_start_frame=%s, c2ws_plucker_emb=None",
-                batch.extra.get("realtime_session_id"),
-                batch.block_idx,
-                cache_state.chunk_idx,
-                current_start_frame,
-            )
-        else:
-            logger.info(
-                "LingBot transformer conditioning: session_id=%s, block_idx=%s, chunk_idx=%s, current_start_frame=%s, cond_idx=%s, c2ws_plucker_emb_shape=%s, abs_mean=%.6f, abs_max=%.6f",
-                batch.extra.get("realtime_session_id"),
-                batch.block_idx,
-                cache_state.chunk_idx,
-                current_start_frame,
-                cond_idx,
-                tuple(c2ws_plucker_emb.shape),
-                c2ws_plucker_emb.abs().mean().item(),
-                c2ws_plucker_emb.abs().max().item(),
-            )
+        if logger.isEnabledFor(logging.DEBUG):
+            if c2ws_plucker_emb is None:
+                logger.debug(
+                    "LingBot transformer conditioning: session_id=%s, block_idx=%s, chunk_idx=%s, current_start_frame=%s, c2ws_plucker_emb=None",
+                    batch.extra.get("realtime_session_id"),
+                    batch.block_idx,
+                    cache_state.chunk_idx,
+                    current_start_frame,
+                )
+            else:
+                logger.debug(
+                    "LingBot transformer conditioning: session_id=%s, block_idx=%s, chunk_idx=%s, current_start_frame=%s, cond_idx=%s, c2ws_plucker_emb_shape=%s, abs_mean=%.6f, abs_max=%.6f",
+                    batch.extra.get("realtime_session_id"),
+                    batch.block_idx,
+                    cache_state.chunk_idx,
+                    current_start_frame,
+                    cond_idx,
+                    tuple(c2ws_plucker_emb.shape),
+                    c2ws_plucker_emb.abs().mean().item(),
+                    c2ws_plucker_emb.abs().max().item(),
+                )
 
         # --- Denoising loop (single chunk) ---
         current_latents = latents
@@ -215,7 +218,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
         with self.progress_bar(total=len(timesteps)) as progress_bar:
             for i, t_cur in enumerate(timesteps):
-                noise_latents = noise_latents_btchw.clone()
+                noise_latents = noise_latents_btchw
 
                 # Concat [noise, condition] along channel dim
                 latent_model_input = torch.cat([current_latents, condition], dim=1).to(

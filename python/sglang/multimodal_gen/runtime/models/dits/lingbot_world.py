@@ -130,8 +130,13 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         sink_tokens = self.sink_size * frame_seqlen
         kv_cache_size = kv_cache["k"].shape[1]
         num_new_tokens = roped_query.shape[1]
-        global_end_index = kv_cache["global_end_index"].item()
-        local_end_index_prev = kv_cache["local_end_index"].item()
+        global_end_index = kv_cache.get("global_end_index_int")
+        local_end_index_prev = kv_cache.get("local_end_index_int")
+        if global_end_index is None or local_end_index_prev is None:
+            global_end_index = int(kv_cache["global_end_index"].item())
+            local_end_index_prev = int(kv_cache["local_end_index"].item())
+            kv_cache["global_end_index_int"] = global_end_index
+            kv_cache["local_end_index_int"] = local_end_index_prev
         window_start = global_end_index - local_end_index_prev
 
         if current_end <= global_end_index:
@@ -207,6 +212,8 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             kv_cache["k"][:, attn_start_index:visible_local_end],
             kv_cache["v"][:, attn_start_index:visible_local_end],
         )
+        kv_cache["global_end_index_int"] = visible_global_end
+        kv_cache["local_end_index_int"] = visible_local_end
         kv_cache["global_end_index"].fill_(visible_global_end)
         kv_cache["local_end_index"].fill_(visible_local_end)
         return x
