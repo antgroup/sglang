@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     LingBotWorldCausalDecodingStage,
     LingBotWorldCausalDMDDenoisingStage,
     LingBotWorldRealtimeImageVAEEncodingStage,
+    LingBotWorldRealtimeTextEncodingStage,
     WorldConditioningStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -43,7 +44,12 @@ class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
 
     def create_pipeline_stages(self, server_args) -> None:
         self.add_stage(InputValidationStage())
-        self.add_standard_text_encoding_stage()
+        self.add_stage(
+            LingBotWorldRealtimeTextEncodingStage(
+                text_encoders=[self.get_module("text_encoder")],
+                tokenizers=[self.get_module("tokenizer")],
+            )
+        )
 
         image_encoder = self.get_module("image_encoder", None)
         image_processor = self.get_module("image_processor", None)
