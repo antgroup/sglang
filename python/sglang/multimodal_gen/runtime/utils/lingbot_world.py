@@ -333,14 +333,11 @@ def prepare_lingbot_world_condition(
             tail_chunk_size=chunk_size,
         )
         logger.info(
-            "LingBot action condition prepared: session_id=%s, block_idx=%s, new_actions=%s, total_history=%s, c2ws_plucker_emb_shape=%s, abs_mean=%.6f, abs_max=%.6f",
+            "LingBot action condition prepared: session_id=%s, block_idx=%s, new_actions=%s, total_history=%s",
             batch.extra.get("realtime_session_id"),
             batch.block_idx,
             normalized_actions,
             len(action_history),
-            tuple(c2ws_plucker_emb.shape),
-            c2ws_plucker_emb.abs().mean().item(),
-            c2ws_plucker_emb.abs().max().item(),
         )
         return c2ws_plucker_emb, None
     else:
