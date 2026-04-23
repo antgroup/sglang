@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
+    KVCacheSteadyStateIndices,
+)
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
     BaseRealtimeState,
@@ -153,18 +156,78 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
         self.kv_cache1 = kv_cache1
 
-    def _should_use_cuda_graph(self, cache_state, server_args) -> bool:
+    def _should_use_cuda_graph(self, cache_state, batch) -> bool:
         """Check if CUDA graph mode should be used for this chunk."""
         from sglang.multimodal_gen import envs
 
         if not envs.SGLANG_LINGBOT_CUDA_GRAPH_ENABLED:
             return False
-        # Need enough chunks for KV window to fill and indices to stabilize
-        warmup_chunks = (
-            self.transformer.config.arch_config.sliding_window_num_frames
-            // self.num_frames_per_block
+        # NCCL all-to-all in CUDA graph is unreliable; disable for ulysses SP.
+        if (
+            getattr(batch, "enable_sequence_shard", False)
+            and get_ulysses_parallel_world_size() > 1
+        ):
+            return False
+        return True
+
+    def _compute_kv_indices(
+        self, cache_state, kv_cache1: list[dict],
+    ) -> tuple[KVCacheSteadyStateIndices, bool, KVCacheSteadyStateIndices]:
+        """Compute KV cache indices for the current chunk.
+
+        Returns (first_call_idx, first_needs_roll, subsequent_idx).
+        - Growing phase (cache not full): no roll, indices advance per chunk.
+        - Steady phase (cache full): first call rolls, subsequent calls overwrite.
+        """
+        from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
+            KVCacheSteadyStateIndices,
         )
-        return cache_state.chunk_idx >= warmup_chunks
+        arch = self.transformer.config.arch_config
+        kv_cache_size = kv_cache1[0]["k"].shape[1]
+        num_new_tokens = self.num_frames_per_block * self.frame_seq_length
+        sink_tokens = arch.sink_size * self.frame_seq_length
+        max_attention_size = (
+            32760 if arch.local_attn_size == -1
+            else arch.local_attn_size * self.frame_seq_length
+        )
+        window_chunks = arch.sliding_window_num_frames // self.num_frames_per_block
+        chunk_idx = cache_state.chunk_idx
+
+        if chunk_idx < window_chunks:
+            # Growing phase: no eviction, write at advancing position
+            write_start = chunk_idx * num_new_tokens
+            write_end = write_start + num_new_tokens
+            attn_end = write_end
+            attn_start = max(0, attn_end - max_attention_size)
+            idx = KVCacheSteadyStateIndices.__new__(KVCacheSteadyStateIndices)
+            idx.roll_dst_start = 0
+            idx.roll_dst_end = 0
+            idx.roll_src_start = 0
+            idx.roll_src_end = 0
+            idx.write_start = write_start
+            idx.write_end = write_end
+            idx.attn_start = attn_start
+            idx.attn_end = attn_end
+            return idx, False, idx  # no roll for any call
+        else:
+            # Steady phase: eviction + roll on first call
+            first_idx = KVCacheSteadyStateIndices(
+                kv_cache_size=kv_cache_size,
+                num_new_tokens=num_new_tokens,
+                sink_tokens=sink_tokens,
+                max_attention_size=max_attention_size,
+            )
+            # Subsequent calls: same write/attn but no roll
+            sub_idx = KVCacheSteadyStateIndices.__new__(KVCacheSteadyStateIndices)
+            sub_idx.roll_dst_start = 0
+            sub_idx.roll_dst_end = 0
+            sub_idx.roll_src_start = 0
+            sub_idx.roll_src_end = 0
+            sub_idx.write_start = first_idx.write_start
+            sub_idx.write_end = first_idx.write_end
+            sub_idx.attn_start = first_idx.attn_start
+            sub_idx.attn_end = first_idx.attn_end
+            return first_idx, True, sub_idx
 
     def _forward_cuda_graph(
         self,
@@ -180,10 +243,6 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         c2ws_plucker_emb: torch.Tensor | None,
     ) -> torch.Tensor:
         """Denoising loop using CUDA graph replay."""
-        from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
-            KVCacheSteadyStateIndices,
-        )
-
         target_dtype = torch.bfloat16
         device = latents.device
         b = latents.shape[0]
@@ -192,62 +251,31 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         w = latents.shape[4]
         current_start_frame = cache_state.current_chunk_start_frame
 
-        # Lazy-init the graph runner
+        # Lazy-init the graph runner (shared across chunks & sessions)
         runner = cache_state.cuda_graph_runner
         if runner is None:
-            arch = self.transformer.config.arch_config
-            kv_cache_size = kv_cache1[0]["k"].shape[1]
-            num_new_tokens = t * self.frame_seq_length
-            sink_tokens = arch.sink_size * self.frame_seq_length
-            max_attention_size = (
-                32760 if arch.local_attn_size == -1
-                else arch.local_attn_size * self.frame_seq_length
-            )
-            kv_idx = KVCacheSteadyStateIndices(
-                kv_cache_size=kv_cache_size,
-                num_new_tokens=num_new_tokens,
-                sink_tokens=sink_tokens,
-                max_attention_size=max_attention_size,
-            )
-            runner = LingBotWorldCudaGraphRunner(self.transformer, kv_idx)
-
-            # Prepare sample inputs for capture
-            sample_input = torch.cat([latents, condition], dim=1).to(target_dtype)
-            t_sample = timesteps[0] * torch.ones((b, 1), device=device, dtype=torch.long)
-            freqs_cis = self.transformer.compute_rope(
-                num_frames=t,
-                height=h,
-                width=w,
-                start_frame=current_start_frame,
-                device=device,
-            )
-            enc_hs = prompt_embeds[0] if isinstance(prompt_embeds, list) else prompt_embeds
-            enc_img = image_embeds[0] if len(image_embeds) > 0 else None
-
-            with torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=target_dtype,
-                enabled=True,
-            ):
-                runner.capture(
-                    hidden_states=sample_input,
-                    encoder_hidden_states=enc_hs,
-                    timestep=t_sample,
-                    freqs_cis=freqs_cis,
-                    kv_cache=kv_cache1,
-                    c2ws_plucker_emb=c2ws_plucker_emb,
-                    encoder_hidden_states_image=enc_img,
-                )
+            runner = LingBotWorldCudaGraphRunner(self.transformer)
             cache_state.cuda_graph_runner = runner
-            logger.info("CUDA graph runner initialized at chunk_idx=%d", cache_state.chunk_idx)
+
+        # Compute KV indices for this chunk
+        first_idx, first_needs_roll, sub_idx = self._compute_kv_indices(
+            cache_state, kv_cache1,
+        )
 
         # Pre-compute ROPE for this chunk
         freqs_cis = self.transformer.compute_rope(
-            num_frames=t,
-            height=h,
-            width=w,
-            start_frame=current_start_frame,
-            device=device,
+            num_frames=t, height=h, width=w,
+            start_frame=current_start_frame, device=device,
+        )
+
+        enc_hs = prompt_embeds[0] if isinstance(prompt_embeds, list) else prompt_embeds
+        enc_img = image_embeds[0] if len(image_embeds) > 0 else None
+        common_replay_kwargs = dict(
+            encoder_hidden_states=enc_hs,
+            kv_cache=kv_cache1,
+            c2ws_plucker_emb=c2ws_plucker_emb,
+            encoder_hidden_states_image=enc_img,
+            autocast_dtype=target_dtype,
         )
 
         # Denoising loop with graph replay
@@ -263,14 +291,18 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             t_expand = t_cur.repeat(b)
             t_expanded = t_cur * torch.ones((b, 1), device=device, dtype=torch.long)
 
-            # First call per chunk rolls KV cache; subsequent calls overwrite
+            # First call may need roll; subsequent calls never roll
             if i == 0:
-                pred_noise = runner.replay_with_roll(
-                    latent_model_input, t_expanded, freqs_cis, c2ws_plucker_emb,
+                pred_noise = runner.replay(
+                    latent_model_input, t_expanded, freqs_cis,
+                    kv_idx=first_idx, with_roll=first_needs_roll,
+                    **common_replay_kwargs,
                 )
             else:
-                pred_noise = runner.replay_no_roll(
-                    latent_model_input, t_expanded, freqs_cis, c2ws_plucker_emb,
+                pred_noise = runner.replay(
+                    latent_model_input, t_expanded, freqs_cis,
+                    kv_idx=sub_idx, with_roll=False,
+                    **common_replay_kwargs,
                 )
 
             # Convert flow pred -> x0
@@ -310,7 +342,11 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         t_context_val = int(context_noise)
         t_context = torch.ones((b, 1), device=device, dtype=torch.long) * t_context_val
         context_input = torch.cat([current_latents, condition], dim=1).to(target_dtype)
-        runner.replay_no_roll(context_input, t_context, freqs_cis, c2ws_plucker_emb)
+        runner.replay(
+            context_input, t_context, freqs_cis,
+            kv_idx=sub_idx, with_roll=False,
+            **common_replay_kwargs,
+        )
 
         return current_latents
 
@@ -436,7 +472,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         c2ws_plucker_emb = getattr(batch, "c2ws_plucker_emb", None)
 
         # ====== CUDA Graph path ======
-        if self._should_use_cuda_graph(cache_state, server_args):
+        if self._should_use_cuda_graph(cache_state, batch):
             current_latents = self._forward_cuda_graph(
                 batch=batch,
                 server_args=server_args,
