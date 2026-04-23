@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import LingBotWorldVideoConfig
@@ -45,8 +46,8 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
-    _usp_input_all_to_all,
-    _usp_output_all_to_all,
+    _usp_input_all_to_all_variable,
+    _usp_output_all_to_all_variable,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     PatchEmbed,
@@ -79,6 +80,40 @@ _is_cuda = current_platform.is_cuda()
 
 if _use_aiter:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
+
+
+def _compute_sequence_splits(total_len: int, world_size: int) -> list[int]:
+    base = total_len // world_size
+    remainder = total_len % world_size
+    return [base + (1 if rank < remainder else 0) for rank in range(world_size)]
+
+
+def _sequence_shard_tensor(
+    x: torch.Tensor, seq_splits: list[int], rank: int
+) -> torch.Tensor:
+    start = sum(seq_splits[:rank])
+    end = start + seq_splits[rank]
+    return x[:, start:end, ...].contiguous()
+
+
+def _sequence_all_gather_variable(
+    x: torch.Tensor,
+    seq_splits: list[int],
+    group: dist.ProcessGroup,
+) -> torch.Tensor:
+    rank = get_sp_parallel_rank()
+    max_seq = max(seq_splits)
+    local_seq = seq_splits[rank]
+    if local_seq < max_seq:
+        pad_shape = list(x.shape)
+        pad_shape[1] = max_seq - local_seq
+        pad = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
+        x = torch.cat([x, pad], dim=1)
+    gathered = [torch.empty_like(x) for _ in seq_splits]
+    dist.all_gather(gathered, x.contiguous(), group=group)
+    return torch.cat(
+        [chunk[:, :seq_len, ...] for chunk, seq_len in zip(gathered, seq_splits)], dim=1
+    )
 
 
 class LingBotWorldCamConditioner(nn.Module):
@@ -145,6 +180,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
         roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
         forward_batch = get_forward_context().forward_batch
+        seq_splits = None
         sequence_shard_enabled = (
             kv_cache is not None
             and forward_batch is not None
@@ -169,9 +205,19 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             )
 
         if sequence_shard_enabled:
-            roped_query = _usp_input_all_to_all(roped_query, head_dim=2)
-            roped_key = _usp_input_all_to_all(roped_key, head_dim=2)
-            v = _usp_input_all_to_all(v, head_dim=2)
+            seq_splits = getattr(forward_batch, "sequence_shard_splits", None)
+            if seq_splits is None:
+                raise ValueError(
+                    "LingBot causal sequence sharding requires forward_batch.sequence_shard_splits."
+                )
+            seq_splits = list(seq_splits)
+            roped_query = _usp_input_all_to_all_variable(
+                roped_query, seq_splits, head_dim=2
+            )
+            roped_key = _usp_input_all_to_all_variable(
+                roped_key, seq_splits, head_dim=2
+            )
+            v = _usp_input_all_to_all_variable(v, seq_splits, head_dim=2)
 
         frame_seqlen = roped_query.shape[1]
         current_end = current_start + roped_query.shape[1]
@@ -262,7 +308,8 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             kv_cache["v"][:, attn_start_index:visible_local_end],
         )
         if sequence_shard_enabled:
-            x = _usp_output_all_to_all(x, head_dim=2)
+            assert seq_splits is not None
+            x = _usp_output_all_to_all_variable(x, seq_splits, head_dim=2)
         kv_cache["global_end_index_int"] = visible_global_end
         kv_cache["local_end_index_int"] = visible_local_end
         kv_cache["global_end_index"].fill_(visible_global_end)
@@ -1062,6 +1109,12 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
+        if sequence_shard_enabled:
+            seq_shard_splits = _compute_sequence_splits(
+                post_patch_num_frames * post_patch_height * post_patch_width,
+                self.sp_size,
+            )
+            forward_batch.sequence_shard_splits = tuple(seq_shard_splits)
         if not sequence_shard_enabled:
             freqs_cos, freqs_sin = get_rotary_pos_embed(
                 (
@@ -1090,23 +1143,18 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             hidden_states, c2ws_plucker_emb
         )
         if sequence_shard_enabled:
-            seq_len_orig = hidden_states.shape[1]
-            if seq_len_orig % self.sp_size != 0:
-                raise ValueError(
-                    "LingBot causal sequence sharding requires chunk token count to be divisible by sp_degree, "
-                    f"got seq_len={seq_len_orig}, sp_degree={self.sp_size}."
-                )
             sp_rank = get_sp_parallel_rank()
-            local_seq_len = seq_len_orig // self.sp_size
-            hidden_states = hidden_states.view(
-                batch_size, self.sp_size, local_seq_len, hidden_states.shape[2]
-            )[:, sp_rank, :, :]
+            seq_shard_splits = list(forward_batch.sequence_shard_splits)
+            local_seq_len = seq_shard_splits[sp_rank]
+            hidden_states = _sequence_shard_tensor(
+                hidden_states, seq_shard_splits, sp_rank
+            )
             if c2ws_plucker_emb is not None:
-                c2ws_plucker_emb = c2ws_plucker_emb.view(
-                    batch_size, self.sp_size, local_seq_len, c2ws_plucker_emb.shape[2]
-                )[:, sp_rank, :, :]
+                c2ws_plucker_emb = _sequence_shard_tensor(
+                    c2ws_plucker_emb, seq_shard_splits, sp_rank
+                )
             frame_stride = post_patch_height * post_patch_width
-            token_start = start_frame * frame_stride + sp_rank * local_seq_len
+            token_start = start_frame * frame_stride + sum(seq_shard_splits[:sp_rank])
             freqs_cos, freqs_sin = self._compute_rope_for_sequence_shard_with_offset(
                 local_seq_len,
                 token_start,
@@ -1149,8 +1197,10 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             )
 
         if sequence_shard_enabled:
-            hidden_states = sequence_model_parallel_all_gather(
-                hidden_states.contiguous(), dim=1
+            hidden_states = _sequence_all_gather_variable(
+                hidden_states.contiguous(),
+                list(forward_batch.sequence_shard_splits),
+                get_sp_group().device_group,
             )
 
         temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)

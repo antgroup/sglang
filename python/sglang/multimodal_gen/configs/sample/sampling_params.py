@@ -474,13 +474,13 @@ class SamplingParams:
         if self.enable_sequence_shard:
             self.adjust_frames = False
             logger.info(
-                f"Sequence dimension shard is enabled, disabling frame adjustment for better performance"
+                "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
-                logger.debug(f"Setting `num_frames` to 1 for image generation model")
+                logger.debug("Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
 
         else:
@@ -565,7 +565,7 @@ class SamplingParams:
             sampling_params = SamplingParams.from_pretrained(
                 model_path, backend=server_args.backend, model_id=server_args.model_id
             )
-        except (AttributeError, ValueError) as e:
+        except (AttributeError, ValueError):
             # Handle safetensors files or other cases where model_index.json is not available
             # Use appropriate SamplingParams based on pipeline_class_name from registry
             if os.path.isfile(model_path) and model_path.endswith(".safetensors"):
