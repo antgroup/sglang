@@ -33,7 +33,6 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import dict_to_3d_list
 
 logger = init_logger(__name__)
 
@@ -124,32 +123,23 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         logger.info("Using timesteps: %s", timesteps)
 
         # --- Transformer kwargs ---
+        # Note: bypass prepare_extra_func_kwargs because
+        # CausalWanTransformer3DModel.forward uses (*args, **kwargs) which
+        # causes inspect-based filtering to drop all keyword arguments.
+        # The underlying _forward_inference accepts these explicitly.
         image_embeds = getattr(batch, "image_embeds", [])
         if len(image_embeds) > 0:
             image_embeds = [ie.to(target_dtype) for ie in image_embeds]
 
-        image_kwargs = self.prepare_extra_func_kwargs(
-            getattr(self.transformer, "forward", self.transformer),
-            {
-                "encoder_hidden_states_image": image_embeds,
-                "mask_strategy": dict_to_3d_list(None, t_max=50, l_max=60, h_max=24),
-            },
-        )
+        image_kwargs = {
+            "encoder_hidden_states_image": image_embeds,
+        }
 
-        # pos_cond_kwargs includes c2ws_plucker_emb via
-        # LingBotWorldI2VConfig.prepare_pos_cond_kwargs()
-        pos_cond_kwargs = self.prepare_extra_func_kwargs(
-            getattr(self.transformer, "forward", self.transformer),
-            {
-                "encoder_hidden_states_2": getattr(batch, "clip_embedding_pos", None),
-                "encoder_attention_mask": getattr(batch, "prompt_attention_mask", None),
-            }
-            | server_args.pipeline_config.prepare_pos_cond_kwargs(
-                batch,
-                self.device,
-                getattr(self.transformer, "rotary_emb", None),
-                dtype=target_dtype,
-            ),
+        pos_cond_kwargs = server_args.pipeline_config.prepare_pos_cond_kwargs(
+            batch,
+            self.device,
+            getattr(self.transformer, "rotary_emb", None),
+            dtype=target_dtype,
         )
 
         if self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN:
