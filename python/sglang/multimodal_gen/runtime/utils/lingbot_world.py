@@ -169,6 +169,7 @@ def actions_to_c2ws(action_history: list[list[str]]) -> list[np.ndarray]:
 def get_camera_control(
     action_history: list[list[str]],
     *,
+    chunk_size: int,
     width: int,
     height: int,
     device: torch.device | str,
@@ -181,7 +182,8 @@ def get_camera_control(
         [[500.0, 500.0, width / 2, height / 2]],
         device=device,
         dtype=dtype,
-    ).repeat(len(action_history), 1)
+    ).repeat(chunk_size, 1)
+    logger.info(f"prefix c2ws shape: {c2ws.shape}, Ks shape: {Ks.shape}")
     return c2ws, Ks
 
 
@@ -265,6 +267,7 @@ def _build_camera_condition(
 ) -> torch.Tensor:
     c2ws_prefix, Ks = get_camera_control(
         action_history,
+        chunk_size=tail_chunk_size,
         width=width,
         height=height,
         device=device,
@@ -273,7 +276,7 @@ def _build_camera_condition(
     c2ws_prefix = compute_relative_poses(c2ws_prefix, framewise=True)
     if tail_chunk_size is not None:
         c2ws_prefix = c2ws_prefix[-tail_chunk_size:]
-        Ks = Ks[-tail_chunk_size:]
+
     return camera_poses_to_plucker(
         c2ws=c2ws_prefix,
         Ks=Ks,
