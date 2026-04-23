@@ -161,9 +161,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         )
 
         if should_reset_cache:
-            self._initialize_kv_cache(
-                batch_size=b, dtype=target_dtype, device=device
-            )
+            self._initialize_kv_cache(batch_size=b, dtype=target_dtype, device=device)
             self._initialize_crossattn_cache(
                 batch_size=b,
                 max_text_len=server_args.pipeline_config.text_encoder_configs[
@@ -187,6 +185,27 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         condition_chunks = condition_full.split(t, dim=2)
         cond_idx = min(cache_state.chunk_idx, len(condition_chunks) - 1)
         condition = condition_chunks[cond_idx]
+        c2ws_plucker_emb = getattr(batch, "c2ws_plucker_emb", None)
+        if c2ws_plucker_emb is None:
+            logger.info(
+                "LingBot transformer conditioning: session_id=%s, block_idx=%s, chunk_idx=%s, current_start_frame=%s, c2ws_plucker_emb=None",
+                batch.extra.get("realtime_session_id"),
+                batch.block_idx,
+                cache_state.chunk_idx,
+                current_start_frame,
+            )
+        else:
+            logger.info(
+                "LingBot transformer conditioning: session_id=%s, block_idx=%s, chunk_idx=%s, current_start_frame=%s, cond_idx=%s, c2ws_plucker_emb_shape=%s, abs_mean=%.6f, abs_max=%.6f",
+                batch.extra.get("realtime_session_id"),
+                batch.block_idx,
+                cache_state.chunk_idx,
+                current_start_frame,
+                cond_idx,
+                tuple(c2ws_plucker_emb.shape),
+                c2ws_plucker_emb.abs().mean().item(),
+                c2ws_plucker_emb.abs().max().item(),
+            )
 
         # --- Denoising loop (single chunk) ---
         current_latents = latents
@@ -199,9 +218,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 noise_latents = noise_latents_btchw.clone()
 
                 # Concat [noise, condition] along channel dim
-                latent_model_input = torch.cat(
-                    [current_latents, condition], dim=1
-                ).to(target_dtype)
+                latent_model_input = torch.cat([current_latents, condition], dim=1).to(
+                    target_dtype
+                )
 
                 t_expand = t_cur.repeat(b)
 
@@ -234,7 +253,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                     ),
                 ):
                     t_expanded = t_cur * torch.ones(
-                        (b, 1), device=device, dtype=torch.long,
+                        (b, 1),
+                        device=device,
+                        dtype=torch.long,
                     )
                     pred_noise = self.transformer(
                         latent_model_input,
@@ -288,9 +309,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         t_context = torch.ones([b], device=device, dtype=torch.long) * int(
             context_noise
         )
-        context_input = torch.cat(
-            [current_latents, condition], dim=1
-        ).to(target_dtype)
+        context_input = torch.cat([current_latents, condition], dim=1).to(target_dtype)
         with (
             torch.autocast(
                 device_type=current_platform.device_type,

@@ -59,6 +59,13 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             chunk_size = batch.extra.get("chunk_size", 1)
             control_chunk = session.sample_control_chunk(chunk_size)
             if control_chunk is not None:
+                logger.info(
+                    "consume realtime action, session_id=%s, block_idx=%s, chunk_size=%s, control_chunk=%s",
+                    session.id,
+                    batch.block_idx,
+                    chunk_size,
+                    control_chunk,
+                )
                 batch.extra["actions"] = control_chunk
             batch.input_video = (
                 session.sample_video_frames() if session.is_v2v_enabled() else None

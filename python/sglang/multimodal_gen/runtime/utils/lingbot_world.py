@@ -8,6 +8,9 @@ import torch
 from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
     BaseRealtimeState,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def se3_inverse(T: torch.Tensor) -> torch.Tensor:
@@ -166,6 +169,7 @@ def actions_to_c2ws(action_history: list[list[str]]) -> list[np.ndarray]:
 def get_camera_control(
     action_history: list[list[str]],
     *,
+    chunk_size: int,
     width: int,
     height: int,
     device: torch.device | str,
@@ -178,7 +182,8 @@ def get_camera_control(
         [[500.0, 500.0, width / 2, height / 2]],
         device=device,
         dtype=dtype,
-    ).repeat(len(action_history), 1)
+    ).repeat(chunk_size, 1)
+    logger.info(f"prefix c2ws shape: {c2ws.shape}, Ks shape: {Ks.shape}")
     return c2ws, Ks
 
 
@@ -262,6 +267,7 @@ def _build_camera_condition(
 ) -> torch.Tensor:
     c2ws_prefix, Ks = get_camera_control(
         action_history,
+        chunk_size=tail_chunk_size,
         width=width,
         height=height,
         device=device,
@@ -270,7 +276,7 @@ def _build_camera_condition(
     c2ws_prefix = compute_relative_poses(c2ws_prefix, framewise=True)
     if tail_chunk_size is not None:
         c2ws_prefix = c2ws_prefix[-tail_chunk_size:]
-        Ks = Ks[-tail_chunk_size:]
+
     return camera_poses_to_plucker(
         c2ws=c2ws_prefix,
         Ks=Ks,
@@ -317,18 +323,26 @@ def prepare_lingbot_world_condition(
         if len(action_history) == 0:
             return None, None
 
-        return (
-            _build_camera_condition(
-                action_history=action_history,
-                width=int(batch.width),
-                height=int(batch.height),
-                spatial_scale=spatial_scale,
-                device=device,
-                dtype=dtype,
-                tail_chunk_size=chunk_size,
-            ),
-            None,
+        c2ws_plucker_emb = _build_camera_condition(
+            action_history=action_history,
+            width=int(batch.width),
+            height=int(batch.height),
+            spatial_scale=spatial_scale,
+            device=device,
+            dtype=dtype,
+            tail_chunk_size=chunk_size,
         )
+        logger.info(
+            "LingBot action condition prepared: session_id=%s, block_idx=%s, new_actions=%s, total_history=%s, c2ws_plucker_emb_shape=%s, abs_mean=%.6f, abs_max=%.6f",
+            batch.extra.get("realtime_session_id"),
+            batch.block_idx,
+            normalized_actions,
+            len(action_history),
+            tuple(c2ws_plucker_emb.shape),
+            c2ws_plucker_emb.abs().mean().item(),
+            c2ws_plucker_emb.abs().max().item(),
+        )
+        return c2ws_plucker_emb, None
     else:
         # Offline: actions define the full trajectory.
         temporal_ratio = (

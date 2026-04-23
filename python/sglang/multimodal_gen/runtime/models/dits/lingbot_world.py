@@ -78,10 +78,13 @@ class LingBotWorldCamConditioner(nn.Module):
         self.cam_shift_layer = nn.Linear(dim, dim)
 
     def forward(
-        self, hidden_states: torch.Tensor, c2ws_plucker_emb: torch.Tensor | None
-    ) -> torch.Tensor:
+        self,
+        hidden_states: torch.Tensor,
+        c2ws_plucker_emb: torch.Tensor | None,
+        return_debug_stats: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
         if c2ws_plucker_emb is None:
-            return hidden_states
+            return (hidden_states, {}) if return_debug_stats else hidden_states
         if c2ws_plucker_emb.shape != hidden_states.shape:
             raise ValueError(
                 "c2ws_plucker_emb shape must match hidden_states shape, "
@@ -91,7 +94,17 @@ class LingBotWorldCamConditioner(nn.Module):
         c2ws_hidden_states = c2ws_hidden_states + c2ws_plucker_emb
         cam_scale = self.cam_scale_layer(c2ws_hidden_states)
         cam_shift = self.cam_shift_layer(c2ws_hidden_states)
-        return (1.0 + cam_scale) * hidden_states + cam_shift
+        conditioned = (1.0 + cam_scale) * hidden_states + cam_shift
+        if not return_debug_stats:
+            return conditioned
+        return conditioned, {
+            "cam_input_abs_mean": c2ws_plucker_emb.abs().mean().item(),
+            "cam_hidden_abs_mean": c2ws_hidden_states.abs().mean().item(),
+            "cam_scale_abs_mean": cam_scale.abs().mean().item(),
+            "cam_scale_abs_max": cam_scale.abs().max().item(),
+            "cam_shift_abs_mean": cam_shift.abs().mean().item(),
+            "cam_shift_abs_max": cam_shift.abs().max().item(),
+        }
 
 
 class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
@@ -772,6 +785,7 @@ class LingBotWorldTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
 class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
     def __init__(self, *args, **kwargs):
+        prefix = kwargs.get("prefix", "")
         super().__init__(*args, **kwargs)
         self.attn1 = LingBotWorldCausalSelfAttention(
             dim=self.hidden_dim,
@@ -782,6 +796,11 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             eps=self.attn1.eps,
         )
         self.cam_conditioner = LingBotWorldCamConditioner(self.hidden_dim)
+        self.debug_block_idx = None
+        if isinstance(prefix, str):
+            maybe_idx = prefix.rsplit(".", 1)[-1]
+            if maybe_idx.isdigit():
+                self.debug_block_idx = int(maybe_idx)
 
     def forward(
         self,
@@ -849,9 +868,41 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        hidden_states = self.cam_conditioner(
-            hidden_states.to(orig_dtype), c2ws_plucker_emb
-        )
+        hidden_states_before_cam = hidden_states.to(orig_dtype)
+        if c2ws_plucker_emb is not None and self.debug_block_idx == 0:
+            hidden_states, cam_stats = self.cam_conditioner(
+                hidden_states_before_cam,
+                c2ws_plucker_emb,
+                return_debug_stats=True,
+            )
+            delta = hidden_states - hidden_states_before_cam
+            forward_ctx = get_forward_context()
+            forward_batch = getattr(forward_ctx, "forward_batch", None)
+            logger.info(
+                "LingBot cam conditioner effect: session_id=%s, request_block_idx=%s, model_block_idx=%s, timestep_idx=%s, hidden_abs_mean=%.6f, conditioned_abs_mean=%.6f, delta_abs_mean=%.6f, delta_abs_max=%.6f, cam_input_abs_mean=%.6f, cam_hidden_abs_mean=%.6f, cam_scale_abs_mean=%.6f, cam_scale_abs_max=%.6f, cam_shift_abs_mean=%.6f, cam_shift_abs_max=%.6f",
+                (
+                    forward_batch.extra.get("realtime_session_id")
+                    if forward_batch is not None and hasattr(forward_batch, "extra")
+                    else None
+                ),
+                getattr(forward_batch, "block_idx", None),
+                self.debug_block_idx,
+                getattr(forward_ctx, "current_timestep", None),
+                hidden_states_before_cam.abs().mean().item(),
+                hidden_states.abs().mean().item(),
+                delta.abs().mean().item(),
+                delta.abs().max().item(),
+                cam_stats["cam_input_abs_mean"],
+                cam_stats["cam_hidden_abs_mean"],
+                cam_stats["cam_scale_abs_mean"],
+                cam_stats["cam_scale_abs_max"],
+                cam_stats["cam_shift_abs_mean"],
+                cam_stats["cam_shift_abs_max"],
+            )
+        else:
+            hidden_states = self.cam_conditioner(
+                hidden_states_before_cam, c2ws_plucker_emb
+            )
         norm_hidden_states = self.self_attn_residual_norm.norm(hidden_states).to(
             orig_dtype
         )
@@ -889,6 +940,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
     ) -> None:
         super().__init__(config=config, hf_config=hf_config, quant_config=quant_config)
         inner_dim = config.num_attention_heads * config.attention_head_dim
+        self._logged_camera_weight_stats = False
         self.patch_embedding_wancamctrl = WanCamControlPatchEmbedding(
             in_chans=6 * 64,
             embed_dim=inner_dim,
@@ -920,10 +972,42 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
     ) -> torch.Tensor | None:
         if c2ws_plucker_emb is None:
             return None
-        c2ws_plucker_emb = self.patch_embedding_wancamctrl(
+        c2ws_patch_emb = self.patch_embedding_wancamctrl(
             c2ws_plucker_emb.to(device=hidden_states.device, dtype=hidden_states.dtype)
         )
-        return c2ws_plucker_emb + self.c2ws_mlp(c2ws_plucker_emb)
+        c2ws_prepared = c2ws_patch_emb + self.c2ws_mlp(c2ws_patch_emb)
+        if not self._logged_camera_weight_stats:
+            self._logged_camera_weight_stats = True
+            block0 = self.blocks[0]
+            logger.info(
+                "LingBot camera weight stats: patch_proj_abs_mean=%.6f, c2ws_fc_in_abs_mean=%.6f, c2ws_fc_out_abs_mean=%.6f, block0_cam_fc_in_abs_mean=%.6f, block0_cam_fc_out_abs_mean=%.6f, block0_cam_scale_abs_mean=%.6f, block0_cam_shift_abs_mean=%.6f",
+                self.patch_embedding_wancamctrl.proj.weight.abs().mean().item(),
+                self.c2ws_mlp.fc_in.weight.abs().mean().item(),
+                self.c2ws_mlp.fc_out.weight.abs().mean().item(),
+                block0.cam_conditioner.cam_injector.fc_in.weight.abs().mean().item(),
+                block0.cam_conditioner.cam_injector.fc_out.weight.abs().mean().item(),
+                block0.cam_conditioner.cam_scale_layer.weight.abs().mean().item(),
+                block0.cam_conditioner.cam_shift_layer.weight.abs().mean().item(),
+            )
+        forward_ctx = get_forward_context()
+        forward_batch = getattr(forward_ctx, "forward_batch", None)
+        logger.info(
+            "LingBot c2ws embedding prepared: session_id=%s, request_block_idx=%s, timestep_idx=%s, patch_emb_shape=%s, prepared_shape=%s, patch_emb_abs_mean=%.6f, patch_emb_abs_max=%.6f, prepared_abs_mean=%.6f, prepared_abs_max=%.6f",
+            (
+                forward_batch.extra.get("realtime_session_id")
+                if forward_batch is not None and hasattr(forward_batch, "extra")
+                else None
+            ),
+            getattr(forward_batch, "block_idx", None),
+            getattr(forward_ctx, "current_timestep", None),
+            tuple(c2ws_patch_emb.shape),
+            tuple(c2ws_prepared.shape),
+            c2ws_patch_emb.abs().mean().item(),
+            c2ws_patch_emb.abs().max().item(),
+            c2ws_prepared.abs().mean().item(),
+            c2ws_prepared.abs().max().item(),
+        )
+        return c2ws_prepared
 
     def _forward_inference(
         self,
