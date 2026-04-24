@@ -341,9 +341,10 @@ class DecodePreallocQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        # HiSparse Host pool has page_size=1; use it when hisparse is enabled
         kv_args.page_size = (
-            1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size
+            self.scheduler.hisparse_coordinator.mem_pool_host.page_size
+            if self.scheduler.enable_hisparse
+            else self.token_to_kv_pool.page_size
         )
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
@@ -744,7 +745,7 @@ class DecodePreallocQueue:
                 kv_indices = (
                     dst_kv_indices[:origin_input_len].cpu().numpy().astype(np.int32)
                 )
-                page_size = 1  # host pool page_size
+                page_size = self.scheduler.hisparse_coordinator.mem_pool_host.page_size
             else:
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx
@@ -909,14 +910,7 @@ class DecodePreallocQueue:
                 extend_num_tokens=fill_len,
             )
             # Allocate host indices for the RDMA transfer target
-            host_indices = coordinator.mem_pool_host.alloc(fill_len)
-            if host_indices is None:
-                raise RuntimeError(
-                    f"HiSparse host mem pool alloc failed for {fill_len} tokens "
-                    f"in _pre_alloc (req {req.rid})"
-                )
-            host_indices = host_indices.to(device=coordinator.device)
-            coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
+            host_indices = coordinator.ensure_host_slots(req.req_pool_idx, 0, fill_len)
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
         else:
