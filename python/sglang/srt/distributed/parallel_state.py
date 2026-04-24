@@ -69,6 +69,10 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
+# Reuse the user-provided distributed timeout for model-parallel subgroup
+# creation so runtime collectives do not silently fall back to backend defaults.
+_MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
+
 
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
@@ -278,6 +282,7 @@ class GroupCoordinator:
         for ranks in group_ranks:
             active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
             active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
+            subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
 
@@ -285,16 +290,21 @@ class GroupCoordinator:
                     ranks,
                     backend="mooncake",
                     pg_options=MooncakeBackendOptions(active_ranks),
+                    timeout=subgroup_timeout,
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake-cpu",
                     pg_options=MooncakeBackendOptions(active_ranks_cpu),
+                    timeout=subgroup_timeout,
                 )
             else:
                 pg_options = get_torch_distributed_pg_options(group_name)
                 device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend, pg_options=pg_options
+                    ranks,
+                    backend=torch_distributed_backend,
+                    pg_options=pg_options,
+                    timeout=subgroup_timeout,
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
@@ -1724,6 +1734,7 @@ def init_distributed_environment(
         mooncake_ep.set_host_ip(get_local_ip_auto())
 
     if not torch.distributed.is_initialized():
+        global _MODEL_PARALLEL_GROUP_TIMEOUT
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
             "distributed environment"
@@ -1732,7 +1743,7 @@ def init_distributed_environment(
             assert isinstance(timeout, (int)), "timeout must be a number"
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)
-
+        _MODEL_PARALLEL_GROUP_TIMEOUT = timeout
         pg_options = get_torch_distributed_pg_options()
 
         # this backend is used for WORLD
@@ -1932,6 +1943,7 @@ def initialize_model_parallel(
                 )
                 ranks = list(range(st, en))
                 group_ranks.append(ranks)
+
         _ATTN_TP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -1990,8 +2002,12 @@ def initialize_model_parallel(
 
     global _MOE_DP
     assert _MOE_DP is None, "moe data parallel group is already initialized"
-    # gpus_per_pp_stage = tensor_model_parallel_size * attention_context_model_parallel_size
-    if moe_dp_size == tensor_model_parallel_size:
+    if attn_cp_size > moe_dp_size:
+        # When moe_dp_size < attn_cp_size, CP ranks must share tokens before MoE.
+        # The MOE_DP group includes these CP partners, so the existing DP
+        # allgather/scatter handles the token sharing.
+        _MOE_DP = _ATTN_CP
+    elif moe_dp_size == tensor_model_parallel_size:
         _MOE_DP = _TP
     else:
         group_ranks = []
@@ -2319,6 +2335,12 @@ def destroy_model_parallel():
     _MOE_TP = None
 
     global _ATTN_CP
+    global _MOE_DP
+    # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
+    # Only destroy if not aliasing another group.
+    if _MOE_DP and _MOE_DP is not _ATTN_CP and _MOE_DP is not _TP:
+        _MOE_DP.destroy()
+    _MOE_DP = None
     if _ATTN_CP:
         _ATTN_CP.destroy()
     _ATTN_CP = None
@@ -2327,11 +2349,6 @@ def destroy_model_parallel():
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
-
-    global _MOE_DP
-    if _MOE_DP:
-        _MOE_DP.destroy()
-    _MOE_DP = None
 
     global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
@@ -2345,10 +2362,11 @@ def destroy_model_parallel():
 
 
 def destroy_distributed_environment():
-    global _WORLD
+    global _WORLD, _MODEL_PARALLEL_GROUP_TIMEOUT
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
+    _MODEL_PARALLEL_GROUP_TIMEOUT = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 
