@@ -8,8 +8,6 @@ Extends CausalDMDDenoisingStage with:
 - Session-persistent KV cache with cumulative frame position tracking
 """
 
-from typing import Any
-
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
@@ -26,9 +24,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDDenoisingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.lingbot_world_realtime_text import (
-    make_lingbot_world_realtime_text_cache_key,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -53,7 +48,6 @@ class LingBotWorldCausalDMDRealtimeState(BaseRealtimeState):
         super().__init__()
         self.current_chunk_start_frame: int = 0
         self.chunk_idx: int = 0
-        self.crossattn_cache_key: tuple[Any, ...] | None = None
 
 
 class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
@@ -152,52 +146,6 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
         self.kv_cache1 = kv_cache1
 
-    def _initialize_crossattn_cache(
-        self, batch_size, max_text_len, dtype, device
-    ) -> None:
-        """
-        Initialize LingBot cross-attention cache in the same local-head layout as attn2.
-        """
-        crossattn_cache = []
-        attn2 = self.transformer.blocks[0].attn2
-        num_attention_heads = attn2.local_num_heads
-        attention_head_dim = attn2.head_dim
-        for _ in range(self.num_transformer_blocks):
-            crossattn_cache.append(
-                {
-                    "k": torch.zeros(
-                        [
-                            batch_size,
-                            max_text_len,
-                            num_attention_heads,
-                            attention_head_dim,
-                        ],
-                        dtype=dtype,
-                        device=device,
-                    ),
-                    "v": torch.zeros(
-                        [
-                            batch_size,
-                            max_text_len,
-                            num_attention_heads,
-                            attention_head_dim,
-                        ],
-                        dtype=dtype,
-                        device=device,
-                    ),
-                    "context_len": 0,
-                    "is_init": False,
-                }
-            )
-        self.crossattn_cache = crossattn_cache
-
-    def _invalidate_crossattn_cache(
-        self, crossattn_cache: list[dict[str, Any]]
-    ) -> None:
-        for block_cache in crossattn_cache:
-            block_cache["context_len"] = 0
-            block_cache["is_init"] = False
-
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         target_dtype = torch.bfloat16
         autocast_enabled = (
@@ -269,7 +217,6 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             self.prepare_sta_param(batch, server_args)
 
         prompt_embeds = server_args.pipeline_config.get_pos_prompt_embeds(batch)
-        crossattn_cache_key = make_lingbot_world_realtime_text_cache_key(batch)
 
         # --- KV cache from session state ---
         cache_state, persist_cache_state = self._get_cache_state(batch)
@@ -286,8 +233,6 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                     "LingBot causal sequence sharding currently supports ulysses_degree > 1 with ring_degree = 1 only."
                 )
             expected_cache_heads //= get_ulysses_parallel_world_size()
-        expected_crossattn_heads = self.transformer.blocks[0].attn2.local_num_heads
-        expected_crossattn_head_dim = self.transformer.blocks[0].attn2.head_dim
 
         should_reset_cache = (
             batch.block_idx == 0
@@ -296,10 +241,6 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             or len(kv_cache1) != self.num_transformer_blocks
             or len(crossattn_cache) != self.num_transformer_blocks
             or kv_cache1[0]["k"].shape[2] != expected_cache_heads
-            or crossattn_cache[0]["k"].shape[0] != b
-            or crossattn_cache[0]["k"].shape[1] < prompt_embeds.shape[1]
-            or crossattn_cache[0]["k"].shape[2] != expected_crossattn_heads
-            or crossattn_cache[0]["k"].shape[3] != expected_crossattn_head_dim
         )
 
         if should_reset_cache:
@@ -322,12 +263,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             # Reset frame position on cache reset
             cache_state.current_chunk_start_frame = 0
             cache_state.chunk_idx = 0
-            cache_state.crossattn_cache_key = None
-
-        if should_reset_cache or cache_state.crossattn_cache_key != crossattn_cache_key:
-            assert crossattn_cache is not None
-            self._invalidate_crossattn_cache(crossattn_cache)
-            cache_state.crossattn_cache_key = crossattn_cache_key
+        else:
+            for block_index in range(self.num_transformer_blocks):
+                crossattn_cache[block_index]["is_init"] = False
 
         current_start_frame = cache_state.current_chunk_start_frame
 
