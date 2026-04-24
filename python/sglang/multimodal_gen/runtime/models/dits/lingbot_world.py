@@ -211,13 +211,10 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                     "LingBot causal sequence sharding requires forward_batch.sequence_shard_splits."
                 )
             seq_splits = list(seq_splits)
-            roped_query = _usp_input_all_to_all_variable(
-                roped_query, seq_splits, head_dim=2
-            )
-            roped_key = _usp_input_all_to_all_variable(
-                roped_key, seq_splits, head_dim=2
-            )
-            v = _usp_input_all_to_all_variable(v, seq_splits, head_dim=2)
+            # Pack Q/K/V to avoid launching three Ulysses all-to-all collectives.
+            qkv = torch.cat([roped_query, roped_key, v], dim=-1)
+            qkv = _usp_input_all_to_all_variable(qkv, seq_splits, head_dim=2)
+            roped_query, roped_key, v = qkv.chunk(3, dim=-1)
 
         frame_seqlen = roped_query.shape[1]
         current_end = current_start + roped_query.shape[1]
