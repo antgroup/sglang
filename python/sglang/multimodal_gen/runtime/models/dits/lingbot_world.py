@@ -116,6 +116,69 @@ def _sequence_all_gather_variable(
     )
 
 
+class LingBotWorldT2VCrossAttention(WanT2VCrossAttention):
+    def _project_context_kv(
+        self,
+        context: torch.Tensor,
+        crossattn_cache: dict[str, Any] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        context_len = context.shape[1]
+        if crossattn_cache is not None:
+            cache_k = crossattn_cache["k"]
+            cache_v = crossattn_cache["v"]
+            if context_len > cache_k.shape[1]:
+                raise ValueError(
+                    "cross-attention cache is smaller than the current text context: "
+                    f"{context_len} > {cache_k.shape[1]}"
+                )
+            cached_context_len = int(crossattn_cache.get("context_len", 0))
+            if crossattn_cache["is_init"] and cached_context_len == context_len:
+                return (
+                    cache_k[:, :context_len],
+                    cache_v[:, :context_len],
+                )
+
+        k, _ = self.to_k(context)
+        if self.tp_rmsnorm:
+            k = tensor_parallel_rms_norm(k, self.norm_k)
+        else:
+            k = self.norm_k(k)
+        k = k.unflatten(2, (self.local_num_heads, self.head_dim))
+
+        v, _ = self.to_v(context)
+        v = v.unflatten(2, (self.local_num_heads, self.head_dim))
+
+        if crossattn_cache is not None:
+            crossattn_cache["k"][:, :context_len].copy_(k)
+            crossattn_cache["v"][:, :context_len].copy_(v)
+            crossattn_cache["context_len"] = context_len
+            crossattn_cache["is_init"] = True
+
+        return k, v
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        context_lens: int | None,
+        crossattn_cache: dict[str, Any] | None = None,
+    ) -> torch.Tensor:
+        del context_lens
+        q, _ = self.to_q(x)
+        if self.tp_rmsnorm:
+            q = tensor_parallel_rms_norm(q, self.norm_q)
+        else:
+            q = self.norm_q(q)
+        q = q.unflatten(2, (self.local_num_heads, self.head_dim))
+
+        k, v = self._project_context_kv(context, crossattn_cache)
+
+        x = self.attn(q, k, v)
+        x = x.flatten(2)
+        x, _ = self.to_out(x)
+        return x
+
+
 class LingBotWorldCamConditioner(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
@@ -408,9 +471,11 @@ class LingBotWorldTransformerBlock(nn.Module):
             dtype=torch.float32,
         )
 
-        cross_attn_backends = {
-            b for b in supported_attention_backends if not b.is_sparse
-        }
+        cross_attn_backends = (
+            {b for b in supported_attention_backends if not b.is_sparse}
+            if supported_attention_backends is not None
+            else None
+        )
         if added_kv_proj_dim is not None:
             self.attn2 = WanI2VCrossAttention(
                 dim,
@@ -422,7 +487,7 @@ class LingBotWorldTransformerBlock(nn.Module):
                 quant_config=quant_config,
             )
         else:
-            self.attn2 = WanT2VCrossAttention(
+            self.attn2 = LingBotWorldT2VCrossAttention(
                 dim,
                 num_heads,
                 qk_norm=qk_norm,
@@ -876,8 +941,35 @@ class LingBotWorldTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
 
 class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        dim: int,
+        ffn_dim: int,
+        num_heads: int,
+        local_attn_size: int = -1,
+        sink_size: int = 0,
+        qk_norm: str = "rms_norm_across_heads",
+        cross_attn_norm: bool = False,
+        eps: float = 1e-6,
+        added_kv_proj_dim: int | None = None,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
+    ):
+        super().__init__(
+            dim=dim,
+            ffn_dim=ffn_dim,
+            num_heads=num_heads,
+            local_attn_size=local_attn_size,
+            sink_size=sink_size,
+            qk_norm=qk_norm,
+            cross_attn_norm=cross_attn_norm,
+            eps=eps,
+            added_kv_proj_dim=added_kv_proj_dim,
+            supported_attention_backends=supported_attention_backends,
+            prefix=prefix,
+            quant_config=quant_config,
+        )
         self.attn1 = LingBotWorldCausalSelfAttention(
             dim=self.hidden_dim,
             num_heads=self.num_attention_heads,
@@ -885,6 +977,20 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             sink_size=self.attn1.sink_size,
             qk_norm=self.attn1.qk_norm,
             eps=self.attn1.eps,
+        )
+        cross_attn_backends = (
+            {b for b in supported_attention_backends if not b.is_sparse}
+            if supported_attention_backends is not None
+            else None
+        )
+        self.attn2 = LingBotWorldT2VCrossAttention(
+            dim=self.hidden_dim,
+            num_heads=self.num_attention_heads,
+            qk_norm=qk_norm,
+            eps=eps,
+            prefix=add_prefix("attn2", prefix),
+            supported_attention_backends=cross_attn_backends,
+            quant_config=quant_config,
         )
         self.cam_conditioner = LingBotWorldCamConditioner(self.hidden_dim)
 
@@ -964,6 +1070,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             norm_hidden_states,
             context=encoder_hidden_states,
             context_lens=None,
+            crossattn_cache=crossattn_cache,
         )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa

@@ -39,6 +39,18 @@ def _copy_tensor_list(
     return list(value)
 
 
+def make_lingbot_world_realtime_text_cache_key(batch: Req) -> tuple[Any, ...]:
+    return (
+        _normalize_prompt_value(batch.prompt),
+        bool(batch.do_classifier_free_guidance),
+        (
+            _normalize_prompt_value(batch.negative_prompt)
+            if batch.do_classifier_free_guidance
+            else None
+        ),
+    )
+
+
 class LingBotWorldRealtimeTextState(BaseRealtimeState):
     def __init__(self):
         super().__init__()
@@ -66,15 +78,7 @@ class LingBotWorldRealtimeTextState(BaseRealtimeState):
 
 class LingBotWorldRealtimeTextEncodingStage(TextEncodingStage):
     def _make_cache_key(self, batch: Req) -> tuple[Any, ...]:
-        return (
-            _normalize_prompt_value(batch.prompt),
-            bool(batch.do_classifier_free_guidance),
-            (
-                _normalize_prompt_value(batch.negative_prompt)
-                if batch.do_classifier_free_guidance
-                else None
-            ),
-        )
+        return make_lingbot_world_realtime_text_cache_key(batch)
 
     def _restore_cached_outputs(
         self, batch: Req, state: LingBotWorldRealtimeTextState
