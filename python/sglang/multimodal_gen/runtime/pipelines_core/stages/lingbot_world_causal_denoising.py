@@ -269,6 +269,12 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             self.prepare_sta_param(batch, server_args)
 
         prompt_embeds = server_args.pipeline_config.get_pos_prompt_embeds(batch)
+        if isinstance(prompt_embeds, list):
+            if len(prompt_embeds) == 0:
+                raise ValueError(
+                    "LingBot causal denoising requires non-empty prompt_embeds."
+                )
+            prompt_embeds = prompt_embeds[0]
         crossattn_cache_key = make_lingbot_world_realtime_text_cache_key(batch)
 
         # --- KV cache from session state ---
