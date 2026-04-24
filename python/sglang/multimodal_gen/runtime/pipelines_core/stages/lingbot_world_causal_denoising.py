@@ -285,7 +285,6 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         enc_hs = prompt_embeds[0] if isinstance(prompt_embeds, list) else prompt_embeds
         enc_img = image_embeds[0] if len(image_embeds) > 0 else None
         common_replay_kwargs = dict(
-            encoder_hidden_states=enc_hs,
             kv_cache=kv_cache1,
             c2ws_plucker_emb=c2ws_plucker_emb,
             encoder_hidden_states_image=enc_img,
@@ -308,13 +307,13 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             # First call may need roll; subsequent calls never roll
             if i == 0:
                 pred_noise = runner.replay(
-                    latent_model_input, t_expanded, freqs_cis,
+                    latent_model_input, enc_hs, t_expanded, freqs_cis,
                     kv_idx=first_idx, with_roll=first_needs_roll,
                     **common_replay_kwargs,
                 )
             else:
                 pred_noise = runner.replay(
-                    latent_model_input, t_expanded, freqs_cis,
+                    latent_model_input, enc_hs, t_expanded, freqs_cis,
                     kv_idx=sub_idx, with_roll=False,
                     **common_replay_kwargs,
                 )
@@ -357,7 +356,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         t_context = torch.ones((b, 1), device=device, dtype=torch.long) * t_context_val
         context_input = torch.cat([current_latents, condition], dim=1).to(target_dtype)
         runner.replay(
-            context_input, t_context, freqs_cis,
+            context_input, enc_hs, t_context, freqs_cis,
             kv_idx=sub_idx, with_roll=False,
             **common_replay_kwargs,
         )
