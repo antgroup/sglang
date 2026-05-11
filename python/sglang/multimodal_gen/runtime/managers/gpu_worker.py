@@ -13,6 +13,7 @@ import torch
 from setproctitle import setproctitle
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_tp_rank,
@@ -32,7 +33,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     FileReadyNotification,
+    FrameBytesNotification,
+    SharedFrameBytesNotification,
+    encode_video_outputs_to_frame_bytes,
     save_outputs,
+    unlink_shared_memory,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.loader.weights_updater import (
@@ -355,14 +360,91 @@ class GPUWorker:
                         if copy_event is not None:
                             copy_event.synchronize()
                         del source_ref
-                        saved_paths = _save_output_file(output, req, output_batch)
-                        notify_callback(
-                            FileReadyNotification(
-                                dispatch_id=req.extra.get("realtime_session_id", ""),
-                                request_id=req.request_id,
-                                file_paths=saved_paths,
+                        realtime_session_id = req.extra.get("realtime_session_id", "")
+                        if (
+                            req.session is not None
+                            and realtime_session_id
+                            and req.data_type == DataType.VIDEO
+                        ):
+                            image_format = req.extra.get(
+                                "realtime_frame_encoding", "jpeg"
                             )
-                        )
+                            frame_bytes, mime_type = (
+                                encode_video_outputs_to_frame_bytes(
+                                    output,
+                                    req.data_type,
+                                    req.fps,
+                                    image_format=image_format,
+                                    output_compression=req.output_compression,
+                                    enable_frame_interpolation=req.enable_frame_interpolation,
+                                    frame_interpolation_exp=req.frame_interpolation_exp,
+                                    frame_interpolation_scale=req.frame_interpolation_scale,
+                                    frame_interpolation_model_path=req.frame_interpolation_model_path,
+                                    enable_upscaling=req.enable_upscaling,
+                                    upscaling_model_path=req.upscaling_model_path,
+                                    upscaling_scale=req.upscaling_scale,
+                                )
+                            )
+                            frame_slices: list[tuple[int, int]] = []
+                            total_size = sum(len(frame) for frame in frame_bytes)
+                            try:
+                                import multiprocessing.shared_memory as shared_memory
+
+                                shm = shared_memory.SharedMemory(
+                                    create=True, size=max(total_size, 1)
+                                )
+                            except OSError as e:
+                                logger.warning(
+                                    "Failed to create shared memory for realtime "
+                                    "frames; falling back to ZMQ multipart: %s",
+                                    e,
+                                )
+                                notify_callback(
+                                    FrameBytesNotification(
+                                        dispatch_id=realtime_session_id,
+                                        request_id=req.request_id,
+                                        mime_type=mime_type,
+                                        frames=frame_bytes,
+                                    )
+                                )
+                                return
+
+                            shm_name = shm.name
+                            try:
+                                offset = 0
+                                for frame in frame_bytes:
+                                    frame_size = len(frame)
+                                    shm.buf[offset : offset + frame_size] = frame
+                                    frame_slices.append((offset, frame_size))
+                                    offset += frame_size
+                            except Exception:
+                                shm.close()
+                                unlink_shared_memory(shm_name)
+                                raise
+                            else:
+                                shm.close()
+
+                            notification_sent = notify_callback(
+                                SharedFrameBytesNotification(
+                                    dispatch_id=realtime_session_id,
+                                    request_id=req.request_id,
+                                    mime_type=mime_type,
+                                    shm_name=shm_name,
+                                    shm_size=total_size,
+                                    frame_slices=frame_slices,
+                                )
+                            )
+                            if notification_sent is False:
+                                unlink_shared_memory(shm_name)
+                        else:
+                            saved_paths = _save_output_file(output, req, output_batch)
+                            notify_callback(
+                                FileReadyNotification(
+                                    dispatch_id=realtime_session_id,
+                                    request_id=req.request_id,
+                                    file_paths=saved_paths,
+                                )
+                            )
 
                     self._save_file_executor.submit(
                         _async_save_with_postprocess,

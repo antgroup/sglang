@@ -20,8 +20,10 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromDiskReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    FrameBytesNotification,
     ListLorasReq,
     MergeLoraWeightsReq,
+    Notification,
     ReleaseRealtimeSessionReq,
     SetLoraReq,
     ShutdownReq,
@@ -195,17 +197,28 @@ class Scheduler:
         if not is_warmup and self.receiver is not None and identity is not None:
             self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
 
-    def _send_notification(self, notification: dict):
+    def _send_notification(self, notification: Notification) -> bool:
         """Send notification directly via ZMQ PUSH socket.
 
         This is called from ThreadPoolExecutor's worker thread (max_workers=1),
         so it's safe to use ZMQ socket directly without additional synchronization.
         """
-        if self.notifier is not None:
-            try:
+        if self.notifier is None:
+            return False
+        try:
+            if isinstance(notification, FrameBytesNotification):
+                frames = notification.frames
+                notification.frames = []
+                try:
+                    self.notifier.send_multipart([pickle.dumps(notification), *frames])
+                finally:
+                    notification.frames = frames
+            else:
                 self.notifier.send(pickle.dumps(notification))
-            except Exception as e:
-                logger.error(f"Error sending notification: {e}")
+            return True
+        except Exception as e:
+            logger.error(f"Error sending notification: {e}")
+            return False
 
     def get_next_batch_to_run(self) -> list[tuple[bytes, Req]] | None:
         """pull a req from waiting_queue"""

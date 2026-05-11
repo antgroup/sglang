@@ -5,7 +5,12 @@ from typing import Any
 import zmq
 import zmq.asyncio
 
-from sglang.multimodal_gen.runtime.entrypoints.utils import Notification
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    FrameBytesNotification,
+    Notification,
+    SharedFrameBytesNotification,
+    unlink_shared_memory,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -25,7 +30,15 @@ def register_notification_listener(dispatch_id: str) -> asyncio.Queue:
 
 def unregister_notification_listener(dispatch_id: str) -> None:
     """Remove the per-session notification queue."""
-    _notification_registry.pop(dispatch_id, None)
+    q = _notification_registry.pop(dispatch_id, None)
+    if q is not None:
+        while True:
+            try:
+                notification = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if isinstance(notification, SharedFrameBytesNotification):
+                unlink_shared_memory(notification.shm_name)
     logger.debug(f"Unregistered notification listener for dispatch_id={dispatch_id}")
 
 
@@ -39,6 +52,8 @@ def _dispatch_notification(notification: Notification) -> None:
         logger.warning(
             f"No listener for notification dispatch_id={dispatch_id}, dropping"
         )
+        if isinstance(notification, SharedFrameBytesNotification):
+            unlink_shared_memory(notification.shm_name)
 
 
 async def run_notification_listener(server_args: ServerArgs) -> None:
@@ -53,8 +68,10 @@ async def run_notification_listener(server_args: ServerArgs) -> None:
 
     while True:
         try:
-            payload = await socket.recv()
-            notification = pickle.loads(payload)
+            parts = await socket.recv_multipart()
+            notification = pickle.loads(parts[0])
+            if isinstance(notification, FrameBytesNotification):
+                notification.frames = parts[1:]
             _dispatch_notification(notification)
         except Exception as e:
             logger.error(f"Error in notification listener: {e}", exc_info=True)

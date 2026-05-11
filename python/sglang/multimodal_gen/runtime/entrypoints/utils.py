@@ -8,6 +8,7 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
+import io
 import os
 import shutil
 import subprocess
@@ -83,6 +84,38 @@ class Notification:
 class FileReadyNotification(Notification):
     request_id: str
     file_paths: list[str]
+
+
+@dataclass
+class FrameBytesNotification(Notification):
+    request_id: str
+    mime_type: str
+    frames: list[bytes] = field(default_factory=list, repr=False)
+
+
+@dataclass
+class SharedFrameBytesNotification(Notification):
+    request_id: str
+    mime_type: str
+    shm_name: str
+    shm_size: int
+    frame_slices: list[tuple[int, int]]
+
+
+def unlink_shared_memory(shm_name: str) -> None:
+    import multiprocessing.shared_memory as shared_memory
+
+    try:
+        shm = shared_memory.SharedMemory(name=shm_name)
+    except FileNotFoundError:
+        return
+
+    try:
+        shm.unlink()
+    except FileNotFoundError:
+        pass
+    finally:
+        shm.close()
 
 
 def format_lora_message(
@@ -406,6 +439,81 @@ def save_outputs(
     return output_paths
 
 
+def encode_video_outputs_to_frame_bytes(
+    outputs: Sequence[Any],
+    data_type: DataType,
+    fps: int,
+    *,
+    image_format: str = "jpeg",
+    output_compression: Optional[int] = None,
+    enable_frame_interpolation: bool = False,
+    frame_interpolation_exp: int = 1,
+    frame_interpolation_scale: float = 1.0,
+    frame_interpolation_model_path: Optional[str] = None,
+    enable_upscaling: bool = False,
+    upscaling_model_path: Optional[str] = None,
+    upscaling_scale: int = 4,
+) -> tuple[list[bytes], str]:
+    """Encode generated video frames into per-frame image payloads in memory."""
+    if data_type != DataType.VIDEO:
+        raise ValueError(f"Frame byte streaming only supports video, got {data_type}")
+
+    normalized_format = (image_format or "jpeg").lower()
+    if normalized_format in ("jpg", "jpeg"):
+        pil_format = "JPEG"
+        mime_type = "image/jpeg"
+    elif normalized_format == "png":
+        pil_format = "PNG"
+        mime_type = "image/png"
+    else:
+        raise ValueError(f"Unsupported realtime frame encoding: {image_format}")
+
+    encoded_frames: list[bytes] = []
+    for output in outputs:
+        frames = post_process_sample(
+            output,
+            data_type,
+            fps,
+            save_output=False,
+            output_compression=output_compression,
+            enable_frame_interpolation=enable_frame_interpolation,
+            frame_interpolation_exp=frame_interpolation_exp,
+            frame_interpolation_scale=frame_interpolation_scale,
+            frame_interpolation_model_path=frame_interpolation_model_path,
+            enable_upscaling=enable_upscaling,
+            upscaling_model_path=upscaling_model_path,
+            upscaling_scale=upscaling_scale,
+        )
+        for frame in frames:
+            from PIL import Image
+
+            frame_array = np.asarray(frame)
+            if frame_array.ndim == 3 and frame_array.shape[-1] == 1:
+                frame_array = frame_array[..., 0]
+            image = Image.fromarray(frame_array)
+            if pil_format == "JPEG" and image.mode != "RGB":
+                image = image.convert("RGB")
+
+            with io.BytesIO() as buffer:
+                if pil_format == "JPEG":
+                    quality = (
+                        max(1, min(95, int(output_compression)))
+                        if output_compression is not None
+                        else 85
+                    )
+                    image.save(buffer, format=pil_format, quality=quality)
+                else:
+                    compress_level = (
+                        max(0, min(9, int(output_compression) // 10))
+                        if output_compression is not None
+                        else 1
+                    )
+                    image.save(buffer, format=pil_format, compress_level=compress_level)
+                encoded_frames.append(buffer.getvalue())
+
+    return encoded_frames, mime_type
+
+
 def post_process_sample(
     sample: Any,
     data_type: DataType,
@@ -530,7 +638,7 @@ def post_process_sample(
 
             logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
         else:
-            logger.info(f"No output path provided, output not saved")
+            logger.info("No output path provided, output not saved")
 
     return frames
 

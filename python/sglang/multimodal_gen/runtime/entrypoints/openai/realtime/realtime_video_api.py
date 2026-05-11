@@ -21,7 +21,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     FileReadyNotification,
+    FrameBytesNotification,
     ReleaseRealtimeSessionReq,
+    SharedFrameBytesNotification,
     prepare_request,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import (
@@ -46,17 +48,49 @@ async def _recv_notify_and_send(
             notification = await asyncio.wait_for(
                 notification_queue.get(), timeout=None
             )
-            if not isinstance(notification, FileReadyNotification):
+            if isinstance(notification, FrameBytesNotification):
+                for frame_bytes in notification.frames:
+                    await write_binary_frame_msg(frame_bytes, ws)
                 continue
 
-            # send file contents to client
-            for file_path in notification.file_paths:
-                with open(file_path, "rb") as f:
-                    frame_bytes = f.read()
-                await write_frame_msg(frame_bytes, ws)
+            if isinstance(notification, SharedFrameBytesNotification):
+                await _send_shared_frame_notification(notification, ws)
+                continue
+
+            if isinstance(notification, FileReadyNotification):
+                # send file contents to client
+                for file_path in notification.file_paths:
+                    with open(file_path, "rb") as f:
+                        frame_bytes = f.read()
+                    await write_frame_msg(frame_bytes, ws)
         except Exception as e:
             err_msg = str(e).splitlines()[0]
             logger.error(f"error during sending bytes from queue: {err_msg}")
+
+
+async def _send_shared_frame_notification(
+    notification: SharedFrameBytesNotification,
+    ws: WebSocket,
+):
+    import multiprocessing.shared_memory as shared_memory
+
+    shm = shared_memory.SharedMemory(name=notification.shm_name)
+    try:
+        for offset, frame_size in notification.frame_slices:
+            if offset < 0 or frame_size < 0:
+                raise ValueError("invalid shared frame slice")
+            if offset + frame_size > notification.shm_size:
+                raise ValueError("shared frame slice exceeds advertised size")
+            if offset + frame_size > shm.size:
+                raise ValueError("shared frame slice exceeds shared memory size")
+            frame_bytes = bytes(shm.buf[offset : offset + frame_size])
+            await write_binary_frame_msg(frame_bytes, ws)
+    finally:
+        try:
+            shm.unlink()
+        except FileNotFoundError:
+            pass
+        shm.close()
 
 
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
@@ -83,6 +117,9 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             )
             batch.session = session.realtime_session
             batch.extra["realtime_session_id"] = session.id
+            batch.extra["realtime_frame_encoding"] = (
+                session.request.realtime_frame_encoding or "jpeg"
+            )
             batch.block_idx = session.generate_chunk_cnt
             chunk_size = batch.extra.get("chunk_size", 1)
             control_chunk = session.sample_control_chunk(chunk_size)
@@ -295,3 +332,7 @@ async def write_status_msg(status: str, websocket: WebSocket):
 
 async def write_frame_msg(content: bytes, websocket: WebSocket):
     await websocket.send_bytes(packb({"type": "frame", "content": content}))
+
+
+async def write_binary_frame_msg(content: bytes, websocket: WebSocket):
+    await websocket.send_bytes(content)
