@@ -132,6 +132,7 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     seed: Optional[int] = 42
     guidance_scale: Optional[float] = 1.0
     size: Optional[str] = "832x480"
+    upscaling_scale: Optional[int] = 2
     profile: Optional[bool] = False
     num_profiled_timesteps: Optional[int] = None
     profile_all_stages: Optional[bool] = False

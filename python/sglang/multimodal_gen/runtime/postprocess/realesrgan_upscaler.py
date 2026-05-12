@@ -592,6 +592,18 @@ def upscale_frames(
     Returns:
         List of upscaled uint8 HWC numpy frames.
     """
+    from sglang.multimodal_gen.runtime.postprocess.flashvsr_upscaler import (
+        is_flashvsr_model_path,
+        upscale_frames_flashvsr,
+    )
+
+    if is_flashvsr_model_path(model_path):
+        return upscale_frames_flashvsr(
+            frames,
+            model_path=model_path,
+            scale=scale,
+        )
+
     upscaler = ImageUpscaler(
         model_path=model_path, scale=scale, half_precision=half_precision
     )
