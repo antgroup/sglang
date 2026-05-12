@@ -283,25 +283,26 @@ async def process_generation_batch(
         save_file_path_list = []
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths
-        elif result.output:
+        elif result.output is not None:
             num_outputs = len(result.output)
-            save_file_path_list = save_outputs(
-                result.output,
-                batch.data_type,
-                batch.fps,
-                batch.save_output,
-                lambda idx: str(batch.output_file_path(num_outputs, idx)),
-                audio=result.audio,
-                audio_sample_rate=result.audio_sample_rate,
-                output_compression=batch.output_compression,
-                enable_frame_interpolation=batch.enable_frame_interpolation,
-                frame_interpolation_exp=batch.frame_interpolation_exp,
-                frame_interpolation_scale=batch.frame_interpolation_scale,
-                frame_interpolation_model_path=batch.frame_interpolation_model_path,
-                enable_upscaling=batch.enable_upscaling,
-                upscaling_model_path=batch.upscaling_model_path,
-                upscaling_scale=batch.upscaling_scale,
-            )
+            if num_outputs > 0:
+                save_file_path_list = save_outputs(
+                    result.output,
+                    batch.data_type,
+                    batch.fps,
+                    batch.save_output,
+                    lambda idx: str(batch.output_file_path(num_outputs, idx)),
+                    audio=result.audio,
+                    audio_sample_rate=result.audio_sample_rate,
+                    output_compression=batch.output_compression,
+                    enable_frame_interpolation=batch.enable_frame_interpolation,
+                    frame_interpolation_exp=batch.frame_interpolation_exp,
+                    frame_interpolation_scale=batch.frame_interpolation_scale,
+                    frame_interpolation_model_path=batch.frame_interpolation_model_path,
+                    enable_upscaling=batch.enable_upscaling,
+                    upscaling_model_path=batch.upscaling_model_path,
+                    upscaling_scale=batch.upscaling_scale,
+                )
 
     total_time = time.perf_counter() - total_start_time
     log_batch_completion(logger, 1, total_time)

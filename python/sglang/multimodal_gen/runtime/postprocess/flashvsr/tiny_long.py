@@ -407,7 +407,7 @@ def _model_fn_wan_video_window_sp(
 ):
     win = (2, 8, 8)
     x_windows = _tokens_to_windows(x, f, h, w, win)
-    freq_windows = _tokens_to_windows(freqs.transpose(0, 1), f, h, w, win)[0]
+    freq_windows = _tokens_to_windows(freqs.transpose(0, 1), f, h, w, win)
     total_windows = x_windows.shape[0]
     start, end = _balanced_range(
         total_windows, sp_group.world_size, sp_group.rank_in_group
@@ -417,7 +417,7 @@ def _model_fn_wan_video_window_sp(
         for rank in range(sp_group.world_size)
     ]
     x = _flatten_windows(x_windows[start:end])
-    freqs_local = _flatten_windows(freq_windows[start:end].unsqueeze(0)).transpose(0, 1)
+    freqs_local = _flatten_windows(freq_windows[start:end]).transpose(0, 1)
     lq_window_latents = None
     if lq_latents is not None:
         lq_window_latents = [
