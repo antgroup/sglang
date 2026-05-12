@@ -422,7 +422,7 @@ def save_outputs_distributed_flashvsr(
 ) -> list[str]:
     """Run FlashVSR upscaling cooperatively across the SP group.
 
-    Rank 0 converts and saves frames.  All SP ranks receive the same pre-VSR
+    Rank 0 converts and saves frames. All SP ranks receive the same pre-VSR
     frames and enter FlashVSR so its internal collectives cannot deadlock.
     """
     import torch.distributed as dist

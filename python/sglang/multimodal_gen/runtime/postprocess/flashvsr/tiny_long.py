@@ -13,14 +13,24 @@ import os
 from typing import Literal
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 from safetensors.torch import load_file as load_safetensors
 
 from .lq_projector import Causal_LQ4x_Proj
 from .model_utils import init_weights_on_device
 from .tc_decoder import build_tcdecoder
-from .wan_video_dit import WanModel, WanModelStateDictConverter, sinusoidal_embedding_1d
+from .wan_video_dit import (
+    WanModel,
+    WanModelStateDictConverter,
+    WindowPartition3D,
+    build_local_block_mask_shifted_vec_normal_slide,
+    modulate,
+    rope_apply,
+    sinusoidal_embedding_1d,
+)
 
 _DIT_WEIGHT_KEYS = {
     "dim",
@@ -148,7 +158,10 @@ class FlashVSRTinyLongRunner(nn.Module):
             )
 
         self.dit.LQ_proj_in.clear_cache()
-        self.tc_decoder.clean_mem()
+        sp_group = _get_flashvsr_sp_group()
+        decode_on_rank = sp_group is None or sp_group.rank_in_group == 0
+        if decode_on_rank:
+            self.tc_decoder.clean_mem()
         lq_pre_idx = 0
         lq_cur_idx = 0
         frames_total = []
@@ -187,31 +200,34 @@ class FlashVSRTinyLongRunner(nn.Module):
                 local_range=local_range,
             )
             cur_latents = cur_latents - noise_pred
-            cur_lq_frame = lq_video[:, :, lq_pre_idx:lq_cur_idx, :, :]
-            cur_frames = (
-                self.tc_decoder.decode_video(
-                    cur_latents.transpose(1, 2),
-                    parallel=False,
-                    show_progress_bar=False,
-                    cond=cur_lq_frame,
-                )
-                .transpose(1, 2)
-                .mul_(2)
-                .sub_(1)
-            )
-
-            if color_fix:
-                cur_frames = self.color_corrector(
-                    cur_frames.to(device=self.device),
-                    cur_lq_frame,
-                    clip_range=(-1, 1),
-                    chunk_size=None,
-                    method="adain",
+            if decode_on_rank:
+                cur_lq_frame = lq_video[:, :, lq_pre_idx:lq_cur_idx, :, :]
+                cur_frames = (
+                    self.tc_decoder.decode_video(
+                        cur_latents.transpose(1, 2),
+                        parallel=False,
+                        show_progress_bar=False,
+                        cond=cur_lq_frame,
+                    )
+                    .transpose(1, 2)
+                    .mul_(2)
+                    .sub_(1)
                 )
 
-            frames_total.append(cur_frames.cpu())
+                if color_fix:
+                    cur_frames = self.color_corrector(
+                        cur_frames.to(device=self.device),
+                        cur_lq_frame,
+                        clip_range=(-1, 1),
+                        chunk_size=None,
+                        method="adain",
+                    )
+
+                frames_total.append(cur_frames.cpu())
             lq_pre_idx = lq_cur_idx
 
+        if not decode_on_rank:
+            return torch.empty((3, 0, height, width), dtype=self.dtype)
         return torch.cat(frames_total, dim=2)[0]
 
     def _collect_lq_latents(
@@ -298,6 +314,27 @@ def model_fn_wan_video(
             .to(x.device)
         )
 
+    sp_group = _get_flashvsr_sp_group()
+    if sp_group is not None:
+        return _model_fn_wan_video_window_sp(
+            dit,
+            x=x,
+            context=context,
+            lq_latents=lq_latents,
+            pre_cache_k=pre_cache_k,
+            pre_cache_v=pre_cache_v,
+            topk=topk,
+            kv_len=kv_len,
+            f=f,
+            h=h,
+            w=w,
+            freqs=freqs,
+            t_mod=t_mod,
+            t=t,
+            local_range=local_range,
+            sp_group=sp_group,
+        )
+
     for block_id, block in enumerate(dit.blocks):
         if lq_latents is not None and block_id < len(lq_latents):
             x = x + lq_latents[block_id]
@@ -326,6 +363,316 @@ def model_fn_wan_video(
 
     x = dit.head(x, t)
     return dit.unpatchify(x, (f, h, w)), pre_cache_k, pre_cache_v
+
+
+def _get_flashvsr_sp_group():
+    if os.environ.get("FLASHVSR_SP", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return None
+    if not dist.is_available() or not dist.is_initialized():
+        return None
+    try:
+        from sglang.multimodal_gen.runtime.distributed import get_sp_group
+
+        sp_group = get_sp_group()
+    except Exception:
+        return None
+    if getattr(sp_group, "world_size", 1) <= 1:
+        return None
+    return sp_group
+
+
+def _model_fn_wan_video_window_sp(
+    dit: WanModel,
+    *,
+    x: torch.Tensor,
+    context: torch.Tensor | None,
+    lq_latents: list[torch.Tensor] | None,
+    pre_cache_k: list[torch.Tensor] | None,
+    pre_cache_v: list[torch.Tensor] | None,
+    topk: int,
+    kv_len: int,
+    f: int,
+    h: int,
+    w: int,
+    freqs: torch.Tensor,
+    t_mod: torch.Tensor,
+    t: torch.Tensor,
+    local_range: int,
+    sp_group,
+):
+    win = (2, 8, 8)
+    x_windows = _tokens_to_windows(x, f, h, w, win)
+    freq_windows = _tokens_to_windows(freqs.transpose(0, 1), f, h, w, win)[0]
+    total_windows = x_windows.shape[0]
+    start, end = _balanced_range(
+        total_windows, sp_group.world_size, sp_group.rank_in_group
+    )
+    window_ranges = [
+        _balanced_range(total_windows, sp_group.world_size, rank)
+        for rank in range(sp_group.world_size)
+    ]
+    x = _flatten_windows(x_windows[start:end])
+    freqs_local = _flatten_windows(freq_windows[start:end].unsqueeze(0)).transpose(0, 1)
+    lq_window_latents = None
+    if lq_latents is not None:
+        lq_window_latents = [
+            _flatten_windows(_tokens_to_windows(item, f, h, w, win)[start:end])
+            for item in lq_latents
+        ]
+
+    for block_id, block in enumerate(dit.blocks):
+        if lq_window_latents is not None and block_id < len(lq_window_latents):
+            x = x + lq_window_latents[block_id]
+        x, last_pre_cache_k, last_pre_cache_v = _dit_block_window_sp(
+            block,
+            x=x,
+            context=context,
+            t_mod=t_mod,
+            freqs=freqs_local,
+            f=f,
+            h=h,
+            w=w,
+            topk=topk,
+            kv_len=kv_len,
+            pre_cache_k=pre_cache_k[block_id] if pre_cache_k is not None else None,
+            pre_cache_v=pre_cache_v[block_id] if pre_cache_v is not None else None,
+            local_range=local_range,
+            sp_group=sp_group,
+            window_ranges=window_ranges,
+            local_window_start=start,
+        )
+        if pre_cache_k is not None:
+            pre_cache_k[block_id] = last_pre_cache_k
+        if pre_cache_v is not None:
+            pre_cache_v[block_id] = last_pre_cache_v
+
+    x = dit.head(x, t)
+    local_windows = _unflatten_windows(x, end - start, win)
+    gathered_windows = _all_gather_variable_windows(
+        local_windows, window_ranges, sp_group
+    )
+    tokens = _windows_to_tokens(gathered_windows, f, h, w, win)
+    return dit.unpatchify(tokens, (f, h, w)), pre_cache_k, pre_cache_v
+
+
+def _dit_block_window_sp(
+    block,
+    *,
+    x: torch.Tensor,
+    context: torch.Tensor | None,
+    t_mod: torch.Tensor,
+    freqs: torch.Tensor,
+    f: int,
+    h: int,
+    w: int,
+    topk: int,
+    kv_len: int,
+    pre_cache_k: torch.Tensor | None,
+    pre_cache_v: torch.Tensor | None,
+    local_range: int,
+    sp_group,
+    window_ranges: list[tuple[int, int]],
+    local_window_start: int,
+):
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+        block.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
+    ).chunk(6, dim=1)
+    input_x = modulate(block.norm1(x), shift_msa, scale_msa)
+    self_attn_output, cache_k, cache_v = _self_attention_window_sp(
+        block.self_attn,
+        input_x,
+        freqs=freqs,
+        f=f,
+        h=h,
+        w=w,
+        topk=topk,
+        kv_len=kv_len,
+        pre_cache_k=pre_cache_k,
+        pre_cache_v=pre_cache_v,
+        local_range=local_range,
+        sp_group=sp_group,
+        window_ranges=window_ranges,
+        local_window_start=local_window_start,
+    )
+    x = block.gate(x, gate_msa, self_attn_output)
+    x = x + block.cross_attn(block.norm3(x), context, is_stream=True)
+    input_x = modulate(block.norm2(x), shift_mlp, scale_mlp)
+    x = block.gate(x, gate_mlp, block.ffn(input_x))
+    return x, cache_k, cache_v
+
+
+def _self_attention_window_sp(
+    self_attn,
+    x: torch.Tensor,
+    *,
+    freqs: torch.Tensor,
+    f: int,
+    h: int,
+    w: int,
+    topk: int,
+    kv_len: int,
+    pre_cache_k: torch.Tensor | None,
+    pre_cache_v: torch.Tensor | None,
+    local_range: int,
+    sp_group,
+    window_ranges: list[tuple[int, int]],
+    local_window_start: int,
+):
+    batch, local_len, dim = x.shape
+    win = (2, 8, 8)
+    block_s = win[0] * win[1] * win[2]
+    local_windows = local_len // block_s
+    q = self_attn.norm_q(self_attn.q(x))
+    k = self_attn.norm_k(self_attn.k(x))
+    v = self_attn.v(x)
+    q = rope_apply(q, freqs, self_attn.num_heads)
+    k = rope_apply(k, freqs, self_attn.num_heads)
+    q_w = rearrange(q, "b (n s) d -> (b n) s d", n=local_windows, s=block_s)
+    k_w_local = rearrange(k, "b (n s) d -> (b n) s d", n=local_windows, s=block_s)
+    v_w_local = rearrange(v, "b (n s) d -> (b n) s d", n=local_windows, s=block_s)
+    k_w = _all_gather_variable_windows(k_w_local, window_ranges, sp_group)
+    v_w = _all_gather_variable_windows(v_w_local, window_ranges, sp_group)
+    if pre_cache_k is not None and pre_cache_v is not None:
+        k_w = torch.cat([pre_cache_k, k_w], dim=0)
+        v_w = torch.cat([pre_cache_v, v_w], dim=0)
+
+    reorder_q = rearrange(
+        q_w, "(b block_n) block_s d -> b (block_n block_s) d", b=batch
+    )
+    reorder_k = rearrange(
+        k_w, "(b block_n) block_s d -> b (block_n block_s) d", b=batch
+    )
+    reorder_v = rearrange(
+        v_w, "(b block_n) block_s d -> b (block_n block_s) d", b=batch
+    )
+    q_indices = torch.arange(
+        local_window_start,
+        local_window_start + local_windows,
+        device=x.device,
+    )
+    k_indices = torch.arange(k_w.shape[0], device=x.device)
+    attention_mask = _generate_window_sp_block_mask(
+        batch,
+        self_attn.num_heads,
+        q_w,
+        k_w,
+        q_indices,
+        k_indices,
+        h=h,
+        w=w,
+        topk=topk,
+        local_range=local_range,
+    )
+    out = self_attn.attn(reorder_q, reorder_k, reorder_v, attention_mask)
+    out = self_attn.o(out)
+
+    spatial_windows = h // 8 * (w // 8)
+    cache_num = k_w.shape[0] // spatial_windows
+    if cache_num > kv_len:
+        cache_k = k_w[spatial_windows:, :, :]
+        cache_v = v_w[spatial_windows:, :, :]
+    else:
+        cache_k = k_w
+        cache_v = v_w
+    return out, cache_k, cache_v
+
+
+def _generate_window_sp_block_mask(
+    batch_size: int,
+    nheads: int,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    q_indices: torch.Tensor,
+    k_indices: torch.Tensor,
+    *,
+    h: int,
+    w: int,
+    topk: int,
+    local_range: int,
+) -> torch.Tensor:
+    avgpool_q = torch.mean(q_w, dim=1)
+    avgpool_k = torch.mean(k_w, dim=1)
+    avgpool_q = rearrange(avgpool_q, "s (h d) -> s h d", h=nheads)
+    avgpool_k = rearrange(avgpool_k, "s (h d) -> s h d", h=nheads)
+    q_heads = avgpool_q.permute(1, 0, 2)
+    k_heads = avgpool_k.permute(1, 0, 2)
+    scores = torch.einsum("hld,hmd->hlm", q_heads, k_heads) / (q_heads.shape[-1] ** 0.5)
+    spatial_windows = h // 8 * (w // 8)
+    local_attn_mask = build_local_block_mask_shifted_vec_normal_slide(
+        h // 8,
+        w // 8,
+        local_range,
+        local_range,
+        include_self=True,
+        device=k_w.device,
+    )
+    q_spatial = q_indices % spatial_windows
+    k_spatial = k_indices % spatial_windows
+    spatial_mask = local_attn_mask[q_spatial][:, k_spatial].unsqueeze(0)
+    scores = scores.masked_fill(~spatial_mask, -float("inf"))
+    apply_topk = min(max(int(topk), 1), scores.shape[-1])
+    thresholds = torch.topk(scores, k=apply_topk, dim=-1, largest=True).values[..., -1:]
+    mask = scores >= thresholds
+    return mask.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+
+
+def _tokens_to_windows(
+    x: torch.Tensor, f: int, h: int, w: int, win: tuple[int, int, int]
+) -> torch.Tensor:
+    batch, _seq, dim = x.shape
+    x_5d = x.reshape(batch, f, h, w, dim)
+    return WindowPartition3D.partition(x_5d, win)
+
+
+def _windows_to_tokens(
+    windows: torch.Tensor, f: int, h: int, w: int, win: tuple[int, int, int]
+) -> torch.Tensor:
+    x = WindowPartition3D.reverse(windows, win, (f, h, w))
+    return rearrange(x, "b f h w c -> b (f h w) c")
+
+
+def _flatten_windows(windows: torch.Tensor) -> torch.Tensor:
+    return rearrange(windows, "(b n) s d -> b (n s) d", b=1)
+
+
+def _unflatten_windows(
+    tokens: torch.Tensor, num_windows: int, win: tuple[int, int, int]
+) -> torch.Tensor:
+    block_s = win[0] * win[1] * win[2]
+    return rearrange(tokens, "b (n s) d -> (b n) s d", n=num_windows, s=block_s)
+
+
+def _balanced_range(total: int, world_size: int, rank: int) -> tuple[int, int]:
+    base, remainder = divmod(total, world_size)
+    start = rank * base + min(rank, remainder)
+    end = start + base + (1 if rank < remainder else 0)
+    return start, end
+
+
+def _all_gather_variable_windows(
+    local_windows: torch.Tensor, ranges: list[tuple[int, int]], sp_group
+) -> torch.Tensor:
+    max_windows = max(end - start for start, end in ranges)
+    if local_windows.shape[0] < max_windows:
+        pad = torch.zeros(
+            (
+                max_windows - local_windows.shape[0],
+                local_windows.shape[1],
+                local_windows.shape[2],
+            ),
+            dtype=local_windows.dtype,
+            device=local_windows.device,
+        )
+        local_windows = torch.cat([local_windows, pad], dim=0)
+    gathered = [torch.empty_like(local_windows) for _ in range(sp_group.world_size)]
+    dist.all_gather(gathered, local_windows.contiguous(), group=sp_group.device_group)
+    pieces = [item[: end - start] for item, (start, end) in zip(gathered, ranges)]
+    return torch.cat(pieces, dim=0)
 
 
 class TorchColorCorrectorWavelet(nn.Module):
