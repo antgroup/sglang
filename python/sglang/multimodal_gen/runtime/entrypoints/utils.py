@@ -406,6 +406,85 @@ def save_outputs(
     return output_paths
 
 
+def save_outputs_distributed_flashvsr(
+    outputs: Sequence[Any] | None,
+    data_type: DataType,
+    fps: int,
+    build_output_path: Callable[[int, int], str],
+    *,
+    output_compression: Optional[int] = None,
+    enable_frame_interpolation: bool = False,
+    frame_interpolation_exp: int = 1,
+    frame_interpolation_scale: float = 1.0,
+    frame_interpolation_model_path: Optional[str] = None,
+    upscaling_model_path: Optional[str] = None,
+    upscaling_scale: int = 2,
+) -> list[str]:
+    """Run FlashVSR upscaling cooperatively across the SP group.
+
+    Rank 0 converts and saves frames.  All SP ranks receive the same pre-VSR
+    frames and enter FlashVSR so its internal collectives cannot deadlock.
+    """
+    import torch.distributed as dist
+
+    from sglang.multimodal_gen.runtime.distributed import get_sp_group
+    from sglang.multimodal_gen.runtime.postprocess import upscale_frames
+
+    sp_group = get_sp_group()
+    is_rank0 = sp_group.rank_in_group == 0
+    output_count_payload = [len(outputs) if is_rank0 and outputs is not None else 0]
+    dist.broadcast_object_list(
+        output_count_payload, src=sp_group.ranks[0], group=sp_group.cpu_group
+    )
+    output_count = int(output_count_payload[0])
+    output_paths: list[str] = []
+
+    for idx in range(output_count):
+        payload = [None]
+        if is_rank0:
+            frames = post_process_sample(
+                outputs[idx],
+                data_type,
+                fps,
+                save_output=False,
+                audio_sample_rate=None,
+                output_compression=output_compression,
+                enable_frame_interpolation=enable_frame_interpolation,
+                frame_interpolation_exp=frame_interpolation_exp,
+                frame_interpolation_scale=frame_interpolation_scale,
+                frame_interpolation_model_path=frame_interpolation_model_path,
+                enable_upscaling=False,
+            )
+            payload[0] = frames
+
+        dist.broadcast_object_list(
+            payload, src=sp_group.ranks[0], group=sp_group.cpu_group
+        )
+        frames = payload[0]
+        if frames is None:
+            raise RuntimeError("Failed to broadcast frames for distributed FlashVSR")
+
+        upscaled_frames = upscale_frames(
+            frames,
+            model_path=upscaling_model_path,
+            scale=upscaling_scale,
+        )
+        if is_rank0:
+            save_file_path = build_output_path(output_count, idx)
+            post_process_sample(
+                np.asarray(upscaled_frames),
+                data_type,
+                fps,
+                save_output=True,
+                save_file_path=save_file_path,
+                output_compression=output_compression,
+                enable_upscaling=False,
+            )
+            output_paths.append(save_file_path)
+
+    return output_paths
+
+
 def post_process_sample(
     sample: Any,
     data_type: DataType,
@@ -530,7 +609,7 @@ def post_process_sample(
 
             logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
         else:
-            logger.info(f"No output path provided, output not saved")
+            logger.info("No output path provided, output not saved")
 
     return frames
 

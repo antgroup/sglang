@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     FileReadyNotification,
     save_outputs,
+    save_outputs_distributed_flashvsr,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.loader.weights_updater import (
@@ -312,7 +313,51 @@ class GPUWorker:
                     upscaling_scale=req.upscaling_scale,
                 )
 
-            if req.save_output and req.return_file_paths_only and self.rank == 0:
+            def _should_use_distributed_flashvsr(req: Req) -> bool:
+                if os.environ.get("FLASHVSR_SP", "").strip().lower() not in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
+                    return False
+                if not req.enable_upscaling:
+                    return False
+                from sglang.multimodal_gen.runtime.postprocess.flashvsr_upscaler import (
+                    is_flashvsr_model_path,
+                )
+
+                return is_flashvsr_model_path(req.upscaling_model_path)
+
+            if (
+                req.save_output
+                and req.return_file_paths_only
+                and _should_use_distributed_flashvsr(req)
+            ):
+                if output_batch.asyn_post_process and self.rank == 0:
+                    logger.warning(
+                        "FLASHVSR_SP uses synchronous postprocess because all SP ranks must enter collectives."
+                    )
+                output_batch.output_file_paths = save_outputs_distributed_flashvsr(
+                    output_batch.output if self.rank == 0 else None,
+                    req.data_type,
+                    req.fps,
+                    req.output_file_path,
+                    output_compression=req.output_compression,
+                    enable_frame_interpolation=req.enable_frame_interpolation,
+                    frame_interpolation_exp=req.frame_interpolation_exp,
+                    frame_interpolation_scale=req.frame_interpolation_scale,
+                    frame_interpolation_model_path=req.frame_interpolation_model_path,
+                    upscaling_model_path=req.upscaling_model_path,
+                    upscaling_scale=req.upscaling_scale,
+                )
+                output_batch.output = None
+                output_batch.audio = None
+                output_batch.audio_sample_rate = None
+                if torch.cuda.is_initialized():
+                    torch.cuda.empty_cache()
+
+            elif req.save_output and req.return_file_paths_only and self.rank == 0:
                 if output_batch.asyn_post_process:
                     _req = req
                     _output_batch = output_batch

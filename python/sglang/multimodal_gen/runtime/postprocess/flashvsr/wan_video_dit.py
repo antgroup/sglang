@@ -9,6 +9,7 @@ import time
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -218,6 +219,16 @@ def flash_attention(
                 "FlashVSR Tiny Long requires the block_sparse_attn package when "
                 "sparse attention is enabled."
             )
+        sp_info = _get_flashvsr_attention_sp_info(num_heads)
+        if sp_info is not None:
+            return _flash_attention_block_sparse_head_parallel(
+                q,
+                k,
+                v,
+                num_heads=num_heads,
+                attention_mask=attention_mask,
+                sp_info=sp_info,
+            )
         seqlen = q.shape[1]
         seqlen_kv = k.shape[1]
         q = rearrange(q, "b s (n d) -> (b s) n d", n=num_heads)
@@ -285,6 +296,108 @@ def flash_attention(
         x = F.scaled_dot_product_attention(q, k, v)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
     return x
+
+
+def _get_flashvsr_attention_sp_info(num_heads: int):
+    if os.environ.get("FLASHVSR_SP", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return None
+    if not dist.is_available() or not dist.is_initialized():
+        return None
+    try:
+        from sglang.multimodal_gen.runtime.distributed import get_sp_group
+
+        sp_group = get_sp_group()
+    except Exception:
+        return None
+    world_size = getattr(sp_group, "world_size", 1)
+    if world_size <= 1:
+        return None
+    if world_size > num_heads:
+        raise ValueError(
+            f"FLASHVSR_SP requires SP world size ({world_size}) to be no larger "
+            f"than num_heads ({num_heads})."
+        )
+    return sp_group, sp_group.rank_in_group, world_size
+
+
+def _flash_attention_block_sparse_head_parallel(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    num_heads: int,
+    attention_mask: torch.Tensor,
+    sp_info,
+) -> torch.Tensor:
+    sp_group, sp_rank, sp_world_size = sp_info
+    batch, seqlen, _ = q.shape
+    seqlen_kv = k.shape[1]
+    head_ranges = [
+        _balanced_head_range(num_heads, sp_world_size, rank)
+        for rank in range(sp_world_size)
+    ]
+    head_start, head_end = head_ranges[sp_rank]
+    heads_per_rank = head_end - head_start
+    max_heads_per_rank = max(end - start for start, end in head_ranges)
+
+    q = rearrange(q, "b s (n d) -> (b s) n d", n=num_heads)[
+        :, head_start:head_end
+    ].contiguous()
+    k = rearrange(k, "b s (n d) -> (b s) n d", n=num_heads)[
+        :, head_start:head_end
+    ].contiguous()
+    v = rearrange(v, "b s (n d) -> (b s) n d", n=num_heads)[
+        :, head_start:head_end
+    ].contiguous()
+
+    cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
+    head_mask_type = torch.ones(heads_per_rank, device=q.device, dtype=torch.int32)
+    local_mask = attention_mask[:, head_start:head_end].contiguous()
+
+    local = block_sparse_attn_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        head_mask_type,
+        None,
+        local_mask,
+        seqlen,
+        seqlen_kv,
+        0.0,
+        deterministic=False,
+        softmax_scale=None,
+        is_causal=False,
+        exact_streaming=False,
+        return_attn_probs=False,
+    ).unsqueeze(0)
+    local = rearrange(local, "b s n d -> b s (n d)", n=heads_per_rank)
+    head_dim = local.shape[-1] // heads_per_rank
+    padded_width = max_heads_per_rank * head_dim
+    if local.shape[-1] < padded_width:
+        local = F.pad(local, (0, padded_width - local.shape[-1]))
+
+    gathered = [torch.empty_like(local) for _ in range(sp_world_size)]
+    dist.all_gather(gathered, local.contiguous(), group=sp_group.device_group)
+    gathered = [
+        item[..., : (end - start) * head_dim]
+        for item, (start, end) in zip(gathered, head_ranges)
+    ]
+    return torch.cat(gathered, dim=-1).reshape(batch, seqlen, -1)
+
+
+def _balanced_head_range(num_heads: int, world_size: int, rank: int) -> tuple[int, int]:
+    base, remainder = divmod(num_heads, world_size)
+    start = rank * base + min(rank, remainder)
+    end = start + base + (1 if rank < remainder else 0)
+    return start, end
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
