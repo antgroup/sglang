@@ -34,6 +34,11 @@ DEFAULT_NUM_FRAMES = 117
 DEFAULT_MOVE_SPEED = 0.05
 DEFAULT_ROTATE_SPEED_DEG_IK = 4.0
 DEFAULT_ROTATE_SPEED_DEG_JL = 6.0
+DEFAULT_ENABLE_UPSCALING = True
+DEFAULT_UPSCALING_SCALE = 2
+DEFAULT_UPSCALING_MODEL_PATH = (
+    "/home/admin/realesr-general-x4v3/realesr-general-x4v3.pth"
+)
 SUPPORTED_CONTROL_KEYS = {"w", "a", "s", "d", "i", "j", "k", "l"}
 
 
@@ -124,6 +129,21 @@ def _parse_float_field(data: dict[str, Any], name: str, default: float) -> float
         raise ValueError(f"{name} must be a number") from exc
 
 
+def _parse_bool_field(data: dict[str, Any], name: str, default: bool) -> bool:
+    value = data.get(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(value, int):
+        return bool(value)
+    raise ValueError(f"{name} must be a boolean")
+
+
 def _parse_resolution(data: dict[str, Any]) -> tuple[int, int]:
     width = data.get("width")
     height = data.get("height")
@@ -187,6 +207,15 @@ def _build_start_request(
         negative_prompt=data.get("negative_prompt"),
         num_inference_steps=data.get("num_inference_steps"),
         enable_teacache=data.get("enable_teacache"),
+        enable_upscaling=_parse_bool_field(
+            data, "enable_upscaling", DEFAULT_ENABLE_UPSCALING
+        ),
+        upscaling_model_path=data.get(
+            "upscaling_model_path", DEFAULT_UPSCALING_MODEL_PATH
+        ),
+        upscaling_scale=_parse_int_field(
+            data, "upscaling_scale", DEFAULT_UPSCALING_SCALE
+        ),
         diffusers_kwargs=data.get("diffusers_kwargs"),
     )
     return request, seed
@@ -226,7 +255,7 @@ def _normalize_rgb_array(
     return np.ascontiguousarray(arr)
 
 
-def output_to_rgb_bytes(output: Any) -> bytes:
+def output_to_rgb_frames(output: Any) -> list[np.ndarray]:
     if isinstance(output, (list, tuple)):
         if len(output) == 0:
             raise ValueError("empty model output")
@@ -237,7 +266,7 @@ def output_to_rgb_bytes(output: Any) -> bytes:
         if tensor.dtype != torch.uint8:
             tensor = (tensor.clamp(0, 1) * 255).to(torch.uint8)
         arr = tensor.cpu().numpy()
-        return _normalize_rgb_array(arr, prefer_channel_first=True).tobytes()
+        return list(_normalize_rgb_array(arr, prefer_channel_first=True))
     elif isinstance(output, np.ndarray):
         arr = output
         if arr.dtype != np.uint8:
@@ -245,7 +274,32 @@ def output_to_rgb_bytes(output: Any) -> bytes:
     else:
         raise TypeError(f"unsupported model output type: {type(output)}")
 
-    return _normalize_rgb_array(arr).tobytes()
+    return list(_normalize_rgb_array(arr))
+
+
+def rgb_frames_to_bytes(frames: list[np.ndarray]) -> bytes:
+    return np.ascontiguousarray(np.stack(frames, axis=0)).tobytes()
+
+
+def output_to_rgb_bytes(
+    output: Any,
+    *,
+    enable_upscaling: bool = False,
+    upscaling_model_path: str | None = None,
+    upscaling_scale: int = 4,
+    half_precision: bool = False,
+) -> bytes:
+    frames = output_to_rgb_frames(output)
+    if enable_upscaling:
+        from sglang.multimodal_gen.runtime.postprocess import upscale_frames
+
+        frames = upscale_frames(
+            frames,
+            model_path=upscaling_model_path,
+            scale=upscaling_scale,
+            half_precision=half_precision,
+        )
+    return rgb_frames_to_bytes(frames)
 
 
 async def _release_realtime_session(session: LingBotDeployCompatSession) -> None:
@@ -295,7 +349,15 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                 error_msg = result.error or "Model generation returned no raw frames"
                 raise RuntimeError(error_msg)
 
-            await ws.send_bytes(output_to_rgb_bytes(result.output))
+            await ws.send_bytes(
+                output_to_rgb_bytes(
+                    result.output,
+                    enable_upscaling=bool(batch.enable_upscaling),
+                    upscaling_model_path=batch.upscaling_model_path,
+                    upscaling_scale=int(batch.upscaling_scale),
+                    half_precision=server_args.realesrgan_half_precision,
+                )
+            )
 
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             await _send_json(
