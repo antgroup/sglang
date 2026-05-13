@@ -99,10 +99,15 @@ def get_rotation_matrix(axis: str, angle_rad: float) -> np.ndarray:
     return np.eye(3)
 
 
-def actions_to_c2ws(action_history: list[list[str]]) -> list[np.ndarray]:
-    move_speed = 0.05
-    rotate_speed_rad_ik = np.deg2rad(4.0)
-    rotate_speed_rad_jl = np.deg2rad(6.0)
+def actions_to_c2ws(
+    action_history: list[list[str]],
+    *,
+    move_speed: float = 0.05,
+    rotate_speed_deg_ik: float = 4.0,
+    rotate_speed_deg_jl: float = 6.0,
+) -> list[np.ndarray]:
+    rotate_speed_rad_ik = np.deg2rad(rotate_speed_deg_ik)
+    rotate_speed_rad_jl = np.deg2rad(rotate_speed_deg_jl)
 
     current_c2w = np.eye(4)
     current_pitch = 0.0
@@ -169,15 +174,25 @@ def actions_to_c2ws(action_history: list[list[str]]) -> list[np.ndarray]:
 def get_camera_control(
     action_history: list[list[str]],
     *,
-    chunk_size: int,
+    chunk_size: int | None,
     width: int,
     height: int,
     device: torch.device | str,
     dtype: torch.dtype,
+    move_speed: float = 0.05,
+    rotate_speed_deg_ik: float = 4.0,
+    rotate_speed_deg_jl: float = 6.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    c2ws_list = actions_to_c2ws(action_history)
+    c2ws_list = actions_to_c2ws(
+        action_history,
+        move_speed=move_speed,
+        rotate_speed_deg_ik=rotate_speed_deg_ik,
+        rotate_speed_deg_jl=rotate_speed_deg_jl,
+    )
     c2ws_np = np.stack(c2ws_list[1:])
     c2ws = torch.from_numpy(c2ws_np).to(device=device, dtype=dtype)
+    if chunk_size is None:
+        chunk_size = len(action_history)
     Ks = torch.tensor(
         [[500.0, 500.0, width / 2, height / 2]],
         device=device,
@@ -264,6 +279,9 @@ def _build_camera_condition(
     device: torch.device | str,
     dtype: torch.dtype,
     tail_chunk_size: int | None = None,
+    move_speed: float = 0.05,
+    rotate_speed_deg_ik: float = 4.0,
+    rotate_speed_deg_jl: float = 6.0,
 ) -> torch.Tensor:
     c2ws_prefix, Ks = get_camera_control(
         action_history,
@@ -272,6 +290,9 @@ def _build_camera_condition(
         height=height,
         device=device,
         dtype=dtype,
+        move_speed=move_speed,
+        rotate_speed_deg_ik=rotate_speed_deg_ik,
+        rotate_speed_deg_jl=rotate_speed_deg_jl,
     )
     c2ws_prefix = compute_relative_poses(c2ws_prefix, framewise=True)
     if tail_chunk_size is not None:
@@ -307,6 +328,9 @@ def prepare_lingbot_world_condition(
         "chunk_size",
         max(1, int(pipeline_config.dit_config.arch_config.num_frames_per_block)),
     )
+    move_speed = float(batch.extra.get("move_speed", 0.05))
+    rotate_speed_deg_ik = float(batch.extra.get("rotate_speed_deg_ik", 4.0))
+    rotate_speed_deg_jl = float(batch.extra.get("rotate_speed_deg_jl", 6.0))
 
     normalized_actions = _validate_actions(actions)
     if len(normalized_actions) == 0:
@@ -331,6 +355,9 @@ def prepare_lingbot_world_condition(
             device=device,
             dtype=dtype,
             tail_chunk_size=chunk_size,
+            move_speed=move_speed,
+            rotate_speed_deg_ik=rotate_speed_deg_ik,
+            rotate_speed_deg_jl=rotate_speed_deg_jl,
         )
         logger.info(
             "LingBot action condition prepared: session_id=%s, block_idx=%s, new_actions=%s, total_history=%s",
@@ -354,6 +381,9 @@ def prepare_lingbot_world_condition(
                 spatial_scale=spatial_scale,
                 device=device,
                 dtype=dtype,
+                move_speed=move_speed,
+                rotate_speed_deg_ik=rotate_speed_deg_ik,
+                rotate_speed_deg_jl=rotate_speed_deg_jl,
             ),
             resolved_num_frames,
         )

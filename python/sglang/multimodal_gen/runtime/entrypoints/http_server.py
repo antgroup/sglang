@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
+    lingbot_deploy_api,
     realtime_video_api,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
@@ -292,6 +293,7 @@ def create_app(server_args: ServerArgs):
     app.include_router(image_api.router)
     app.include_router(video_api.router)
     app.include_router(realtime_video_api.router)
+    app.include_router(lingbot_deploy_api.router)
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
 
