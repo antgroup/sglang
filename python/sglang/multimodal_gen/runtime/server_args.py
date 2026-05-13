@@ -194,6 +194,8 @@ class ServerArgs:
     # http server endpoint config
     host: str | None = "127.0.0.1"
     port: int | None = 30000
+    ssl_keyfile: str | None = None
+    ssl_certfile: str | None = None
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -261,6 +263,7 @@ class ServerArgs:
     def _adjust_path(self):
         expand_path_fields(self)
         self._adjust_save_paths()
+        self._adjust_ssl_paths()
 
     def _adjust_parameters(self):
         """set defaults and normalize values."""
@@ -278,6 +281,7 @@ class ServerArgs:
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        self._validate_ssl()
         self._validate_pipeline()
         self._validate_offload()
         self._validate_parallelism()
@@ -289,6 +293,22 @@ class ServerArgs:
             self.output_path = None
         if self.input_save_path is not None and self.input_save_path.strip() == "":
             self.input_save_path = None
+
+    def _adjust_ssl_paths(self):
+        if self.ssl_keyfile:
+            self.ssl_keyfile = os.path.expanduser(self.ssl_keyfile)
+        if self.ssl_certfile:
+            self.ssl_certfile = os.path.expanduser(self.ssl_certfile)
+
+    def _validate_ssl(self):
+        if bool(self.ssl_keyfile) != bool(self.ssl_certfile):
+            raise ValueError(
+                "--ssl-keyfile and --ssl-certfile must be provided together"
+            )
+        if self.ssl_keyfile and not os.path.exists(self.ssl_keyfile):
+            raise FileNotFoundError(f"SSL key file not found: {self.ssl_keyfile}")
+        if self.ssl_certfile and not os.path.exists(self.ssl_certfile):
+            raise FileNotFoundError(f"SSL cert file not found: {self.ssl_certfile}")
 
     def _adjust_quant_config(self):
         """
@@ -813,6 +833,18 @@ class ServerArgs:
             help="Port for the HTTP API server.",
         )
         parser.add_argument(
+            "--ssl-keyfile",
+            type=str,
+            default=ServerArgs.ssl_keyfile,
+            help="Path to the SSL private key file. Enables HTTPS/WSS when used with --ssl-certfile.",
+        )
+        parser.add_argument(
+            "--ssl-certfile",
+            type=str,
+            default=ServerArgs.ssl_certfile,
+            help="Path to the SSL certificate file. Enables HTTPS/WSS when used with --ssl-keyfile.",
+        )
+        parser.add_argument(
             "--strict-ports",
             action=StoreBoolean,
             default=ServerArgs.strict_ports,
@@ -916,10 +948,11 @@ class ServerArgs:
             host = "127.0.0.1"
         elif host == "::":
             host = "::1"
+        scheme = "https" if self.ssl_keyfile and self.ssl_certfile else "http"
         if is_valid_ipv6_address(host):
-            return f"http://[{host}]:{self.port}"
+            return f"{scheme}://[{host}]:{self.port}"
         else:
-            return f"http://{host}:{self.port}"
+            return f"{scheme}://{host}:{self.port}"
 
     @property
     def scheduler_endpoint(self):
