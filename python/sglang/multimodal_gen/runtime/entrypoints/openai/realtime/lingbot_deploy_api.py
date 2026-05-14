@@ -339,6 +339,12 @@ def _parse_bool_field(data: dict[str, Any], name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean")
 
 
+def _resolve_enable_upscaling(data: dict[str, Any], width: int, height: int) -> bool:
+    if "enable_upscaling" in data:
+        return _parse_bool_field(data, "enable_upscaling", DEFAULT_ENABLE_UPSCALING)
+    return width * height > DEFAULT_WIDTH * DEFAULT_HEIGHT
+
+
 def _parse_resolution(data: dict[str, Any]) -> tuple[int, int]:
     width = data.get("width")
     height = data.get("height")
@@ -394,10 +400,8 @@ def _build_start_request(
         raise ValueError(f"image_path is not a valid file: {first_frame}")
 
     fps = _parse_int_field(data, "fps", DEFAULT_FPS)
-    enable_upscaling = _parse_bool_field(
-        data, "enable_upscaling", DEFAULT_ENABLE_UPSCALING
-    )
     upscaling_scale = _parse_int_field(data, "upscaling_scale", DEFAULT_UPSCALING_SCALE)
+    enable_upscaling = _resolve_enable_upscaling(data, output_width, output_height)
     if upscaling_scale <= 0:
         raise ValueError("upscaling_scale must be positive")
 
