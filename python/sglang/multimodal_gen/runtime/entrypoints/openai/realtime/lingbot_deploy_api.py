@@ -426,8 +426,22 @@ def _build_start_request(
         raise ValueError("debug_video_path must be a string")
     session.set_debug_video(debug_video_path if debug_save_video else None, fps=fps)
 
+    prompt = str(data.get("prompt") or DEFAULT_PROMPT)
+    logger.info(
+        "LingBot START request: session_id=%s prompt=%r image_path=%s "
+        "seed=%s output=%sx%s model=%sx%s",
+        session.id,
+        prompt,
+        first_frame,
+        seed,
+        output_width,
+        output_height,
+        model_width,
+        model_height,
+    )
+
     request = RealtimeVideoGenerationsRequest(
-        prompt=str(data.get("prompt") or DEFAULT_PROMPT),
+        prompt=prompt,
         first_frame=first_frame,
         width=model_width,
         height=model_height,
