@@ -3,6 +3,7 @@ import json
 import os
 import random
 import time
+from collections import deque
 from typing import Any
 
 import numpy as np
@@ -109,6 +110,10 @@ class LingBotDeployCompatSession(GenerateSession):
         self.output_height = DEFAULT_HEIGHT
         self.model_width = DEFAULT_WIDTH
         self.model_height = DEFAULT_HEIGHT
+        self._control_events: deque[tuple[float, list[str]]] = deque(maxlen=512)
+        self._control_sample_cursor: float | None = None
+        self._control_sample_base_actions: list[str] = []
+        self.reset_control_sampler()
 
     def dispose(self):
         self.close_debug_video()
@@ -125,6 +130,7 @@ class LingBotDeployCompatSession(GenerateSession):
         self.output_height = DEFAULT_HEIGHT
         self.model_width = DEFAULT_WIDTH
         self.model_height = DEFAULT_HEIGHT
+        self.reset_control_sampler()
 
     def build_sampling_params(self):
         sampling_params = super().build_sampling_params()
@@ -160,6 +166,16 @@ class LingBotDeployCompatSession(GenerateSession):
         batch.extra["move_speed"] = self.move_speed
         batch.extra["rotate_speed_deg_ik"] = self.rotate_speed_deg_ik
         batch.extra["rotate_speed_deg_jl"] = self.rotate_speed_deg_jl
+
+    def reset_control_sampler(self, *, timestamp: float | None = None) -> None:
+        self.control_queue.clear()
+        self._control_events.clear()
+        self._control_sample_cursor = (
+            time.perf_counter() if timestamp is None else timestamp
+        )
+        self._control_sample_base_actions = sorted(self.current_keys)
+        self.last_control_actions = list(self._control_sample_base_actions)
+        self.has_control_state = bool(self._control_sample_base_actions)
 
     def set_debug_video(self, path: str | None, fps: int) -> None:
         self.close_debug_video()
@@ -197,10 +213,13 @@ class LingBotDeployCompatSession(GenerateSession):
         finally:
             self.debug_video_recorder = None
 
-    def set_key_state(self, key: str, action: str) -> None:
+    def set_key_state(
+        self, key: str, action: str, *, timestamp: float | None = None
+    ) -> None:
         normalized_key = key.lower()
         if normalized_key not in SUPPORTED_CONTROL_KEYS:
             raise ValueError(f"unsupported control key: {key}")
+        before = set(self.current_keys)
         if action == "down":
             self.current_keys.add(normalized_key)
         elif action == "up":
@@ -208,7 +227,55 @@ class LingBotDeployCompatSession(GenerateSession):
         else:
             raise ValueError(f"unsupported control action: {action}")
 
-        self._append_control_frame(sorted(self.current_keys))
+        if self.current_keys == before:
+            return
+
+        event_time = time.perf_counter() if timestamp is None else timestamp
+        self._control_events.append((event_time, sorted(self.current_keys)))
+
+    def sample_control_chunk(
+        self, chunk_size: int, *, timestamp: float | None = None
+    ) -> list[list[str]] | None:
+        if chunk_size <= 0:
+            return None
+
+        now = time.perf_counter() if timestamp is None else timestamp
+        start = self._control_sample_cursor
+        if start is None:
+            start = now
+
+        events = [
+            (event_time, actions)
+            for event_time, actions in self._control_events
+            if event_time <= now
+        ]
+        base_actions = list(self._control_sample_base_actions)
+        state = list(base_actions)
+        chunk: list[list[str]] = []
+        duration = max(0.0, now - start)
+
+        if duration == 0.0:
+            chunk = [list(state) for _ in range(chunk_size)]
+        else:
+            event_idx = 0
+            for frame_idx in range(chunk_size):
+                sample_time = start + duration * (frame_idx + 1) / chunk_size
+                while event_idx < len(events) and events[event_idx][0] <= sample_time:
+                    state = list(events[event_idx][1])
+                    event_idx += 1
+                chunk.append(list(state))
+
+        for _, actions in events:
+            state = list(actions)
+        self._control_sample_cursor = now
+        self._control_sample_base_actions = list(state)
+        self.last_control_actions = list(self._control_sample_base_actions)
+        if events:
+            self.has_control_state = True
+        while self._control_events and self._control_events[0][0] <= now:
+            self._control_events.popleft()
+
+        return chunk
 
 
 def _json_message(payload: dict[str, Any]) -> str:
@@ -451,8 +518,13 @@ def output_to_rgb_frames_for_send(
     upscaling_model_path: str | None = None,
     upscaling_scale: int = 4,
     half_precision: bool = False,
-) -> bytes:
+    timings: dict[str, float] | None = None,
+) -> list[np.ndarray]:
+    stage_start = time.perf_counter()
     frames = output_to_rgb_frames(output)
+    if timings is not None:
+        timings["rgb_convert_ms"] = (time.perf_counter() - stage_start) * 1000.0
+
     input_shape = tuple(frames[0].shape) if frames else None
     if enable_upscaling:
         from sglang.multimodal_gen.runtime.postprocess import upscale_frames
@@ -465,13 +537,18 @@ def output_to_rgb_frames_for_send(
             upscaling_scale,
             half_precision,
         )
+        stage_start = time.perf_counter()
         frames = upscale_frames(
             frames,
             model_path=upscaling_model_path,
             scale=upscaling_scale,
             half_precision=half_precision,
         )
+        if timings is not None:
+            timings["sr_ms"] = (time.perf_counter() - stage_start) * 1000.0
     else:
+        if timings is not None:
+            timings["sr_ms"] = 0.0
         logger.info(
             "LingBot deploy SR disabled: frames=%d input_shape=%s",
             len(frames),
@@ -525,6 +602,8 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
             session.new_request()
 
             start = time.perf_counter()
+            timings: dict[str, float] = {}
+            stage_start = time.perf_counter()
             server_args = get_global_server_args()
             sampling_params = session.build_sampling_params()
             batch = prepare_request(
@@ -535,6 +614,7 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
             batch.extra["realtime_session_id"] = session.id
             session.apply_camera_config(batch)
             batch.block_idx = session.generate_chunk_cnt
+            timings["prepare_ms"] = (time.perf_counter() - stage_start) * 1000.0
 
             chunk_size = batch.extra.get("chunk_size", 1)
             control_chunk = session.sample_control_chunk(chunk_size)
@@ -548,24 +628,56 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                 )
                 batch.extra["actions"] = control_chunk
 
+            stage_start = time.perf_counter()
             result = await async_scheduler_client.forward([batch])
+            timings["scheduler_ms"] = (time.perf_counter() - stage_start) * 1000.0
             if result.output is None:
                 error_msg = result.error or "Model generation returned no raw frames"
                 raise RuntimeError(error_msg)
 
+            stage_start = time.perf_counter()
             frames = output_to_rgb_frames_for_send(
                 result.output,
                 enable_upscaling=bool(batch.enable_upscaling),
                 upscaling_model_path=batch.upscaling_model_path,
                 upscaling_scale=int(batch.upscaling_scale),
                 half_precision=server_args.realesrgan_half_precision,
+                timings=timings,
             )
+            timings["postprocess_ms"] = (time.perf_counter() - stage_start) * 1000.0
+            stage_start = time.perf_counter()
             session.append_debug_video(frames)
+            timings["debug_video_ms"] = (time.perf_counter() - stage_start) * 1000.0
+            stage_start = time.perf_counter()
             payload = rgb_frames_to_bytes(frames)
+            timings["pack_bytes_ms"] = (time.perf_counter() - stage_start) * 1000.0
             logger.info("LingBot deploy raw chunk prepared: bytes=%d", len(payload))
+            stage_start = time.perf_counter()
             await ws.send_bytes(payload)
+            timings["ws_send_ms"] = (time.perf_counter() - stage_start) * 1000.0
 
             elapsed_ms = (time.perf_counter() - start) * 1000.0
+            timings["total_ms"] = elapsed_ms
+            logger.info(
+                "LingBot deploy stage timing: session_id=%s chunk_idx=%s "
+                "prepare=%.2fms scheduler=%.2fms rgb_convert=%.2fms sr=%.2fms "
+                "postprocess=%.2fms debug_video=%.2fms pack_bytes=%.2fms "
+                "ws_send=%.2fms total=%.2fms frames=%d frame_shape=%s payload_bytes=%d",
+                session.id,
+                session.generate_chunk_cnt,
+                timings["prepare_ms"],
+                timings["scheduler_ms"],
+                timings["rgb_convert_ms"],
+                timings["sr_ms"],
+                timings["postprocess_ms"],
+                timings["debug_video_ms"],
+                timings["pack_bytes_ms"],
+                timings["ws_send_ms"],
+                elapsed_ms,
+                len(frames),
+                tuple(frames[0].shape) if frames else None,
+                len(payload),
+            )
             await _send_json(
                 ws,
                 {
@@ -574,6 +686,9 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                     "chunk_time_ms": elapsed_ms,
                     "chunks_per_sec": 1000.0 / elapsed_ms if elapsed_ms > 0 else 0,
                     "queue_size": 0,
+                    "stage_timings_ms": {
+                        key: round(value, 3) for key, value in timings.items()
+                    },
                 },
             )
 
@@ -596,6 +711,8 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
             pass
     finally:
         session.started = False
+        session.current_keys.clear()
+        session.reset_control_sampler()
         session.close_debug_video()
         await _release_realtime_session(session)
 
@@ -644,6 +761,8 @@ async def _handle_message(
         session.stop_requested = False
         session.set_mode(RealtimeVideoMode.V2V)
         session.setRequest(request)
+        session.current_keys.clear()
+        session.reset_control_sampler()
         session.started = True
         await _send_json(
             ws,
