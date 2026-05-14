@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import random
 import time
 from typing import Any
@@ -39,7 +40,55 @@ DEFAULT_UPSCALING_SCALE = 2
 DEFAULT_UPSCALING_MODEL_PATH = (
     "/home/admin/realesr-general-x4v3/realesr-general-x4v3.pth"
 )
+DEFAULT_DEBUG_SAVE_VIDEO = os.environ.get(
+    "SGLANG_LINGBOT_DEBUG_SAVE_VIDEO", "0"
+).lower() in {"1", "true", "yes", "on"}
+DEFAULT_DEBUG_VIDEO_DIR = os.environ.get(
+    "SGLANG_LINGBOT_DEBUG_VIDEO_DIR", "/tmp/sglang_lingbot_debug"
+)
 SUPPORTED_CONTROL_KEYS = {"w", "a", "s", "d", "i", "j", "k", "l"}
+
+
+class LingBotDebugVideoRecorder:
+    def __init__(self, path: str, fps: int):
+        self.path = path
+        self.fps = fps
+        self.writer = None
+        self.frame_count = 0
+
+    def append(self, frames: list[np.ndarray]) -> None:
+        if not frames:
+            return
+
+        import imageio
+
+        output_dir = os.path.dirname(self.path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        if self.writer is None:
+            self.writer = imageio.get_writer(
+                self.path,
+                fps=self.fps,
+                codec="libx264",
+                quality=8,
+                macro_block_size=1,
+            )
+            logger.info("LingBot deploy debug video opened: %s", self.path)
+
+        for frame in frames:
+            self.writer.append_data(np.ascontiguousarray(frame))
+            self.frame_count += 1
+
+    def close(self) -> None:
+        if self.writer is None:
+            return
+        self.writer.close()
+        self.writer = None
+        logger.info(
+            "LingBot deploy debug video saved: path=%s frames=%d",
+            self.path,
+            self.frame_count,
+        )
 
 
 class LingBotDeployCompatSession(GenerateSession):
@@ -54,8 +103,11 @@ class LingBotDeployCompatSession(GenerateSession):
         self.move_speed = DEFAULT_MOVE_SPEED
         self.rotate_speed_deg_ik = DEFAULT_ROTATE_SPEED_DEG_IK
         self.rotate_speed_deg_jl = DEFAULT_ROTATE_SPEED_DEG_JL
+        self.debug_video_path: str | None = None
+        self.debug_video_recorder: LingBotDebugVideoRecorder | None = None
 
     def dispose(self):
+        self.close_debug_video()
         super().dispose()
         self.current_keys.clear()
         self.selected_image_id = None
@@ -64,6 +116,7 @@ class LingBotDeployCompatSession(GenerateSession):
         self.move_speed = DEFAULT_MOVE_SPEED
         self.rotate_speed_deg_ik = DEFAULT_ROTATE_SPEED_DEG_IK
         self.rotate_speed_deg_jl = DEFAULT_ROTATE_SPEED_DEG_JL
+        self.debug_video_path = None
 
     def build_sampling_params(self):
         sampling_params = super().build_sampling_params()
@@ -86,6 +139,42 @@ class LingBotDeployCompatSession(GenerateSession):
         batch.extra["move_speed"] = self.move_speed
         batch.extra["rotate_speed_deg_ik"] = self.rotate_speed_deg_ik
         batch.extra["rotate_speed_deg_jl"] = self.rotate_speed_deg_jl
+
+    def set_debug_video(self, path: str | None, fps: int) -> None:
+        self.close_debug_video()
+        self.debug_video_path = path
+        if path:
+            self.debug_video_recorder = LingBotDebugVideoRecorder(path, fps=fps)
+        else:
+            self.debug_video_recorder = None
+
+    def append_debug_video(self, frames: list[np.ndarray]) -> None:
+        if self.debug_video_recorder is None:
+            return
+        try:
+            self.debug_video_recorder.append(frames)
+        except Exception as e:
+            logger.warning(
+                "failed to append LingBot deploy debug video, path=%s, error=%s",
+                self.debug_video_path,
+                e,
+                exc_info=True,
+            )
+
+    def close_debug_video(self) -> None:
+        if self.debug_video_recorder is None:
+            return
+        try:
+            self.debug_video_recorder.close()
+        except Exception as e:
+            logger.warning(
+                "failed to close LingBot deploy debug video, path=%s, error=%s",
+                self.debug_video_path,
+                e,
+                exc_info=True,
+            )
+        finally:
+            self.debug_video_recorder = None
 
     def set_key_state(self, key: str, action: str) -> None:
         normalized_key = key.lower()
@@ -191,6 +280,29 @@ def _build_start_request(
     session.selected_image_id = None
     if not first_frame:
         raise ValueError("START requires image_path")
+    if not isinstance(first_frame, str):
+        raise ValueError("image_path must be a string")
+    if not first_frame.startswith(("http://", "https://")) and not os.path.isfile(
+        first_frame
+    ):
+        raise ValueError(f"image_path is not a valid file: {first_frame}")
+
+    fps = _parse_int_field(data, "fps", DEFAULT_FPS)
+    debug_video_path = data.get("debug_video_path")
+    debug_save_video = _parse_bool_field(
+        data,
+        "debug_save_video",
+        DEFAULT_DEBUG_SAVE_VIDEO or debug_video_path is not None,
+    )
+    if debug_save_video and not debug_video_path:
+        debug_video_dir = str(data.get("debug_video_dir") or DEFAULT_DEBUG_VIDEO_DIR)
+        debug_video_path = os.path.join(
+            debug_video_dir,
+            f"lingbot_{session.id}_{int(time.time() * 1000)}.mp4",
+        )
+    if debug_video_path is not None and not isinstance(debug_video_path, str):
+        raise ValueError("debug_video_path must be a string")
+    session.set_debug_video(debug_video_path if debug_save_video else None, fps=fps)
 
     request = RealtimeVideoGenerationsRequest(
         prompt=str(data.get("prompt") or DEFAULT_PROMPT),
@@ -198,7 +310,7 @@ def _build_start_request(
         width=width,
         height=height,
         size=f"{width}x{height}",
-        fps=_parse_int_field(data, "fps", DEFAULT_FPS),
+        fps=fps,
         num_frames=_parse_int_field(data, "num_frames", DEFAULT_NUM_FRAMES),
         seed=seed,
         generator_device=data.get("generator_device"),
@@ -281,7 +393,7 @@ def rgb_frames_to_bytes(frames: list[np.ndarray]) -> bytes:
     return np.ascontiguousarray(np.stack(frames, axis=0)).tobytes()
 
 
-def output_to_rgb_bytes(
+def output_to_rgb_frames_for_send(
     output: Any,
     *,
     enable_upscaling: bool = False,
@@ -315,14 +427,31 @@ def output_to_rgb_bytes(
             input_shape,
         )
 
-    output_shape = tuple(frames[0].shape) if frames else None
-    payload = rgb_frames_to_bytes(frames)
     logger.info(
-        "LingBot deploy raw chunk prepared: frames=%d output_shape=%s bytes=%d",
+        "LingBot deploy RGB frames prepared: frames=%d output_shape=%s",
         len(frames),
-        output_shape,
-        len(payload),
+        tuple(frames[0].shape) if frames else None,
     )
+    return frames
+
+
+def output_to_rgb_bytes(
+    output: Any,
+    *,
+    enable_upscaling: bool = False,
+    upscaling_model_path: str | None = None,
+    upscaling_scale: int = 4,
+    half_precision: bool = False,
+) -> bytes:
+    frames = output_to_rgb_frames_for_send(
+        output,
+        enable_upscaling=enable_upscaling,
+        upscaling_model_path=upscaling_model_path,
+        upscaling_scale=upscaling_scale,
+        half_precision=half_precision,
+    )
+    payload = rgb_frames_to_bytes(frames)
+    logger.info("LingBot deploy raw chunk prepared: bytes=%d", len(payload))
     return payload
 
 
@@ -373,15 +502,17 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                 error_msg = result.error or "Model generation returned no raw frames"
                 raise RuntimeError(error_msg)
 
-            await ws.send_bytes(
-                output_to_rgb_bytes(
-                    result.output,
-                    enable_upscaling=bool(batch.enable_upscaling),
-                    upscaling_model_path=batch.upscaling_model_path,
-                    upscaling_scale=int(batch.upscaling_scale),
-                    half_precision=server_args.realesrgan_half_precision,
-                )
+            frames = output_to_rgb_frames_for_send(
+                result.output,
+                enable_upscaling=bool(batch.enable_upscaling),
+                upscaling_model_path=batch.upscaling_model_path,
+                upscaling_scale=int(batch.upscaling_scale),
+                half_precision=server_args.realesrgan_half_precision,
             )
+            session.append_debug_video(frames)
+            payload = rgb_frames_to_bytes(frames)
+            logger.info("LingBot deploy raw chunk prepared: bytes=%d", len(payload))
+            await ws.send_bytes(payload)
 
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             await _send_json(
@@ -414,6 +545,7 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
             pass
     finally:
         session.started = False
+        session.close_debug_video()
         await _release_realtime_session(session)
 
 
@@ -479,6 +611,7 @@ async def _handle_message(
                 "upscaling_model_path": request.upscaling_model_path,
                 "output_width": request.width * output_scale,
                 "output_height": request.height * output_scale,
+                "debug_video_path": session.debug_video_path,
             },
         )
         return asyncio.create_task(_generate_loop(ws, session))
