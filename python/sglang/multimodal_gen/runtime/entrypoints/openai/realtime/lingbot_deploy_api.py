@@ -105,6 +105,10 @@ class LingBotDeployCompatSession(GenerateSession):
         self.rotate_speed_deg_jl = DEFAULT_ROTATE_SPEED_DEG_JL
         self.debug_video_path: str | None = None
         self.debug_video_recorder: LingBotDebugVideoRecorder | None = None
+        self.output_width = DEFAULT_WIDTH
+        self.output_height = DEFAULT_HEIGHT
+        self.model_width = DEFAULT_WIDTH
+        self.model_height = DEFAULT_HEIGHT
 
     def dispose(self):
         self.close_debug_video()
@@ -117,6 +121,10 @@ class LingBotDeployCompatSession(GenerateSession):
         self.rotate_speed_deg_ik = DEFAULT_ROTATE_SPEED_DEG_IK
         self.rotate_speed_deg_jl = DEFAULT_ROTATE_SPEED_DEG_JL
         self.debug_video_path = None
+        self.output_width = DEFAULT_WIDTH
+        self.output_height = DEFAULT_HEIGHT
+        self.model_width = DEFAULT_WIDTH
+        self.model_height = DEFAULT_HEIGHT
 
     def build_sampling_params(self):
         sampling_params = super().build_sampling_params()
@@ -134,6 +142,19 @@ class LingBotDeployCompatSession(GenerateSession):
         self.move_speed = move_speed
         self.rotate_speed_deg_ik = rotate_speed_deg_ik
         self.rotate_speed_deg_jl = rotate_speed_deg_jl
+
+    def set_resolution_config(
+        self,
+        *,
+        output_width: int,
+        output_height: int,
+        model_width: int,
+        model_height: int,
+    ) -> None:
+        self.output_width = output_width
+        self.output_height = output_height
+        self.model_width = model_width
+        self.model_height = model_height
 
     def apply_camera_config(self, batch) -> None:
         batch.extra["move_speed"] = self.move_speed
@@ -256,7 +277,7 @@ def _parse_resolution(data: dict[str, Any]) -> tuple[int, int]:
 def _build_start_request(
     data: dict[str, Any], session: LingBotDeployCompatSession
 ) -> tuple[RealtimeVideoGenerationsRequest, int]:
-    width, height = _parse_resolution(data)
+    output_width, output_height = _parse_resolution(data)
     seed = data.get("seed")
     if seed is None:
         seed = random.randint(0, 2**31 - 1)
@@ -288,6 +309,40 @@ def _build_start_request(
         raise ValueError(f"image_path is not a valid file: {first_frame}")
 
     fps = _parse_int_field(data, "fps", DEFAULT_FPS)
+    enable_upscaling = _parse_bool_field(
+        data, "enable_upscaling", DEFAULT_ENABLE_UPSCALING
+    )
+    upscaling_scale = _parse_int_field(data, "upscaling_scale", DEFAULT_UPSCALING_SCALE)
+    if upscaling_scale <= 0:
+        raise ValueError("upscaling_scale must be positive")
+
+    model_width = output_width
+    model_height = output_height
+    if enable_upscaling:
+        if output_width % upscaling_scale != 0 or output_height % upscaling_scale != 0:
+            raise ValueError(
+                "width and height must be divisible by upscaling_scale "
+                "when enable_upscaling is true"
+            )
+        model_width = output_width // upscaling_scale
+        model_height = output_height // upscaling_scale
+
+    session.set_resolution_config(
+        output_width=output_width,
+        output_height=output_height,
+        model_width=model_width,
+        model_height=model_height,
+    )
+    logger.info(
+        "LingBot START resolution: output=%sx%s model=%sx%s enable_upscaling=%s scale=%s",
+        output_width,
+        output_height,
+        model_width,
+        model_height,
+        enable_upscaling,
+        upscaling_scale,
+    )
+
     debug_video_path = data.get("debug_video_path")
     debug_save_video = _parse_bool_field(
         data,
@@ -307,9 +362,9 @@ def _build_start_request(
     request = RealtimeVideoGenerationsRequest(
         prompt=str(data.get("prompt") or DEFAULT_PROMPT),
         first_frame=first_frame,
-        width=width,
-        height=height,
-        size=f"{width}x{height}",
+        width=model_width,
+        height=model_height,
+        size=f"{model_width}x{model_height}",
         fps=fps,
         num_frames=_parse_int_field(data, "num_frames", DEFAULT_NUM_FRAMES),
         seed=seed,
@@ -319,15 +374,11 @@ def _build_start_request(
         negative_prompt=data.get("negative_prompt"),
         num_inference_steps=data.get("num_inference_steps"),
         enable_teacache=data.get("enable_teacache"),
-        enable_upscaling=_parse_bool_field(
-            data, "enable_upscaling", DEFAULT_ENABLE_UPSCALING
-        ),
+        enable_upscaling=enable_upscaling,
         upscaling_model_path=data.get(
             "upscaling_model_path", DEFAULT_UPSCALING_MODEL_PATH
         ),
-        upscaling_scale=_parse_int_field(
-            data, "upscaling_scale", DEFAULT_UPSCALING_SCALE
-        ),
+        upscaling_scale=upscaling_scale,
         diffusers_kwargs=data.get("diffusers_kwargs"),
     )
     return request, seed
@@ -594,9 +645,6 @@ async def _handle_message(
         session.set_mode(RealtimeVideoMode.V2V)
         session.setRequest(request)
         session.started = True
-        output_scale = (
-            int(request.upscaling_scale or 1) if request.enable_upscaling else 1
-        )
         await _send_json(
             ws,
             {
@@ -609,8 +657,12 @@ async def _handle_message(
                 "enable_upscaling": request.enable_upscaling,
                 "upscaling_scale": request.upscaling_scale,
                 "upscaling_model_path": request.upscaling_model_path,
-                "output_width": request.width * output_scale,
-                "output_height": request.height * output_scale,
+                "width": session.output_width,
+                "height": session.output_height,
+                "output_width": session.output_width,
+                "output_height": session.output_height,
+                "model_width": session.model_width,
+                "model_height": session.model_height,
                 "debug_video_path": session.debug_video_path,
             },
         )
