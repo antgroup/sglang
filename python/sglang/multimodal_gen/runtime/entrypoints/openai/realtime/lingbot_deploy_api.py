@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import random
+import tempfile
 import time
 from collections import deque
 from typing import Any
@@ -48,6 +49,23 @@ DEFAULT_DEBUG_VIDEO_DIR = os.environ.get(
     "SGLANG_LINGBOT_DEBUG_VIDEO_DIR", "/tmp/sglang_lingbot_debug"
 )
 SUPPORTED_CONTROL_KEYS = {"w", "a", "s", "d", "i", "j", "k", "l"}
+STARTUP_WARMUP_CHUNKS = int(os.environ.get("SGLANG_LINGBOT_STARTUP_WARMUP_CHUNKS", "0"))
+STARTUP_WARMUP_IMAGE_PATH = os.environ.get("SGLANG_LINGBOT_STARTUP_WARMUP_IMAGE_PATH")
+STARTUP_WARMUP_WIDTH = int(
+    os.environ.get(
+        "SGLANG_LINGBOT_STARTUP_WARMUP_WIDTH",
+        str(DEFAULT_WIDTH * DEFAULT_UPSCALING_SCALE),
+    )
+)
+STARTUP_WARMUP_HEIGHT = int(
+    os.environ.get(
+        "SGLANG_LINGBOT_STARTUP_WARMUP_HEIGHT",
+        str(DEFAULT_HEIGHT * DEFAULT_UPSCALING_SCALE),
+    )
+)
+STARTUP_WARMUP_PROMPT = os.environ.get(
+    "SGLANG_LINGBOT_STARTUP_WARMUP_PROMPT", DEFAULT_PROMPT
+)
 
 
 class LingBotDebugVideoRecorder:
@@ -595,6 +613,117 @@ def output_to_rgb_bytes(
     payload = rgb_frames_to_bytes(frames)
     logger.info("LingBot deploy raw chunk prepared: bytes=%d", len(payload))
     return payload
+
+
+def _ensure_startup_warmup_image(width: int, height: int) -> str:
+    if STARTUP_WARMUP_IMAGE_PATH:
+        if not os.path.isfile(STARTUP_WARMUP_IMAGE_PATH):
+            raise FileNotFoundError(
+                f"SGLANG_LINGBOT_STARTUP_WARMUP_IMAGE_PATH does not exist: "
+                f"{STARTUP_WARMUP_IMAGE_PATH}"
+            )
+        return STARTUP_WARMUP_IMAGE_PATH
+
+    from PIL import Image
+
+    path = os.path.join(tempfile.gettempdir(), "sglang_lingbot_startup_warmup.png")
+    if not os.path.isfile(path):
+        Image.new("RGB", (max(1, width), max(1, height)), (24, 24, 24)).save(path)
+    return path
+
+
+async def run_startup_warmup_if_enabled(server_args) -> None:
+    if STARTUP_WARMUP_CHUNKS <= 0:
+        return
+
+    session = LingBotDeployCompatSession()
+    start_time = time.perf_counter()
+    try:
+        warmup_image = _ensure_startup_warmup_image(
+            STARTUP_WARMUP_WIDTH,
+            STARTUP_WARMUP_HEIGHT,
+        )
+        request, seed = _build_start_request(
+            {
+                "type": "START",
+                "prompt": STARTUP_WARMUP_PROMPT,
+                "image_path": warmup_image,
+                "width": STARTUP_WARMUP_WIDTH,
+                "height": STARTUP_WARMUP_HEIGHT,
+                "seed": 0,
+                "debug_save_video": False,
+            },
+            session,
+        )
+        session.stop_requested = False
+        session.set_mode(RealtimeVideoMode.V2V)
+        session.setRequest(request)
+        session.current_keys.clear()
+        session.reset_control_sampler()
+        session.started = True
+
+        logger.info(
+            "LingBot startup warmup begin: chunks=%d output=%sx%s model=%sx%s "
+            "image_path=%s seed=%s",
+            STARTUP_WARMUP_CHUNKS,
+            session.output_width,
+            session.output_height,
+            session.model_width,
+            session.model_height,
+            warmup_image,
+            seed,
+        )
+
+        for chunk_idx in range(STARTUP_WARMUP_CHUNKS):
+            chunk_start = time.perf_counter()
+            session.new_request()
+            sampling_params = session.build_sampling_params()
+            sampling_params.suppress_logs = True
+            batch = prepare_request(
+                server_args=server_args,
+                sampling_params=sampling_params,
+            )
+            batch.session = session.realtime_session
+            batch.extra["realtime_session_id"] = session.id
+            session.apply_camera_config(batch)
+            batch.block_idx = session.generate_chunk_cnt
+            chunk_size = batch.extra.get("chunk_size", 1)
+            batch.extra["actions"] = [[] for _ in range(chunk_size)]
+
+            result = await async_scheduler_client.forward([batch])
+            if result.output is None:
+                error_msg = result.error or "LingBot startup warmup returned no output"
+                raise RuntimeError(error_msg)
+
+            frames = output_to_rgb_frames_for_send(
+                result.output,
+                enable_upscaling=bool(batch.enable_upscaling),
+                upscaling_model_path=batch.upscaling_model_path,
+                upscaling_scale=int(batch.upscaling_scale),
+                half_precision=server_args.realesrgan_half_precision,
+            )
+            logger.info(
+                "LingBot startup warmup chunk %d/%d done: %.2fms frames=%d shape=%s",
+                chunk_idx + 1,
+                STARTUP_WARMUP_CHUNKS,
+                (time.perf_counter() - chunk_start) * 1000.0,
+                len(frames),
+                tuple(frames[0].shape) if frames else None,
+            )
+            session.generate_chunk_completed()
+
+        logger.info(
+            "LingBot startup warmup complete: chunks=%d elapsed=%.2fs",
+            STARTUP_WARMUP_CHUNKS,
+            time.perf_counter() - start_time,
+        )
+    finally:
+        session.started = False
+        session.current_keys.clear()
+        session.reset_control_sampler()
+        session.close_debug_video()
+        await _release_realtime_session(session)
+        session.dispose()
 
 
 async def _release_realtime_session(session: LingBotDeployCompatSession) -> None:

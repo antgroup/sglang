@@ -61,6 +61,8 @@ async def lifespan(app: FastAPI):
     # 3. Start the notification listener for GPU worker file-ready events
     notification_task = asyncio.create_task(run_notification_listener(server_args))
 
+    await lingbot_deploy_api.run_startup_warmup_if_enabled(server_args)
+
     yield
 
     # On shutdown
