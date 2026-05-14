@@ -290,16 +290,40 @@ def output_to_rgb_bytes(
     half_precision: bool = False,
 ) -> bytes:
     frames = output_to_rgb_frames(output)
+    input_shape = tuple(frames[0].shape) if frames else None
     if enable_upscaling:
         from sglang.multimodal_gen.runtime.postprocess import upscale_frames
 
+        logger.info(
+            "LingBot deploy SR enabled: frames=%d input_shape=%s model_path=%s scale=%s half_precision=%s",
+            len(frames),
+            input_shape,
+            upscaling_model_path,
+            upscaling_scale,
+            half_precision,
+        )
         frames = upscale_frames(
             frames,
             model_path=upscaling_model_path,
             scale=upscaling_scale,
             half_precision=half_precision,
         )
-    return rgb_frames_to_bytes(frames)
+    else:
+        logger.info(
+            "LingBot deploy SR disabled: frames=%d input_shape=%s",
+            len(frames),
+            input_shape,
+        )
+
+    output_shape = tuple(frames[0].shape) if frames else None
+    payload = rgb_frames_to_bytes(frames)
+    logger.info(
+        "LingBot deploy raw chunk prepared: frames=%d output_shape=%s bytes=%d",
+        len(frames),
+        output_shape,
+        len(payload),
+    )
+    return payload
 
 
 async def _release_realtime_session(session: LingBotDeployCompatSession) -> None:
@@ -438,6 +462,9 @@ async def _handle_message(
         session.set_mode(RealtimeVideoMode.V2V)
         session.setRequest(request)
         session.started = True
+        output_scale = (
+            int(request.upscaling_scale or 1) if request.enable_upscaling else 1
+        )
         await _send_json(
             ws,
             {
@@ -447,6 +474,11 @@ async def _handle_message(
                 "move_speed": session.move_speed,
                 "rotate_speed_deg_ik": session.rotate_speed_deg_ik,
                 "rotate_speed_deg_jl": session.rotate_speed_deg_jl,
+                "enable_upscaling": request.enable_upscaling,
+                "upscaling_scale": request.upscaling_scale,
+                "upscaling_model_path": request.upscaling_model_path,
+                "output_width": request.width * output_scale,
+                "output_height": request.height * output_scale,
             },
         )
         return asyncio.create_task(_generate_loop(ws, session))
