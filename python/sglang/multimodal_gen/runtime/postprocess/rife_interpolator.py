@@ -454,6 +454,57 @@ class FrameInterpolator:
         multiplier = 2**exp
         return result, multiplier
 
+    def interpolate_tensor(
+        self,
+        frames: torch.Tensor,
+        exp: int = 1,
+        scale: float = 1.0,
+    ) -> tuple[torch.Tensor, int]:
+        """
+        Interpolate an NCHW RGB tensor without converting through numpy.
+
+        Args:
+            frames: Tensor with shape [N, 3, H, W], either float in [0, 1] or
+                    uint8 in [0, 255].
+            exp:    Exponent for interpolation factor. 1 → 2×, 2 → 4×.
+            scale:  RIFE inference scale. Use 0.5 for high-resolution inputs.
+
+        Returns:
+            (interpolated_frames, multiplier) where frames are float32 NCHW on
+            the RIFE model device and multiplier = 2**exp.
+        """
+        if frames.ndim != 4 or frames.shape[1] != 3:
+            raise ValueError(
+                f"expected NCHW RGB tensor with shape [N, 3, H, W], got {tuple(frames.shape)}"
+            )
+        if frames.shape[0] < 2 or exp <= 0:
+            return frames, 1
+
+        model = self._ensure_model_loaded()
+        device = model.device()
+        if frames.dtype == torch.uint8:
+            frames = frames.to(device=device, dtype=torch.float32).mul(1.0 / 255.0)
+        else:
+            frames = frames.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
+        frames = frames.contiguous()
+
+        n_intermediate = 2**exp // 2  # intermediates per adjacent pair
+
+        result: list[torch.Tensor] = []
+        for i in range(frames.shape[0] - 1):
+            I0 = frames[i : i + 1]
+            I1 = frames[i + 1 : i + 2]
+            intermediate_tensors = self._make_inference(
+                model, I0, I1, n_intermediate, scale
+            )
+
+            result.append(I0)
+            result.extend(intermediate_tensors)
+
+        result.append(frames[-1:])
+        multiplier = 2**exp
+        return torch.cat(result, dim=0).contiguous(), multiplier
+
 
 # ---------------------------------------------------------------------------
 # Module-level convenience function
@@ -481,3 +532,27 @@ def interpolate_video_frames(
     """
     interpolator = FrameInterpolator(model_path=model_path)
     return interpolator.interpolate(frames, exp=exp, scale=scale)
+
+
+def interpolate_video_tensor(
+    frames: torch.Tensor,
+    exp: int = 1,
+    scale: float = 1.0,
+    model_path: Optional[str] = None,
+) -> tuple[torch.Tensor, int]:
+    """
+    Convenience wrapper around FrameInterpolator for NCHW RGB tensors.
+
+    Args:
+        frames:     Tensor with shape [N, 3, H, W], either float in [0, 1]
+                    or uint8 in [0, 255].
+        exp:        Interpolation exponent (1=2×, 2=4×).
+        scale:      RIFE inference scale (default 1.0; use 0.5 for high-res).
+        model_path: Local directory or HuggingFace repo ID containing
+                    ``flownet.pkl``.  *None* → default ``elfgum/RIFE-4.22.lite``.
+
+    Returns:
+        (interpolated_frames, multiplier)
+    """
+    interpolator = FrameInterpolator(model_path=model_path)
+    return interpolator.interpolate_tensor(frames, exp=exp, scale=scale)

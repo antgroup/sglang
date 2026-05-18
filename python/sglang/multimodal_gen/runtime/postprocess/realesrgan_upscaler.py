@@ -295,6 +295,20 @@ class UpscalerModel:
             imgs_t = imgs_t.contiguous(memory_format=torch.channels_last)
         return imgs_t
 
+    def _prepare_nchw_tensor(self, imgs_t: torch.Tensor) -> torch.Tensor:
+        """Prepare an NCHW RGB tensor on the model device without host copies."""
+        if imgs_t.ndim != 4 or imgs_t.shape[1] != 3:
+            raise ValueError(
+                f"expected NCHW RGB tensor with shape [N, 3, H, W], got {tuple(imgs_t.shape)}"
+            )
+        if imgs_t.dtype == torch.uint8:
+            imgs_t = imgs_t.to(device=self.device, dtype=self.dtype).mul(1.0 / 255.0)
+        else:
+            imgs_t = imgs_t.to(device=self.device, dtype=self.dtype).clamp(0.0, 1.0)
+        if self.device.type == "cuda":
+            imgs_t = imgs_t.contiguous(memory_format=torch.channels_last)
+        return imgs_t
+
     def _tensor_to_uint8_frames(self, out: torch.Tensor) -> np.ndarray:
         out = self._postprocess_output_tensor(out)
         return self._copy_output_to_host(out)
@@ -460,6 +474,28 @@ class UpscalerModel:
         )
         return outputs
 
+    def upscale_tensor(
+        self, frames: torch.Tensor, outscale: float | None = None
+    ) -> torch.Tensor:
+        """Upscale an NCHW RGB tensor and keep the result on device as float [0, 1]."""
+        if frames.numel() == 0:
+            return frames
+
+        h, w = frames.shape[-2:]
+        imgs_t = self._prepare_nchw_tensor(frames)
+
+        with torch.inference_mode():
+            out = self.net(imgs_t)
+
+        if outscale is not None and outscale != self.scale:
+            target_h = int(h * outscale)
+            target_w = int(w * outscale)
+            out = F.interpolate(
+                out, size=(target_h, target_w), mode="bicubic", align_corners=False
+            )
+
+        return out.clamp(0.0, 1.0).contiguous()
+
 
 # ---------------------------------------------------------------------------
 # ImageUpscaler public class
@@ -586,6 +622,24 @@ class ImageUpscaler:
         )
         return output_frames
 
+    def upscale_tensor(self, frames: torch.Tensor) -> torch.Tensor:
+        """Upscale an NCHW RGB tensor without converting through numpy."""
+        if frames.numel() == 0:
+            return frames
+        total_start_time = time.perf_counter()
+        model = self._ensure_model_loaded()
+        outscale = self._scale if self._scale != model.scale else None
+        output = model.upscale_tensor(frames, outscale=outscale)
+        total_duration_s = time.perf_counter() - total_start_time
+        logger.info(
+            "RealESRGAN upscale_tensor completed in %.3f seconds for %d frames shape=%s dtype=%s",
+            total_duration_s,
+            frames.shape[0],
+            tuple(output.shape),
+            output.dtype,
+        )
+        return output
+
 
 # ---------------------------------------------------------------------------
 # HF download helper
@@ -680,3 +734,32 @@ def upscale_frames(
         half_precision=half_precision,
     )
     return upscaler.upscale(frames)
+
+
+def upscale_tensor(
+    frames: torch.Tensor,
+    model_path: Optional[str] = None,
+    scale: int = 4,
+    half_precision: bool = False,
+) -> torch.Tensor:
+    """
+    Convenience wrapper around ImageUpscaler for NCHW RGB tensors.
+
+    Args:
+        frames:         Tensor with shape [N, 3, H, W], either float in [0, 1]
+                        or uint8 in [0, 255].
+        model_path:     Local .pth file, HuggingFace repo ID, or
+                        ``repo_id:filename`` for a custom weight file.
+        scale:          Desired final upscaling factor.
+        half_precision: Use fp16 inference (faster on supported GPUs).
+
+    Returns:
+        Upscaled tensor with shape [N, 3, H * scale, W * scale], float in [0, 1],
+        on the Real-ESRGAN model device.
+    """
+    upscaler = ImageUpscaler(
+        model_path=model_path,
+        scale=scale,
+        half_precision=half_precision,
+    )
+    return upscaler.upscale_tensor(frames)

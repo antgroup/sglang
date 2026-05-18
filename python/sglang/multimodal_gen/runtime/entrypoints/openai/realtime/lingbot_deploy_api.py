@@ -90,8 +90,8 @@ class LingBotDebugVideoRecorder:
         self.writer = None
         self.frame_count = 0
 
-    def append(self, frames: list[np.ndarray]) -> None:
-        if not frames:
+    def append(self, frames: list[np.ndarray] | np.ndarray) -> None:
+        if len(frames) == 0:
             return
 
         import imageio
@@ -218,7 +218,7 @@ class LingBotDeployCompatSession(GenerateSession):
         else:
             self.debug_video_recorder = None
 
-    def append_debug_video(self, frames: list[np.ndarray]) -> None:
+    def append_debug_video(self, frames: list[np.ndarray] | np.ndarray) -> None:
         if self.debug_video_recorder is None:
             return
         try:
@@ -543,30 +543,229 @@ def _normalize_rgb_array(
     return np.ascontiguousarray(arr)
 
 
-def output_to_rgb_frames(output: Any) -> list[np.ndarray]:
+def _normalize_rgb_tensor(
+    tensor: torch.Tensor, *, prefer_channel_first: bool = False
+) -> torch.Tensor:
+    if tensor.ndim == 5:
+        tensor = tensor[0]
+
+    if tensor.ndim == 4:
+        if (
+            prefer_channel_first
+            and tensor.shape[0] in (1, 3, 4)
+            and tensor.shape[1] not in (1, 3, 4)
+        ):
+            tensor = tensor[:3].permute(1, 0, 2, 3)
+        elif tensor.shape[-1] in (1, 3, 4):
+            tensor = tensor[..., :3].permute(0, 3, 1, 2)
+        elif tensor.shape[1] in (1, 3, 4):
+            tensor = tensor[:, :3]
+        elif tensor.shape[0] in (1, 3, 4):
+            tensor = tensor[:3].permute(1, 0, 2, 3)
+        else:
+            raise ValueError(f"unsupported video tensor shape: {tuple(tensor.shape)}")
+    elif tensor.ndim == 3:
+        if tensor.shape[-1] in (1, 3, 4):
+            tensor = tensor[..., :3].permute(2, 0, 1).unsqueeze(0)
+        elif tensor.shape[0] in (1, 3, 4):
+            tensor = tensor[:3].unsqueeze(0)
+        else:
+            raise ValueError(f"unsupported image tensor shape: {tuple(tensor.shape)}")
+    else:
+        raise ValueError(f"unsupported output tensor shape: {tuple(tensor.shape)}")
+
+    if tensor.shape[1] == 1:
+        tensor = tensor.repeat(1, 3, 1, 1)
+    if tensor.shape[1] != 3:
+        raise ValueError(f"expected RGB frames, got shape: {tuple(tensor.shape)}")
+    return tensor.contiguous()
+
+
+def output_to_rgb_tensor(output: Any) -> torch.Tensor:
+    """Normalize model output to an NCHW RGB tensor on the existing device."""
     if isinstance(output, (list, tuple)):
         if len(output) == 0:
             raise ValueError("empty model output")
         output = output[0]
 
     if isinstance(output, torch.Tensor):
-        tensor = output.detach()
-        if tensor.dtype != torch.uint8:
-            tensor = (tensor.clamp(0, 1) * 255).to(torch.uint8)
-        arr = tensor.cpu().numpy()
-        return list(_normalize_rgb_array(arr, prefer_channel_first=True))
+        tensor = _normalize_rgb_tensor(output.detach(), prefer_channel_first=True)
     elif isinstance(output, np.ndarray):
-        arr = output
-        if arr.dtype != np.uint8:
-            arr = (np.clip(arr, 0.0, 1.0) * 255).astype(np.uint8)
+        tensor = _normalize_rgb_tensor(torch.from_numpy(output))
     else:
         raise TypeError(f"unsupported model output type: {type(output)}")
 
+    if tensor.dtype == torch.uint8:
+        return tensor
+    if not tensor.is_floating_point():
+        tensor = tensor.float()
+    return tensor.clamp(0.0, 1.0).contiguous()
+
+
+def rgb_tensor_to_uint8_array(frames: torch.Tensor) -> np.ndarray:
+    if frames.ndim != 4 or frames.shape[1] != 3:
+        raise ValueError(
+            f"expected NCHW RGB tensor with shape [N, 3, H, W], got {tuple(frames.shape)}"
+        )
+    if frames.dtype == torch.uint8:
+        out = frames
+    else:
+        out = frames.clamp(0.0, 1.0).mul(255.0).to(torch.uint8)
+    out = out.permute(0, 2, 3, 1).contiguous()
+    return out.cpu().numpy()
+
+
+def rgb_tensor_hwc_shape(frames: torch.Tensor) -> tuple[int, int, int] | None:
+    if frames.numel() == 0:
+        return None
+    return (int(frames.shape[-2]), int(frames.shape[-1]), int(frames.shape[1]))
+
+
+def output_to_rgb_frames(output: Any) -> list[np.ndarray]:
+    if isinstance(output, torch.Tensor):
+        return list(rgb_tensor_to_uint8_array(output_to_rgb_tensor(output)))
+    if (
+        isinstance(output, (list, tuple))
+        and output
+        and isinstance(output[0], torch.Tensor)
+    ):
+        return list(rgb_tensor_to_uint8_array(output_to_rgb_tensor(output)))
+
+    if isinstance(output, (list, tuple)):
+        if len(output) == 0:
+            raise ValueError("empty model output")
+        output = output[0]
+    if not isinstance(output, np.ndarray):
+        raise TypeError(f"unsupported model output type: {type(output)}")
+
+    arr = output
+    if arr.dtype != np.uint8:
+        arr = (np.clip(arr, 0.0, 1.0) * 255).astype(np.uint8)
     return list(_normalize_rgb_array(arr))
 
 
-def rgb_frames_to_bytes(frames: list[np.ndarray]) -> bytes:
+def rgb_frames_to_bytes(frames: list[np.ndarray] | np.ndarray) -> bytes:
+    if isinstance(frames, np.ndarray):
+        return np.ascontiguousarray(frames).tobytes()
     return np.ascontiguousarray(np.stack(frames, axis=0)).tobytes()
+
+
+def output_to_rgb_tensor_for_send(
+    output: Any,
+    *,
+    enable_upscaling: bool = False,
+    upscaling_model_path: str | None = None,
+    upscaling_scale: int = 4,
+    half_precision: bool = False,
+    enable_rife: bool = DEFAULT_ENABLE_RIFE,
+    rife_model_path: str | None = DEFAULT_RIFE_MODEL_PATH,
+    rife_exp: int = DEFAULT_RIFE_EXP,
+    rife_scale: float = DEFAULT_RIFE_SCALE,
+    timings: dict[str, float] | None = None,
+) -> torch.Tensor:
+    stage_start = time.perf_counter()
+    frames = output_to_rgb_tensor(output)
+    if timings is not None:
+        timings["rgb_convert_ms"] = (time.perf_counter() - stage_start) * 1000.0
+
+    input_shape = rgb_tensor_hwc_shape(frames)
+    if enable_upscaling:
+        from sglang.multimodal_gen.runtime.postprocess import upscale_tensor
+
+        logger.info(
+            "LingBot deploy SR enabled: frames=%d input_shape=%s model_path=%s scale=%s half_precision=%s",
+            frames.shape[0],
+            input_shape,
+            upscaling_model_path,
+            upscaling_scale,
+            half_precision,
+        )
+        stage_start = time.perf_counter()
+        frames = upscale_tensor(
+            frames,
+            model_path=upscaling_model_path,
+            scale=upscaling_scale,
+            half_precision=half_precision,
+        )
+        if timings is not None:
+            timings["sr_ms"] = (time.perf_counter() - stage_start) * 1000.0
+    else:
+        if timings is not None:
+            timings["sr_ms"] = 0.0
+        logger.info(
+            "LingBot deploy SR disabled: frames=%d input_shape=%s",
+            frames.shape[0],
+            input_shape,
+        )
+
+    if enable_rife:
+        from sglang.multimodal_gen.runtime.postprocess import (
+            interpolate_video_tensor,
+        )
+
+        rife_input_shape = rgb_tensor_hwc_shape(frames)
+        logger.info(
+            "LingBot deploy RIFE enabled after SR: frames=%d input_shape=%s model_path=%s exp=%s scale=%s",
+            frames.shape[0],
+            rife_input_shape,
+            rife_model_path,
+            rife_exp,
+            rife_scale,
+        )
+        stage_start = time.perf_counter()
+        frames, multiplier = interpolate_video_tensor(
+            frames,
+            exp=rife_exp,
+            scale=rife_scale,
+            model_path=rife_model_path,
+        )
+        if timings is not None:
+            timings["rife_ms"] = (time.perf_counter() - stage_start) * 1000.0
+            timings["rife_multiplier"] = float(multiplier)
+    else:
+        if timings is not None:
+            timings["rife_ms"] = 0.0
+            timings["rife_multiplier"] = 1.0
+        logger.info("LingBot deploy RIFE disabled: frames=%d", frames.shape[0])
+
+    logger.info(
+        "LingBot deploy RGB frames prepared: frames=%d output_shape=%s",
+        frames.shape[0],
+        rgb_tensor_hwc_shape(frames),
+    )
+    return frames
+
+
+def output_to_rgb_array_for_send(
+    output: Any,
+    *,
+    enable_upscaling: bool = False,
+    upscaling_model_path: str | None = None,
+    upscaling_scale: int = 4,
+    half_precision: bool = False,
+    enable_rife: bool = DEFAULT_ENABLE_RIFE,
+    rife_model_path: str | None = DEFAULT_RIFE_MODEL_PATH,
+    rife_exp: int = DEFAULT_RIFE_EXP,
+    rife_scale: float = DEFAULT_RIFE_SCALE,
+    timings: dict[str, float] | None = None,
+) -> np.ndarray:
+    frames = output_to_rgb_tensor_for_send(
+        output,
+        enable_upscaling=enable_upscaling,
+        upscaling_model_path=upscaling_model_path,
+        upscaling_scale=upscaling_scale,
+        half_precision=half_precision,
+        enable_rife=enable_rife,
+        rife_model_path=rife_model_path,
+        rife_exp=rife_exp,
+        rife_scale=rife_scale,
+        timings=timings,
+    )
+    stage_start = time.perf_counter()
+    frame_array = rgb_tensor_to_uint8_array(frames)
+    if timings is not None:
+        timings["finalize_ms"] = (time.perf_counter() - stage_start) * 1000.0
+    return frame_array
 
 
 def output_to_rgb_frames_for_send(
@@ -582,77 +781,20 @@ def output_to_rgb_frames_for_send(
     rife_scale: float = DEFAULT_RIFE_SCALE,
     timings: dict[str, float] | None = None,
 ) -> list[np.ndarray]:
-    stage_start = time.perf_counter()
-    frames = output_to_rgb_frames(output)
-    if timings is not None:
-        timings["rgb_convert_ms"] = (time.perf_counter() - stage_start) * 1000.0
-
-    input_shape = tuple(frames[0].shape) if frames else None
-    if enable_upscaling:
-        from sglang.multimodal_gen.runtime.postprocess import upscale_frames
-
-        logger.info(
-            "LingBot deploy SR enabled: frames=%d input_shape=%s model_path=%s scale=%s half_precision=%s",
-            len(frames),
-            input_shape,
-            upscaling_model_path,
-            upscaling_scale,
-            half_precision,
-        )
-        stage_start = time.perf_counter()
-        frames = upscale_frames(
-            frames,
-            model_path=upscaling_model_path,
-            scale=upscaling_scale,
+    return list(
+        output_to_rgb_array_for_send(
+            output,
+            enable_upscaling=enable_upscaling,
+            upscaling_model_path=upscaling_model_path,
+            upscaling_scale=upscaling_scale,
             half_precision=half_precision,
+            enable_rife=enable_rife,
+            rife_model_path=rife_model_path,
+            rife_exp=rife_exp,
+            rife_scale=rife_scale,
+            timings=timings,
         )
-        if timings is not None:
-            timings["sr_ms"] = (time.perf_counter() - stage_start) * 1000.0
-    else:
-        if timings is not None:
-            timings["sr_ms"] = 0.0
-        logger.info(
-            "LingBot deploy SR disabled: frames=%d input_shape=%s",
-            len(frames),
-            input_shape,
-        )
-
-    if enable_rife:
-        from sglang.multimodal_gen.runtime.postprocess import (
-            interpolate_video_frames,
-        )
-
-        rife_input_shape = tuple(frames[0].shape) if frames else None
-        logger.info(
-            "LingBot deploy RIFE enabled after SR: frames=%d input_shape=%s model_path=%s exp=%s scale=%s",
-            len(frames),
-            rife_input_shape,
-            rife_model_path,
-            rife_exp,
-            rife_scale,
-        )
-        stage_start = time.perf_counter()
-        frames, multiplier = interpolate_video_frames(
-            frames,
-            exp=rife_exp,
-            scale=rife_scale,
-            model_path=rife_model_path,
-        )
-        if timings is not None:
-            timings["rife_ms"] = (time.perf_counter() - stage_start) * 1000.0
-            timings["rife_multiplier"] = float(multiplier)
-    else:
-        if timings is not None:
-            timings["rife_ms"] = 0.0
-            timings["rife_multiplier"] = 1.0
-        logger.info("LingBot deploy RIFE disabled: frames=%d", len(frames))
-
-    logger.info(
-        "LingBot deploy RGB frames prepared: frames=%d output_shape=%s",
-        len(frames),
-        tuple(frames[0].shape) if frames else None,
     )
-    return frames
 
 
 def output_to_rgb_bytes(
@@ -663,7 +805,7 @@ def output_to_rgb_bytes(
     upscaling_scale: int = 4,
     half_precision: bool = False,
 ) -> bytes:
-    frames = output_to_rgb_frames_for_send(
+    frames = output_to_rgb_array_for_send(
         output,
         enable_upscaling=enable_upscaling,
         upscaling_model_path=upscaling_model_path,
@@ -759,7 +901,7 @@ async def run_startup_warmup_if_enabled(server_args) -> None:
                 error_msg = result.error or "LingBot startup warmup returned no output"
                 raise RuntimeError(error_msg)
 
-            frames = output_to_rgb_frames_for_send(
+            frames = output_to_rgb_array_for_send(
                 result.output,
                 enable_upscaling=bool(batch.enable_upscaling),
                 upscaling_model_path=batch.upscaling_model_path,
@@ -772,7 +914,7 @@ async def run_startup_warmup_if_enabled(server_args) -> None:
                 STARTUP_WARMUP_CHUNKS,
                 (time.perf_counter() - chunk_start) * 1000.0,
                 len(frames),
-                tuple(frames[0].shape) if frames else None,
+                tuple(frames[0].shape) if len(frames) else None,
             )
             session.generate_chunk_completed()
 
@@ -843,7 +985,7 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                 raise RuntimeError(error_msg)
 
             stage_start = time.perf_counter()
-            frames = output_to_rgb_frames_for_send(
+            frames = output_to_rgb_array_for_send(
                 result.output,
                 enable_upscaling=bool(batch.enable_upscaling),
                 upscaling_model_path=batch.upscaling_model_path,
@@ -883,7 +1025,7 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                 timings["ws_send_ms"],
                 elapsed_ms,
                 len(frames),
-                tuple(frames[0].shape) if frames else None,
+                tuple(frames[0].shape) if len(frames) else None,
                 len(payload),
                 timings["rife_multiplier"],
             )
@@ -896,7 +1038,7 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                     "chunks_per_sec": 1000.0 / elapsed_ms if elapsed_ms > 0 else 0,
                     "queue_size": 0,
                     "frames": len(frames),
-                    "frame_shape": list(frames[0].shape) if frames else None,
+                    "frame_shape": list(frames[0].shape) if len(frames) else None,
                     "rife_multiplier": timings["rife_multiplier"],
                     "stage_timings_ms": {
                         key: round(value, 3) for key, value in timings.items()
