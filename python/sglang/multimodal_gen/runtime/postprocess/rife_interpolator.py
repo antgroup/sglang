@@ -435,6 +435,23 @@ class FrameInterpolator:
         model = self._ensure_model_loaded()
         device = model.device()
 
+        if exp == 1 and all(frame.shape == frames[0].shape for frame in frames):
+            input_tensors = torch.cat(
+                [self._frame_to_tensor(frame, device) for frame in frames], dim=0
+            ).contiguous()
+            middle_tensors = model.inference(
+                input_tensors[:-1],
+                input_tensors[1:],
+                scale=scale,
+            )
+
+            result: list[np.ndarray] = []
+            for i in range(len(frames) - 1):
+                result.append(frames[i])
+                result.append(self._tensor_to_frame(middle_tensors[i : i + 1]))
+            result.append(frames[-1])
+            return result, 2
+
         n_intermediate = 2**exp // 2  # intermediates per adjacent pair
 
         result: list[np.ndarray] = []
@@ -487,6 +504,21 @@ class FrameInterpolator:
         else:
             frames = frames.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
         frames = frames.contiguous()
+
+        if exp == 1:
+            middle_frames = model.inference(
+                frames[:-1],
+                frames[1:],
+                scale=scale,
+            )
+            result = torch.empty(
+                (frames.shape[0] * 2 - 1, *frames.shape[1:]),
+                device=frames.device,
+                dtype=middle_frames.dtype,
+            )
+            result[0::2] = frames
+            result[1::2] = middle_frames
+            return result.contiguous(), 2
 
         n_intermediate = 2**exp // 2  # intermediates per adjacent pair
 
