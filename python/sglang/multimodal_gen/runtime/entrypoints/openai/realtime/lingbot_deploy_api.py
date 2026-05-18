@@ -29,6 +29,14 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 router = APIRouter(tags=["lingbot-realtime"])
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 DEFAULT_PROMPT = "A cinematic video with smooth camera motion"
 DEFAULT_WIDTH = 832
 DEFAULT_HEIGHT = 480
@@ -42,6 +50,13 @@ DEFAULT_UPSCALING_SCALE = 2
 DEFAULT_UPSCALING_MODEL_PATH = (
     "/home/admin/realesr-general-x4v3/realesr-general-x4v3.pth"
 )
+DEFAULT_ENABLE_RIFE = _env_bool("SGLANG_LINGBOT_ENABLE_RIFE", False)
+DEFAULT_RIFE_MODEL_PATH = os.environ.get(
+    "SGLANG_LINGBOT_RIFE_MODEL_PATH",
+    "/home/admin/RIFE-4.22.lite",
+)
+DEFAULT_RIFE_EXP = int(os.environ.get("SGLANG_LINGBOT_RIFE_EXP", "1"))
+DEFAULT_RIFE_SCALE = float(os.environ.get("SGLANG_LINGBOT_RIFE_SCALE", "1.0"))
 DEFAULT_DEBUG_SAVE_VIDEO = os.environ.get(
     "SGLANG_LINGBOT_DEBUG_SAVE_VIDEO", "0"
 ).lower() in {"1", "true", "yes", "on"}
@@ -446,12 +461,16 @@ def _build_start_request(
         )
     if debug_video_path is not None and not isinstance(debug_video_path, str):
         raise ValueError("debug_video_path must be a string")
-    session.set_debug_video(debug_video_path if debug_save_video else None, fps=fps)
+    debug_video_fps = fps * (2**DEFAULT_RIFE_EXP if DEFAULT_ENABLE_RIFE else 1)
+    session.set_debug_video(
+        debug_video_path if debug_save_video else None,
+        fps=debug_video_fps,
+    )
 
     prompt = str(data.get("prompt") or DEFAULT_PROMPT)
     logger.info(
         "LingBot START request: session_id=%s prompt=%r image_path=%s "
-        "seed=%s output=%sx%s model=%sx%s",
+        "seed=%s output=%sx%s model=%sx%s rife=%s rife_exp=%s rife_scale=%s",
         session.id,
         prompt,
         first_frame,
@@ -460,6 +479,9 @@ def _build_start_request(
         output_height,
         model_width,
         model_height,
+        DEFAULT_ENABLE_RIFE,
+        DEFAULT_RIFE_EXP,
+        DEFAULT_RIFE_SCALE,
     )
 
     request = RealtimeVideoGenerationsRequest(
@@ -554,6 +576,10 @@ def output_to_rgb_frames_for_send(
     upscaling_model_path: str | None = None,
     upscaling_scale: int = 4,
     half_precision: bool = False,
+    enable_rife: bool = DEFAULT_ENABLE_RIFE,
+    rife_model_path: str | None = DEFAULT_RIFE_MODEL_PATH,
+    rife_exp: int = DEFAULT_RIFE_EXP,
+    rife_scale: float = DEFAULT_RIFE_SCALE,
     timings: dict[str, float] | None = None,
 ) -> list[np.ndarray]:
     stage_start = time.perf_counter()
@@ -591,6 +617,36 @@ def output_to_rgb_frames_for_send(
             input_shape,
         )
 
+    if enable_rife:
+        from sglang.multimodal_gen.runtime.postprocess import (
+            interpolate_video_frames,
+        )
+
+        rife_input_shape = tuple(frames[0].shape) if frames else None
+        logger.info(
+            "LingBot deploy RIFE enabled after SR: frames=%d input_shape=%s model_path=%s exp=%s scale=%s",
+            len(frames),
+            rife_input_shape,
+            rife_model_path,
+            rife_exp,
+            rife_scale,
+        )
+        stage_start = time.perf_counter()
+        frames, multiplier = interpolate_video_frames(
+            frames,
+            exp=rife_exp,
+            scale=rife_scale,
+            model_path=rife_model_path,
+        )
+        if timings is not None:
+            timings["rife_ms"] = (time.perf_counter() - stage_start) * 1000.0
+            timings["rife_multiplier"] = float(multiplier)
+    else:
+        if timings is not None:
+            timings["rife_ms"] = 0.0
+            timings["rife_multiplier"] = 1.0
+        logger.info("LingBot deploy RIFE disabled: frames=%d", len(frames))
+
     logger.info(
         "LingBot deploy RGB frames prepared: frames=%d output_shape=%s",
         len(frames),
@@ -613,6 +669,10 @@ def output_to_rgb_bytes(
         upscaling_model_path=upscaling_model_path,
         upscaling_scale=upscaling_scale,
         half_precision=half_precision,
+        enable_rife=DEFAULT_ENABLE_RIFE,
+        rife_model_path=DEFAULT_RIFE_MODEL_PATH,
+        rife_exp=DEFAULT_RIFE_EXP,
+        rife_scale=DEFAULT_RIFE_SCALE,
     )
     payload = rgb_frames_to_bytes(frames)
     logger.info("LingBot deploy raw chunk prepared: bytes=%d", len(payload))
@@ -807,15 +867,16 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
             timings["total_ms"] = elapsed_ms
             logger.info(
                 "LingBot deploy stage timing: session_id=%s chunk_idx=%s "
-                "prepare=%.2fms scheduler=%.2fms rgb_convert=%.2fms sr=%.2fms "
+                "prepare=%.2fms scheduler=%.2fms rgb_convert=%.2fms sr=%.2fms rife=%.2fms "
                 "postprocess=%.2fms debug_video=%.2fms pack_bytes=%.2fms "
-                "ws_send=%.2fms total=%.2fms frames=%d frame_shape=%s payload_bytes=%d",
+                "ws_send=%.2fms total=%.2fms frames=%d frame_shape=%s payload_bytes=%d rife_multiplier=%.1f",
                 session.id,
                 session.generate_chunk_cnt,
                 timings["prepare_ms"],
                 timings["scheduler_ms"],
                 timings["rgb_convert_ms"],
                 timings["sr_ms"],
+                timings["rife_ms"],
                 timings["postprocess_ms"],
                 timings["debug_video_ms"],
                 timings["pack_bytes_ms"],
@@ -824,6 +885,7 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                 len(frames),
                 tuple(frames[0].shape) if frames else None,
                 len(payload),
+                timings["rife_multiplier"],
             )
             await _send_json(
                 ws,
@@ -833,6 +895,9 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                     "chunk_time_ms": elapsed_ms,
                     "chunks_per_sec": 1000.0 / elapsed_ms if elapsed_ms > 0 else 0,
                     "queue_size": 0,
+                    "frames": len(frames),
+                    "frame_shape": list(frames[0].shape) if frames else None,
+                    "rife_multiplier": timings["rife_multiplier"],
                     "stage_timings_ms": {
                         key: round(value, 3) for key, value in timings.items()
                     },
@@ -923,6 +988,10 @@ async def _handle_message(
                 "enable_upscaling": request.enable_upscaling,
                 "upscaling_scale": request.upscaling_scale,
                 "upscaling_model_path": request.upscaling_model_path,
+                "enable_rife": DEFAULT_ENABLE_RIFE,
+                "rife_model_path": DEFAULT_RIFE_MODEL_PATH,
+                "rife_exp": DEFAULT_RIFE_EXP,
+                "rife_scale": DEFAULT_RIFE_SCALE,
                 "width": session.output_width,
                 "height": session.output_height,
                 "output_width": session.output_width,
