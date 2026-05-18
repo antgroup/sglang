@@ -621,6 +621,75 @@ def rgb_tensor_hwc_shape(frames: torch.Tensor) -> tuple[int, int, int] | None:
     return (int(frames.shape[-2]), int(frames.shape[-1]), int(frames.shape[1]))
 
 
+def _cuda_device_from_output(output: Any) -> torch.device | None:
+    if isinstance(output, torch.Tensor) and output.device.type == "cuda":
+        return output.device
+    if isinstance(output, (list, tuple)) and output:
+        return _cuda_device_from_output(output[0])
+    return None
+
+
+def _cuda_device_from_tensor(tensor: torch.Tensor) -> torch.device | None:
+    if tensor.device.type == "cuda":
+        return tensor.device
+    return None
+
+
+def _start_cuda_stage_timer(
+    device: torch.device | None,
+) -> tuple[float, Any, Any, torch.device | None]:
+    wall_start = time.perf_counter()
+    if device is None or not torch.cuda.is_available():
+        return wall_start, None, None, None
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record(torch.cuda.current_stream(device))
+    return wall_start, start_event, end_event, device
+
+
+def _stop_cuda_stage_timer(
+    timings: dict[str, float] | None,
+    stage_name: str,
+    timer: tuple[float, Any, Any, torch.device | None],
+    cuda_events: dict[str, tuple[Any, Any]] | None,
+    *,
+    wall_timing_key: str | None = None,
+    fallback_timing_key: str | None = None,
+) -> None:
+    if timings is None:
+        return
+
+    wall_start, start_event, end_event, device = timer
+    wall_ms = (time.perf_counter() - wall_start) * 1000.0
+    timing_key = f"{stage_name}_ms"
+    if (
+        start_event is None
+        or end_event is None
+        or device is None
+        or cuda_events is None
+    ):
+        timings[fallback_timing_key or timing_key] = wall_ms
+        return
+
+    end_event.record(torch.cuda.current_stream(device))
+    timings[wall_timing_key or f"{stage_name}_enqueue_ms"] = wall_ms
+    cuda_events[stage_name] = (start_event, end_event)
+
+
+def _resolve_cuda_stage_timings(
+    timings: dict[str, float] | None,
+    cuda_events: dict[str, tuple[Any, Any]] | None,
+) -> None:
+    if timings is None or not cuda_events:
+        return
+
+    for stage_name, (start_event, end_event) in cuda_events.items():
+        end_event.synchronize()
+        timings[f"{stage_name}_ms"] = start_event.elapsed_time(end_event)
+    cuda_events.clear()
+
+
 def output_to_rgb_frames(output: Any) -> list[np.ndarray]:
     if isinstance(output, torch.Tensor):
         return list(rgb_tensor_to_uint8_array(output_to_rgb_tensor(output)))
@@ -662,11 +731,17 @@ def output_to_rgb_tensor_for_send(
     rife_exp: int = DEFAULT_RIFE_EXP,
     rife_scale: float = DEFAULT_RIFE_SCALE,
     timings: dict[str, float] | None = None,
+    cuda_events: dict[str, tuple[Any, Any]] | None = None,
 ) -> torch.Tensor:
-    stage_start = time.perf_counter()
+    stage_timer = _start_cuda_stage_timer(_cuda_device_from_output(output))
     frames = output_to_rgb_tensor(output)
-    if timings is not None:
-        timings["rgb_convert_ms"] = (time.perf_counter() - stage_start) * 1000.0
+    _stop_cuda_stage_timer(
+        timings,
+        "rgb_convert",
+        stage_timer,
+        cuda_events,
+        fallback_timing_key="rgb_convert_ms",
+    )
 
     input_shape = rgb_tensor_hwc_shape(frames)
     if enable_upscaling:
@@ -680,15 +755,20 @@ def output_to_rgb_tensor_for_send(
             upscaling_scale,
             half_precision,
         )
-        stage_start = time.perf_counter()
+        stage_timer = _start_cuda_stage_timer(_cuda_device_from_tensor(frames))
         frames = upscale_tensor(
             frames,
             model_path=upscaling_model_path,
             scale=upscaling_scale,
             half_precision=half_precision,
         )
-        if timings is not None:
-            timings["sr_ms"] = (time.perf_counter() - stage_start) * 1000.0
+        _stop_cuda_stage_timer(
+            timings,
+            "sr",
+            stage_timer,
+            cuda_events,
+            fallback_timing_key="sr_ms",
+        )
     else:
         if timings is not None:
             timings["sr_ms"] = 0.0
@@ -712,15 +792,21 @@ def output_to_rgb_tensor_for_send(
             rife_exp,
             rife_scale,
         )
-        stage_start = time.perf_counter()
+        stage_timer = _start_cuda_stage_timer(_cuda_device_from_tensor(frames))
         frames, multiplier = interpolate_video_tensor(
             frames,
             exp=rife_exp,
             scale=rife_scale,
             model_path=rife_model_path,
         )
+        _stop_cuda_stage_timer(
+            timings,
+            "rife",
+            stage_timer,
+            cuda_events,
+            fallback_timing_key="rife_ms",
+        )
         if timings is not None:
-            timings["rife_ms"] = (time.perf_counter() - stage_start) * 1000.0
             timings["rife_multiplier"] = float(multiplier)
     else:
         if timings is not None:
@@ -749,6 +835,7 @@ def output_to_rgb_array_for_send(
     rife_scale: float = DEFAULT_RIFE_SCALE,
     timings: dict[str, float] | None = None,
 ) -> np.ndarray:
+    cuda_events: dict[str, tuple[Any, Any]] | None = {} if timings is not None else None
     frames = output_to_rgb_tensor_for_send(
         output,
         enable_upscaling=enable_upscaling,
@@ -760,11 +847,19 @@ def output_to_rgb_array_for_send(
         rife_exp=rife_exp,
         rife_scale=rife_scale,
         timings=timings,
+        cuda_events=cuda_events,
     )
-    stage_start = time.perf_counter()
+    stage_timer = _start_cuda_stage_timer(_cuda_device_from_tensor(frames))
     frame_array = rgb_tensor_to_uint8_array(frames)
-    if timings is not None:
-        timings["finalize_ms"] = (time.perf_counter() - stage_start) * 1000.0
+    _stop_cuda_stage_timer(
+        timings,
+        "finalize_cuda",
+        stage_timer,
+        cuda_events,
+        wall_timing_key="finalize_ms",
+        fallback_timing_key="finalize_ms",
+    )
+    _resolve_cuda_stage_timings(timings, cuda_events)
     return frame_array
 
 
@@ -1010,7 +1105,8 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
             logger.info(
                 "LingBot deploy stage timing: session_id=%s chunk_idx=%s "
                 "prepare=%.2fms scheduler=%.2fms rgb_convert=%.2fms sr=%.2fms rife=%.2fms "
-                "postprocess=%.2fms debug_video=%.2fms pack_bytes=%.2fms "
+                "finalize=%.2fms finalize_cuda=%.2fms postprocess=%.2fms "
+                "debug_video=%.2fms pack_bytes=%.2fms "
                 "ws_send=%.2fms total=%.2fms frames=%d frame_shape=%s payload_bytes=%d rife_multiplier=%.1f",
                 session.id,
                 session.generate_chunk_cnt,
@@ -1019,6 +1115,8 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                 timings["rgb_convert_ms"],
                 timings["sr_ms"],
                 timings["rife_ms"],
+                timings["finalize_ms"],
+                timings.get("finalize_cuda_ms", 0.0),
                 timings["postprocess_ms"],
                 timings["debug_video_ms"],
                 timings["pack_bytes_ms"],
