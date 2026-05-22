@@ -248,7 +248,7 @@ class HiSparseCoordinator:
         """
         self.alloc_device_buffer(req)
 
-        host_len = self._host_token_len(req.kv_allocated_len)
+        host_len = self.host_token_len(req.kv_allocated_len)
         if host_len <= self.device_buffer_size:
             # Short sequences (seq_len <= device_buffer_size): the kernel fast path
             # returns device_buffer_locs directly without any host loading, so we
@@ -266,14 +266,14 @@ class HiSparseCoordinator:
         self._skip_first_backup[req.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
-    def _host_token_len(self, kv_allocated_len: int) -> int:
+    def host_token_len(self, kv_allocated_len: int) -> int:
         if self.is_dsv4_hisparse:
             return kv_allocated_len // self.compress_ratio
         return kv_allocated_len
 
     def _preload_to_device_buffer(self, req: Req) -> None:
         """Preload all tokens from host pool into the device buffer."""
-        n = self._host_token_len(req.kv_allocated_len)
+        n = self.host_token_len(req.kv_allocated_len)
         host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
         device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
 

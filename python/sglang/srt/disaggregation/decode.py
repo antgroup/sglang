@@ -1304,7 +1304,7 @@ class DecodePreallocQueue:
                 coordinator.req_to_host_pool_allocated_len,
                 req.req_pool_idx,
                 0,
-                coordinator._host_token_len(fill_len),
+                coordinator.host_token_len(fill_len),
             )
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
