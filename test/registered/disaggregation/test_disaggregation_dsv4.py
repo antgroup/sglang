@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=500, stage="base-c", runner_config="dsv4-8-gpu-h200")
+register_cuda_ci(est_time=1200, stage="base-c", runner_config="dsv4-8-gpu-h200")
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 
@@ -170,7 +170,6 @@ class TestDisaggregationDSV4HiSparse(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             "4",
-            "--disable-radix-cache",
             "--page-size",
             "256",
             "--chunked-prefill-size",
@@ -259,6 +258,22 @@ class TestDisaggregationDSV4HiSparse(PDDisaggregationServerBase):
         self.assertIn("output_ids", output)
         self.assertEqual(len(output["output_ids"]), max_new_tokens)
         self.assertEqual(output["meta_info"]["prompt_tokens"], prompt_len)
+
+    def test_gsm8k_24_shot(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+            num_shots=24,
+        )
+        metrics = run_eval(args)
+        print(f"Evaluation metrics: {metrics}")
+
+        self.assertGreater(metrics["score"], 0.95)
 
 
 if __name__ == "__main__":
