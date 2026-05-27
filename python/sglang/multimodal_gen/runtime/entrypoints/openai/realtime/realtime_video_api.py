@@ -124,6 +124,7 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             batch.input_video = (
                 session.sample_video_frames() if session.is_v2v_enabled() else None
             )
+            session.apply_prompt_event_to_batch(batch)
             save_file_path_list, result = await process_generation_batch(
                 async_scheduler_client, batch
             )
@@ -196,13 +197,36 @@ async def _listen_actions(ws: WebSocket, session: GenerateSession):
                 )
             elif realtime_action.type == "control":
                 control_chunk = realtime_action.control_chunk
+                key = realtime_action.key
+                key_action = realtime_action.action
+                event_ids = session.resolve_action_event_ids(realtime_action)
+                if event_ids:
+                    event_ids = session.validate_prompt_event_ids(event_ids)
+                if key is not None or key_action is not None:
+                    if key is None or key_action is None:
+                        raise ValueError("control key and action must be set together")
+                    key, key_action = session.validate_control_key_action(
+                        key, key_action
+                    )
+                action_log_parts = []
                 if control_chunk is not None:
                     session.append_control_chunk(control_chunk)
-                    action_log = (
-                        f"type=control, mode=chunk, chunk_len={len(control_chunk)}"
+                    action_log_parts.append(
+                        f"mode=chunk, chunk_len={len(control_chunk)}"
                     )
-                else:
-                    raise ValueError("control action requires control_chunk")
+                if key is not None or key_action is not None:
+                    session.set_key_state(key, key_action)
+                    action_log_parts.append(f"key={key}, action={key_action}")
+                if event_ids:
+                    session.trigger_prompt_events(event_ids)
+                    action_log_parts.append(
+                        f"events={event_ids}, event_chunk={session.prompt_event_chunk}"
+                    )
+                if not action_log_parts:
+                    raise ValueError(
+                        "control action requires control_chunk, key/action, or event(s)"
+                    )
+                action_log = "type=control, " + ", ".join(action_log_parts)
             else:
                 if not realtime_action.action_content:
                     raise ValueError("prompt action requires action_content")

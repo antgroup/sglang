@@ -135,6 +135,9 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     profile: Optional[bool] = False
     num_profiled_timesteps: Optional[int] = None
     profile_all_stages: Optional[bool] = False
+    events: Optional[Dict[str, str]] = None
+    event_mode: Optional[Literal["overwrite", "append"]] = "overwrite"
+    event_chunk: Optional[int] = 1
 
 
 class RealtimeAction(BaseModel):
@@ -143,6 +146,12 @@ class RealtimeAction(BaseModel):
     video_frame: Optional[bytes] = None
     video_frames: Optional[List[bytes]] = None
     control_chunk: Optional[List[List[str]]] = None
+    key: Optional[str] = None
+    action: Optional[Literal["down", "up"]] = None
+    event: Optional[str] = None
+    event_id: Optional[str] = None
+    events: Optional[Union[str, List[str]]] = None
+    event_ids: Optional[Union[str, List[str]]] = None
 
 
 # Mesh API protocol models

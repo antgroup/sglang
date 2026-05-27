@@ -63,7 +63,6 @@ DEFAULT_DEBUG_SAVE_VIDEO = os.environ.get(
 DEFAULT_DEBUG_VIDEO_DIR = os.environ.get(
     "SGLANG_LINGBOT_DEBUG_VIDEO_DIR", "/tmp/sglang_lingbot_debug"
 )
-SUPPORTED_CONTROL_KEYS = {"w", "a", "s", "d", "i", "j", "k", "l"}
 STARTUP_WARMUP_CHUNKS = int(os.environ.get("SGLANG_LINGBOT_STARTUP_WARMUP_CHUNKS", "0"))
 STARTUP_WARMUP_IMAGE_PATH = os.environ.get("SGLANG_LINGBOT_STARTUP_WARMUP_IMAGE_PATH")
 STARTUP_WARMUP_WIDTH = int(
@@ -249,16 +248,12 @@ class LingBotDeployCompatSession(GenerateSession):
     def set_key_state(
         self, key: str, action: str, *, timestamp: float | None = None
     ) -> None:
-        normalized_key = key.lower()
-        if normalized_key not in SUPPORTED_CONTROL_KEYS:
-            raise ValueError(f"unsupported control key: {key}")
+        normalized_key, action = self.validate_control_key_action(key, action)
         before = set(self.current_keys)
         if action == "down":
             self.current_keys.add(normalized_key)
         elif action == "up":
             self.current_keys.discard(normalized_key)
-        else:
-            raise ValueError(f"unsupported control action: {action}")
 
         if self.current_keys == before:
             return
@@ -505,6 +500,9 @@ def _build_start_request(
         ),
         upscaling_scale=upscaling_scale,
         diffusers_kwargs=data.get("diffusers_kwargs"),
+        events=data.get("events"),
+        event_mode=data.get("event_mode"),
+        event_chunk=data.get("event_chunk"),
     )
     return request, seed
 
@@ -990,6 +988,7 @@ async def run_startup_warmup_if_enabled(server_args) -> None:
             batch.block_idx = session.generate_chunk_cnt
             chunk_size = batch.extra.get("chunk_size", 1)
             batch.extra["actions"] = [[] for _ in range(chunk_size)]
+            session.apply_prompt_event_to_batch(batch)
 
             result = await async_scheduler_client.forward([batch])
             if result.output is None:
@@ -1071,6 +1070,8 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                     control_chunk,
                 )
                 batch.extra["actions"] = control_chunk
+
+            session.apply_prompt_event_to_batch(batch)
 
             stage_start = time.perf_counter()
             result = await async_scheduler_client.forward([batch])
@@ -1244,10 +1245,48 @@ async def _handle_message(
         return asyncio.create_task(_generate_loop(ws, session))
 
     if msg_type == "CONTROL":
-        try:
-            session.set_key_state(str(data.get("key", "")), str(data.get("action", "")))
-        except Exception as exc:
-            await _send_error(ws, str(exc))
+        key = data.get("key")
+        action = data.get("action")
+        event_ids = session.resolve_event_ids(
+            event_id=data.get("event_id"),
+            event=data.get("event"),
+            event_ids=data.get("event_ids"),
+            events=data.get("events"),
+        )
+        if event_ids:
+            try:
+                event_ids = session.validate_prompt_event_ids(event_ids)
+            except Exception as exc:
+                await _send_error(ws, str(exc))
+                return generate_task
+        if key is not None or action is not None:
+            try:
+                key, action = session.validate_control_key_action(
+                    str(key or ""), str(action or "")
+                )
+            except Exception as exc:
+                await _send_error(ws, str(exc))
+                return generate_task
+        did_handle = False
+
+        if key is not None or action is not None:
+            try:
+                session.set_key_state(key, action)
+                did_handle = True
+            except Exception as exc:
+                await _send_error(ws, str(exc))
+                return generate_task
+
+        if event_ids:
+            try:
+                session.trigger_prompt_events(event_ids)
+                did_handle = True
+            except Exception as exc:
+                await _send_error(ws, str(exc))
+                return generate_task
+
+        if not did_handle:
+            await _send_error(ws, "CONTROL requires key/action or event(s)")
         return generate_task
 
     if msg_type == "STOP":

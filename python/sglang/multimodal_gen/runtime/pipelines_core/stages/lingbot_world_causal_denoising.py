@@ -279,6 +279,16 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             # Reset frame position on cache reset
             cache_state.current_chunk_start_frame = 0
             cache_state.chunk_idx = 0
+        elif getattr(batch, "update_prompt_embeds", False):
+            for block_cache in crossattn_cache:
+                block_cache["is_init"] = False
+            logger.info(
+                "LingBot cross-attention cache reset for prompt embedding change: "
+                "session_id=%s block_idx=%s event_ids=%s",
+                batch.extra.get("realtime_session_id"),
+                batch.block_idx,
+                batch.extra.get("active_prompt_event_ids"),
+            )
         # Keep cross-attention K/V cache across realtime chunks; LingBot text/image
         # conditions are session-static and are invalidated by the cache reset above.
 
