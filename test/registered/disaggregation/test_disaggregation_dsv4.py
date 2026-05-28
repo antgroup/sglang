@@ -132,7 +132,11 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase, GSM8KMixin):
         )
 
 
-class TestDisaggregationDSV4HiSparse(PDDisaggregationServerBase):
+class TestDisaggregationDSV4HiSparse(PDDisaggregationServerBase, GSM8KMixin):
+
+    gsm8k_accuracy_thres = 0.93
+    gsm8k_num_shots = 24
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -245,22 +249,6 @@ class TestDisaggregationDSV4HiSparse(PDDisaggregationServerBase):
         self.assertIn("output_ids", output)
         self.assertEqual(len(output["output_ids"]), max_new_tokens)
         self.assertEqual(output["meta_info"]["prompt_tokens"], prompt_len)
-
-    def test_gsm8k_24_shot(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
-            num_shots=24,
-        )
-        metrics = run_eval(args)
-        print(f"Evaluation metrics: {metrics}")
-
-        self.assertGreater(metrics["score"], 0.90)
 
 
 if __name__ == "__main__":
