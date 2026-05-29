@@ -326,7 +326,7 @@ class CompletionRequest(BaseModel):
     return_hidden_states: bool = False
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
-    return_cached_tokens_details: bool = False
+    return_cached_tokens_details: bool = True
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -674,7 +674,7 @@ class ChatCompletionRequest(BaseModel):
     return_hidden_states: bool = False
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
-    return_cached_tokens_details: bool = False
+    return_cached_tokens_details: bool = True
     reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
