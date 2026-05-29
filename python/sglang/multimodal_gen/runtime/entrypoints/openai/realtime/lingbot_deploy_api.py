@@ -1039,9 +1039,111 @@ async def _release_realtime_session(session: LingBotDeployCompatSession) -> None
         )
 
 
+def _raise_if_sender_failed(sender_task: asyncio.Task) -> None:
+    if not sender_task.done():
+        return
+    if sender_task.cancelled():
+        raise asyncio.CancelledError()
+    exc = sender_task.exception()
+    if exc is not None:
+        raise exc
+
+
+async def _send_chunk_item(
+    ws: WebSocket,
+    session: LingBotDeployCompatSession,
+    item: dict[str, Any],
+) -> None:
+    frames = item["frames"]
+    timings = item["timings"]
+    chunk_idx = item["chunk_idx"]
+    start = item["start"]
+    queue_size = item["queue_size"]
+    frame_count = len(frames)
+    frame_shape = tuple(frames[0].shape) if frame_count else None
+
+    stage_start = time.perf_counter()
+    payload = rgb_frames_to_bytes(frames)
+    item["frames"] = None
+    del frames
+    timings["pack_bytes_ms"] = (time.perf_counter() - stage_start) * 1000.0
+    logger.info("LingBot deploy raw chunk prepared: bytes=%d", len(payload))
+
+    stage_start = time.perf_counter()
+    await ws.send_bytes(payload)
+    timings["ws_send_ms"] = (time.perf_counter() - stage_start) * 1000.0
+
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    timings["total_ms"] = elapsed_ms
+    logger.info(
+        "LingBot deploy stage timing: session_id=%s chunk_idx=%s "
+        "prepare=%.2fms scheduler=%.2fms rgb_convert=%.2fms sr=%.2fms rife=%.2fms "
+        "finalize=%.2fms finalize_cuda=%.2fms postprocess=%.2fms "
+        "debug_video=%.2fms send_queue_wait=%.2fms pack_bytes=%.2fms "
+        "ws_send=%.2fms produce=%.2fms total=%.2fms frames=%d frame_shape=%s "
+        "payload_bytes=%d rife_multiplier=%.1f",
+        session.id,
+        chunk_idx,
+        timings["prepare_ms"],
+        timings["scheduler_ms"],
+        timings["rgb_convert_ms"],
+        timings["sr_ms"],
+        timings["rife_ms"],
+        timings["finalize_ms"],
+        timings.get("finalize_cuda_ms", 0.0),
+        timings["postprocess_ms"],
+        timings["debug_video_ms"],
+        timings.get("send_queue_wait_ms", 0.0),
+        timings["pack_bytes_ms"],
+        timings["ws_send_ms"],
+        timings["produce_ms"],
+        elapsed_ms,
+        frame_count,
+        frame_shape,
+        len(payload),
+        timings["rife_multiplier"],
+    )
+    await _send_json(
+        ws,
+        {
+            "type": "TIMING",
+            "chunk_idx": chunk_idx,
+            "chunk_time_ms": elapsed_ms,
+            "chunks_per_sec": 1000.0 / elapsed_ms if elapsed_ms > 0 else 0,
+            "produce_time_ms": timings["produce_ms"],
+            "producer_chunks_per_sec": (
+                1000.0 / timings["produce_ms"] if timings["produce_ms"] > 0 else 0
+            ),
+            "queue_size": queue_size,
+            "frames": frame_count,
+            "frame_shape": list(frame_shape) if frame_shape is not None else None,
+            "rife_multiplier": timings["rife_multiplier"],
+            "stage_timings_ms": {
+                key: round(value, 3) for key, value in timings.items()
+            },
+        },
+    )
+
+
+async def _send_chunk_loop(
+    ws: WebSocket,
+    session: LingBotDeployCompatSession,
+    send_queue: asyncio.Queue[dict[str, Any]],
+) -> None:
+    while True:
+        item = await send_queue.get()
+        try:
+            await _send_chunk_item(ws, session, item)
+        finally:
+            send_queue.task_done()
+
+
 async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> None:
+    send_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
+    sender_task = asyncio.create_task(_send_chunk_loop(ws, session, send_queue))
     try:
         while not session.stop_requested:
+            _raise_if_sender_failed(sender_task)
             session.new_request()
 
             start = time.perf_counter()
@@ -1093,60 +1195,27 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
             stage_start = time.perf_counter()
             session.append_debug_video(frames)
             timings["debug_video_ms"] = (time.perf_counter() - stage_start) * 1000.0
-            stage_start = time.perf_counter()
-            payload = rgb_frames_to_bytes(frames)
-            timings["pack_bytes_ms"] = (time.perf_counter() - stage_start) * 1000.0
-            logger.info("LingBot deploy raw chunk prepared: bytes=%d", len(payload))
-            stage_start = time.perf_counter()
-            await ws.send_bytes(payload)
-            timings["ws_send_ms"] = (time.perf_counter() - stage_start) * 1000.0
 
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
-            timings["total_ms"] = elapsed_ms
-            logger.info(
-                "LingBot deploy stage timing: session_id=%s chunk_idx=%s "
-                "prepare=%.2fms scheduler=%.2fms rgb_convert=%.2fms sr=%.2fms rife=%.2fms "
-                "finalize=%.2fms finalize_cuda=%.2fms postprocess=%.2fms "
-                "debug_video=%.2fms pack_bytes=%.2fms "
-                "ws_send=%.2fms total=%.2fms frames=%d frame_shape=%s payload_bytes=%d rife_multiplier=%.1f",
-                session.id,
-                session.generate_chunk_cnt,
-                timings["prepare_ms"],
-                timings["scheduler_ms"],
-                timings["rgb_convert_ms"],
-                timings["sr_ms"],
-                timings["rife_ms"],
-                timings["finalize_ms"],
-                timings.get("finalize_cuda_ms", 0.0),
-                timings["postprocess_ms"],
-                timings["debug_video_ms"],
-                timings["pack_bytes_ms"],
-                timings["ws_send_ms"],
-                elapsed_ms,
-                len(frames),
-                tuple(frames[0].shape) if len(frames) else None,
-                len(payload),
-                timings["rife_multiplier"],
-            )
-            await _send_json(
-                ws,
+            timings["produce_ms"] = (time.perf_counter() - start) * 1000.0
+            chunk_idx = session.generate_chunk_cnt
+            queue_wait_start = time.perf_counter()
+            await send_queue.put(
                 {
-                    "type": "TIMING",
-                    "chunk_idx": session.generate_chunk_cnt,
-                    "chunk_time_ms": elapsed_ms,
-                    "chunks_per_sec": 1000.0 / elapsed_ms if elapsed_ms > 0 else 0,
-                    "queue_size": 0,
-                    "frames": len(frames),
-                    "frame_shape": list(frames[0].shape) if len(frames) else None,
-                    "rife_multiplier": timings["rife_multiplier"],
-                    "stage_timings_ms": {
-                        key: round(value, 3) for key, value in timings.items()
-                    },
-                },
+                    "chunk_idx": chunk_idx,
+                    "frames": frames,
+                    "timings": timings,
+                    "start": start,
+                    "queue_size": send_queue.qsize(),
+                }
             )
+            timings["send_queue_wait_ms"] = (
+                time.perf_counter() - queue_wait_start
+            ) * 1000.0
 
             session.generate_chunk_completed()
 
+        await send_queue.join()
+        _raise_if_sender_failed(sender_task)
         await _send_json(ws, {"type": "FINISH"})
     except asyncio.CancelledError:
         raise
@@ -1163,6 +1232,9 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
         except Exception:
             pass
     finally:
+        if not sender_task.done():
+            sender_task.cancel()
+            await asyncio.gather(sender_task, return_exceptions=True)
         session.started = False
         session.current_keys.clear()
         session.reset_control_sampler()
