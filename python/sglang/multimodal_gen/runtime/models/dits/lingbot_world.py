@@ -1051,7 +1051,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             and query.shape[-1] == self.hidden_dim
             and query.stride(-1) == 1
             and key.stride(-1) == 1
-            and not self.tp_rmsnorm
+            and not getattr(self, "tp_rmsnorm", False)
             and self.norm_q.variance_epsilon == self.norm_k.variance_epsilon
             and query.dtype in (torch.float16, torch.bfloat16, torch.float32)
         )
