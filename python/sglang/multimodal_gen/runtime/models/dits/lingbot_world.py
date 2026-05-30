@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from functools import lru_cache
 from typing import Any
 
@@ -78,6 +79,14 @@ from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 
 if _use_aiter:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
@@ -904,6 +913,15 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         self.cam_conditioner = LingBotWorldCamConditioner(self.hidden_dim)
         self._fused_qkv_weight = None
         self._fused_qkv_bias = None
+        norm1_eps = getattr(self.norm1, "variance_epsilon", None)
+        if norm1_eps is None:
+            norm1_eps = getattr(self.norm1, "eps", 1e-6)
+        self.norm1 = LayerNormScaleShift(
+            self.hidden_dim,
+            eps=norm1_eps,
+            elementwise_affine=False,
+            dtype=torch.float32,
+        )
 
     def _can_fuse_qkv_projection(self) -> bool:
         if self._fused_qkv_weight is not None:
@@ -1020,20 +1038,38 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = e.chunk(
             6, dim=2
         )
-        norm_hidden_states = (
-            (
-                self.norm1(hidden_states.float()).unflatten(
-                    dim=1, sizes=(num_frames, frame_seqlen)
-                )
-                * (1 + scale_msa)
-                + shift_msa
-            )
-            .flatten(1, 2)
-            .to(orig_dtype)
+        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa).to(
+            orig_dtype
         )
         query, key, value = self._project_qkv(norm_hidden_states)
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+        use_triton_qknorm = (
+            _env_bool("SGLANG_LINGBOT_TRITON_QKNORM_ACROSS_HEADS")
+            and _is_cuda
+            and query.is_cuda
+            and key.is_cuda
+            and query.shape == key.shape
+            and query.shape[-1] == self.hidden_dim
+            and query.stride(-1) == 1
+            and key.stride(-1) == 1
+            and not self.tp_rmsnorm
+            and self.norm_q.variance_epsilon == self.norm_k.variance_epsilon
+            and query.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        )
+        if use_triton_qknorm:
+            from sglang.jit_kernel.diffusion.triton.qknorm_across_heads import (
+                fused_qknorm_across_heads_,
+            )
+
+            fused_qknorm_across_heads_(
+                query,
+                key,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                self.norm_q.variance_epsilon,
+            )
+        else:
+            query = self.norm_q(query)
+            key = self.norm_k(key)
         query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))

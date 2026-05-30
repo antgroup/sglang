@@ -63,6 +63,8 @@ DEFAULT_DEBUG_SAVE_VIDEO = os.environ.get(
 DEFAULT_DEBUG_VIDEO_DIR = os.environ.get(
     "SGLANG_LINGBOT_DEBUG_VIDEO_DIR", "/tmp/sglang_lingbot_debug"
 )
+DEFAULT_PINNED_D2H = _env_bool("SGLANG_LINGBOT_PINNED_D2H", False)
+DEFAULT_SEND_MEMORYVIEW = _env_bool("SGLANG_LINGBOT_SEND_MEMORYVIEW", False)
 STARTUP_WARMUP_CHUNKS = int(os.environ.get("SGLANG_LINGBOT_STARTUP_WARMUP_CHUNKS", "0"))
 STARTUP_WARMUP_IMAGE_PATH = os.environ.get("SGLANG_LINGBOT_STARTUP_WARMUP_IMAGE_PATH")
 STARTUP_WARMUP_WIDTH = int(
@@ -610,6 +612,16 @@ def rgb_tensor_to_uint8_array(frames: torch.Tensor) -> np.ndarray:
     else:
         out = frames.clamp(0.0, 1.0).mul(255.0).to(torch.uint8)
     out = out.permute(0, 2, 3, 1).contiguous()
+    if DEFAULT_PINNED_D2H and out.device.type == "cuda":
+        cpu_out = torch.empty(
+            out.shape,
+            dtype=out.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        cpu_out.copy_(out, non_blocking=True)
+        torch.cuda.current_stream(out.device).synchronize()
+        return cpu_out.numpy()
     return out.cpu().numpy()
 
 
@@ -711,10 +723,20 @@ def output_to_rgb_frames(output: Any) -> list[np.ndarray]:
     return list(_normalize_rgb_array(arr))
 
 
-def rgb_frames_to_bytes(frames: list[np.ndarray] | np.ndarray) -> bytes:
+def rgb_frames_to_bytes(frames: list[np.ndarray] | np.ndarray) -> bytes | memoryview:
     if isinstance(frames, np.ndarray):
-        return np.ascontiguousarray(frames).tobytes()
-    return np.ascontiguousarray(np.stack(frames, axis=0)).tobytes()
+        arr = np.ascontiguousarray(frames)
+    else:
+        arr = np.ascontiguousarray(np.stack(frames, axis=0))
+    if DEFAULT_SEND_MEMORYVIEW:
+        return memoryview(arr).cast("B")
+    return arr.tobytes()
+
+
+def _payload_nbytes(payload: bytes | bytearray | memoryview) -> int:
+    if isinstance(payload, memoryview):
+        return payload.nbytes
+    return len(payload)
 
 
 def output_to_rgb_tensor_for_send(
@@ -897,7 +919,7 @@ def output_to_rgb_bytes(
     upscaling_model_path: str | None = None,
     upscaling_scale: int = 4,
     half_precision: bool = False,
-) -> bytes:
+) -> bytes | memoryview:
     frames = output_to_rgb_array_for_send(
         output,
         enable_upscaling=enable_upscaling,
@@ -910,7 +932,7 @@ def output_to_rgb_bytes(
         rife_scale=DEFAULT_RIFE_SCALE,
     )
     payload = rgb_frames_to_bytes(frames)
-    logger.info("LingBot deploy raw chunk prepared: bytes=%d", len(payload))
+    logger.info("LingBot deploy raw chunk prepared: bytes=%d", _payload_nbytes(payload))
     return payload
 
 
@@ -1067,7 +1089,8 @@ async def _send_chunk_item(
     item["frames"] = None
     del frames
     timings["pack_bytes_ms"] = (time.perf_counter() - stage_start) * 1000.0
-    logger.info("LingBot deploy raw chunk prepared: bytes=%d", len(payload))
+    payload_bytes = _payload_nbytes(payload)
+    logger.info("LingBot deploy raw chunk prepared: bytes=%d", payload_bytes)
 
     stage_start = time.perf_counter()
     await ws.send_bytes(payload)
@@ -1100,7 +1123,7 @@ async def _send_chunk_item(
         elapsed_ms,
         frame_count,
         frame_shape,
-        len(payload),
+        payload_bytes,
         timings["rife_multiplier"],
     )
     await _send_json(

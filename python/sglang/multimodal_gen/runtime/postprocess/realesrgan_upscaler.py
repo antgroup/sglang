@@ -32,6 +32,13 @@ _DEFAULT_REALESRGAN_FILENAME = "RealESRGAN_x4.pth"
 _MODEL_CACHE: dict[str, "UpscalerModel"] = {}
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # Vendored Real-ESRGAN architecture code
 # (SRVGGNetCompact, ResidualDenseBlock, RRDB, RRDBNet)
@@ -573,6 +580,16 @@ class ImageUpscaler:
             native_scale = net.upscale
         elif hasattr(net, "scale"):
             native_scale = net.scale
+
+        if _env_bool("SGLANG_REALESRGAN_TORCH_COMPILE"):
+            compile_mode = os.environ.get(
+                "SGLANG_REALESRGAN_TORCH_COMPILE_MODE", "reduce-overhead"
+            )
+            logger.info(
+                "Compiling Real-ESRGAN model with torch.compile mode=%s",
+                compile_mode,
+            )
+            net = torch.compile(net, mode=compile_mode, dynamic=False)
 
         model = UpscalerModel(net=net, scale=native_scale)
         _MODEL_CACHE[resolved_path] = model
