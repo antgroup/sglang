@@ -37,7 +37,7 @@ from sglang.test.test_utils import (
     run_bench_one_batch_server,
 )
 
-register_cuda_ci(est_time=554, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=782, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=650, suite="stage-c-test-4-gpu-amd")
 
 
