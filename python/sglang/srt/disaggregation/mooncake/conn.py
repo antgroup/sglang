@@ -760,11 +760,18 @@ class MooncakeKVManager(CommonKVManager):
         )
 
     def _dsv4_c4_layer_count(self) -> int:
-        first_item_len = self.kv_args.kv_item_lens[0]
-        for i, item_len in enumerate(self.kv_args.kv_item_lens):
-            if item_len != first_item_len:
-                return i
-        return len(self.kv_args.kv_item_lens)
+        mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
+        if mla_ratios is None:
+            raise RuntimeError(
+                "DeepSeek V4 HiSparse transfer requires "
+                "KVArgs.mla_compression_ratios"
+            )
+
+        start_layer = getattr(self.kv_args, "prefill_start_layer", 0) or 0
+        end_layer = getattr(self.kv_args, "prefill_end_layer", None)
+        if end_layer is None:
+            end_layer = len(mla_ratios)
+        return sum(1 for r in mla_ratios[start_layer:end_layer] if r == 4)
 
     def _send_dsv4_c4_to_host(
         self,
