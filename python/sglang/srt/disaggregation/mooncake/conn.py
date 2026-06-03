@@ -576,6 +576,7 @@ class MooncakeKVManager(CommonKVManager):
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        pp_aligned: bool = False,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -590,9 +591,14 @@ class MooncakeKVManager(CommonKVManager):
 
         # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend:
-            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
-            )
+            if pp_aligned:
+                src_kv_ptrs = src_data_ptrs
+                dst_kv_ptrs = dst_data_ptrs
+                layers_current_pp_stage = len(src_kv_ptrs)
+            else:
+                src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                    self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+                )
             layers_params = [
                 (
                     src_kv_ptrs[layer_id],
@@ -715,8 +721,12 @@ class MooncakeKVManager(CommonKVManager):
     ) -> int:
         c4_page_size = self.kv_args.page_size // 4
         assert self.kv_args.page_size % 4 == 0
+        src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+            self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+        )
+        item_lens = self.kv_args.kv_item_lens[:layers_current_pp_stage]
         src_c4_layer_num = self._dsv4_c4_layer_count()
-        src_c4_layer_num = min(src_c4_layer_num, len(dst_kv_ptrs))
+        src_c4_layer_num = min(src_c4_layer_num, layers_current_pp_stage)
 
         src_c4_indices = self._expand_page_indices(
             prefill_kv_indices, c4_page_size, np.int64
@@ -729,7 +739,7 @@ class MooncakeKVManager(CommonKVManager):
             mooncake_session_id,
             src_c4_indices[:count],
             dst_c4_indices[:count],
-            self.kv_args.kv_data_ptrs[:src_c4_layer_num],
+            src_kv_ptrs[:src_c4_layer_num],
             dst_kv_ptrs[:src_c4_layer_num],
             dst_kv_item_len,
             c4_page_size,
@@ -751,12 +761,13 @@ class MooncakeKVManager(CommonKVManager):
             return 0
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
-            src_data_ptrs=self.kv_args.kv_data_ptrs[src_c4_layer_num:],
+            src_data_ptrs=src_kv_ptrs[src_c4_layer_num:],
             dst_data_ptrs=dst_kv_ptrs[src_c4_layer_num:],
-            item_lens=self.kv_args.kv_item_lens[src_c4_layer_num:],
+            item_lens=item_lens[src_c4_layer_num:],
             prefill_data_indices=prefill_kv_indices[:count],
             dst_data_indices=dst_pages[:count],
             executor=executor,
+            pp_aligned=True,
         )
 
     def _dsv4_c4_layer_count(self) -> int:
