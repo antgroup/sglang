@@ -1123,6 +1123,49 @@ def _raise_if_sender_failed(sender_task: asyncio.Task) -> None:
     exc = sender_task.exception()
     if exc is not None:
         raise exc
+    raise RuntimeError("LingBot deploy sender task exited unexpectedly")
+
+
+async def _await_cancelled_task(task: asyncio.Task) -> None:
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+async def _enqueue_send_item(
+    send_queue: asyncio.Queue[dict[str, Any]],
+    sender_task: asyncio.Task,
+    item: dict[str, Any],
+) -> None:
+    put_task = asyncio.create_task(send_queue.put(item))
+    done, pending = await asyncio.wait(
+        {put_task, sender_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if sender_task in done:
+        for task in pending:
+            task.cancel()
+            await _await_cancelled_task(task)
+        _raise_if_sender_failed(sender_task)
+    await put_task
+
+
+async def _join_send_queue(
+    send_queue: asyncio.Queue[dict[str, Any]],
+    sender_task: asyncio.Task,
+) -> None:
+    join_task = asyncio.create_task(send_queue.join())
+    done, pending = await asyncio.wait(
+        {join_task, sender_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if sender_task in done:
+        for task in pending:
+            task.cancel()
+            await _await_cancelled_task(task)
+        _raise_if_sender_failed(sender_task)
+    await join_task
 
 
 async def _send_chunk_item(
@@ -1276,14 +1319,16 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
             timings["produce_ms"] = (time.perf_counter() - start) * 1000.0
             chunk_idx = session.generate_chunk_cnt
             queue_wait_start = time.perf_counter()
-            await send_queue.put(
+            await _enqueue_send_item(
+                send_queue,
+                sender_task,
                 {
                     "chunk_idx": chunk_idx,
                     "frames": frames,
                     "timings": timings,
                     "start": start,
                     "queue_size": send_queue.qsize(),
-                }
+                },
             )
             timings["send_queue_wait_ms"] = (
                 time.perf_counter() - queue_wait_start
@@ -1291,7 +1336,7 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
 
             session.generate_chunk_completed()
 
-        await send_queue.join()
+        await _join_send_queue(send_queue, sender_task)
         _raise_if_sender_failed(sender_task)
         await _send_json(ws, {"type": "FINISH"})
     except asyncio.CancelledError:
