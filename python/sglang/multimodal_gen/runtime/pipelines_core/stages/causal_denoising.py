@@ -356,6 +356,11 @@ class CausalDMDDenoisingStage(DenoisingStage):
             cache_state=cache_state,
             policy=policy,
         ):
+            cuda_graph_state = getattr(cache_state, "cuda_graph_state", None)
+            if cuda_graph_state is not None and hasattr(cuda_graph_state, "dispose"):
+                cuda_graph_state.dispose()
+            if hasattr(cache_state, "cuda_graph_state"):
+                cache_state.cuda_graph_state = None
             causal_kv_cache, crossattn_cache = self._initialize_causal_caches(
                 batch_size=ctx.batch_size,
                 max_text_len=self._get_max_text_len(server_args),

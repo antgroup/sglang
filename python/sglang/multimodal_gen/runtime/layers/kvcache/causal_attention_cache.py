@@ -220,6 +220,94 @@ class CausalSelfAttentionKVCache:
             visible_global_end=updated_global_end,
         )
 
+    def steady_append_and_get_attention_kv(
+        self,
+        *,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> CausalAttentionKVView:
+        """Append one fixed-size chunk in a full sliding window.
+
+        This is the steady-state specialization of ``update_and_get_attention_kv``:
+        keep sink tokens, roll the non-sink window left by ``key.shape[1]`` tokens,
+        and write the new chunk at the tail. It intentionally does not update the
+        Python/tensor cursors; graph callers refresh them outside replay with the
+        real global position.
+        """
+        num_new_tokens = key.shape[1]
+        kv_cache_size = self.cache_size
+        sink_tokens = self.sink_tokens
+        local_start_index = kv_cache_size - num_new_tokens
+        local_end_index = kv_cache_size
+        num_rolled_tokens = kv_cache_size - sink_tokens - num_new_tokens
+
+        if num_new_tokens <= 0 or local_start_index < sink_tokens:
+            raise RuntimeError(
+                "Invalid steady append range: "
+                f"cache_size={kv_cache_size}, sink_tokens={sink_tokens}, "
+                f"num_new_tokens={num_new_tokens}"
+            )
+
+        if self.k.requires_grad:
+            self.k = self.k.detach()
+        if self.v.requires_grad:
+            self.v = self.v.detach()
+
+        if num_rolled_tokens > 0:
+            src_start = sink_tokens + num_new_tokens
+            src_end = src_start + num_rolled_tokens
+            self.k[:, sink_tokens : sink_tokens + num_rolled_tokens] = self.k[
+                :, src_start:src_end
+            ].clone()
+            self.v[:, sink_tokens : sink_tokens + num_rolled_tokens] = self.v[
+                :, src_start:src_end
+            ].clone()
+
+        self.k[:, local_start_index:local_end_index] = key
+        self.v[:, local_start_index:local_end_index] = value
+        return CausalAttentionKVView(
+            k=self.k,
+            v=self.v,
+            local_start_index=local_start_index,
+            local_end_index=local_end_index,
+            visible_local_end=kv_cache_size,
+            visible_global_end=0,
+        )
+
+    def steady_overwrite_current_and_get_attention_kv(
+        self,
+        *,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> CausalAttentionKVView:
+        """Overwrite the current tail chunk in a full sliding window."""
+        num_new_tokens = key.shape[1]
+        kv_cache_size = self.cache_size
+        local_start_index = kv_cache_size - num_new_tokens
+        local_end_index = kv_cache_size
+
+        if num_new_tokens <= 0 or local_start_index < self.sink_tokens:
+            raise RuntimeError(
+                "Invalid steady overwrite range: "
+                f"cache_size={kv_cache_size}, sink_tokens={self.sink_tokens}, "
+                f"num_new_tokens={num_new_tokens}"
+            )
+
+        if self.k.requires_grad:
+            self.k = self.k.detach()
+        if self.v.requires_grad:
+            self.v = self.v.detach()
+        self.k[:, local_start_index:local_end_index] = key
+        self.v[:, local_start_index:local_end_index] = value
+        return CausalAttentionKVView(
+            k=self.k,
+            v=self.v,
+            local_start_index=local_start_index,
+            local_end_index=local_end_index,
+            visible_local_end=kv_cache_size,
+            visible_global_end=0,
+        )
+
 
 @dataclass(slots=True)
 class CrossAttentionKVCache:
