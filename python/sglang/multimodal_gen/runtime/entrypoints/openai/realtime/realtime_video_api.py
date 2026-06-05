@@ -60,9 +60,27 @@ async def _recv_notify_and_send(
                 request_id=notification.request_id,
             )
             chunk_index += len(notification.file_paths)
+        except asyncio.CancelledError:
+            raise
+        except WebSocketDisconnect:
+            logger.info("client disconnected during async frame sending")
+            break
         except Exception as e:
             err_msg = str(e).splitlines()[0]
             logger.error(f"error during sending bytes from queue: {err_msg}")
+
+
+async def _await_realtime_task(task: asyncio.Task | None, task_name: str) -> None:
+    if task is None:
+        return
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except WebSocketDisconnect:
+        logger.info("%s exited after client disconnect", task_name)
+    except Exception as e:
+        logger.error("%s exited with error: %s", task_name, e, exc_info=True)
 
 
 async def _send_file_paths(
@@ -148,6 +166,11 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
 
         except asyncio.CancelledError:
             logger.info(f"generation completed, session_id: {session.id}")
+            break
+        except WebSocketDisconnect:
+            logger.info(
+                f"client disconnected during generation, session_id: {session.id}"
+            )
             break
         except Exception as e:
             err_msg = str(e).splitlines()[0]
@@ -336,6 +359,9 @@ async def generate(websocket: WebSocket):
             listen_task.cancel()
         if send_task and not send_task.done():
             send_task.cancel()
+        await _await_realtime_task(generate_task, "realtime generate task")
+        await _await_realtime_task(listen_task, "realtime listen task")
+        await _await_realtime_task(send_task, "realtime send task")
         try:
             await async_scheduler_client.forward(
                 ReleaseRealtimeSessionReq(session_id=session.id)

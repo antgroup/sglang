@@ -5,7 +5,7 @@ import random
 import tempfile
 import time
 from collections import deque
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -28,6 +28,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 router = APIRouter(tags=["lingbot-realtime"])
+
+
+class _ControlEvent(NamedTuple):
+    event_time: float
+    key: str
+    action: str
+    actions: list[str]
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -145,7 +152,7 @@ class LingBotDeployCompatSession(GenerateSession):
         self.output_height = DEFAULT_HEIGHT
         self.model_width = DEFAULT_WIDTH
         self.model_height = DEFAULT_HEIGHT
-        self._control_events: deque[tuple[float, list[str]]] = deque(maxlen=512)
+        self._control_events: deque[_ControlEvent] = deque(maxlen=512)
         self._control_sample_cursor: float | None = None
         self._control_sample_base_actions: list[str] = []
         self.reset_control_sampler()
@@ -262,7 +269,51 @@ class LingBotDeployCompatSession(GenerateSession):
             return
 
         event_time = time.perf_counter() if timestamp is None else timestamp
-        self._control_events.append((event_time, sorted(self.current_keys)))
+        self._control_events.append(
+            _ControlEvent(
+                event_time=event_time,
+                key=normalized_key,
+                action=action,
+                actions=sorted(self.current_keys),
+            )
+        )
+
+    def _log_dropped_control_events(
+        self,
+        dropped_events: list[_ControlEvent],
+        *,
+        start: float,
+        now: float,
+        chunk_size: int,
+    ) -> None:
+        if not dropped_events:
+            return
+
+        max_events_to_log = 16
+        dropped_summary: list[dict[str, Any]] = [
+            {
+                "key": event.key,
+                "action": event.action,
+                "offset_ms": round((event.event_time - start) * 1000.0, 3),
+                "actions": event.actions,
+            }
+            for event in dropped_events[:max_events_to_log]
+        ]
+        if len(dropped_events) > max_events_to_log:
+            dropped_summary.append(
+                {"truncated_count": len(dropped_events) - max_events_to_log}
+            )
+
+        logger.info(
+            "drop LingBot deploy control events during sampling, "
+            "session_id=%s, chunk_size=%s, window_ms=%.3f, "
+            "dropped_count=%s, dropped_events=%s",
+            self.id,
+            chunk_size,
+            (now - start) * 1000.0,
+            len(dropped_events),
+            dropped_summary,
+        )
 
     def sample_control_chunk(
         self, chunk_size: int, *, timestamp: float | None = None
@@ -276,34 +327,48 @@ class LingBotDeployCompatSession(GenerateSession):
             start = now
 
         events = [
-            (event_time, actions)
-            for event_time, actions in self._control_events
-            if event_time <= now
+            control_event
+            for control_event in self._control_events
+            if control_event.event_time <= now
         ]
         base_actions = list(self._control_sample_base_actions)
         state = list(base_actions)
         chunk: list[list[str]] = []
         duration = max(0.0, now - start)
+        dropped_events: list[_ControlEvent] = []
 
         if duration == 0.0:
             chunk = [list(state) for _ in range(chunk_size)]
+            dropped_events.extend(events)
         else:
             event_idx = 0
             for frame_idx in range(chunk_size):
                 sample_time = start + duration * (frame_idx + 1) / chunk_size
-                while event_idx < len(events) and events[event_idx][0] <= sample_time:
-                    state = list(events[event_idx][1])
+                sampled_events: list[_ControlEvent] = []
+                while (
+                    event_idx < len(events)
+                    and events[event_idx].event_time <= sample_time
+                ):
+                    sampled_events.append(events[event_idx])
+                    state = list(events[event_idx].actions)
                     event_idx += 1
+                dropped_events.extend(sampled_events[:-1])
                 chunk.append(list(state))
 
-        for _, actions in events:
-            state = list(actions)
+        for event in events:
+            state = list(event.actions)
         self._control_sample_cursor = now
         self._control_sample_base_actions = list(state)
         self.last_control_actions = list(self._control_sample_base_actions)
         if events:
             self.has_control_state = True
-        while self._control_events and self._control_events[0][0] <= now:
+        self._log_dropped_control_events(
+            dropped_events,
+            start=start,
+            now=now,
+            chunk_size=chunk_size,
+        )
+        while self._control_events and self._control_events[0].event_time <= now:
             self._control_events.popleft()
 
         return chunk
@@ -1341,6 +1406,11 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
         await _send_json(ws, {"type": "FINISH"})
     except asyncio.CancelledError:
         raise
+    except WebSocketDisconnect:
+        logger.info(
+            "LingBot deploy client disconnected during generation, session_id=%s",
+            session.id,
+        )
     except Exception as e:
         err_msg = str(e).splitlines()[0]
         logger.error(
@@ -1356,7 +1426,7 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
     finally:
         if not sender_task.done():
             sender_task.cancel()
-            await asyncio.gather(sender_task, return_exceptions=True)
+        await asyncio.gather(sender_task, return_exceptions=True)
         session.started = False
         session.current_keys.clear()
         session.reset_control_sampler()
@@ -1510,6 +1580,7 @@ async def generate(websocket: WebSocket):
         session.stop_requested = True
         if generate_task is not None and not generate_task.done():
             generate_task.cancel()
+        if generate_task is not None:
             await asyncio.gather(generate_task, return_exceptions=True)
         await _release_realtime_session(session)
         session.dispose()
