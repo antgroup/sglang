@@ -19,7 +19,10 @@ from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+
+logger = init_logger(__name__)
 
 
 class RealtimeVAEState(BaseRealtimeState):
@@ -36,10 +39,12 @@ class RealtimeVAEDecodeState(BaseRealtimeState):
     def __init__(self):
         super().__init__()
         self.reset_causal_decode_state = None
+        self.taehv_cache = None
 
     def dispose(self):
         reset_causal_decode_state = self.reset_causal_decode_state
         self.reset_causal_decode_state = None
+        self.taehv_cache = None
         if callable(reset_causal_decode_state):
             reset_causal_decode_state()
 
@@ -97,6 +102,40 @@ class CausalVaeDecodingStage(DecodingStage):
             return self.vae.clear_cache
         return None
 
+    def _get_taehv_decoder(self, server_args: ServerArgs):
+        checkpoint_path = getattr(
+            server_args.pipeline_config, "realtime_taehv_decoder_path", None
+        )
+        if not checkpoint_path:
+            return None
+
+        precision = getattr(
+            server_args.pipeline_config, "realtime_taehv_decoder_precision", "bf16"
+        )
+        try:
+            decoder_dtype = PRECISION_TO_TYPE[precision]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unsupported realtime_taehv_decoder_precision={precision!r}"
+            ) from exc
+
+        decoder = getattr(self, "_taehv_decoder", None)
+        if (
+            decoder is None
+            or getattr(self, "_taehv_decoder_path", None) != checkpoint_path
+            or getattr(self, "_taehv_decoder_dtype", None) != decoder_dtype
+        ):
+            from sglang.multimodal_gen.runtime.models.vaes.taehv import (
+                LingBotTAEHVDecoder,
+            )
+
+            decoder = LingBotTAEHVDecoder(checkpoint_path, dtype=decoder_dtype)
+            self._taehv_decoder = decoder
+            self._taehv_decoder_path = checkpoint_path
+            self._taehv_decoder_dtype = decoder_dtype
+            logger.info("Enabled LingBot TAEHV realtime decoder: %s", checkpoint_path)
+        return decoder.to(device=get_local_torch_device(), dtype=decoder_dtype)
+
     def _decode_wan_with_persistent_cache(
         self,
         latents: torch.Tensor,
@@ -127,12 +166,17 @@ class CausalVaeDecodingStage(DecodingStage):
         server_args: ServerArgs,
         *,
         first_chunk: bool,
+        taehv_decoder=None,
+        taehv_cache=None,
     ) -> torch.Tensor:
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        self.vae = self.vae.to(device=get_local_torch_device(), dtype=vae_dtype)
+        if taehv_decoder is None:
+            decode_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            self.vae = self.vae.to(device=get_local_torch_device(), dtype=decode_dtype)
+        else:
+            decode_dtype = getattr(taehv_decoder, "decode_dtype", torch.bfloat16)
         latents = latents.to(get_local_torch_device())
         vae_autocast_enabled = (
-            vae_dtype != torch.float32
+            decode_dtype != torch.float32
         ) and not server_args.disable_autocast
 
         latents = self.scale_and_shift(latents, server_args)
@@ -142,7 +186,7 @@ class CausalVaeDecodingStage(DecodingStage):
 
         with torch.autocast(
             device_type=current_platform.device_type,
-            dtype=vae_dtype,
+            dtype=decode_dtype,
             enabled=vae_autocast_enabled,
         ):
             try:
@@ -152,20 +196,23 @@ class CausalVaeDecodingStage(DecodingStage):
                 pass
 
             if not vae_autocast_enabled:
-                latents = latents.to(vae_dtype)
+                latents = latents.to(decode_dtype)
 
-            decode_fn = getattr(self.vae, "causal_decode", None)
-            if callable(decode_fn):
-                decode_output = decode_fn(latents)
-                image = _ensure_tensor_decode_output(decode_output)
-            elif self._supports_wan_decoder_cache(self.vae):
-                image = self._decode_wan_with_persistent_cache(
-                    latents,
-                    first_chunk=first_chunk,
-                )
+            if taehv_decoder is not None:
+                image = taehv_decoder.causal_decode(latents, cache=taehv_cache)
             else:
-                decode_output = self.vae.decode(latents)
-                image = _ensure_tensor_decode_output(decode_output)
+                decode_fn = getattr(self.vae, "causal_decode", None)
+                if callable(decode_fn):
+                    decode_output = decode_fn(latents)
+                    image = _ensure_tensor_decode_output(decode_output)
+                elif self._supports_wan_decoder_cache(self.vae):
+                    image = self._decode_wan_with_persistent_cache(
+                        latents,
+                        first_chunk=first_chunk,
+                    )
+                else:
+                    decode_output = self.vae.decode(latents)
+                    image = _ensure_tensor_decode_output(decode_output)
 
         return (image / 2 + 0.5).clamp(0, 1)
 
@@ -180,16 +227,26 @@ class CausalVaeDecodingStage(DecodingStage):
 
         self.load_model()
 
-        reset_causal_state = self._get_causal_decode_reset_fn()
         decode_state = batch.session.get_or_create_state(RealtimeVAEDecodeState)
-        decode_state.reset_causal_decode_state = reset_causal_state
-        if batch.block_idx == 0 and callable(reset_causal_state):
-            reset_causal_state()
+        taehv_decoder = self._get_taehv_decoder(server_args)
+        if taehv_decoder is None:
+            reset_causal_state = self._get_causal_decode_reset_fn()
+            decode_state.reset_causal_decode_state = reset_causal_state
+            if batch.block_idx == 0 and callable(reset_causal_state):
+                reset_causal_state()
+            taehv_cache = None
+        else:
+            decode_state.reset_causal_decode_state = None
+            if batch.block_idx == 0 or decode_state.taehv_cache is None:
+                decode_state.taehv_cache = taehv_decoder.prepare_cache()
+            taehv_cache = decode_state.taehv_cache
 
         frames = self.decode_causal(
             batch.latents,
             server_args,
             first_chunk=batch.block_idx == 0,
+            taehv_decoder=taehv_decoder,
+            taehv_cache=taehv_cache,
         )
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
 
