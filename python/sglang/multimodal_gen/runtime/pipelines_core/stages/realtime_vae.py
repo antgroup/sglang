@@ -179,10 +179,11 @@ class CausalVaeDecodingStage(DecodingStage):
             decode_dtype != torch.float32
         ) and not server_args.disable_autocast
 
-        latents = self.scale_and_shift(latents, server_args)
-        latents = server_args.pipeline_config.preprocess_decoding(
-            latents, server_args, vae=self.vae
-        )
+        if taehv_decoder is None:
+            latents = self.scale_and_shift(latents, server_args)
+            latents = server_args.pipeline_config.preprocess_decoding(
+                latents, server_args, vae=self.vae
+            )
 
         with torch.autocast(
             device_type=current_platform.device_type,
