@@ -6,6 +6,7 @@
 
 import argparse
 import contextlib
+import contextvars
 import dataclasses
 import datetime
 import inspect
@@ -34,11 +35,12 @@ RESET = "\033[0;0m"
 
 _FORMAT = (
     f"{SGLANG_DIFFUSION_LOGGING_PREFIX}%(levelname)s %(asctime)s "
-    "[%(filename)s: %(lineno)d] %(message)s"
+    "[session_id=%(session_id)s] [%(filename)s: %(lineno)d] %(message)s"
 )
 
 # _FORMAT = "[%(asctime)s] %(message)s"
 _DATE_FORMAT = "%m-%d %H:%M:%S"
+_LOG_SESSION_ID = contextvars.ContextVar("sglang_diffusion_log_session_id", default="-")
 
 DEFAULT_LOGGING_CONFIG = {
     "formatters": {
@@ -83,6 +85,8 @@ class ColoredFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         """Adds color to the log"""
 
+        if not hasattr(record, "session_id"):
+            record.session_id = _LOG_SESSION_ID.get()
         formatted_message = super().format(record)
 
         color = self.LEVEL_COLORS.get(record.levelno)
@@ -90,6 +94,15 @@ class ColoredFormatter(logging.Formatter):
             formatted_message = f"{color}{formatted_message}{RESET}"
 
         return formatted_message
+
+
+@contextmanager
+def log_session_context(session_id: str | None):
+    token = _LOG_SESSION_ID.set(session_id or "-")
+    try:
+        yield
+    finally:
+        _LOG_SESSION_ID.reset(token)
 
 
 class SortedHelpFormatter(argparse.HelpFormatter):
@@ -518,7 +531,7 @@ class _UvicornAccessLogFilter(logging.Filter):
 
 
 def configure_logger(server_args, prefix: str = ""):
-    log_format = f"[%(asctime)s{prefix}] %(message)s"
+    log_format = f"[%(asctime)s{prefix}] [session_id=%(session_id)s] %(message)s"
     datefmt = "%m-%d %H:%M:%S"
 
     formatter = ColoredFormatter(log_format, datefmt=datefmt)

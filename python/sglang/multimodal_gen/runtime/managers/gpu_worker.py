@@ -60,6 +60,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     globally_suppress_loggers,
     init_logger,
+    log_session_context,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
@@ -240,7 +241,16 @@ class GPUWorker:
         assert self.pipeline is not None
         req = batch[0]
         output_batch = None
+        realtime_session_id = (
+            req.extra.get("realtime_session_id")
+            if isinstance(req.extra, dict)
+            else None
+        )
+        session_log_context = log_session_context(realtime_session_id)
+        session_log_context.__enter__()
         try:
+            if req.metrics is not None:
+                req.metrics.session_id = realtime_session_id
             if self.rank == 0:
                 torch.get_device_module().reset_peak_memory_stats()
 
@@ -352,33 +362,41 @@ class GPUWorker:
                         copy_event: Any | None = None,
                         source_ref: torch.Tensor | None = None,
                     ):
-                        start_time = time.perf_counter()
-                        try:
-                            if copy_event is not None:
-                                copy_event.synchronize()
-                            del source_ref
-                            saved_paths = _save_output_file(output, req, output_batch)
-                            notify_callback(
-                                FileReadyNotification(
-                                    dispatch_id=req.extra.get(
-                                        "realtime_session_id", ""
-                                    ),
-                                    request_id=req.request_id,
-                                    file_paths=saved_paths,
+                        async_session_id = (
+                            req.extra.get("realtime_session_id")
+                            if isinstance(req.extra, dict)
+                            else None
+                        )
+                        with log_session_context(async_session_id):
+                            start_time = time.perf_counter()
+                            try:
+                                if copy_event is not None:
+                                    copy_event.synchronize()
+                                del source_ref
+                                saved_paths = _save_output_file(
+                                    output, req, output_batch
                                 )
-                            )
-                            duration_s = time.perf_counter() - start_time
-                            logger.info(
-                                "Async postprocess completed in %.3f seconds for request %s (files=%s)",
-                                duration_s,
-                                req.request_id,
-                                saved_paths,
-                            )
-                        except Exception:
-                            logger.exception(
-                                "Async postprocess/save failed for request %s",
-                                req.request_id,
-                            )
+                                notify_callback(
+                                    FileReadyNotification(
+                                        dispatch_id=req.extra.get(
+                                            "realtime_session_id", ""
+                                        ),
+                                        request_id=req.request_id,
+                                        file_paths=saved_paths,
+                                    )
+                                )
+                                duration_s = time.perf_counter() - start_time
+                                logger.info(
+                                    "Async postprocess completed in %.3f seconds for request %s (files=%s)",
+                                    duration_s,
+                                    req.request_id,
+                                    saved_paths,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Async postprocess/save failed for request %s",
+                                    req.request_id,
+                                )
 
                     self._save_file_executor.submit(
                         _async_save_with_postprocess,
@@ -433,6 +451,8 @@ class GPUWorker:
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
+        finally:
+            session_log_context.__exit__(None, None, None)
         return output_batch
 
     def get_can_stay_resident_components(

@@ -50,6 +50,7 @@ class RequestMetrics:
 
     def __init__(self, request_id: str):
         self.request_id = request_id
+        self.session_id: str | None = None
         self.stages: Dict[str, float] = {}
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
@@ -75,6 +76,7 @@ class RequestMetrics:
         """Serializes the metrics data to a dictionary."""
         return {
             "request_id": self.request_id,
+            "session_id": self.session_id,
             "stages": self.stages,
             "steps": self.steps,
             "total_duration_ms": self.total_duration_ms,
@@ -143,6 +145,7 @@ def capture_memory_snapshot() -> MemorySnapshot:
 @dataclasses.dataclass
 class RequestPerfRecord:
     request_id: str
+    session_id: str | None
 
     timestamp: str
     commit_hash: str
@@ -163,8 +166,10 @@ class RequestPerfRecord:
         total_duration_ms,
         memory_snapshots=None,
         timestamp=None,
+        session_id=None,
     ):
         self.request_id = request_id
+        self.session_id = session_id
         if timestamp is not None:
             self.timestamp = timestamp
         else:
@@ -305,6 +310,7 @@ class PerformanceLogger:
         report = {
             "timestamp": datetime.now(UTC).isoformat(),
             "request_id": metrics.request_id,
+            "session_id": metrics.session_id,
             "commit_hash": get_git_commit_hash(),
             "tag": tag,
             "total_duration_ms": metrics.total_duration_ms,
@@ -346,6 +352,7 @@ class PerformanceLogger:
 
         record = RequestPerfRecord(
             metrics.request_id,
+            session_id=metrics.session_id,
             commit_hash=get_git_commit_hash(),
             tag="pipeline_stage_metrics",
             stages=formatted_stages,
