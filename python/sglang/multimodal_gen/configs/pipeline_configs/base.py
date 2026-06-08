@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.models.vision_utils import get_default_height_width
+from sglang.multimodal_gen.runtime.utils.hf_file_utils import resolve_hf_file_reference
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
@@ -240,9 +241,6 @@ class PipelineConfig:
     # See PRECISION_TO_TYPE for detailed mapping
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
     text_encoder_extra_args: list[dict] = field(default_factory=lambda: [{}])
-
-    def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig()
 
     def postprocess_image(self, image):
         return image.last_hidden_state
@@ -1029,6 +1027,10 @@ class PipelineConfig:
             json.dump(output_dict, f, indent=2)
 
     def load_from_json(self, file_path: str):
+        file_path = resolve_hf_file_reference(
+            file_path,
+            description="pipeline config",
+        )
         with open(file_path) as f:
             input_pipeline_dict = json.load(f)
         self.update_pipeline_config(input_pipeline_dict)

@@ -10,9 +10,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.utils.hf_file_utils import resolve_hf_file_reference
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+DEFAULT_TAEHV_CHECKPOINT_FILENAME = "lighttaew2_1.pth"
 
 
 @dataclass
@@ -206,6 +209,11 @@ class TAEHV(nn.Module):
         return value
 
     def load_from_checkpoint(self, checkpoint_path: str) -> None:
+        checkpoint_path = resolve_hf_file_reference(
+            checkpoint_path,
+            default_filename=DEFAULT_TAEHV_CHECKPOINT_FILENAME,
+            description="TAEHV checkpoint",
+        )
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         state_dict = _extract_state_dict(checkpoint)
         decoder_state_dict = {}

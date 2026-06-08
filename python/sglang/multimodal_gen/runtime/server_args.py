@@ -56,6 +56,7 @@ from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
     is_valid_ipv6_address,
 )
+from sglang.multimodal_gen.runtime.utils.hf_file_utils import resolve_hf_file_reference
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     _sanitize_for_logging,
     configure_logger,
@@ -1714,6 +1715,36 @@ class ServerArgs(DisaggArgsMixin):
         provided_args["_explicit_arg_names"] = explicit_arg_names
         return cls.from_dict(provided_args)
 
+    @staticmethod
+    def _apply_realtime_decode_vae_path_alias(
+        kwargs: dict[str, Any],
+        component_paths: dict[str, str],
+        pipeline_config: PipelineConfig,
+    ) -> None:
+        """Map legacy ``vae_path`` to realtime decode-only VAE config when supported."""
+        if not hasattr(pipeline_config, "realtime_taehv_decoder_path"):
+            return
+        if getattr(pipeline_config, "realtime_taehv_decoder_path", None) is not None:
+            return
+
+        legacy_vae_path = kwargs.get("vae_path")
+        source_component_paths = False
+        if legacy_vae_path is None:
+            legacy_vae_path = component_paths.get("vae")
+            source_component_paths = legacy_vae_path is not None
+        if legacy_vae_path is None:
+            return
+
+        setattr(pipeline_config, "realtime_taehv_decoder_path", legacy_vae_path)
+        if source_component_paths:
+            component_paths.pop("vae", None)
+        logger.info(
+            "Interpreting legacy vae_path as realtime decode-only TAEHV "
+            "checkpoint for %s: %s",
+            pipeline_config.__class__.__name__,
+            legacy_vae_path,
+        )
+
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":
         """Create a ServerArgs object from a dictionary."""
@@ -1724,15 +1755,18 @@ class ServerArgs(DisaggArgsMixin):
             explicit_arg_names = set(kwargs)
 
         component_paths = dict(kwargs.get("component_paths") or {})
-        if component_paths:
-            server_args_kwargs["component_paths"] = component_paths
         server_args_kwargs["_explicit_arg_names"] = set(explicit_arg_names)
 
         for attr in attrs:
             if attr == "_explicit_arg_names":
                 continue
+            elif attr == "component_paths":
+                continue
             elif attr == "pipeline_config":
                 pipeline_config = PipelineConfig.from_kwargs(kwargs)
+                cls._apply_realtime_decode_vae_path_alias(
+                    kwargs, component_paths, pipeline_config
+                )
                 logger.debug(f"Using PipelineConfig: {type(pipeline_config)}")
                 server_args_kwargs["pipeline_config"] = pipeline_config
             elif attr == "nunchaku_config":
@@ -1741,11 +1775,18 @@ class ServerArgs(DisaggArgsMixin):
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 
+        if component_paths:
+            server_args_kwargs["component_paths"] = component_paths
+
         return cls(**server_args_kwargs)
 
     @staticmethod
     def load_config_file(config_file: str) -> dict[str, Any]:
         """Load a config file."""
+        config_file = resolve_hf_file_reference(
+            config_file,
+            description="server args config",
+        )
         if config_file.endswith(".json"):
             with open(config_file, "r") as f:
                 return json.load(f)

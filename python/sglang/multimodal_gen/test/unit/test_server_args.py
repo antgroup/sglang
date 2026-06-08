@@ -71,6 +71,115 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             args.component_paths["vae"], os.path.expanduser("~/fake/local/vae")
         )
 
+    def test_legacy_vae_path_aliases_to_realtime_decode_config(self):
+        pipeline_config = PipelineConfig()
+        pipeline_config.realtime_taehv_decoder_path = None
+
+        with patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config):
+            args = ServerArgs.from_dict(
+                {
+                    "model_path": "/data/my-model",
+                    "vae_path": "org/repo:lighttaew2_1.pth",
+                }
+            )
+
+        self.assertEqual(
+            args.pipeline_config.realtime_taehv_decoder_path,
+            "org/repo:lighttaew2_1.pth",
+        )
+        self.assertEqual(args.component_paths, {})
+
+    def test_dynamic_vae_path_alias_does_not_override_realtime_main_vae(self):
+        pipeline_config = PipelineConfig()
+        pipeline_config.realtime_taehv_decoder_path = None
+
+        with patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config):
+            args = ServerArgs.from_dict(
+                {
+                    "model_path": "/data/my-model",
+                    "component_paths": {"vae": "org/repo:lighttaew2_1.pth"},
+                }
+            )
+
+        self.assertEqual(
+            args.pipeline_config.realtime_taehv_decoder_path,
+            "org/repo:lighttaew2_1.pth",
+        )
+        self.assertNotIn("vae", args.component_paths)
+
+    def test_explicit_realtime_decoder_path_preserves_component_vae_override(self):
+        pipeline_config = PipelineConfig()
+        pipeline_config.realtime_taehv_decoder_path = "/explicit/taehv.pth"
+
+        with patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config):
+            args = ServerArgs.from_dict(
+                {
+                    "model_path": "/data/my-model",
+                    "component_paths": {"vae": "/custom/vae"},
+                }
+            )
+
+        self.assertEqual(
+            args.pipeline_config.realtime_taehv_decoder_path,
+            "/explicit/taehv.pth",
+        )
+        self.assertEqual(args.component_paths["vae"], "/custom/vae")
+
+    def test_empty_realtime_decoder_path_disables_legacy_vae_path_alias(self):
+        pipeline_config = PipelineConfig()
+        pipeline_config.realtime_taehv_decoder_path = ""
+
+        with patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config):
+            args = ServerArgs.from_dict(
+                {
+                    "model_path": "/data/my-model",
+                    "vae_path": "org/repo:lighttaew2_1.pth",
+                }
+            )
+
+        self.assertEqual(args.pipeline_config.realtime_taehv_decoder_path, "")
+
+    def test_config_file_can_resolve_remote_file_reference(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write("model_path: /data/my-model\n")
+            config_path = f.name
+
+        try:
+            with patch(
+                "sglang.multimodal_gen.runtime.server_args.resolve_hf_file_reference",
+                return_value=config_path,
+            ) as resolve_file:
+                loaded = ServerArgs.load_config_file("org/repo:server_args.yaml")
+        finally:
+            os.unlink(config_path)
+
+        resolve_file.assert_called_once_with(
+            "org/repo:server_args.yaml",
+            description="server args config",
+        )
+        self.assertEqual(loaded["model_path"], "/data/my-model")
+
+    def test_pipeline_config_can_resolve_remote_file_reference(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write('{"flow_shift": 3.0}\n')
+            config_path = f.name
+
+        pipeline_config = PipelineConfig()
+        try:
+            with patch(
+                "sglang.multimodal_gen.configs.pipeline_configs.base.resolve_hf_file_reference",
+                return_value=config_path,
+            ) as resolve_file:
+                pipeline_config.load_from_json("org/repo:pipeline_config.json")
+        finally:
+            os.unlink(config_path)
+
+        resolve_file.assert_called_once_with(
+            "org/repo:pipeline_config.json",
+            description="pipeline config",
+        )
+        self.assertEqual(pipeline_config.flow_shift, 3.0)
+
     def test_component_attention_backends_are_normalized(self):
         args = self._from_dict_without_model_resolution(
             {
