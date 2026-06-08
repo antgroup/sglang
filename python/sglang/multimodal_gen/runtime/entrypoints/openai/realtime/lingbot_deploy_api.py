@@ -24,7 +24,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    log_session_context,
+)
 
 logger = init_logger(__name__)
 router = APIRouter(tags=["lingbot-realtime"])
@@ -1068,6 +1071,8 @@ async def run_startup_warmup_if_enabled(server_args) -> None:
 
     for size_idx, (warmup_width, warmup_height) in enumerate(warmup_sizes, start=1):
         session = LingBotDeployCompatSession()
+        session_log_context = log_session_context(session.id)
+        session_log_context.__enter__()
         try:
             warmup_image = _ensure_startup_warmup_image(
                 warmup_width,
@@ -1156,6 +1161,7 @@ async def run_startup_warmup_if_enabled(server_args) -> None:
             session.close_debug_video()
             await _release_realtime_session(session)
             session.dispose()
+            session_log_context.__exit__(None, None, None)
 
     logger.info(
         "LingBot startup warmup complete: sizes=%d chunks_per_size=%d "
@@ -1324,6 +1330,8 @@ async def _send_chunk_loop(
 
 
 async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> None:
+    session_log_context = log_session_context(session.id)
+    session_log_context.__enter__()
     send_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
     sender_task = asyncio.create_task(_send_chunk_loop(ws, session, send_queue))
     try:
@@ -1432,6 +1440,7 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
         session.reset_control_sampler()
         session.close_debug_video()
         await _release_realtime_session(session)
+        session_log_context.__exit__(None, None, None)
 
 
 async def _handle_message(
@@ -1568,6 +1577,8 @@ async def _handle_message(
 async def generate(websocket: WebSocket):
     await websocket.accept()
     session = LingBotDeployCompatSession()
+    session_log_context = log_session_context(session.id)
+    session_log_context.__enter__()
     generate_task = None
     try:
         async for message in websocket.iter_text():
@@ -1584,3 +1595,4 @@ async def generate(websocket: WebSocket):
             await asyncio.gather(generate_task, return_exceptions=True)
         await _release_realtime_session(session)
         session.dispose()
+        session_log_context.__exit__(None, None, None)
