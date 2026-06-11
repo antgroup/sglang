@@ -409,7 +409,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 enabled=autocast_enabled,
             ),
             set_forward_context(
-                current_timestep=0,
+                current_timestep=-1,
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
             ),
@@ -422,6 +422,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 crossattn_cache=crossattn_cache,
                 current_start=current_start_frame * self.frame_seq_length,
                 start_frame=current_start_frame,
+                skip_final_projection=True,
                 **image_kwargs,
                 **pos_cond_kwargs,
             )
