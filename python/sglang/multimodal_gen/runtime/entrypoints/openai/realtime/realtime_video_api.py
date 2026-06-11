@@ -293,6 +293,7 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
                 raise ValueError("first_frame is not allowed when mode=t2v")
 
             realtime_req = RealtimeVideoGenerationsRequest.model_validate(data)
+            session.set_stream_id(realtime_req.stream_id)
             # TODO(puf147): convert RGB for krea
             # params.start_frame = Image.open(params.start_frame).convert("RGB")
             if realtime_req.first_frame is not None:

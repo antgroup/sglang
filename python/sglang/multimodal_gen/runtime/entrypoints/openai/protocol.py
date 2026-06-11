@@ -128,6 +128,7 @@ class VideoRemixRequest(BaseModel):
 
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     # WebSocket does not support multipart/form-data image uploads
+    stream_id: Optional[str] = None
     first_frame: Optional[bytes | str] = None
     seed: Optional[int] = 42
     guidance_scale: Optional[float] = 1.0

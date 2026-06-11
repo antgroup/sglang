@@ -551,6 +551,7 @@ def _build_start_request(
     )
 
     request = RealtimeVideoGenerationsRequest(
+        stream_id=session.id if data.get("stream_id") is not None else None,
         prompt=prompt,
         first_frame=first_frame,
         width=model_width,
@@ -1479,6 +1480,7 @@ async def _handle_message(
             return generate_task
 
         try:
+            session.set_stream_id(data.get("stream_id"))
             request, seed = _build_start_request(data, session)
         except Exception as exc:
             await _send_error(ws, str(exc))

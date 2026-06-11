@@ -51,6 +51,21 @@ class GenerateSession:
         self.request = request
         self.configure_prompt_events(request)
 
+    def set_stream_id(self, stream_id: Any | None):
+        if stream_id is None:
+            return
+        if self.request_id is not None or self.generate_chunk_cnt != 0:
+            raise ValueError("stream_id must be set before generation starts")
+
+        if isinstance(stream_id, bytes):
+            stream_id = stream_id.decode("utf-8")
+        stream_id = str(stream_id).strip()
+        if not stream_id:
+            raise ValueError("stream_id cannot be empty")
+        if any(ch in stream_id for ch in ("/", "\\", "\x00")):
+            raise ValueError("stream_id cannot contain path separators")
+        self.id = stream_id
+
     def set_mode(self, mode: RealtimeVideoMode | None):
         self.mode = mode
 
