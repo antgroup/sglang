@@ -281,6 +281,47 @@ class GenerateSession:
                 del self.active_prompt_events[event_id]
             self.active_prompt_events[event_id] = self.prompt_event_chunk
 
+    def _append_prompt_suffix(self, prompt: str, suffix: Any) -> str:
+        if suffix is None:
+            return prompt
+        suffix = str(suffix)
+        if not suffix:
+            return prompt
+        if not prompt:
+            return suffix
+        return f"{prompt}\n{suffix}"
+
+    def _actions_have_movement(self, actions: Any) -> bool:
+        if not actions:
+            return False
+        for frame_actions in actions:
+            if frame_actions:
+                return True
+        return False
+
+    def build_movement_prompt(self, actions: Any | None = None) -> str:
+        prompt = str(self.request.prompt)
+        suffix = (
+            getattr(self.request, "movement_dynamic", None)
+            if self._actions_have_movement(actions)
+            else getattr(self.request, "movement_static", None)
+        )
+        return self._append_prompt_suffix(prompt, suffix)
+
+    def build_movement_prompt_variants(self) -> list[str]:
+        prompts: list[str] = []
+        for actions in ([], [["__movement__"]]):
+            prompt = self.build_movement_prompt(actions)
+            if prompt not in prompts:
+                prompts.append(prompt)
+        return prompts
+
+    def apply_movement_prompt_to_batch(self, batch) -> None:
+        if self.request is None or "actions" not in batch.extra:
+            return
+        batch.prompt = self.build_movement_prompt(batch.extra.get("actions"))
+        batch.extra["movement_prompt_variants"] = self.build_movement_prompt_variants()
+
     def apply_prompt_event_to_batch(self, batch) -> None:
         if not self.prompt_events:
             return

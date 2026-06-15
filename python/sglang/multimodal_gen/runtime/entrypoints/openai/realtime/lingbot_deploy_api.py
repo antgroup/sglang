@@ -420,6 +420,14 @@ def _parse_bool_field(data: dict[str, Any], name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean")
 
 
+def _parse_optional_str_alias(data: dict[str, Any], *names: str) -> str | None:
+    for name in names:
+        if name in data:
+            value = data.get(name)
+            return None if value is None else str(value)
+    return None
+
+
 def _resolve_enable_upscaling(data: dict[str, Any], width: int, height: int) -> bool:
     if "enable_upscaling" in data:
         return _parse_bool_field(data, "enable_upscaling", DEFAULT_ENABLE_UPSCALING)
@@ -575,6 +583,12 @@ def _build_start_request(
         events=data.get("events"),
         event_mode=data.get("event_mode"),
         event_chunk=data.get("event_chunk"),
+        movement_static=_parse_optional_str_alias(
+            data, "movement static", "movement_static"
+        ),
+        movement_dynamic=_parse_optional_str_alias(
+            data, "movement dynamic", "movement_dynamic"
+        ),
     )
     return request, seed
 
@@ -1127,6 +1141,7 @@ async def run_startup_warmup_if_enabled(server_args) -> None:
                 batch.block_idx = session.generate_chunk_cnt
                 chunk_size = batch.extra.get("chunk_size", 1)
                 batch.extra["actions"] = [[] for _ in range(chunk_size)]
+                session.apply_movement_prompt_to_batch(batch)
                 session.apply_prompt_event_to_batch(batch)
 
                 result = await async_scheduler_client.forward([batch])
@@ -1367,6 +1382,7 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                 )
                 batch.extra["actions"] = control_chunk
 
+            session.apply_movement_prompt_to_batch(batch)
             session.apply_prompt_event_to_batch(batch)
 
             stage_start = time.perf_counter()

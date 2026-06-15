@@ -4,7 +4,7 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 # Image API protocol models
@@ -127,6 +127,8 @@ class VideoRemixRequest(BaseModel):
 
 
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
+    model_config = ConfigDict(populate_by_name=True)
+
     # WebSocket does not support multipart/form-data image uploads
     stream_id: Optional[str] = None
     first_frame: Optional[bytes | str] = None
@@ -139,6 +141,14 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     events: Optional[Dict[str, str]] = None
     event_mode: Optional[Literal["overwrite", "append"]] = "overwrite"
     event_chunk: Optional[int] = 1
+    movement_static: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("movement static", "movement_static"),
+    )
+    movement_dynamic: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("movement dynamic", "movement_dynamic"),
+    )
 
 
 class RealtimeAction(BaseModel):

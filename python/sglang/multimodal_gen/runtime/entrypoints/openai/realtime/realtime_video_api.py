@@ -142,6 +142,7 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             batch.input_video = (
                 session.sample_video_frames() if session.is_v2v_enabled() else None
             )
+            session.apply_movement_prompt_to_batch(batch)
             session.apply_prompt_event_to_batch(batch)
             save_file_path_list, result = await process_generation_batch(
                 async_scheduler_client, batch

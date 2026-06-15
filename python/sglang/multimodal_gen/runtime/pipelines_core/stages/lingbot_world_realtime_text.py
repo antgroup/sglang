@@ -9,6 +9,7 @@ to the actual denoising step.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Any
@@ -23,6 +24,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def _normalize_prompt_value(
@@ -54,27 +58,17 @@ class _TextEncodingOutputs:
 class LingBotWorldRealtimeTextState(BaseRealtimeState):
     def __init__(self):
         super().__init__()
-        self.cache_key: tuple[Any, ...] | None = None
-        self.prompt_embeds: list[torch.Tensor] | None = None
-        self.pooled_embeds: list[torch.Tensor] | None = None
-        self.prompt_attention_mask: list[torch.Tensor] | None = None
-        self.negative_prompt_embeds: list[torch.Tensor] | None = None
-        self.neg_pooled_embeds: list[torch.Tensor] | None = None
-        self.negative_attention_mask: list[torch.Tensor] | None = None
-        self.event_config_key: tuple[Any, ...] | None = None
-        self.event_outputs: dict[tuple[str, ...], _TextEncodingOutputs] = {}
+        self.base_outputs: dict[tuple[Any, ...], _TextEncodingOutputs] = {}
+        self.event_outputs: dict[
+            tuple[Any, ...], dict[tuple[str, ...], _TextEncodingOutputs]
+        ] = {}
+        self.prompt_variant_keys: tuple[tuple[Any, ...], ...] | None = None
         self.last_effective_cache_key: tuple[Any, ...] | None = None
 
     def clear_text_cache(self):
-        self.cache_key = None
-        self.prompt_embeds = None
-        self.pooled_embeds = None
-        self.prompt_attention_mask = None
-        self.negative_prompt_embeds = None
-        self.neg_pooled_embeds = None
-        self.negative_attention_mask = None
-        self.event_config_key = None
+        self.base_outputs.clear()
         self.event_outputs.clear()
+        self.prompt_variant_keys = None
         self.last_effective_cache_key = None
 
     def dispose(self):
@@ -84,39 +78,19 @@ class LingBotWorldRealtimeTextState(BaseRealtimeState):
 
 class LingBotWorldRealtimeTextEncodingStage(TextEncodingStage):
     def _make_cache_key(self, batch: Req) -> tuple[Any, ...]:
+        return self._make_cache_key_for_prompt(batch, batch.prompt)
+
+    def _make_cache_key_for_prompt(
+        self, batch: Req, prompt: str | list[str]
+    ) -> tuple[Any, ...]:
         return (
-            _normalize_prompt_value(batch.prompt),
+            _normalize_prompt_value(prompt),
             bool(batch.do_classifier_free_guidance),
             (
                 _normalize_prompt_value(batch.negative_prompt)
                 if batch.do_classifier_free_guidance
                 else None
             ),
-        )
-
-    def _restore_cached_outputs(
-        self, batch: Req, state: LingBotWorldRealtimeTextState
-    ) -> Req:
-        return self._restore_outputs(batch, self._outputs_from_state(state))
-
-    def _store_outputs(self, batch: Req, state: LingBotWorldRealtimeTextState) -> None:
-        state.prompt_embeds = _copy_tensor_list(batch.prompt_embeds)
-        state.pooled_embeds = _copy_tensor_list(batch.pooled_embeds)
-        state.prompt_attention_mask = _copy_tensor_list(batch.prompt_attention_mask)
-        state.negative_prompt_embeds = _copy_tensor_list(batch.negative_prompt_embeds)
-        state.neg_pooled_embeds = _copy_tensor_list(batch.neg_pooled_embeds)
-        state.negative_attention_mask = _copy_tensor_list(batch.negative_attention_mask)
-
-    def _outputs_from_state(
-        self, state: LingBotWorldRealtimeTextState
-    ) -> _TextEncodingOutputs:
-        return _TextEncodingOutputs(
-            prompt_embeds=state.prompt_embeds,
-            pooled_embeds=state.pooled_embeds,
-            prompt_attention_mask=state.prompt_attention_mask,
-            negative_prompt_embeds=state.negative_prompt_embeds,
-            neg_pooled_embeds=state.neg_pooled_embeds,
-            negative_attention_mask=state.negative_attention_mask,
         )
 
     def _restore_outputs(self, batch: Req, outputs: _TextEncodingOutputs) -> Req:
@@ -129,6 +103,31 @@ class LingBotWorldRealtimeTextEncodingStage(TextEncodingStage):
             outputs.negative_attention_mask
         )
         return batch
+
+    def _normalize_prompt_variants(self, batch: Req) -> list[str | list[str]]:
+        prompts: list[str | list[str]] = []
+        raw_variants = batch.extra.get("movement_prompt_variants")
+        if isinstance(raw_variants, list):
+            for raw_prompt in raw_variants:
+                if isinstance(raw_prompt, str) and raw_prompt not in prompts:
+                    prompts.append(raw_prompt)
+        if batch.prompt not in prompts:
+            prompts.insert(0, batch.prompt)
+        return prompts
+
+    def _ensure_base_outputs(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        state: LingBotWorldRealtimeTextState,
+        prompt: str | list[str],
+    ) -> tuple[tuple[Any, ...], _TextEncodingOutputs]:
+        cache_key = self._make_cache_key_for_prompt(batch, prompt)
+        outputs = state.base_outputs.get(cache_key)
+        if outputs is None:
+            outputs = self._encode_outputs(batch, server_args, prompt)
+            state.base_outputs[cache_key] = outputs
+        return cache_key, outputs
 
     def _encode_outputs(
         self, batch: Req, server_args: ServerArgs, prompt_text: str | list[str]
@@ -236,10 +235,76 @@ class LingBotWorldRealtimeTextEncodingStage(TextEncodingStage):
     ) -> tuple[Any, ...] | None:
         if not events:
             return None
+        if event_mode == "append":
+            return (
+                event_mode,
+                base_cache_key,
+                tuple(events.items()),
+            )
         return (
-            base_cache_key,
             event_mode,
+            base_cache_key[1:],
             tuple(events.items()),
+        )
+
+    def _ensure_event_outputs(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        state: LingBotWorldRealtimeTextState,
+        *,
+        base_cache_key: tuple[Any, ...],
+        base_prompt: str | list[str],
+        events: dict[str, str],
+        event_mode: str,
+    ) -> tuple[Any, ...] | None:
+        event_config_key = self._make_event_config_key(
+            base_cache_key, events, event_mode
+        )
+        if event_config_key is None or event_config_key in state.event_outputs:
+            return event_config_key
+
+        event_outputs: dict[tuple[str, ...], _TextEncodingOutputs] = {}
+        for active_event_ids in self._iter_event_id_combinations(events):
+            event_prompt = self._build_joined_event_prompt(events, active_event_ids)
+            prompt_text = self._build_event_prompt(
+                base_prompt, event_prompt, event_mode
+            )
+            event_outputs[active_event_ids] = self._encode_outputs(
+                batch, server_args, prompt_text
+            )
+        state.event_outputs[event_config_key] = event_outputs
+        return event_config_key
+
+    def _log_effective_prompt(
+        self,
+        batch: Req,
+        *,
+        active_event_ids: tuple[str, ...],
+        events: dict[str, str],
+        event_mode: str,
+    ) -> None:
+        if os.environ.get("SGLANG_LOG_FULL_PROMPT", "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return
+
+        prompt: str | list[str] = batch.prompt
+        if active_event_ids:
+            event_prompt = self._build_joined_event_prompt(events, active_event_ids)
+            prompt = self._build_event_prompt(batch.prompt, event_prompt, event_mode)
+
+        logger.info(
+            "LingBot effective prompt: session_id=%s block_idx=%s "
+            "event_mode=%s event_ids=%s prompt=%r",
+            batch.extra.get("realtime_session_id"),
+            batch.block_idx,
+            event_mode,
+            list(active_event_ids),
+            prompt,
         )
 
     @torch.no_grad()
@@ -259,38 +324,51 @@ class LingBotWorldRealtimeTextEncodingStage(TextEncodingStage):
         event_mode = str(batch.extra.get("prompt_event_mode") or "overwrite")
         if event_mode not in ("overwrite", "append"):
             event_mode = "overwrite"
+
+        prompt_variants = self._normalize_prompt_variants(batch)
+        prompt_variant_keys = tuple(
+            self._make_cache_key_for_prompt(batch, prompt) for prompt in prompt_variants
+        )
+        if (
+            state.prompt_variant_keys is not None
+            and state.prompt_variant_keys != prompt_variant_keys
+        ):
+            state.clear_text_cache()
+        state.prompt_variant_keys = prompt_variant_keys
+
+        base_outputs = None
+        for prompt in prompt_variants:
+            prompt_cache_key, prompt_outputs = self._ensure_base_outputs(
+                batch, server_args, state, prompt
+            )
+            self._ensure_event_outputs(
+                batch,
+                server_args,
+                state,
+                base_cache_key=prompt_cache_key,
+                base_prompt=prompt,
+                events=events,
+                event_mode=event_mode,
+            )
+            if prompt_cache_key == base_cache_key:
+                base_outputs = prompt_outputs
+
+        if base_outputs is None:
+            _, base_outputs = self._ensure_base_outputs(
+                batch, server_args, state, batch.prompt
+            )
+
         event_config_key = self._make_event_config_key(
             base_cache_key, events, event_mode
         )
 
-        if state.cache_key != base_cache_key or state.prompt_embeds is None:
-            state.clear_text_cache()
-            base_outputs = self._encode_outputs(batch, server_args, batch.prompt)
-            self._restore_outputs(batch, base_outputs)
-            state.cache_key = base_cache_key
-            self._store_outputs(batch, state)
-        elif state.event_config_key != event_config_key:
-            state.event_outputs.clear()
-
-        if event_config_key is not None and state.event_config_key != event_config_key:
-            for active_event_ids in self._iter_event_id_combinations(events):
-                event_prompt = self._build_joined_event_prompt(events, active_event_ids)
-                prompt_text = self._build_event_prompt(
-                    batch.prompt, event_prompt, event_mode
-                )
-                state.event_outputs[active_event_ids] = self._encode_outputs(
-                    batch, server_args, prompt_text
-                )
-            state.event_config_key = event_config_key
-        elif event_config_key is None:
-            state.event_config_key = None
-            state.event_outputs.clear()
-
         active_event_ids = self._normalize_active_event_ids(batch, events)
-        effective_outputs = self._outputs_from_state(state)
+        effective_outputs = base_outputs
         effective_cache_key: tuple[Any, ...] = ("base", base_cache_key)
         if active_event_ids and event_config_key is not None:
-            cached_event = state.event_outputs.get(active_event_ids)
+            cached_event = state.event_outputs.get(event_config_key, {}).get(
+                active_event_ids
+            )
             if cached_event is None:
                 batch.extra.pop("prompt_event_id", None)
                 batch.extra.pop("prompt_event_ids", None)
@@ -304,6 +382,12 @@ class LingBotWorldRealtimeTextEncodingStage(TextEncodingStage):
                 if len(active_event_ids) == 1:
                     batch.extra["active_prompt_event_id"] = active_event_ids[0]
 
+        self._log_effective_prompt(
+            batch,
+            active_event_ids=active_event_ids,
+            events=events,
+            event_mode=event_mode,
+        )
         self._restore_outputs(batch, effective_outputs)
         batch.update_prompt_embeds = (
             state.last_effective_cache_key != effective_cache_key
