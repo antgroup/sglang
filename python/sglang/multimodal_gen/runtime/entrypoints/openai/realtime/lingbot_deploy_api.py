@@ -1604,6 +1604,18 @@ async def _handle_message(
 
         if not did_handle:
             await _send_error(ws, "CONTROL requires key/action or event(s)")
+            return generate_task
+
+        logger.info(
+            "LingBot CONTROL request: session_id=%s key=%s action=%s "
+            "event_ids=%s current_keys=%s started=%s",
+            session.id,
+            key,
+            action,
+            event_ids,
+            sorted(session.current_keys),
+            session.started,
+        )
         return generate_task
 
     if msg_type == "STOP":
