@@ -11,7 +11,6 @@ in a functional manner, reducing the need for explicit parameter passing.
 
 from __future__ import annotations
 
-import logging
 import os
 import pprint
 from copy import deepcopy
@@ -29,14 +28,7 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import (
-    _sanitize_for_logging,
-    init_logger,
-)
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
-from sglang.multimodal_gen.utils import align_to
-
-logger = init_logger(__name__)
 
 SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
 
@@ -297,52 +289,7 @@ class Req:
         return pprint.pformat(asdict(self), indent=2, width=120)
 
     def log(self, server_args: ServerArgs):
-        if self.is_warmup or self.suppress_logs:
-            return
-        # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
-        if self.height:
-            target_height = align_to(self.height, 16)
-        else:
-            target_height = -1
-        if self.width:
-            target_width = align_to(self.width, 16)
-        else:
-            target_width = -1
-
-        log_full_prompt = os.environ.get("SGLANG_LOG_FULL_PROMPT", "").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        if logger.isEnabledFor(logging.DEBUG) or log_full_prompt:
-            display_prompt = self.prompt
-            display_neg_prompt = self.negative_prompt
-        else:
-            display_prompt = _sanitize_for_logging(self.prompt, key_hint="prompt")
-            display_neg_prompt = _sanitize_for_logging(
-                self.negative_prompt, key_hint="negative_prompt"
-            )
-
-        debug_str = f"""Sampling params:
-                       width: {target_width}
-                      height: {target_height}
-                  num_frames: {self.num_frames}
-                         fps: {self.fps}
-                      prompt: {display_prompt}
-                  neg_prompt: {display_neg_prompt}
-                        seed: {self.seed}
-                 infer_steps: {self.num_inference_steps}
-      num_outputs_per_prompt: {self.num_outputs_per_prompt}
-              guidance_scale: {self.guidance_scale}
-     embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
-                    n_tokens: {self.n_tokens}
-                  flow_shift: {server_args.pipeline_config.flow_shift}
-                  image_path: {self.image_path}
-                 save_output: {self.save_output}
-            output_file_path: {self.output_file_path()}
-        """  # type: ignore[attr-defined]
-        logger.info(debug_str)
+        return
 
 
 @dataclass
