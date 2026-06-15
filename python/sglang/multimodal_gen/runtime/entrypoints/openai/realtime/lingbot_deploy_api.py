@@ -381,6 +381,30 @@ def _json_message(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _format_prompt_for_log(prompt: Any) -> str:
+    prompt_text = str(prompt)
+    if _env_bool("SGLANG_LOG_FULL_PROMPT", False):
+        return repr(prompt_text)
+    return f"<redacted, len={len(prompt_text)}>"
+
+
+def _log_chunk_movement_prompt(
+    session: LingBotDeployCompatSession,
+    batch,
+    *,
+    chunk_size: int,
+) -> None:
+    logger.info(
+        "LingBot chunk movement prompt: session_id=%s block_idx=%s "
+        "chunk_size=%s mode=%s prompt=%s",
+        session.id,
+        batch.block_idx,
+        chunk_size,
+        batch.extra.get("movement_prompt_mode"),
+        _format_prompt_for_log(batch.prompt),
+    )
+
+
 async def _send_json(ws: WebSocket, payload: dict[str, Any]) -> None:
     await ws.send_text(_json_message(payload))
 
@@ -1142,6 +1166,7 @@ async def run_startup_warmup_if_enabled(server_args) -> None:
                 chunk_size = batch.extra.get("chunk_size", 1)
                 batch.extra["actions"] = [[] for _ in range(chunk_size)]
                 session.apply_movement_prompt_to_batch(batch)
+                _log_chunk_movement_prompt(session, batch, chunk_size=chunk_size)
                 session.apply_prompt_event_to_batch(batch)
 
                 result = await async_scheduler_client.forward([batch])
@@ -1383,6 +1408,7 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                 batch.extra["actions"] = control_chunk
 
             session.apply_movement_prompt_to_batch(batch)
+            _log_chunk_movement_prompt(session, batch, chunk_size=chunk_size)
             session.apply_prompt_event_to_batch(batch)
 
             stage_start = time.perf_counter()

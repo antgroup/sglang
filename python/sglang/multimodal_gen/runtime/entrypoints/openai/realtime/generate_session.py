@@ -301,12 +301,16 @@ class GenerateSession:
 
     def build_movement_prompt(self, actions: Any | None = None) -> str:
         prompt = str(self.request.prompt)
+        has_movement = self._actions_have_movement(actions)
         suffix = (
             getattr(self.request, "movement_dynamic", None)
-            if self._actions_have_movement(actions)
+            if has_movement
             else getattr(self.request, "movement_static", None)
         )
         return self._append_prompt_suffix(prompt, suffix)
+
+    def get_movement_prompt_mode(self, actions: Any | None = None) -> str:
+        return "dynamic" if self._actions_have_movement(actions) else "static"
 
     def build_movement_prompt_variants(self) -> list[str]:
         prompts: list[str] = []
@@ -319,7 +323,9 @@ class GenerateSession:
     def apply_movement_prompt_to_batch(self, batch) -> None:
         if self.request is None or "actions" not in batch.extra:
             return
-        batch.prompt = self.build_movement_prompt(batch.extra.get("actions"))
+        actions = batch.extra.get("actions")
+        batch.prompt = self.build_movement_prompt(actions)
+        batch.extra["movement_prompt_mode"] = self.get_movement_prompt_mode(actions)
         batch.extra["movement_prompt_variants"] = self.build_movement_prompt_variants()
 
     def apply_prompt_event_to_batch(self, batch) -> None:

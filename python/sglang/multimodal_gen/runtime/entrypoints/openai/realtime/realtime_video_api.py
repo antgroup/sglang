@@ -38,6 +38,20 @@ router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 _FRAME_PART_SIZE = 512 * 1024
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _format_prompt_for_log(prompt) -> str:
+    prompt_text = str(prompt)
+    if _env_bool("SGLANG_LOG_FULL_PROMPT", False):
+        return repr(prompt_text)
+    return f"<redacted, len={len(prompt_text)}>"
+
+
 async def _recv_notify_and_send(
     ws: WebSocket,
     notification_queue: asyncio.Queue,
@@ -143,6 +157,16 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                 session.sample_video_frames() if session.is_v2v_enabled() else None
             )
             session.apply_movement_prompt_to_batch(batch)
+            if "movement_prompt_mode" in batch.extra:
+                logger.info(
+                    "Realtime chunk movement prompt: session_id=%s block_idx=%s "
+                    "chunk_size=%s mode=%s prompt=%s",
+                    session.id,
+                    batch.block_idx,
+                    chunk_size,
+                    batch.extra.get("movement_prompt_mode"),
+                    _format_prompt_for_log(batch.prompt),
+                )
             session.apply_prompt_event_to_batch(batch)
             save_file_path_list, result = await process_generation_batch(
                 async_scheduler_client, batch
