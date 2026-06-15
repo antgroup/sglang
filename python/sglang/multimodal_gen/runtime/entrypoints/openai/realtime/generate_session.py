@@ -289,7 +289,7 @@ class GenerateSession:
             return prompt
         if not prompt:
             return suffix
-        return f"{prompt}\n{suffix}"
+        return f"{prompt}{suffix}"
 
     def _actions_have_movement(self, actions: Any) -> bool:
         if not actions:

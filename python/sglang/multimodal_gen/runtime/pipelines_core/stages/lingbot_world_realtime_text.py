@@ -9,6 +9,8 @@ to the actual denoising step.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from dataclasses import dataclass
 from itertools import combinations
@@ -29,12 +31,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-def _normalize_prompt_value(
+def _hash_prompt_value(
     value: str | list[str] | None,
-) -> str | tuple[str, ...] | None:
-    if isinstance(value, list):
-        return tuple(value)
-    return value
+) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), sort_keys=False
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _copy_tensor_list(
@@ -84,10 +87,10 @@ class LingBotWorldRealtimeTextEncodingStage(TextEncodingStage):
         self, batch: Req, prompt: str | list[str]
     ) -> tuple[Any, ...]:
         return (
-            _normalize_prompt_value(prompt),
+            _hash_prompt_value(prompt),
             bool(batch.do_classifier_free_guidance),
             (
-                _normalize_prompt_value(batch.negative_prompt)
+                _hash_prompt_value(batch.negative_prompt)
                 if batch.do_classifier_free_guidance
                 else None
             ),
@@ -181,8 +184,8 @@ class LingBotWorldRealtimeTextEncodingStage(TextEncodingStage):
     ) -> str | list[str]:
         if mode == "append":
             if isinstance(base_prompt, list):
-                return [f"{prompt}\n{event_prompt}" for prompt in base_prompt]
-            return f"{base_prompt}\n{event_prompt}"
+                return [f"{prompt}{event_prompt}" for prompt in base_prompt]
+            return f"{base_prompt}{event_prompt}"
         if isinstance(base_prompt, list):
             return [event_prompt for _ in base_prompt]
         return event_prompt
@@ -235,16 +238,20 @@ class LingBotWorldRealtimeTextEncodingStage(TextEncodingStage):
     ) -> tuple[Any, ...] | None:
         if not events:
             return None
+        event_keys = tuple(
+            (event_id, _hash_prompt_value(prompt))
+            for event_id, prompt in events.items()
+        )
         if event_mode == "append":
             return (
                 event_mode,
                 base_cache_key,
-                tuple(events.items()),
+                event_keys,
             )
         return (
             event_mode,
             base_cache_key[1:],
-            tuple(events.items()),
+            event_keys,
         )
 
     def _ensure_event_outputs(
