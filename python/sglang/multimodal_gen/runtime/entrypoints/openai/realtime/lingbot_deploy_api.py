@@ -1,8 +1,10 @@
 import asyncio
 import json
 import os
+import queue as thread_queue
 import random
 import tempfile
+import threading
 import time
 from collections import deque
 from typing import Any, NamedTuple
@@ -95,46 +97,147 @@ STARTUP_WARMUP_PROMPT = os.environ.get(
 )
 
 
-class LingBotDebugVideoRecorder:
-    def __init__(self, path: str, fps: int):
+def _normalize_lossless_debug_video_path(path: str) -> str:
+    root, ext = os.path.splitext(path)
+    if ext.lower() == ".mkv":
+        return path
+    if root.endswith("_post_sr"):
+        return f"{root}.mkv"
+    return f"{root}_post_sr.mkv"
+
+
+def _derive_pre_sr_debug_video_path(post_sr_path: str) -> str:
+    root, ext = os.path.splitext(post_sr_path)
+    ext = ext or ".mkv"
+    if root.endswith("_post_sr"):
+        root = root[: -len("_post_sr")]
+    return f"{root}_pre_sr{ext}"
+
+
+class _AsyncLosslessVideoWriter:
+    _STOP = object()
+
+    def __init__(self, path: str, fps: int, label: str):
         self.path = path
         self.fps = fps
-        self.writer = None
+        self.label = label
         self.frame_count = 0
+        self._queue: thread_queue.SimpleQueue[Any] = thread_queue.SimpleQueue()
+        self._thread: threading.Thread | None = None
+        self._closed = False
+        self._error: Exception | None = None
 
-    def append(self, frames: list[np.ndarray] | np.ndarray) -> None:
-        if len(frames) == 0:
+    def append(self, frames: list[np.ndarray] | np.ndarray | None) -> None:
+        if frames is None or len(frames) == 0 or self._closed:
             return
-
-        import imageio
-
-        output_dir = os.path.dirname(self.path)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        if self.writer is None:
-            self.writer = imageio.get_writer(
-                self.path,
-                fps=self.fps,
-                codec="libx264",
-                quality=8,
-                macro_block_size=1,
+        if self._error is not None:
+            return
+        if self._thread is None:
+            self._thread = threading.Thread(
+                target=self._run,
+                name=f"lingbot-debug-video-{self.label}",
+                daemon=True,
             )
-            logger.info("LingBot deploy debug video opened: %s", self.path)
-
-        for frame in frames:
-            self.writer.append_data(np.ascontiguousarray(frame))
-            self.frame_count += 1
+            self._thread.start()
+        self._queue.put(frames)
 
     def close(self) -> None:
-        if self.writer is None:
+        self._closed = True
+        if self._thread is None:
             return
-        self.writer.close()
-        self.writer = None
-        logger.info(
-            "LingBot deploy debug video saved: path=%s frames=%d",
-            self.path,
-            self.frame_count,
+        self._queue.put(self._STOP)
+        self._thread.join()
+        self._thread = None
+
+    def _run(self) -> None:
+        writer = None
+        try:
+            import imageio
+
+            output_dir = os.path.dirname(self.path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+
+            writer = imageio.get_writer(
+                self.path,
+                fps=self.fps,
+                codec="ffv1",
+                macro_block_size=1,
+                output_params=["-pix_fmt", "rgb24"],
+            )
+            logger.info(
+                "LingBot deploy lossless debug video opened: stage=%s path=%s",
+                self.label,
+                self.path,
+            )
+
+            while True:
+                frames = self._queue.get()
+                if frames is self._STOP:
+                    break
+                for frame in frames:
+                    writer.append_data(np.ascontiguousarray(frame))
+                    self.frame_count += 1
+        except Exception as e:
+            self._error = e
+            logger.warning(
+                "failed to write LingBot deploy lossless debug video, "
+                "stage=%s path=%s error=%s",
+                self.label,
+                self.path,
+                e,
+                exc_info=True,
+            )
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception as e:
+                    self._error = e
+                    logger.warning(
+                        "failed to close LingBot deploy lossless debug video, "
+                        "stage=%s path=%s error=%s",
+                        self.label,
+                        self.path,
+                        e,
+                        exc_info=True,
+                    )
+                else:
+                    logger.info(
+                        "LingBot deploy lossless debug video saved: "
+                        "stage=%s path=%s frames=%d",
+                        self.label,
+                        self.path,
+                        self.frame_count,
+                    )
+
+
+class LingBotDebugVideoRecorder:
+    def __init__(self, path: str, fps: int):
+        self.post_sr_path = _normalize_lossless_debug_video_path(path)
+        self.pre_sr_path = _derive_pre_sr_debug_video_path(self.post_sr_path)
+        self.path = self.post_sr_path
+        self.fps = fps
+        self.pre_sr_writer = _AsyncLosslessVideoWriter(
+            self.pre_sr_path,
+            fps=fps,
+            label="pre_sr",
         )
+        self.post_sr_writer = _AsyncLosslessVideoWriter(
+            self.post_sr_path,
+            fps=fps,
+            label="post_sr",
+        )
+
+    def append(self, stage_frames: dict[str, np.ndarray] | None) -> None:
+        if not stage_frames:
+            return
+        self.pre_sr_writer.append(stage_frames.get("pre_sr"))
+        self.post_sr_writer.append(stage_frames.get("post_sr"))
+
+    def close(self) -> None:
+        self.pre_sr_writer.close()
+        self.post_sr_writer.close()
 
 
 class LingBotDeployCompatSession(GenerateSession):
@@ -150,6 +253,8 @@ class LingBotDeployCompatSession(GenerateSession):
         self.rotate_speed_deg_ik = DEFAULT_ROTATE_SPEED_DEG_IK
         self.rotate_speed_deg_jl = DEFAULT_ROTATE_SPEED_DEG_JL
         self.debug_video_path: str | None = None
+        self.debug_video_pre_sr_path: str | None = None
+        self.debug_video_post_sr_path: str | None = None
         self.debug_video_recorder: LingBotDebugVideoRecorder | None = None
         self.output_width = DEFAULT_WIDTH
         self.output_height = DEFAULT_HEIGHT
@@ -171,6 +276,8 @@ class LingBotDeployCompatSession(GenerateSession):
         self.rotate_speed_deg_ik = DEFAULT_ROTATE_SPEED_DEG_IK
         self.rotate_speed_deg_jl = DEFAULT_ROTATE_SPEED_DEG_JL
         self.debug_video_path = None
+        self.debug_video_pre_sr_path = None
+        self.debug_video_post_sr_path = None
         self.output_width = DEFAULT_WIDTH
         self.output_height = DEFAULT_HEIGHT
         self.model_width = DEFAULT_WIDTH
@@ -224,20 +331,28 @@ class LingBotDeployCompatSession(GenerateSession):
 
     def set_debug_video(self, path: str | None, fps: int) -> None:
         self.close_debug_video()
-        self.debug_video_path = path
         if path:
-            self.debug_video_recorder = LingBotDebugVideoRecorder(path, fps=fps)
+            recorder = LingBotDebugVideoRecorder(path, fps=fps)
+            self.debug_video_recorder = recorder
+            self.debug_video_path = recorder.post_sr_path
+            self.debug_video_pre_sr_path = recorder.pre_sr_path
+            self.debug_video_post_sr_path = recorder.post_sr_path
         else:
             self.debug_video_recorder = None
+            self.debug_video_path = None
+            self.debug_video_pre_sr_path = None
+            self.debug_video_post_sr_path = None
 
-    def append_debug_video(self, frames: list[np.ndarray] | np.ndarray) -> None:
+    def append_debug_video(self, stage_frames: dict[str, np.ndarray] | None) -> None:
         if self.debug_video_recorder is None:
             return
         try:
-            self.debug_video_recorder.append(frames)
+            self.debug_video_recorder.append(stage_frames)
         except Exception as e:
             logger.warning(
-                "failed to append LingBot deploy debug video, path=%s, error=%s",
+                "failed to append LingBot deploy debug video, "
+                "pre_sr_path=%s, post_sr_path=%s, error=%s",
+                self.debug_video_pre_sr_path,
                 self.debug_video_path,
                 e,
                 exc_info=True,
@@ -250,7 +365,9 @@ class LingBotDeployCompatSession(GenerateSession):
             self.debug_video_recorder.close()
         except Exception as e:
             logger.warning(
-                "failed to close LingBot deploy debug video, path=%s, error=%s",
+                "failed to close LingBot deploy debug video, "
+                "pre_sr_path=%s, post_sr_path=%s, error=%s",
+                self.debug_video_pre_sr_path,
                 self.debug_video_path,
                 e,
                 exc_info=True,
@@ -555,14 +672,13 @@ def _build_start_request(
         debug_video_dir = str(data.get("debug_video_dir") or DEFAULT_DEBUG_VIDEO_DIR)
         debug_video_path = os.path.join(
             debug_video_dir,
-            f"lingbot_{session.id}_{int(time.time() * 1000)}.mp4",
+            f"lingbot_{session.id}_{int(time.time() * 1000)}_post_sr.mkv",
         )
     if debug_video_path is not None and not isinstance(debug_video_path, str):
         raise ValueError("debug_video_path must be a string")
-    debug_video_fps = fps * (2**DEFAULT_RIFE_EXP if DEFAULT_ENABLE_RIFE else 1)
     session.set_debug_video(
         debug_video_path if debug_save_video else None,
-        fps=debug_video_fps,
+        fps=fps,
     )
 
     prompt = str(data.get("prompt") or DEFAULT_PROMPT)
@@ -860,6 +976,7 @@ def output_to_rgb_tensor_for_send(
     rife_scale: float = DEFAULT_RIFE_SCALE,
     timings: dict[str, float] | None = None,
     cuda_events: dict[str, tuple[Any, Any]] | None = None,
+    debug_stage_frames: dict[str, np.ndarray] | None = None,
 ) -> torch.Tensor:
     stage_timer = _start_cuda_stage_timer(_cuda_device_from_output(output))
     frames = output_to_rgb_tensor(output)
@@ -872,6 +989,9 @@ def output_to_rgb_tensor_for_send(
     )
 
     input_shape = rgb_tensor_hwc_shape(frames)
+    if debug_stage_frames is not None:
+        debug_stage_frames["pre_sr"] = rgb_tensor_to_uint8_array(frames)
+
     if enable_upscaling:
         from sglang.multimodal_gen.runtime.postprocess import upscale_tensor
 
@@ -904,6 +1024,13 @@ def output_to_rgb_tensor_for_send(
             "LingBot deploy SR disabled: frames=%d input_shape=%s",
             frames.shape[0],
             input_shape,
+        )
+
+    if debug_stage_frames is not None:
+        debug_stage_frames["post_sr"] = (
+            rgb_tensor_to_uint8_array(frames)
+            if enable_upscaling
+            else debug_stage_frames["pre_sr"]
         )
 
     if enable_rife:
@@ -962,6 +1089,7 @@ def output_to_rgb_array_for_send(
     rife_exp: int = DEFAULT_RIFE_EXP,
     rife_scale: float = DEFAULT_RIFE_SCALE,
     timings: dict[str, float] | None = None,
+    debug_stage_frames: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
     cuda_events: dict[str, tuple[Any, Any]] | None = {} if timings is not None else None
     frames = output_to_rgb_tensor_for_send(
@@ -976,9 +1104,15 @@ def output_to_rgb_array_for_send(
         rife_scale=rife_scale,
         timings=timings,
         cuda_events=cuda_events,
+        debug_stage_frames=debug_stage_frames,
     )
     stage_timer = _start_cuda_stage_timer(_cuda_device_from_tensor(frames))
-    frame_array = rgb_tensor_to_uint8_array(frames)
+    if debug_stage_frames is not None and not enable_rife:
+        frame_array = debug_stage_frames.get("post_sr")
+    else:
+        frame_array = None
+    if frame_array is None:
+        frame_array = rgb_tensor_to_uint8_array(frames)
     _stop_cuda_stage_timer(
         timings,
         "finalize_cuda",
@@ -1419,6 +1553,9 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                 raise RuntimeError(error_msg)
 
             stage_start = time.perf_counter()
+            debug_stage_frames = (
+                {} if session.debug_video_recorder is not None else None
+            )
             frames = output_to_rgb_array_for_send(
                 result.output,
                 enable_upscaling=bool(batch.enable_upscaling),
@@ -1426,10 +1563,11 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                 upscaling_scale=int(batch.upscaling_scale),
                 half_precision=server_args.realesrgan_half_precision,
                 timings=timings,
+                debug_stage_frames=debug_stage_frames,
             )
             timings["postprocess_ms"] = (time.perf_counter() - stage_start) * 1000.0
             stage_start = time.perf_counter()
-            session.append_debug_video(frames)
+            session.append_debug_video(debug_stage_frames)
             timings["debug_video_ms"] = (time.perf_counter() - stage_start) * 1000.0
 
             timings["produce_ms"] = (time.perf_counter() - start) * 1000.0
@@ -1557,6 +1695,8 @@ async def _handle_message(
                 "model_width": session.model_width,
                 "model_height": session.model_height,
                 "debug_video_path": session.debug_video_path,
+                "debug_video_pre_sr_path": session.debug_video_pre_sr_path,
+                "debug_video_post_sr_path": session.debug_video_post_sr_path,
             },
         )
         return asyncio.create_task(_generate_loop(ws, session))
