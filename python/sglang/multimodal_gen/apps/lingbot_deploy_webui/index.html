@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>LingBot Deploy WebUI</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark">LB</div>
+          <div>
+            <h1>LingBot Deploy</h1>
+            <p id="statusText">idle</p>
+          </div>
+        </div>
+        <div class="connection">
+          <label for="wsUrl">WebSocket</label>
+          <input id="wsUrl" autocomplete="off" spellcheck="false">
+          <button id="startBtn" class="primary">Start</button>
+          <button id="stopBtn">Stop</button>
+        </div>
+      </header>
+
+      <section class="layout">
+        <form id="startForm" class="panel config-panel">
+          <div class="panel-head">
+            <h2>Session</h2>
+            <span id="socketBadge" class="badge">closed</span>
+          </div>
+
+          <label class="field span-2">
+            <span>Image path or URL</span>
+            <input id="imagePath" spellcheck="false" value="/ossfs/workspace/image.jpg">
+          </label>
+
+          <label class="field span-2">
+            <span>Prompt</span>
+            <textarea id="prompt" rows="5">A cinematic first-person world navigation video with stable geometry, smooth camera motion, coherent lighting, and consistent scene identity.</textarea>
+          </label>
+
+          <div class="grid-2">
+            <label class="field">
+              <span>Width</span>
+              <input id="width" type="number" min="1" step="1" value="1664">
+            </label>
+            <label class="field">
+              <span>Height</span>
+              <input id="height" type="number" min="1" step="1" value="960">
+            </label>
+            <label class="field">
+              <span>FPS</span>
+              <input id="fps" type="number" min="1" step="1" value="16">
+            </label>
+            <label class="field">
+              <span>Frames</span>
+              <input id="numFrames" type="number" min="1" step="1" value="117">
+            </label>
+            <label class="field">
+              <span>Seed</span>
+              <input id="seed" type="number" step="1" value="42">
+            </label>
+            <label class="field">
+              <span>SR scale</span>
+              <input id="upscalingScale" type="number" min="1" step="1" value="2">
+            </label>
+          </div>
+
+          <div class="toggles">
+            <label><input id="enableUpscaling" type="checkbox" checked> SR</label>
+            <label><input id="debugSaveVideo" type="checkbox" checked> Debug save</label>
+            <label><input id="autoStop" type="checkbox" checked> Auto stop</label>
+          </div>
+
+          <div class="grid-3">
+            <label class="field">
+              <span>Move</span>
+              <input id="moveSpeed" type="number" step="0.01" value="0.05">
+            </label>
+            <label class="field">
+              <span>Pitch</span>
+              <input id="rotateIK" type="number" step="0.1" value="4">
+            </label>
+            <label class="field">
+              <span>Yaw</span>
+              <input id="rotateJL" type="number" step="0.1" value="6">
+            </label>
+          </div>
+
+          <label class="field span-2">
+            <span>Debug video path</span>
+            <input id="debugVideoPath" spellcheck="false" placeholder="/tmp/lingbot_debug_post_sr.mkv">
+          </label>
+
+          <div class="panel-head compact">
+            <h2>Events</h2>
+            <select id="eventMode">
+              <option value="overwrite">overwrite</option>
+              <option value="append">append</option>
+            </select>
+          </div>
+
+          <label class="field">
+            <span>Event chunk</span>
+            <input id="eventChunk" type="number" min="1" step="1" value="4">
+          </label>
+
+          <label class="field span-2">
+            <span>event1</span>
+            <textarea id="event1Text" rows="3"></textarea>
+          </label>
+
+          <label class="field span-2">
+            <span>event2</span>
+            <textarea id="event2Text" rows="3"></textarea>
+          </label>
+
+          <div class="event-actions span-2">
+            <button type="button" data-event="event1">Trigger event1</button>
+            <button type="button" data-event="event2">Trigger event2</button>
+            <input id="customEventId" placeholder="event id">
+            <button type="button" id="triggerCustomEvent">Trigger</button>
+          </div>
+        </form>
+
+        <section class="stage">
+          <div class="viewer">
+            <canvas id="previewCanvas"></canvas>
+            <div id="emptyPreview" class="empty-preview">No frames</div>
+          </div>
+          <div class="transport">
+            <div class="pad">
+              <button data-key="w">W</button>
+              <button data-key="a">A</button>
+              <button data-key="s">S</button>
+              <button data-key="d">D</button>
+              <button data-key="i">I</button>
+              <button data-key="j">J</button>
+              <button data-key="k">K</button>
+              <button data-key="l">L</button>
+            </div>
+            <div class="metrics">
+              <div><span>Output</span><strong id="outputSize">-</strong></div>
+              <div><span>Frames</span><strong id="frameCount">0</strong></div>
+              <div><span>Chunks</span><strong id="chunkCount">0</strong></div>
+              <div><span>Latency</span><strong id="latency">-</strong></div>
+              <div><span>Queue</span><strong id="queueDepth">0</strong></div>
+              <div><span>Dropped</span><strong id="droppedFrames">0</strong></div>
+            </div>
+          </div>
+        </section>
+
+        <aside class="panel side-panel">
+          <div class="panel-head">
+            <h2>Run</h2>
+            <span id="runBadge" class="badge">idle</span>
+          </div>
+
+          <div class="path-list">
+            <label>
+              <span>pre SR</span>
+              <div>
+                <input id="preSrPath" readonly>
+                <button id="copyPreSr" type="button">Copy</button>
+              </div>
+            </label>
+            <label>
+              <span>post SR</span>
+              <div>
+                <input id="postSrPath" readonly>
+                <button id="copyPostSr" type="button">Copy</button>
+              </div>
+            </label>
+          </div>
+
+          <div class="server-message">
+            <h2>Last timing</h2>
+            <pre id="timingView">{}</pre>
+          </div>
+
+          <div class="log-head">
+            <h2>Log</h2>
+            <button id="clearLog" type="button">Clear</button>
+          </div>
+          <pre id="log"></pre>
+        </aside>
+      </section>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>
