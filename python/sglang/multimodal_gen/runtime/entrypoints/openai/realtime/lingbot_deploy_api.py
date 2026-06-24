@@ -58,12 +58,20 @@ DEFAULT_ROTATE_SPEED_DEG_JL = 6.0
 DEFAULT_ENABLE_UPSCALING = True
 DEFAULT_UPSCALING_SCALE = 2
 DEFAULT_UPSCALING_MODEL_PATH = (
-    "/home/admin/realesr-general-x4v3/realesr-general-x4v3.pth"
+    os.environ.get("SGLANG_LINGBOT_UPSCALING_MODEL_PATH")
+    or os.environ.get("SGLANG_REALESRGAN_MODEL_PATH")
+    or os.environ.get("SGLANG_SR_MODEL_PATH")
+    or os.environ.get("SGLANG_REALESRGAN_ASSET_DIR")
+    or os.environ.get("SGLANG_RIFE_SR_ASSET_DIR")
+    or "/home/admin/realesr-general-x4v3/realesr-general-x4v3.pth"
 )
 DEFAULT_ENABLE_RIFE = _env_bool("SGLANG_LINGBOT_ENABLE_RIFE", False)
 DEFAULT_RIFE_MODEL_PATH = os.environ.get(
     "SGLANG_LINGBOT_RIFE_MODEL_PATH",
-    "/home/admin/RIFE-4.22.lite",
+    os.environ.get("SGLANG_RIFE_MODEL_PATH")
+    or os.environ.get("SGLANG_FRAME_INTERPOLATION_MODEL_PATH")
+    or os.environ.get("SGLANG_RIFE_SR_ASSET_DIR")
+    or "/home/admin/RIFE-4.22.lite",
 )
 DEFAULT_RIFE_EXP = int(os.environ.get("SGLANG_LINGBOT_RIFE_EXP", "1"))
 DEFAULT_RIFE_SCALE = float(os.environ.get("SGLANG_LINGBOT_RIFE_SCALE", "1.0"))

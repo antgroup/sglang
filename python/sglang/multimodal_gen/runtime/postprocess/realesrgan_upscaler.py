@@ -12,6 +12,7 @@ The ImageUpscaler wrapper and integration code are original work.
 import math
 import os
 import time
+from glob import glob
 from typing import Optional
 
 import numpy as np
@@ -27,6 +28,17 @@ logger = init_logger(__name__)
 # Default HuggingFace repo and filename for Real-ESRGAN weights
 _DEFAULT_REALESRGAN_HF_REPO = "ai-forever/Real-ESRGAN"
 _DEFAULT_REALESRGAN_FILENAME = "RealESRGAN_x4.pth"
+_REALESRGAN_PATH_ENV_VARS = (
+    "SGLANG_REALESRGAN_MODEL_PATH",
+    "SGLANG_SR_MODEL_PATH",
+    "SGLANG_REALESRGAN_ASSET_DIR",
+    "SGLANG_RIFE_SR_ASSET_DIR",
+)
+_REALESRGAN_LOCAL_CANDIDATES = (
+    "Real-ESRGAN/weights/RealESRGAN_x2plus.pth",
+    "weights/RealESRGAN_x2plus.pth",
+    "RealESRGAN_x2plus.pth",
+)
 
 # Module-level cache: model_path -> UpscalerModel instance
 _MODEL_CACHE: dict[str, "UpscalerModel"] = {}
@@ -529,7 +541,7 @@ class ImageUpscaler:
 
     def _ensure_model_loaded(self) -> UpscalerModel:
         """Download/load Real-ESRGAN weights, detect arch, and cache globally."""
-        model_path = self._model_path or _DEFAULT_REALESRGAN_HF_REPO
+        model_path = self._model_path or _default_realesrgan_model_path()
 
         # Resolve: local .pth pass-through, or HF repo → download single file
         resolved_path = _resolve_model_path(model_path)
@@ -668,13 +680,30 @@ def _resolve_model_path(model_path: str) -> str:
 
     Accepts:
     - An existing local file path (pass-through).
+    - A local Real-ESRGAN directory or the combined RIFE/SR asset root.
     - A HuggingFace ``repo_id`` → downloads the default weight file
       (``RealESRGAN_x4.pth``).
     - A HuggingFace ``repo_id:filename`` → downloads *filename* from *repo_id*,
       allowing users to specify custom weight files hosted on HF.
     """
+    model_path = os.path.expanduser(model_path)
+    if os.path.isdir(model_path):
+        return _resolve_local_realesrgan_dir(model_path)
+
     if os.path.isfile(model_path):
+        if model_path.endswith((".engine", ".plan")):
+            raise ValueError(
+                "TensorRT Real-ESRGAN engine files are not supported by the "
+                "PyTorch upscaler path yet. Provide a .pth checkpoint, such as "
+                "Real-ESRGAN/weights/RealESRGAN_x2plus.pth, or pass the asset "
+                "root directory containing that file."
+            )
         return model_path
+
+    if model_path.endswith((".engine", ".plan", ".onnx", ".pth", ".pt")):
+        raise FileNotFoundError(f"Real-ESRGAN model file does not exist: {model_path}")
+    if os.path.isabs(model_path) or model_path.startswith("."):
+        raise FileNotFoundError(f"Real-ESRGAN model path does not exist: {model_path}")
 
     # Parse optional "repo_id:filename" syntax; fall back to default filename.
     if ":" in model_path and not model_path.startswith("/"):
@@ -710,6 +739,46 @@ def _resolve_model_path(model_path: str) -> str:
             f"Original error: {e}"
         ) from e
     return local_path
+
+
+def _default_realesrgan_model_path() -> str:
+    for env_var in _REALESRGAN_PATH_ENV_VARS:
+        value = os.environ.get(env_var)
+        if value:
+            return value
+    return _DEFAULT_REALESRGAN_HF_REPO
+
+
+def _resolve_local_realesrgan_dir(model_dir: str) -> str:
+    for rel_path in _REALESRGAN_LOCAL_CANDIDATES:
+        candidate = os.path.join(model_dir, rel_path)
+        if os.path.isfile(candidate):
+            return candidate
+
+    pth_matches = sorted(glob(os.path.join(model_dir, "**", "*.pth"), recursive=True))
+    if pth_matches:
+        preferred = [
+            path
+            for path in pth_matches
+            if os.path.basename(path).lower() == "realesrgan_x2plus.pth"
+        ]
+        return preferred[0] if preferred else pth_matches[0]
+
+    engine_matches = sorted(
+        glob(os.path.join(model_dir, "**", "*.engine"), recursive=True)
+        + glob(os.path.join(model_dir, "**", "*.plan"), recursive=True)
+    )
+    if engine_matches:
+        raise ValueError(
+            "Found TensorRT Real-ESRGAN engine files but no .pth checkpoint under "
+            f"{model_dir}. This code path currently loads PyTorch checkpoints; "
+            "use RealESRGAN_x2plus.pth or pass a directory containing it."
+        )
+
+    raise FileNotFoundError(
+        "Could not find a Real-ESRGAN .pth checkpoint under "
+        f"{model_dir}. Expected one of: " + ", ".join(_REALESRGAN_LOCAL_CANDIDATES)
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-RIFE 4.22.lite frame interpolation for SGLang diffusion pipelines.
+RIFE frame interpolation for SGLang diffusion pipelines.
 
 RIFE model code is vendored and adapted from:
   - https://github.com/hzwer/ECCV2022-RIFE  (MIT License)
@@ -11,6 +11,7 @@ The FrameInterpolator wrapper and integration code are original work.
 """
 
 import os
+from glob import glob
 from typing import Optional
 
 import numpy as np
@@ -25,13 +26,25 @@ logger = init_logger(__name__)
 
 # Default HuggingFace repo for RIFE 4.22.lite weights
 _DEFAULT_RIFE_HF_REPO = "elfgum/RIFE-4.22.lite"
+_DEFAULT_RIFE_BLOCK_CHANNELS = (192, 128, 64, 32)
+_RIFE_PATH_ENV_VARS = (
+    "SGLANG_RIFE_MODEL_PATH",
+    "SGLANG_FRAME_INTERPOLATION_MODEL_PATH",
+    "SGLANG_LINGBOT_RIFE_MODEL_PATH",
+    "SGLANG_RIFE_SR_ASSET_DIR",
+)
+_RIFE_LOCAL_CANDIDATES = (
+    "Practical-RIFE/train_log",
+    "train_log",
+    ".",
+)
 
 # Module-level cache: model_path -> Model instance
 _MODEL_CACHE: dict[str, "Model"] = {}
 
 
 # ---------------------------------------------------------------------------
-# Vendored RIFE 4.22.lite model code
+# Vendored RIFE model code
 # (IFBlock, IFNet_HDv3 backbone, Model wrapper)
 # ---------------------------------------------------------------------------
 
@@ -178,15 +191,27 @@ class Head(nn.Module):
 
 
 class IFNet(nn.Module):
-    """4-scale IFNet optical flow network (RIFE 4.22 backbone)."""
+    """Multi-scale IFNet optical flow network."""
 
-    def __init__(self):
+    def __init__(self, block_channels: tuple[int, ...] = _DEFAULT_RIFE_BLOCK_CHANNELS):
         super().__init__()
-        self.block0 = IFBlock(7 + 8, c=192)
-        self.block1 = IFBlock(8 + 4 + 8 + 8, c=128)
-        self.block2 = IFBlock(8 + 4 + 8 + 8, c=64)
-        self.block3 = IFBlock(8 + 4 + 8 + 8, c=32)
+        self.block_channels = tuple(block_channels)
+        for idx, channels in enumerate(self.block_channels):
+            in_planes = 7 + 8 if idx == 0 else 8 + 4 + 8 + 8
+            setattr(self, f"block{idx}", IFBlock(in_planes, c=channels))
         self.encode = Head()
+
+    def _blocks(self) -> list[IFBlock]:
+        return [getattr(self, f"block{i}") for i in range(len(self.block_channels))]
+
+    def default_scale_list(self, scale: float = 1.0) -> list[float]:
+        if len(self.block_channels) == 5:
+            base = [32, 16, 8, 4, 1]
+        elif len(self.block_channels) == 4:
+            base = [8, 4, 2, 1]
+        else:
+            base = [2**i for i in range(len(self.block_channels) - 1, -1, -1)]
+        return [value / scale for value in base]
 
     def forward(
         self,
@@ -195,7 +220,7 @@ class IFNet(nn.Module):
         scale_list: Optional[list] = None,
     ) -> tuple[list, torch.Tensor, list]:
         if scale_list is None:
-            scale_list = [8, 4, 2, 1]
+            scale_list = self.default_scale_list()
 
         channel = x.shape[1] // 2
         img0 = x[:, :channel]
@@ -217,8 +242,8 @@ class IFNet(nn.Module):
         flow = None
         mask = None
 
-        block = [self.block0, self.block1, self.block2, self.block3]
-        for i in range(4):
+        block = self._blocks()
+        for i in range(len(block)):
             if flow is None:
                 flow, mask, feat = block[i](
                     torch.cat((img0[:, :3], img1[:, :3], f0, f1, timestep), 1),
@@ -254,9 +279,9 @@ class IFNet(nn.Module):
             merged.append((warped_img0, warped_img1))
 
         mask = torch.sigmoid(mask)
-        merged[3] = warped_img0 * mask + warped_img1 * (1 - mask)
+        merged[-1] = warped_img0 * mask + warped_img1 * (1 - mask)
 
-        return flow_list, mask_list[3], merged
+        return flow_list, mask_list[-1], merged
 
 
 class Model:
@@ -289,18 +314,50 @@ class Model:
             )
 
         def convert(param):
-            if strip_module_prefix:
-                return {
-                    k.replace("module.", ""): v
-                    for k, v in param.items()
-                    if "module." in k
-                }
-            else:
-                return {k: v for k, v in param.items() if "module." not in k}
+            if not strip_module_prefix:
+                return dict(param)
+            return {
+                (k.removeprefix("module.") if k.startswith("module.") else k): v
+                for k, v in param.items()
+            }
 
         state = torch.load(flownet_path, map_location="cpu", weights_only=False)
-        self.flownet.load_state_dict(convert(state), strict=False)
+        state = convert(state)
+        self._rebuild_flownet_for_state_dict(state)
+        missing, unexpected = self.flownet.load_state_dict(state, strict=False)
+        unexpected = [
+            key for key in unexpected if not key.startswith(("teacher.", "caltime."))
+        ]
+        if missing or unexpected:
+            logger.warning(
+                "Loaded RIFE weights with missing keys=%s unexpected keys=%s",
+                missing,
+                unexpected,
+            )
         logger.info("Loaded RIFE weights from %s", flownet_path)
+
+    @staticmethod
+    def _infer_block_channels(state_dict: dict[str, torch.Tensor]) -> tuple[int, ...]:
+        channels = []
+        for idx in range(16):
+            key = f"block{idx}.conv0.1.0.weight"
+            weight = state_dict.get(key)
+            if weight is None:
+                break
+            channels.append(int(weight.shape[0]))
+        return tuple(channels) or _DEFAULT_RIFE_BLOCK_CHANNELS
+
+    def _rebuild_flownet_for_state_dict(self, state_dict: dict[str, torch.Tensor]):
+        block_channels = self._infer_block_channels(state_dict)
+        if block_channels == self.flownet.block_channels:
+            return
+
+        device = next(self.flownet.parameters()).device
+        dtype = next(self.flownet.parameters()).dtype
+        logger.info("Detected RIFE IFNet block channels: %s", block_channels)
+        self.flownet = IFNet(block_channels=block_channels).to(
+            device=device, dtype=dtype
+        )
 
     def inference(
         self,
@@ -321,7 +378,7 @@ class Model:
         img1 = F.pad(img1, pad)
 
         imgs = torch.cat((img0, img1), 1)
-        scale_list = [8 / scale, 4 / scale, 2 / scale, 1 / scale]
+        scale_list = self.flownet.default_scale_list(scale)
         with torch.no_grad():
             flow_list, mask, merged = self.flownet(
                 imgs,
@@ -330,7 +387,7 @@ class Model:
             )
 
         # Crop back to original resolution
-        return merged[3][:, :, :h, :w]
+        return merged[-1][:, :, :h, :w]
 
 
 # ---------------------------------------------------------------------------
@@ -361,10 +418,13 @@ class FrameInterpolator:
             maybe_download_model,
         )
 
-        model_path = self._model_path or _DEFAULT_RIFE_HF_REPO
+        model_path = self._model_path or _default_rife_model_path()
 
-        # Resolve: local path pass-through, HF repo ID → download & cache
-        model_path = maybe_download_model(model_path)
+        # Resolve: local asset/checkpoint path pass-through, HF repo ID → download & cache
+        if _looks_like_local_rife_path(model_path):
+            model_path = _resolve_local_rife_dir(model_path)
+        else:
+            model_path = maybe_download_model(model_path)
 
         self._resolved_path = model_path
 
@@ -588,3 +648,72 @@ def interpolate_video_tensor(
     """
     interpolator = FrameInterpolator(model_path=model_path)
     return interpolator.interpolate_tensor(frames, exp=exp, scale=scale)
+
+
+def _default_rife_model_path() -> str:
+    for env_var in _RIFE_PATH_ENV_VARS:
+        value = os.environ.get(env_var)
+        if value:
+            return value
+    return _DEFAULT_RIFE_HF_REPO
+
+
+def _looks_like_local_rife_path(model_path: str) -> bool:
+    model_path = os.path.expanduser(model_path)
+    return (
+        os.path.exists(model_path)
+        or model_path.endswith((".pkl", ".onnx", ".engine", ".plan"))
+        or os.path.isabs(model_path)
+        or model_path.startswith(".")
+    )
+
+
+def _resolve_local_rife_dir(model_path: str) -> str:
+    model_path = os.path.expanduser(model_path)
+
+    if os.path.isfile(model_path):
+        if os.path.basename(model_path) == "flownet.pkl":
+            return os.path.dirname(model_path)
+        if model_path.endswith((".engine", ".plan")):
+            raise ValueError(
+                "TensorRT RIFE engine files are not supported by the PyTorch "
+                "interpolator path yet. Provide a directory containing "
+                "flownet.pkl, such as Practical-RIFE/train_log, or pass the "
+                "combined asset root directory."
+            )
+        raise ValueError(
+            f"Unsupported RIFE model file: {model_path}. Expected flownet.pkl "
+            "or a directory containing it."
+        )
+
+    if not os.path.isdir(model_path):
+        raise FileNotFoundError(f"RIFE model path does not exist: {model_path}")
+
+    for rel_path in _RIFE_LOCAL_CANDIDATES:
+        candidate = os.path.join(model_path, rel_path, "flownet.pkl")
+        if os.path.isfile(candidate):
+            return os.path.dirname(candidate)
+
+    flownet_matches = sorted(
+        glob(os.path.join(model_path, "**", "flownet.pkl"), recursive=True)
+    )
+    if flownet_matches:
+        return os.path.dirname(flownet_matches[0])
+
+    engine_matches = sorted(
+        glob(os.path.join(model_path, "**", "*.engine"), recursive=True)
+        + glob(os.path.join(model_path, "**", "*.plan"), recursive=True)
+    )
+    if engine_matches:
+        raise ValueError(
+            "Found TensorRT RIFE engine files but no flownet.pkl under "
+            f"{model_path}. This code path currently loads PyTorch checkpoints; "
+            "use Practical-RIFE/train_log or pass a directory containing "
+            "flownet.pkl."
+        )
+
+    raise FileNotFoundError(
+        "Could not find RIFE flownet.pkl under "
+        f"{model_path}. Expected one of: "
+        + ", ".join(os.path.join(p, "flownet.pkl") for p in _RIFE_LOCAL_CANDIDATES)
+    )
