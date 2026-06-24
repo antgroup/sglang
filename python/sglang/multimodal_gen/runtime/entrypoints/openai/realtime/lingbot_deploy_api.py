@@ -1,8 +1,10 @@
 import asyncio
 import json
 import os
+import queue as thread_queue
 import random
 import tempfile
+import threading
 import time
 from collections import deque
 from typing import Any, NamedTuple
@@ -95,46 +97,120 @@ STARTUP_WARMUP_PROMPT = os.environ.get(
 )
 
 
-class LingBotDebugVideoRecorder:
-    def __init__(self, path: str, fps: int):
+def _normalize_lossless_debug_video_path(path: str) -> str:
+    root, ext = os.path.splitext(path)
+    if ext.lower() == ".mkv":
+        return path
+    return f"{root}.mkv"
+
+
+class _AsyncLosslessVideoWriter:
+    _STOP = object()
+
+    def __init__(self, path: str, fps: int, label: str):
         self.path = path
         self.fps = fps
-        self.writer = None
+        self.label = label
         self.frame_count = 0
+        self._queue: thread_queue.SimpleQueue[Any] = thread_queue.SimpleQueue()
+        self._thread: threading.Thread | None = None
+        self._closed = False
+        self._error: Exception | None = None
 
-    def append(self, frames: list[np.ndarray] | np.ndarray) -> None:
-        if len(frames) == 0:
+    def append(self, frames: list[np.ndarray] | np.ndarray | None) -> None:
+        if frames is None or len(frames) == 0 or self._closed:
             return
-
-        import imageio
-
-        output_dir = os.path.dirname(self.path)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        if self.writer is None:
-            self.writer = imageio.get_writer(
-                self.path,
-                fps=self.fps,
-                codec="libx264",
-                quality=8,
-                macro_block_size=1,
+        if self._error is not None:
+            return
+        if self._thread is None:
+            self._thread = threading.Thread(
+                target=self._run,
+                name=f"lingbot-debug-video-{self.label}",
+                daemon=True,
             )
-            logger.info("LingBot deploy debug video opened: %s", self.path)
-
-        for frame in frames:
-            self.writer.append_data(np.ascontiguousarray(frame))
-            self.frame_count += 1
+            self._thread.start()
+        self._queue.put(frames)
 
     def close(self) -> None:
-        if self.writer is None:
+        self._closed = True
+        if self._thread is None:
             return
+        self._queue.put(self._STOP)
+        self._thread.join()
+        self._thread = None
+
+    def _run(self) -> None:
+        writer = None
+        try:
+            import imageio
+
+            output_dir = os.path.dirname(self.path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            writer = imageio.get_writer(
+                self.path,
+                fps=self.fps,
+                codec="ffv1",
+                macro_block_size=1,
+                output_params=["-pix_fmt", "rgb24"],
+            )
+            logger.info(
+                "LingBot deploy lossless debug video opened: stage=%s path=%s",
+                self.label,
+                self.path,
+            )
+            while True:
+                frames = self._queue.get()
+                if frames is self._STOP:
+                    break
+                for frame in frames:
+                    writer.append_data(np.ascontiguousarray(frame))
+                    self.frame_count += 1
+        except Exception as e:
+            self._error = e
+            logger.warning(
+                "failed to write LingBot deploy lossless debug video, "
+                "stage=%s path=%s error=%s",
+                self.label,
+                self.path,
+                e,
+                exc_info=True,
+            )
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception as e:
+                    self._error = e
+                    logger.warning(
+                        "failed to close LingBot deploy lossless debug video, "
+                        "stage=%s path=%s error=%s",
+                        self.label,
+                        self.path,
+                        e,
+                        exc_info=True,
+                    )
+                else:
+                    logger.info(
+                        "LingBot deploy lossless debug video saved: "
+                        "stage=%s path=%s frames=%d",
+                        self.label,
+                        self.path,
+                        self.frame_count,
+                    )
+
+
+class LingBotDebugVideoRecorder:
+    def __init__(self, path: str, fps: int):
+        self.path = _normalize_lossless_debug_video_path(path)
+        self.fps = fps
+        self.writer = _AsyncLosslessVideoWriter(self.path, fps=fps, label="final")
+
+    def append(self, frames: list[np.ndarray] | np.ndarray | None) -> None:
+        self.writer.append(frames)
+
+    def close(self) -> None:
         self.writer.close()
-        self.writer = None
-        logger.info(
-            "LingBot deploy debug video saved: path=%s frames=%d",
-            self.path,
-            self.frame_count,
-        )
 
 
 class LingBotDeployCompatSession(GenerateSession):
@@ -224,13 +300,14 @@ class LingBotDeployCompatSession(GenerateSession):
 
     def set_debug_video(self, path: str | None, fps: int) -> None:
         self.close_debug_video()
-        self.debug_video_path = path
         if path:
             self.debug_video_recorder = LingBotDebugVideoRecorder(path, fps=fps)
+            self.debug_video_path = self.debug_video_recorder.path
         else:
+            self.debug_video_path = None
             self.debug_video_recorder = None
 
-    def append_debug_video(self, frames: list[np.ndarray] | np.ndarray) -> None:
+    def append_debug_video(self, frames: list[np.ndarray] | np.ndarray | None) -> None:
         if self.debug_video_recorder is None:
             return
         try:
