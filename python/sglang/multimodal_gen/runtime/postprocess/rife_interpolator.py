@@ -10,6 +10,7 @@ RIFE model code is vendored and adapted from:
 The FrameInterpolator wrapper and integration code are original work.
 """
 
+import math
 import os
 from glob import glob
 from typing import Optional
@@ -359,6 +360,13 @@ class Model:
             device=device, dtype=dtype
         )
 
+    @staticmethod
+    def _pad_multiple_for_scale_list(scale_list: list[float]) -> int:
+        # Each IFBlock downsamples twice internally and then upsamples back.
+        # The largest external scale therefore needs input dimensions divisible
+        # by scale * 4 to avoid round-off growth such as 960 -> 1024.
+        return max(32, int(math.ceil(max(scale_list) * 4)))
+
     def inference(
         self,
         img0: torch.Tensor,
@@ -369,16 +377,17 @@ class Model:
         """Interpolate a single intermediate frame between img0 and img1."""
         n, c, h, w = img0.shape
 
-        # Pad to multiples of 32 so that RIFE's downsample/upsample round-trips
-        # preserve spatial dimensions exactly.
-        ph = ((h - 1) // 32 + 1) * 32
-        pw = ((w - 1) // 32 + 1) * 32
+        scale_list = self.flownet.default_scale_list(scale)
+        pad_multiple = self._pad_multiple_for_scale_list(scale_list)
+        # Pad so that RIFE's downsample/upsample round-trips preserve spatial
+        # dimensions exactly for both 4-block and 5-block IFNet variants.
+        ph = ((h - 1) // pad_multiple + 1) * pad_multiple
+        pw = ((w - 1) // pad_multiple + 1) * pad_multiple
         pad = (0, pw - w, 0, ph - h)
         img0 = F.pad(img0, pad)
         img1 = F.pad(img1, pad)
 
         imgs = torch.cat((img0, img1), 1)
-        scale_list = self.flownet.default_scale_list(scale)
         with torch.no_grad():
             flow_list, mask, merged = self.flownet(
                 imgs,
