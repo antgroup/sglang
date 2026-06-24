@@ -174,21 +174,11 @@ def actions_to_c2ws(
         raise ValueError(f"initial_c2w must be 4x4, got {current_c2w.shape}")
     current_pitch = 0.0
     pitch_limit = np.deg2rad(85)
-    all_matrices = []
+    all_matrices = [current_c2w.copy()]
     noise_rng = np.random.default_rng(noise_seed)
 
     for frame_keys in action_history:
         keys = _normalize_action_keys(frame_keys)
-        record = current_c2w.copy()
-        if still_noise_scale > 0:
-            record = _jitter_pose_for_history(
-                record,
-                keys,
-                rng=noise_rng,
-                still_noise_scale=still_noise_scale,
-            )
-        all_matrices.append(record)
-
         R = current_c2w[:3, :3]
         T = current_c2w[:3, 3]
 
@@ -240,8 +230,17 @@ def actions_to_c2ws(
         current_c2w = np.eye(4)
         current_c2w[:3, :3] = R_new
         current_c2w[:3, 3] = T_new
+        record = current_c2w.copy()
+        if still_noise_scale > 0:
+            record = _jitter_pose_for_history(
+                record,
+                keys,
+                rng=noise_rng,
+                still_noise_scale=still_noise_scale,
+            )
+        all_matrices.append(record)
 
-    return all_matrices
+    return all_matrices[1:]
 
 
 def _resolve_camera_intrinsics(
