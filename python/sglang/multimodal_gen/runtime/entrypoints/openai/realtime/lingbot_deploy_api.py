@@ -6,7 +6,8 @@ import random
 import tempfile
 import threading
 import time
-from typing import Any
+from collections import deque
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -32,6 +33,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 
 logger = init_logger(__name__)
 router = APIRouter(tags=["lingbot-realtime"])
+
+
+class _ControlEvent(NamedTuple):
+    event_time: float
+    key: str
+    action: str
+    actions: list[str]
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -230,6 +238,9 @@ class LingBotDeployCompatSession(GenerateSession):
         self.output_height = DEFAULT_HEIGHT
         self.model_width = DEFAULT_WIDTH
         self.model_height = DEFAULT_HEIGHT
+        self._control_events: deque[_ControlEvent] = deque(maxlen=512)
+        self._control_sample_cursor: float | None = None
+        self._control_sample_base_actions: list[str] = []
         self.reset_control_sampler()
 
     def dispose(self):
@@ -289,11 +300,14 @@ class LingBotDeployCompatSession(GenerateSession):
         batch.extra["still_noise_scale"] = self.still_noise_scale
 
     def reset_control_sampler(self, *, timestamp: float | None = None) -> None:
-        _ = timestamp
         self.control_queue.clear()
-        snapshot = sorted(self.current_keys)
-        self.last_control_actions = list(snapshot)
-        self.has_control_state = bool(snapshot)
+        self._control_events.clear()
+        self._control_sample_cursor = (
+            time.perf_counter() if timestamp is None else timestamp
+        )
+        self._control_sample_base_actions = sorted(self.current_keys)
+        self.last_control_actions = list(self._control_sample_base_actions)
+        self.has_control_state = bool(self._control_sample_base_actions)
 
     def set_debug_video(self, path: str | None, fps: int) -> None:
         self.close_debug_video()
@@ -335,7 +349,6 @@ class LingBotDeployCompatSession(GenerateSession):
     def set_key_state(
         self, key: str, action: str, *, timestamp: float | None = None
     ) -> None:
-        _ = timestamp
         normalized_key, action = self.validate_control_key_action(key, action)
         before = set(self.current_keys)
         if action == "down":
@@ -346,33 +359,110 @@ class LingBotDeployCompatSession(GenerateSession):
         if self.current_keys == before:
             return
 
-    def set_keys_state(self, keys: Any, *, timestamp: float | None = None) -> None:
-        _ = timestamp
-        if keys is None:
-            keys = []
-        if not isinstance(keys, list):
-            raise ValueError("keys_state keys must be a list")
+        event_time = time.perf_counter() if timestamp is None else timestamp
+        self._control_events.append(
+            _ControlEvent(
+                event_time=event_time,
+                key=normalized_key,
+                action=action,
+                actions=sorted(self.current_keys),
+            )
+        )
 
-        normalized_keys: set[str] = set()
-        for key in keys:
-            key_str = str(key).strip().lower()
-            if not key_str:
-                continue
-            normalized_key, _ = self.validate_control_key_action(key_str, "down")
-            normalized_keys.add(normalized_key)
-        self.current_keys = normalized_keys
+    def _log_dropped_control_events(
+        self,
+        dropped_events: list[_ControlEvent],
+        *,
+        start: float,
+        now: float,
+        chunk_size: int,
+    ) -> None:
+        if not dropped_events:
+            return
+
+        max_events_to_log = 16
+        dropped_summary: list[dict[str, Any]] = [
+            {
+                "key": event.key,
+                "action": event.action,
+                "offset_ms": round((event.event_time - start) * 1000.0, 3),
+                "actions": event.actions,
+            }
+            for event in dropped_events[:max_events_to_log]
+        ]
+        if len(dropped_events) > max_events_to_log:
+            dropped_summary.append(
+                {"truncated_count": len(dropped_events) - max_events_to_log}
+            )
+
+        logger.info(
+            "drop LingBot deploy control events during sampling, "
+            "session_id=%s, chunk_size=%s, window_ms=%.3f, "
+            "dropped_count=%s, dropped_events=%s",
+            self.id,
+            chunk_size,
+            (now - start) * 1000.0,
+            len(dropped_events),
+            dropped_summary,
+        )
 
     def sample_control_chunk(
         self, chunk_size: int, *, timestamp: float | None = None
     ) -> list[list[str]] | None:
-        _ = timestamp
         if chunk_size <= 0:
             return None
 
-        snapshot = sorted(self.current_keys)
-        self.last_control_actions = list(snapshot)
-        self.has_control_state = bool(snapshot)
-        return [list(snapshot) for _ in range(chunk_size)]
+        now = time.perf_counter() if timestamp is None else timestamp
+        start = self._control_sample_cursor
+        if start is None:
+            start = now
+
+        events = [
+            control_event
+            for control_event in self._control_events
+            if control_event.event_time <= now
+        ]
+        base_actions = list(self._control_sample_base_actions)
+        state = list(base_actions)
+        chunk: list[list[str]] = []
+        duration = max(0.0, now - start)
+        dropped_events: list[_ControlEvent] = []
+
+        if duration == 0.0:
+            chunk = [list(state) for _ in range(chunk_size)]
+            dropped_events.extend(events)
+        else:
+            event_idx = 0
+            for frame_idx in range(chunk_size):
+                sample_time = start + duration * (frame_idx + 1) / chunk_size
+                sampled_events: list[_ControlEvent] = []
+                while (
+                    event_idx < len(events)
+                    and events[event_idx].event_time <= sample_time
+                ):
+                    sampled_events.append(events[event_idx])
+                    state = list(events[event_idx].actions)
+                    event_idx += 1
+                dropped_events.extend(sampled_events[:-1])
+                chunk.append(list(state))
+
+        for event in events:
+            state = list(event.actions)
+        self._control_sample_cursor = now
+        self._control_sample_base_actions = list(state)
+        self.last_control_actions = list(self._control_sample_base_actions)
+        if events:
+            self.has_control_state = True
+        self._log_dropped_control_events(
+            dropped_events,
+            start=start,
+            now=now,
+            chunk_size=chunk_size,
+        )
+        while self._control_events and self._control_events[0].event_time <= now:
+            self._control_events.popleft()
+
+        return chunk
 
 
 def _json_message(payload: dict[str, Any]) -> str:
@@ -1568,21 +1658,6 @@ async def _handle_message(
             },
         )
         return asyncio.create_task(_generate_loop(ws, session))
-
-    if msg_type == "KEYS_STATE":
-        try:
-            session.set_keys_state(data.get("keys"))
-        except Exception as exc:
-            await _send_error(ws, str(exc))
-            return generate_task
-
-        logger.info(
-            "LingBot KEYS_STATE request: session_id=%s current_keys=%s started=%s",
-            session.id,
-            sorted(session.current_keys),
-            session.started,
-        )
-        return generate_task
 
     if msg_type == "CONTROL":
         key = data.get("key")
