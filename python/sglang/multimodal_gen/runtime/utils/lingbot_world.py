@@ -137,6 +137,21 @@ def _jitter_pose_for_history(
     return noisy
 
 
+def _should_normalize_trans_for_chunk(
+    action_chunk: list[list[str]],
+    *,
+    still_noise_scale: float,
+) -> bool:
+    if still_noise_scale <= 0:
+        return True
+
+    for frame_keys in action_chunk:
+        keys = _normalize_action_keys(frame_keys)
+        if not (keys & _WASD_KEYS):
+            return False
+    return True
+
+
 def actions_to_c2ws(
     action_history: list[list[str]],
     *,
@@ -398,7 +413,19 @@ def _build_camera_condition(
         still_noise_scale=still_noise_scale,
         noise_seed=noise_seed,
     )
-    c2ws_prefix = compute_relative_poses(c2ws_prefix, framewise=True)
+    if tail_chunk_size is None:
+        normalize_action_chunk = action_history
+    else:
+        normalize_action_chunk = action_history[-tail_chunk_size:]
+    normalize_trans = _should_normalize_trans_for_chunk(
+        normalize_action_chunk,
+        still_noise_scale=still_noise_scale,
+    )
+    c2ws_prefix = compute_relative_poses(
+        c2ws_prefix,
+        framewise=True,
+        normalize_trans=normalize_trans,
+    )
     if tail_chunk_size is not None:
         c2ws_prefix = c2ws_prefix[-tail_chunk_size:]
         Ks = Ks[-tail_chunk_size:]
