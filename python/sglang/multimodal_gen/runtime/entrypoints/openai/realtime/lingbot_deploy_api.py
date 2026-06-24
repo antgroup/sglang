@@ -1,8 +1,10 @@
 import asyncio
 import json
 import os
+import queue
 import random
 import tempfile
+import threading
 import time
 from collections import deque
 from typing import Any, NamedTuple
@@ -73,6 +75,9 @@ DEFAULT_DEBUG_SAVE_VIDEO = os.environ.get(
 DEFAULT_DEBUG_VIDEO_DIR = os.environ.get(
     "SGLANG_LINGBOT_DEBUG_VIDEO_DIR", "/tmp/sglang_lingbot_debug"
 )
+DEFAULT_DEBUG_VIDEO_QUEUE_SIZE = max(
+    0, int(os.environ.get("SGLANG_LINGBOT_DEBUG_VIDEO_QUEUE_SIZE", "0"))
+)
 DEFAULT_PINNED_D2H = _env_bool("SGLANG_LINGBOT_PINNED_D2H", False)
 DEFAULT_SEND_MEMORYVIEW = _env_bool("SGLANG_LINGBOT_SEND_MEMORYVIEW", False)
 STARTUP_WARMUP_CHUNKS = int(os.environ.get("SGLANG_LINGBOT_STARTUP_WARMUP_CHUNKS", "0"))
@@ -96,14 +101,55 @@ STARTUP_WARMUP_PROMPT = os.environ.get(
 
 
 class LingBotDebugVideoRecorder:
+    _STOP = object()
+
     def __init__(self, path: str, fps: int):
         self.path = path
         self.fps = fps
         self.writer = None
         self.frame_count = 0
+        self.dropped_frames = 0
+        self._closed = False
+        self._last_drop_log_time = 0.0
+        self._queue: queue.Queue[list[np.ndarray] | object] = queue.Queue(
+            maxsize=DEFAULT_DEBUG_VIDEO_QUEUE_SIZE
+        )
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name=f"lingbot-debug-video-{os.path.basename(path) or 'writer'}",
+            daemon=True,
+        )
+        self._worker.start()
 
     def append(self, frames: list[np.ndarray] | np.ndarray) -> None:
-        if len(frames) == 0:
+        if self._closed or len(frames) == 0:
+            return
+
+        if isinstance(frames, np.ndarray):
+            frame_batch = [frames] if frames.ndim == 3 else list(frames)
+        else:
+            frame_batch = list(frames)
+        if not frame_batch:
+            return
+
+        try:
+            self._queue.put_nowait(frame_batch)
+        except queue.Full:
+            dropped = len(frame_batch)
+            self.dropped_frames += dropped
+            now = time.perf_counter()
+            if now - self._last_drop_log_time >= 5.0:
+                self._last_drop_log_time = now
+                logger.warning(
+                    "dropping LingBot deploy debug video frames: path=%s dropped=%d total_dropped=%d queue_size=%d",
+                    self.path,
+                    dropped,
+                    self.dropped_frames,
+                    self._queue.qsize(),
+                )
+
+    def _ensure_writer(self):
+        if self.writer is not None:
             return
 
         import imageio
@@ -111,30 +157,53 @@ class LingBotDebugVideoRecorder:
         output_dir = os.path.dirname(self.path)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
-        if self.writer is None:
-            self.writer = imageio.get_writer(
-                self.path,
-                fps=self.fps,
-                codec="libx264",
-                quality=8,
-                macro_block_size=1,
-            )
-            logger.info("LingBot deploy debug video opened: %s", self.path)
+        self.writer = imageio.get_writer(
+            self.path,
+            fps=self.fps,
+            codec="libx264",
+            quality=8,
+            macro_block_size=1,
+        )
+        logger.info("LingBot deploy debug video opened: %s", self.path)
 
-        for frame in frames:
-            self.writer.append_data(np.ascontiguousarray(frame))
-            self.frame_count += 1
+    def _worker_loop(self) -> None:
+        try:
+            while True:
+                item = self._queue.get()
+                try:
+                    if item is self._STOP:
+                        return
+                    self._ensure_writer()
+                    for frame in item:
+                        self.writer.append_data(np.ascontiguousarray(frame))
+                        self.frame_count += 1
+                except Exception as e:
+                    logger.warning(
+                        "failed to write LingBot deploy debug video frames, path=%s, error=%s",
+                        self.path,
+                        e,
+                        exc_info=True,
+                    )
+                finally:
+                    self._queue.task_done()
+        finally:
+            if self.writer is not None:
+                self.writer.close()
+                self.writer = None
+                logger.info(
+                    "LingBot deploy debug video saved: path=%s frames=%d dropped_frames=%d",
+                    self.path,
+                    self.frame_count,
+                    self.dropped_frames,
+                )
 
     def close(self) -> None:
-        if self.writer is None:
+        if self._closed:
             return
-        self.writer.close()
-        self.writer = None
-        logger.info(
-            "LingBot deploy debug video saved: path=%s frames=%d",
-            self.path,
-            self.frame_count,
-        )
+        self._closed = True
+        self._queue.put(self._STOP)
+        self._queue.join()
+        self._worker.join()
 
 
 class LingBotDeployCompatSession(GenerateSession):
