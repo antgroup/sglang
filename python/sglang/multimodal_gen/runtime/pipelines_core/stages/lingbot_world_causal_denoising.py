@@ -202,8 +202,12 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             server_args.pipeline_config.dmd_denoising_steps, dtype=torch.long
         ).cpu()
         if server_args.pipeline_config.warp_denoising_step:
+            scheduler_timesteps_dtype = self.scheduler.timesteps.dtype
             scheduler_timesteps = torch.cat(
-                (self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))
+                (
+                    self.scheduler.timesteps.cpu(),
+                    torch.tensor([0], dtype=scheduler_timesteps_dtype),
+                )
             )
             timesteps = scheduler_timesteps[1000 - timesteps]
         timesteps = timesteps.to(device)
@@ -214,7 +218,11 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         # CausalWanTransformer3DModel.forward uses (*args, **kwargs) which
         # causes inspect-based filtering to drop all keyword arguments.
         # The underlying _forward_inference accepts these explicitly.
-        image_embeds = getattr(batch, "image_embeds", [])
+        image_embeds = (
+            getattr(batch, "image_embeds", [])
+            if getattr(server_args.pipeline_config, "use_dit_image_aux", True)
+            else []
+        )
         if len(image_embeds) > 0:
             image_embeds = [ie.to(target_dtype) for ie in image_embeds]
 

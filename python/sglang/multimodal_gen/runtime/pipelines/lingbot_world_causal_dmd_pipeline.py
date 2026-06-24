@@ -43,6 +43,7 @@ class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
             shift=server_args.pipeline_config.flow_shift,
             sigma_min=0.0,
             extra_one_step=True,
+            lingbot_compat=True,
         )
 
     def create_pipeline_stages(self, server_args) -> None:
@@ -57,7 +58,9 @@ class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
         image_encoder = self.get_module("image_encoder", None)
         image_processor = self.get_module("image_processor", None)
         self.add_stage_if(
-            image_encoder is not None and image_processor is not None,
+            bool(getattr(server_args.pipeline_config, "use_dit_image_aux", True))
+            and image_encoder is not None
+            and image_processor is not None,
             ImageEncodingStage(
                 image_encoder=image_encoder,
                 image_processor=image_processor,

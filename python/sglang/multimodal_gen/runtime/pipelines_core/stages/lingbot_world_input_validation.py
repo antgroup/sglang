@@ -9,6 +9,8 @@ conditioning image and resolved dimensions can be reused after the first chunk.
 
 from __future__ import annotations
 
+from PIL import Image
+
 from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
     BaseRealtimeState,
 )
@@ -50,6 +52,24 @@ class LingBotWorldInputValidationState(BaseRealtimeState):
 class LingBotWorldInputValidationStage(InputValidationStage):
     """Reuse LingBot realtime conditioning image validation across chunks."""
 
+    @staticmethod
+    def _cover_resize_pil_to_wh(image: Image.Image, width: int, height: int):
+        src_width, src_height = image.size
+        if src_width <= 0 or src_height <= 0:
+            return image.resize((width, height), Image.Resampling.LANCZOS)
+
+        src_aspect = src_width / src_height
+        dst_aspect = width / height
+        if src_aspect > dst_aspect:
+            crop_width = int(round(src_height * dst_aspect))
+            left = max(0, (src_width - crop_width) // 2)
+            image = image.crop((left, 0, left + crop_width, src_height))
+        elif src_aspect < dst_aspect:
+            crop_height = int(round(src_width / dst_aspect))
+            top = max(0, (src_height - crop_height) // 2)
+            image = image.crop((0, top, src_width, top + crop_height))
+        return image.resize((width, height), Image.Resampling.LANCZOS)
+
     def preprocess_condition_image(
         self,
         batch: Req,
@@ -66,7 +86,12 @@ class LingBotWorldInputValidationStage(InputValidationStage):
 
         width = int(batch.width or 832)
         height = int(batch.height or 480)
-        batch.condition_image = batch.condition_image.resize((width, height))
+        if isinstance(batch.condition_image, Image.Image):
+            batch.condition_image = self._cover_resize_pil_to_wh(
+                batch.condition_image, width, height
+            )
+        else:
+            batch.condition_image = batch.condition_image.resize((width, height))
         batch.width = width
         batch.height = height
 

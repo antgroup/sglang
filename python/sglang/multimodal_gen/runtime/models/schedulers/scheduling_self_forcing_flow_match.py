@@ -40,11 +40,15 @@ class SelfForcingFlowMatchScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         inverse_timesteps=False,
         extra_one_step=False,
         reverse_sigmas=False,
+        lingbot_compat=False,
         *args,
         **kwargs,
     ):
         self.num_train_timesteps = num_train_timesteps
         self.shift = shift
+        self.lingbot_compat = lingbot_compat
+        if lingbot_compat and sigma_max == 1.0:
+            sigma_max = 1.0 - 1.0 / num_train_timesteps
         self.sigma_max = sigma_max
         self.sigma_min = sigma_min
         self.inverse_timesteps = inverse_timesteps
@@ -76,6 +80,8 @@ class SelfForcingFlowMatchScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         if self.reverse_sigmas:
             self.sigmas = 1 - self.sigmas
         self.timesteps = self.sigmas * self.num_train_timesteps
+        if self.lingbot_compat:
+            self.timesteps = self.timesteps.to(torch.int64)
 
     def step(
         self,

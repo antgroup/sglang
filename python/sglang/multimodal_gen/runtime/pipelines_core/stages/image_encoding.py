@@ -256,6 +256,11 @@ class ImageVAEEncodingStage(PipelineStage):
 
         self.load_model()
         num_frames = batch.num_frames
+        prepare_vae_encode_num_frames = getattr(
+            server_args.pipeline_config, "prepare_vae_encode_num_frames", None
+        )
+        if callable(prepare_vae_encode_num_frames):
+            num_frames = prepare_vae_encode_num_frames(batch, int(num_frames))
 
         images = (
             batch.vae_image if batch.vae_image is not None else batch.condition_image

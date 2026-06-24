@@ -47,10 +47,13 @@ class LingBotWorldI2VConfig(Wan2_2_I2V_A14B_Config):
 @dataclass
 class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
     is_causal: bool = True
+    flow_shift: float | None = 5.0
     dmd_denoising_steps: list[int] | None = field(
-        default_factory=lambda: [1000, 821, 642, 321]
+        default_factory=lambda: [1000, 750, 500, 250]
     )
     warp_denoising_step: bool = True
+    lazy_vae_encode_black_frames: int = 60
+    use_dit_image_aux: bool = False
 
     def postprocess_image_latent(self, latent_condition, batch):
         """Build condition tensor aligned to chunk_size (num_frames_per_block).
@@ -61,16 +64,21 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
         """
         vae_arch = self.vae_config.arch_config
         temporal_ratio = vae_arch.temporal_compression_ratio
-        spatial_ratio = vae_arch.spatial_compression_ratio
         chunk_size = self.dit_config.arch_config.num_frames_per_block
 
-        latent_height = batch.height // spatial_ratio
-        latent_width = batch.width // spatial_ratio
+        target_num_frames = int(batch.num_frames)
+        target_latent_frames = (target_num_frames - 1) // temporal_ratio + 1
+        target_latent_frames = target_latent_frames - (
+            target_latent_frames % chunk_size
+        )
+        target_latent_frames = max(chunk_size, target_latent_frames)
 
-        # Align num_latent_frames to chunk_size
-        num_latent_frames = latent_condition.shape[2]
-        num_latent_frames = num_latent_frames - (num_latent_frames % chunk_size)
-        latent_condition = latent_condition[:, :, :num_latent_frames, :, :]
+        if latent_condition.shape[2] < target_latent_frames:
+            pad_frames = target_latent_frames - latent_condition.shape[2]
+            tail = latent_condition[:, :, -1:, :, :].repeat(1, 1, pad_frames, 1, 1)
+            latent_condition = torch.cat([latent_condition, tail], dim=2)
+        else:
+            latent_condition = latent_condition[:, :, :target_latent_frames, :, :]
 
         # Number of initial frames that have actual image content
         # (latent_condition from VAE encode of [image, zeros...])
@@ -79,16 +87,21 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
 
         # Build mask: [B, temporal_ratio, num_latent_frames, H, W]
         mask = torch.ones(
-            1,
+            latent_condition.shape[0],
             temporal_ratio,
-            num_latent_frames,
-            latent_height,
-            latent_width,
+            target_latent_frames,
+            latent_condition.shape[3],
+            latent_condition.shape[4],
             dtype=latent_condition.dtype,
             device=latent_condition.device,
         )
         # Zero out mask for frames beyond the initial image
-        if initial_latent_frames < num_latent_frames:
+        if initial_latent_frames < target_latent_frames:
             mask[:, :, initial_latent_frames:] = 0
 
         return torch.cat([mask, latent_condition], dim=1)
+
+    def prepare_vae_encode_num_frames(self, batch, default_num_frames: int) -> int:
+        if self.lazy_vae_encode_black_frames <= 0:
+            return default_num_frames
+        return min(default_num_frames, self.lazy_vae_encode_black_frames + 1)

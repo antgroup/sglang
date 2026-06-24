@@ -11,10 +11,10 @@ from sglang.multimodal_gen.configs.sample.wan import Wan2_2_I2V_A14B_SamplingPar
 class LingBotWorldSamplingParams(Wan2_2_I2V_A14B_SamplingParam):
     actions: list[list[str]] | None = None
     chunk_size: int | None = None
-    guidance_scale: float = 5.0
-    guidance_scale_2: float = 5.0
+    guidance_scale: float = 1.0
+    guidance_scale_2: float = 1.0
     num_inference_steps: int = 70
-    num_frames: int = 117
+    num_frames: int = 3601
     fps: int = 16
 
     def _adjust(self, server_args):

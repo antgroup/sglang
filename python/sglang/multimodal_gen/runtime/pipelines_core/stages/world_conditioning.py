@@ -20,7 +20,7 @@ class WorldConditioningStage(PipelineStage):
             batch=batch,
             pipeline_config=server_args.pipeline_config,
             device=self.device,
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
         )
         if resolved_num_frames is not None:
             batch.num_frames = resolved_num_frames
