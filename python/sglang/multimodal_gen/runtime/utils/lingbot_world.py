@@ -12,11 +12,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-DEFAULT_LINGBOT_MOVE_SPEED = 0.5
-DEFAULT_LINGBOT_ROTATE_SPEED_DEG = 5.5
-_WASD_KEYS = frozenset({"w", "a", "s", "d"})
-_ROTATION_KEYS = frozenset({"i", "j", "k", "l"})
-
 
 def se3_inverse(T: torch.Tensor) -> torch.Tensor:
     rot = T[:, :3, :3]
@@ -104,88 +99,29 @@ def get_rotation_matrix(axis: str, angle_rad: float) -> np.ndarray:
     return np.eye(3)
 
 
-def _normalize_action_keys(frame_keys: list[str]) -> set[str]:
-    return {str(key).lower() for key in frame_keys if str(key).strip()}
-
-
-def _jitter_pose_for_history(
-    pose: np.ndarray,
-    keys: set[str],
-    *,
-    rng: np.random.Generator,
-    still_noise_scale: float,
-) -> np.ndarray:
-    if still_noise_scale <= 0:
-        return pose
-
-    add_trans_noise = not (keys & _WASD_KEYS)
-    add_rot_noise = not (keys & _ROTATION_KEYS)
-    if not add_trans_noise and not add_rot_noise:
-        return pose
-
-    noise = rng.normal(scale=still_noise_scale, size=6).astype(np.float64)
-    noisy = pose.copy()
-    if add_rot_noise:
-        r_noise = (
-            get_rotation_matrix("x", noise[0])
-            @ get_rotation_matrix("y", noise[1])
-            @ get_rotation_matrix("z", noise[2])
-        )
-        noisy[:3, :3] = pose[:3, :3] @ r_noise
-    if add_trans_noise:
-        noisy[:3, 3] = pose[:3, 3] + pose[:3, :3] @ noise[3:6]
-    return noisy
-
-
-def _should_normalize_trans_for_chunk(
-    action_chunk: list[list[str]],
-    *,
-    still_noise_scale: float,
-) -> bool:
-    if still_noise_scale <= 0:
-        return True
-
-    for frame_keys in action_chunk:
-        keys = _normalize_action_keys(frame_keys)
-        if not (keys & _WASD_KEYS):
-            return False
-    return True
-
-
 def actions_to_c2ws(
     action_history: list[list[str]],
     *,
-    move_speed: float = DEFAULT_LINGBOT_MOVE_SPEED,
-    rotate_speed_deg_ik: float = DEFAULT_LINGBOT_ROTATE_SPEED_DEG,
-    rotate_speed_deg_jl: float = DEFAULT_LINGBOT_ROTATE_SPEED_DEG,
-    initial_c2w: Any | None = None,
-    still_noise_scale: float = 0.0,
-    noise_seed: int | None = None,
+    move_speed: float = 0.05,
+    rotate_speed_deg_ik: float = 4.0,
+    rotate_speed_deg_jl: float = 6.0,
 ) -> list[np.ndarray]:
     rotate_speed_rad_ik = np.deg2rad(rotate_speed_deg_ik)
     rotate_speed_rad_jl = np.deg2rad(rotate_speed_deg_jl)
 
-    current_c2w = (
-        np.asarray(initial_c2w, dtype=np.float64).copy()
-        if initial_c2w is not None
-        else np.eye(4, dtype=np.float64)
-    )
-    if current_c2w.shape != (4, 4):
-        raise ValueError(f"initial_c2w must be 4x4, got {current_c2w.shape}")
+    current_c2w = np.eye(4)
     current_pitch = 0.0
     pitch_limit = np.deg2rad(85)
-    all_matrices = [current_c2w.copy()]
-    noise_rng = np.random.default_rng(noise_seed)
+    all_matrices = [current_c2w]
 
     for frame_keys in action_history:
-        keys = _normalize_action_keys(frame_keys)
         R = current_c2w[:3, :3]
         T = current_c2w[:3, 3]
 
         pitch_delta = 0.0
-        if "i" in keys:
+        if "i" in frame_keys:
             pitch_delta += rotate_speed_rad_ik
-        if "k" in keys:
+        if "k" in frame_keys:
             pitch_delta -= rotate_speed_rad_ik
 
         new_pitch = current_pitch + pitch_delta
@@ -195,9 +131,9 @@ def actions_to_c2ws(
             pitch_delta = 0.0
 
         yaw_delta = 0.0
-        if "j" in keys:
+        if "j" in frame_keys:
             yaw_delta -= rotate_speed_rad_jl
-        if "l" in keys:
+        if "l" in frame_keys:
             yaw_delta += rotate_speed_rad_jl
 
         R_pitch = get_rotation_matrix("x", pitch_delta)
@@ -211,64 +147,28 @@ def actions_to_c2ws(
 
         f_norm = np.linalg.norm(forward_flat)
         r_norm = np.linalg.norm(right_flat)
-        if f_norm > 1e-8:
-            forward_flat = forward_flat / f_norm
-        if r_norm > 1e-8:
-            right_flat = right_flat / r_norm
+        if f_norm > 0:
+            forward_flat = forward_flat / (f_norm + 1e-6)
+        if r_norm > 0:
+            right_flat = right_flat / (r_norm + 1e-6)
 
         move_vec = np.zeros(3)
-        if "w" in keys:
+        if "w" in frame_keys:
             move_vec += forward_flat * move_speed
-        if "s" in keys:
+        if "s" in frame_keys:
             move_vec -= forward_flat * move_speed
-        if "d" in keys:
+        if "d" in frame_keys:
             move_vec += right_flat * move_speed
-        if "a" in keys:
+        if "a" in frame_keys:
             move_vec -= right_flat * move_speed
 
         T_new = T + move_vec
         current_c2w = np.eye(4)
         current_c2w[:3, :3] = R_new
         current_c2w[:3, 3] = T_new
-        record = current_c2w.copy()
-        if still_noise_scale > 0:
-            record = _jitter_pose_for_history(
-                record,
-                keys,
-                rng=noise_rng,
-                still_noise_scale=still_noise_scale,
-            )
-        all_matrices.append(record)
+        all_matrices.append(current_c2w)
 
-    return all_matrices[1:]
-
-
-def _resolve_camera_intrinsics(
-    camera_intrinsics: Any | None,
-    *,
-    width: int,
-    height: int,
-    device: torch.device | str,
-    dtype: torch.dtype,
-    num_frames: int,
-) -> torch.Tensor:
-    if camera_intrinsics is None:
-        values = [[500.0, 500.0, width / 2, height / 2]]
-    else:
-        values = camera_intrinsics
-    Ks = torch.as_tensor(values, device=device, dtype=dtype)
-    if Ks.ndim == 1:
-        if Ks.numel() != 4:
-            raise ValueError("camera_intrinsics must have 4 values")
-        Ks = Ks.unsqueeze(0)
-    if Ks.shape[-1] != 4:
-        raise ValueError(f"camera_intrinsics must end with 4 values, got {Ks.shape}")
-    if Ks.shape[0] == 1:
-        Ks = Ks.repeat(num_frames, 1)
-    elif Ks.shape[0] < num_frames:
-        tail = Ks[-1:].repeat(num_frames - Ks.shape[0], 1)
-        Ks = torch.cat([Ks, tail], dim=0)
-    return Ks[:num_frames]
+    return all_matrices
 
 
 def get_camera_control(
@@ -279,35 +179,25 @@ def get_camera_control(
     height: int,
     device: torch.device | str,
     dtype: torch.dtype,
-    move_speed: float = DEFAULT_LINGBOT_MOVE_SPEED,
-    rotate_speed_deg_ik: float = DEFAULT_LINGBOT_ROTATE_SPEED_DEG,
-    rotate_speed_deg_jl: float = DEFAULT_LINGBOT_ROTATE_SPEED_DEG,
-    initial_c2w: Any | None = None,
-    camera_intrinsics: Any | None = None,
-    still_noise_scale: float = 0.0,
-    noise_seed: int | None = None,
+    move_speed: float = 0.05,
+    rotate_speed_deg_ik: float = 4.0,
+    rotate_speed_deg_jl: float = 6.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     c2ws_list = actions_to_c2ws(
         action_history,
         move_speed=move_speed,
         rotate_speed_deg_ik=rotate_speed_deg_ik,
         rotate_speed_deg_jl=rotate_speed_deg_jl,
-        initial_c2w=initial_c2w,
-        still_noise_scale=still_noise_scale,
-        noise_seed=noise_seed,
     )
-    c2ws_np = np.stack(c2ws_list)
+    c2ws_np = np.stack(c2ws_list[1:])
     c2ws = torch.from_numpy(c2ws_np).to(device=device, dtype=dtype)
     if chunk_size is None:
         chunk_size = len(action_history)
-    Ks = _resolve_camera_intrinsics(
-        camera_intrinsics,
-        width=width,
-        height=height,
+    Ks = torch.tensor(
+        [[500.0, 500.0, width / 2, height / 2]],
         device=device,
         dtype=dtype,
-        num_frames=len(c2ws_list),
-    )
+    ).repeat(chunk_size, 1)
     logger.info(f"prefix c2ws shape: {c2ws.shape}, Ks shape: {Ks.shape}")
     return c2ws, Ks
 
@@ -389,13 +279,9 @@ def _build_camera_condition(
     device: torch.device | str,
     dtype: torch.dtype,
     tail_chunk_size: int | None = None,
-    move_speed: float = DEFAULT_LINGBOT_MOVE_SPEED,
-    rotate_speed_deg_ik: float = DEFAULT_LINGBOT_ROTATE_SPEED_DEG,
-    rotate_speed_deg_jl: float = DEFAULT_LINGBOT_ROTATE_SPEED_DEG,
-    initial_c2w: Any | None = None,
-    camera_intrinsics: Any | None = None,
-    still_noise_scale: float = 0.0,
-    noise_seed: int | None = None,
+    move_speed: float = 0.05,
+    rotate_speed_deg_ik: float = 4.0,
+    rotate_speed_deg_jl: float = 6.0,
 ) -> torch.Tensor:
     c2ws_prefix, Ks = get_camera_control(
         action_history,
@@ -407,27 +293,10 @@ def _build_camera_condition(
         move_speed=move_speed,
         rotate_speed_deg_ik=rotate_speed_deg_ik,
         rotate_speed_deg_jl=rotate_speed_deg_jl,
-        initial_c2w=initial_c2w,
-        camera_intrinsics=camera_intrinsics,
-        still_noise_scale=still_noise_scale,
-        noise_seed=noise_seed,
     )
-    if tail_chunk_size is None:
-        normalize_action_chunk = action_history
-    else:
-        normalize_action_chunk = action_history[-tail_chunk_size:]
-    normalize_trans = _should_normalize_trans_for_chunk(
-        normalize_action_chunk,
-        still_noise_scale=still_noise_scale,
-    )
-    c2ws_prefix = compute_relative_poses(
-        c2ws_prefix,
-        framewise=True,
-        normalize_trans=normalize_trans,
-    )
+    c2ws_prefix = compute_relative_poses(c2ws_prefix, framewise=True)
     if tail_chunk_size is not None:
         c2ws_prefix = c2ws_prefix[-tail_chunk_size:]
-        Ks = Ks[-tail_chunk_size:]
 
     return camera_poses_to_plucker(
         c2ws=c2ws_prefix,
@@ -459,18 +328,9 @@ def prepare_lingbot_world_condition(
         "chunk_size",
         max(1, int(pipeline_config.dit_config.arch_config.num_frames_per_block)),
     )
-    move_speed = float(batch.extra.get("move_speed", DEFAULT_LINGBOT_MOVE_SPEED))
-    rotate_speed_deg_ik = float(
-        batch.extra.get("rotate_speed_deg_ik", DEFAULT_LINGBOT_ROTATE_SPEED_DEG)
-    )
-    rotate_speed_deg_jl = float(
-        batch.extra.get("rotate_speed_deg_jl", DEFAULT_LINGBOT_ROTATE_SPEED_DEG)
-    )
-    initial_c2w = batch.extra.get("initial_c2w")
-    camera_intrinsics = batch.extra.get("camera_intrinsics")
-    still_noise_scale = float(batch.extra.get("still_noise_scale", 0.0))
-    noise_seed = batch.extra.get("camera_noise_seed")
-    noise_seed = None if noise_seed is None else int(noise_seed)
+    move_speed = float(batch.extra.get("move_speed", 0.05))
+    rotate_speed_deg_ik = float(batch.extra.get("rotate_speed_deg_ik", 4.0))
+    rotate_speed_deg_jl = float(batch.extra.get("rotate_speed_deg_jl", 6.0))
 
     normalized_actions = _validate_actions(actions)
     if len(normalized_actions) == 0:
@@ -498,10 +358,6 @@ def prepare_lingbot_world_condition(
             move_speed=move_speed,
             rotate_speed_deg_ik=rotate_speed_deg_ik,
             rotate_speed_deg_jl=rotate_speed_deg_jl,
-            initial_c2w=initial_c2w,
-            camera_intrinsics=camera_intrinsics,
-            still_noise_scale=still_noise_scale,
-            noise_seed=noise_seed,
         )
         logger.info(
             "LingBot action condition prepared: session_id=%s, block_idx=%s, new_actions=%s, total_history=%s",
@@ -528,10 +384,6 @@ def prepare_lingbot_world_condition(
                 move_speed=move_speed,
                 rotate_speed_deg_ik=rotate_speed_deg_ik,
                 rotate_speed_deg_jl=rotate_speed_deg_jl,
-                initial_c2w=initial_c2w,
-                camera_intrinsics=camera_intrinsics,
-                still_noise_scale=still_noise_scale,
-                noise_seed=noise_seed,
             ),
             resolved_num_frames,
         )
