@@ -6,8 +6,7 @@ import random
 import tempfile
 import threading
 import time
-from collections import deque
-from typing import Any, NamedTuple
+from typing import Any
 
 import numpy as np
 import torch
@@ -35,13 +34,6 @@ logger = init_logger(__name__)
 router = APIRouter(tags=["lingbot-realtime"])
 
 
-class _ControlEvent(NamedTuple):
-    event_time: float
-    key: str
-    action: str
-    actions: list[str]
-
-
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -57,6 +49,12 @@ DEFAULT_NUM_FRAMES = 3601
 DEFAULT_MOVE_SPEED = 0.5
 DEFAULT_ROTATE_SPEED_DEG_IK = 5.5
 DEFAULT_ROTATE_SPEED_DEG_JL = 5.5
+DEFAULT_STILL_NOISE_SCALE = float(
+    os.environ.get(
+        "SGLANG_LINGBOT_STILL_NOISE_SCALE",
+        os.environ.get("INTERACTIVE_CAMERA_STILL_NOISE_SCALE", "0.0005"),
+    )
+)
 DEFAULT_ENABLE_UPSCALING = True
 DEFAULT_UPSCALING_SCALE = 2
 DEFAULT_UPSCALING_MODEL_PATH = (
@@ -225,15 +223,13 @@ class LingBotDeployCompatSession(GenerateSession):
         self.move_speed = DEFAULT_MOVE_SPEED
         self.rotate_speed_deg_ik = DEFAULT_ROTATE_SPEED_DEG_IK
         self.rotate_speed_deg_jl = DEFAULT_ROTATE_SPEED_DEG_JL
+        self.still_noise_scale = DEFAULT_STILL_NOISE_SCALE
         self.debug_video_path: str | None = None
         self.debug_video_recorder: LingBotDebugVideoRecorder | None = None
         self.output_width = DEFAULT_WIDTH
         self.output_height = DEFAULT_HEIGHT
         self.model_width = DEFAULT_WIDTH
         self.model_height = DEFAULT_HEIGHT
-        self._control_events: deque[_ControlEvent] = deque(maxlen=512)
-        self._control_sample_cursor: float | None = None
-        self._control_sample_base_actions: list[str] = []
         self.reset_control_sampler()
 
     def dispose(self):
@@ -246,6 +242,7 @@ class LingBotDeployCompatSession(GenerateSession):
         self.move_speed = DEFAULT_MOVE_SPEED
         self.rotate_speed_deg_ik = DEFAULT_ROTATE_SPEED_DEG_IK
         self.rotate_speed_deg_jl = DEFAULT_ROTATE_SPEED_DEG_JL
+        self.still_noise_scale = DEFAULT_STILL_NOISE_SCALE
         self.debug_video_path = None
         self.output_width = DEFAULT_WIDTH
         self.output_height = DEFAULT_HEIGHT
@@ -265,10 +262,12 @@ class LingBotDeployCompatSession(GenerateSession):
         move_speed: float,
         rotate_speed_deg_ik: float,
         rotate_speed_deg_jl: float,
+        still_noise_scale: float,
     ) -> None:
         self.move_speed = move_speed
         self.rotate_speed_deg_ik = rotate_speed_deg_ik
         self.rotate_speed_deg_jl = rotate_speed_deg_jl
+        self.still_noise_scale = still_noise_scale
 
     def set_resolution_config(
         self,
@@ -287,16 +286,14 @@ class LingBotDeployCompatSession(GenerateSession):
         batch.extra["move_speed"] = self.move_speed
         batch.extra["rotate_speed_deg_ik"] = self.rotate_speed_deg_ik
         batch.extra["rotate_speed_deg_jl"] = self.rotate_speed_deg_jl
+        batch.extra["still_noise_scale"] = self.still_noise_scale
 
     def reset_control_sampler(self, *, timestamp: float | None = None) -> None:
+        _ = timestamp
         self.control_queue.clear()
-        self._control_events.clear()
-        self._control_sample_cursor = (
-            time.perf_counter() if timestamp is None else timestamp
-        )
-        self._control_sample_base_actions = sorted(self.current_keys)
-        self.last_control_actions = list(self._control_sample_base_actions)
-        self.has_control_state = bool(self._control_sample_base_actions)
+        snapshot = sorted(self.current_keys)
+        self.last_control_actions = list(snapshot)
+        self.has_control_state = bool(snapshot)
 
     def set_debug_video(self, path: str | None, fps: int) -> None:
         self.close_debug_video()
@@ -338,6 +335,7 @@ class LingBotDeployCompatSession(GenerateSession):
     def set_key_state(
         self, key: str, action: str, *, timestamp: float | None = None
     ) -> None:
+        _ = timestamp
         normalized_key, action = self.validate_control_key_action(key, action)
         before = set(self.current_keys)
         if action == "down":
@@ -348,110 +346,33 @@ class LingBotDeployCompatSession(GenerateSession):
         if self.current_keys == before:
             return
 
-        event_time = time.perf_counter() if timestamp is None else timestamp
-        self._control_events.append(
-            _ControlEvent(
-                event_time=event_time,
-                key=normalized_key,
-                action=action,
-                actions=sorted(self.current_keys),
-            )
-        )
+    def set_keys_state(self, keys: Any, *, timestamp: float | None = None) -> None:
+        _ = timestamp
+        if keys is None:
+            keys = []
+        if not isinstance(keys, list):
+            raise ValueError("keys_state keys must be a list")
 
-    def _log_dropped_control_events(
-        self,
-        dropped_events: list[_ControlEvent],
-        *,
-        start: float,
-        now: float,
-        chunk_size: int,
-    ) -> None:
-        if not dropped_events:
-            return
-
-        max_events_to_log = 16
-        dropped_summary: list[dict[str, Any]] = [
-            {
-                "key": event.key,
-                "action": event.action,
-                "offset_ms": round((event.event_time - start) * 1000.0, 3),
-                "actions": event.actions,
-            }
-            for event in dropped_events[:max_events_to_log]
-        ]
-        if len(dropped_events) > max_events_to_log:
-            dropped_summary.append(
-                {"truncated_count": len(dropped_events) - max_events_to_log}
-            )
-
-        logger.info(
-            "drop LingBot deploy control events during sampling, "
-            "session_id=%s, chunk_size=%s, window_ms=%.3f, "
-            "dropped_count=%s, dropped_events=%s",
-            self.id,
-            chunk_size,
-            (now - start) * 1000.0,
-            len(dropped_events),
-            dropped_summary,
-        )
+        normalized_keys: set[str] = set()
+        for key in keys:
+            key_str = str(key).strip().lower()
+            if not key_str:
+                continue
+            normalized_key, _ = self.validate_control_key_action(key_str, "down")
+            normalized_keys.add(normalized_key)
+        self.current_keys = normalized_keys
 
     def sample_control_chunk(
         self, chunk_size: int, *, timestamp: float | None = None
     ) -> list[list[str]] | None:
+        _ = timestamp
         if chunk_size <= 0:
             return None
 
-        now = time.perf_counter() if timestamp is None else timestamp
-        start = self._control_sample_cursor
-        if start is None:
-            start = now
-
-        events = [
-            control_event
-            for control_event in self._control_events
-            if control_event.event_time <= now
-        ]
-        base_actions = list(self._control_sample_base_actions)
-        state = list(base_actions)
-        chunk: list[list[str]] = []
-        duration = max(0.0, now - start)
-        dropped_events: list[_ControlEvent] = []
-
-        if duration == 0.0:
-            chunk = [list(state) for _ in range(chunk_size)]
-            dropped_events.extend(events)
-        else:
-            event_idx = 0
-            for frame_idx in range(chunk_size):
-                sample_time = start + duration * (frame_idx + 1) / chunk_size
-                sampled_events: list[_ControlEvent] = []
-                while (
-                    event_idx < len(events)
-                    and events[event_idx].event_time <= sample_time
-                ):
-                    sampled_events.append(events[event_idx])
-                    state = list(events[event_idx].actions)
-                    event_idx += 1
-                dropped_events.extend(sampled_events[:-1])
-                chunk.append(list(state))
-
-        for event in events:
-            state = list(event.actions)
-        self._control_sample_cursor = now
-        self._control_sample_base_actions = list(state)
-        self.last_control_actions = list(self._control_sample_base_actions)
-        if events:
-            self.has_control_state = True
-        self._log_dropped_control_events(
-            dropped_events,
-            start=start,
-            now=now,
-            chunk_size=chunk_size,
-        )
-        while self._control_events and self._control_events[0].event_time <= now:
-            self._control_events.popleft()
-
-        return chunk
+        snapshot = sorted(self.current_keys)
+        self.last_control_actions = list(snapshot)
+        self.has_control_state = bool(snapshot)
+        return [list(snapshot) for _ in range(chunk_size)]
 
 
 def _json_message(payload: dict[str, Any]) -> str:
@@ -572,10 +493,19 @@ def _build_start_request(
     rotate_speed_deg_jl = _parse_float_field(
         data, "rotate_speed_deg_jl", DEFAULT_ROTATE_SPEED_DEG_JL
     )
+    still_noise_scale = _parse_float_field(
+        data,
+        "still_noise_scale",
+        data.get(
+            "interactive_camera_still_noise_scale",
+            DEFAULT_STILL_NOISE_SCALE,
+        ),
+    )
     session.set_camera_config(
         move_speed=move_speed,
         rotate_speed_deg_ik=rotate_speed_deg_ik,
         rotate_speed_deg_jl=rotate_speed_deg_jl,
+        still_noise_scale=still_noise_scale,
     )
 
     first_frame = data.get("image_path")
@@ -1620,6 +1550,7 @@ async def _handle_message(
                 "move_speed": session.move_speed,
                 "rotate_speed_deg_ik": session.rotate_speed_deg_ik,
                 "rotate_speed_deg_jl": session.rotate_speed_deg_jl,
+                "still_noise_scale": session.still_noise_scale,
                 "enable_upscaling": request.enable_upscaling,
                 "upscaling_scale": request.upscaling_scale,
                 "upscaling_model_path": request.upscaling_model_path,
@@ -1637,6 +1568,21 @@ async def _handle_message(
             },
         )
         return asyncio.create_task(_generate_loop(ws, session))
+
+    if msg_type == "KEYS_STATE":
+        try:
+            session.set_keys_state(data.get("keys"))
+        except Exception as exc:
+            await _send_error(ws, str(exc))
+            return generate_task
+
+        logger.info(
+            "LingBot KEYS_STATE request: session_id=%s current_keys=%s started=%s",
+            session.id,
+            sorted(session.current_keys),
+            session.started,
+        )
+        return generate_task
 
     if msg_type == "CONTROL":
         key = data.get("key")

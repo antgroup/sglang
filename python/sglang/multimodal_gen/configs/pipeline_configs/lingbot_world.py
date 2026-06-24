@@ -47,9 +47,9 @@ class LingBotWorldI2VConfig(Wan2_2_I2V_A14B_Config):
 @dataclass
 class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
     is_causal: bool = True
-    flow_shift: float | None = 5.0
+    flow_shift: float | None = 10.0
     dmd_denoising_steps: list[int] | None = field(
-        default_factory=lambda: [1000, 750, 500, 250]
+        default_factory=lambda: [1000, 821, 642, 321]
     )
     warp_denoising_step: bool = True
     lazy_vae_encode_black_frames: int = 60

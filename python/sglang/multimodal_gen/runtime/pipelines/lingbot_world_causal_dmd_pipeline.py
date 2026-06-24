@@ -43,7 +43,6 @@ class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
             shift=server_args.pipeline_config.flow_shift,
             sigma_min=0.0,
             extra_one_step=True,
-            lingbot_compat=True,
         )
 
     def create_pipeline_stages(self, server_args) -> None:
