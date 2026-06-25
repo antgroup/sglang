@@ -25,6 +25,7 @@ logger = init_logger(__name__)
 
 # Default HuggingFace repo for RIFE 4.22.lite weights
 _DEFAULT_RIFE_HF_REPO = "elfgum/RIFE-4.22.lite"
+_DEFAULT_BLOCK_CHANNELS = (192, 128, 64, 32)
 
 # Module-level cache: model_path -> Model instance
 _MODEL_CACHE: dict[str, "Model"] = {}
@@ -178,15 +179,26 @@ class Head(nn.Module):
 
 
 class IFNet(nn.Module):
-    """4-scale IFNet optical flow network (RIFE 4.22 backbone)."""
+    """Multi-scale IFNet optical flow network (RIFE 4.22/Practical-RIFE)."""
 
-    def __init__(self):
+    def __init__(self, block_channels: tuple[int, ...] = _DEFAULT_BLOCK_CHANNELS):
         super().__init__()
-        self.block0 = IFBlock(7 + 8, c=192)
-        self.block1 = IFBlock(8 + 4 + 8 + 8, c=128)
-        self.block2 = IFBlock(8 + 4 + 8 + 8, c=64)
-        self.block3 = IFBlock(8 + 4 + 8 + 8, c=32)
+        if not block_channels:
+            raise ValueError("RIFE IFNet requires at least one IFBlock")
+
+        self.block_channels = tuple(block_channels)
+        for idx, channels in enumerate(self.block_channels):
+            in_planes = 7 + 8 if idx == 0 else 8 + 4 + 8 + 8
+            setattr(self, f"block{idx}", IFBlock(in_planes, c=channels))
         self.encode = Head()
+
+    def _blocks(self) -> list[IFBlock]:
+        return [getattr(self, f"block{idx}") for idx in range(len(self.block_channels))]
+
+    def default_scale_list(self) -> list[int]:
+        num_blocks = len(self.block_channels)
+        largest_scale = 2 ** (num_blocks if num_blocks >= 5 else num_blocks - 1)
+        return [largest_scale // (2**idx) for idx in range(num_blocks - 1)] + [1]
 
     def forward(
         self,
@@ -195,7 +207,12 @@ class IFNet(nn.Module):
         scale_list: Optional[list] = None,
     ) -> tuple[list, torch.Tensor, list]:
         if scale_list is None:
-            scale_list = [8, 4, 2, 1]
+            scale_list = self.default_scale_list()
+        if len(scale_list) != len(self.block_channels):
+            raise ValueError(
+                "RIFE scale_list length must match block count: "
+                f"got {len(scale_list)} scales for {len(self.block_channels)} blocks"
+            )
 
         channel = x.shape[1] // 2
         img0 = x[:, :channel]
@@ -217,8 +234,8 @@ class IFNet(nn.Module):
         flow = None
         mask = None
 
-        block = [self.block0, self.block1, self.block2, self.block3]
-        for i in range(4):
+        block = self._blocks()
+        for i in range(len(block)):
             if flow is None:
                 flow, mask, feat = block[i](
                     torch.cat((img0[:, :3], img1[:, :3], f0, f1, timestep), 1),
@@ -254,9 +271,9 @@ class IFNet(nn.Module):
             merged.append((warped_img0, warped_img1))
 
         mask = torch.sigmoid(mask)
-        merged[3] = warped_img0 * mask + warped_img1 * (1 - mask)
+        merged[-1] = warped_img0 * mask + warped_img1 * (1 - mask)
 
-        return flow_list, mask_list[3], merged
+        return flow_list, mask_list[-1], merged
 
 
 class Model:
@@ -289,18 +306,42 @@ class Model:
             )
 
         def convert(param):
-            if strip_module_prefix:
-                return {
-                    k.replace("module.", ""): v
-                    for k, v in param.items()
-                    if "module." in k
-                }
-            else:
-                return {k: v for k, v in param.items() if "module." not in k}
+            converted = {}
+            for key, value in param.items():
+                if strip_module_prefix and key.startswith("module."):
+                    key = key[len("module.") :]
+                converted[key] = value
+            return converted
 
         state = torch.load(flownet_path, map_location="cpu", weights_only=False)
-        self.flownet.load_state_dict(convert(state), strict=False)
-        logger.info("Loaded RIFE weights from %s", flownet_path)
+        state_dict = convert(state)
+        block_channels = self._infer_block_channels(state_dict)
+        if block_channels != self.flownet.block_channels:
+            self.flownet = IFNet(block_channels=block_channels)
+        self.flownet.load_state_dict(state_dict, strict=False)
+        logger.info(
+            "Loaded RIFE weights from %s with %d IFBlocks: %s",
+            flownet_path,
+            len(block_channels),
+            block_channels,
+        )
+
+    @staticmethod
+    def _infer_block_channels(state_dict: dict[str, torch.Tensor]) -> tuple[int, ...]:
+        block_channels = []
+        idx = 0
+        while True:
+            key = f"block{idx}.conv0.1.0.weight"
+            weight = state_dict.get(key)
+            if weight is None:
+                break
+            block_channels.append(int(weight.shape[0]))
+            idx += 1
+        return tuple(block_channels) or _DEFAULT_BLOCK_CHANNELS
+
+    @staticmethod
+    def _pad_multiple_for_scale_list(scale_list: list[float]) -> int:
+        return int(np.ceil(max(scale_list) * 4))
 
     def inference(
         self,
@@ -312,16 +353,19 @@ class Model:
         """Interpolate a single intermediate frame between img0 and img1."""
         n, c, h, w = img0.shape
 
-        # Pad to multiples of 32 so that RIFE's downsample/upsample round-trips
+        default_scale_list = self.flownet.default_scale_list()
+        scale_list = [item / scale for item in default_scale_list]
+        pad_multiple = self._pad_multiple_for_scale_list(scale_list)
+
+        # Pad so that RIFE's downsample/upsample round-trips
         # preserve spatial dimensions exactly.
-        ph = ((h - 1) // 32 + 1) * 32
-        pw = ((w - 1) // 32 + 1) * 32
+        ph = ((h - 1) // pad_multiple + 1) * pad_multiple
+        pw = ((w - 1) // pad_multiple + 1) * pad_multiple
         pad = (0, pw - w, 0, ph - h)
         img0 = F.pad(img0, pad)
         img1 = F.pad(img1, pad)
 
         imgs = torch.cat((img0, img1), 1)
-        scale_list = [8 / scale, 4 / scale, 2 / scale, 1 / scale]
         with torch.no_grad():
             flow_list, mask, merged = self.flownet(
                 imgs,
