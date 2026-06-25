@@ -1111,11 +1111,13 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         c2ws_plucker_emb: torch.Tensor | None = None,
         cam_conditioner_scale_shift: tuple[torch.Tensor, torch.Tensor] | None = None,
         update_cache_only: bool = False,
+        frame_seq_length: int | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         num_frames = temb.shape[1]
         frame_seqlen = hidden_states.shape[1] // num_frames
+        cache_frame_seqlen = frame_seq_length or frame_seqlen
         orig_dtype = hidden_states.dtype
         e = self.scale_shift_table + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = e.chunk(
@@ -1166,7 +1168,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             kv_cache,
             current_start,
             cache_start,
-            frame_seq_length=frame_seqlen,
+            frame_seq_length=cache_frame_seqlen,
             update_cache_only=update_cache_only,
         )
         if update_cache_only:
@@ -1590,9 +1592,10 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
+        frame_seq_length = post_patch_height * post_patch_width
         if sequence_shard_enabled:
             seq_shard_splits = _compute_sequence_splits(
-                post_patch_num_frames * post_patch_height * post_patch_width,
+                post_patch_num_frames * frame_seq_length,
                 self.sp_size,
             )
             forward_batch.sequence_shard_splits = tuple(seq_shard_splits)
@@ -1675,6 +1678,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 ),
                 update_cache_only=skip_final_projection
                 and block_index == len(self.blocks) - 1,
+                frame_seq_length=frame_seq_length,
             )
 
         if skip_final_projection:
