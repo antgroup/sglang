@@ -12,6 +12,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_WASD_KEYS = {"w", "a", "s", "d"}
+_ROTATION_KEYS = {"i", "j", "k", "l"}
+
 
 def se3_inverse(T: torch.Tensor) -> torch.Tensor:
     rot = T[:, :3, :3]
@@ -99,12 +102,62 @@ def get_rotation_matrix(axis: str, angle_rad: float) -> np.ndarray:
     return np.eye(3)
 
 
+def _frame_keys_set(frame_keys: list[str]) -> set[str]:
+    return {str(key).lower() for key in frame_keys}
+
+
+def _jitter_pose_for_history(
+    pose: np.ndarray,
+    frame_keys: list[str],
+    *,
+    still_noise_scale: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if still_noise_scale <= 0.0:
+        return pose
+
+    keys = _frame_keys_set(frame_keys)
+    add_trans_noise = not (keys & _WASD_KEYS)
+    add_rot_noise = not (keys & _ROTATION_KEYS)
+    if not add_trans_noise and not add_rot_noise:
+        return pose
+
+    noise = rng.normal(scale=still_noise_scale, size=6).astype(np.float64)
+    noisy = pose.copy()
+    if add_rot_noise:
+        rx, ry, rz = noise[0], noise[1], noise[2]
+        r_noise = (
+            get_rotation_matrix("x", rx)
+            @ get_rotation_matrix("y", ry)
+            @ get_rotation_matrix("z", rz)
+        )
+        noisy[:3, :3] = pose[:3, :3] @ r_noise
+    if add_trans_noise:
+        tx, ty, tz = noise[3], noise[4], noise[5]
+        noisy[:3, 3] = pose[:3, 3] + pose[:3, :3] @ np.array(
+            [tx, ty, tz], dtype=np.float64
+        )
+    return noisy
+
+
+def _chunk_should_normalize_trans(
+    actions: list[list[str]], *, still_noise_scale: float
+) -> bool:
+    if still_noise_scale <= 0.0:
+        return True
+    return all(
+        bool(_frame_keys_set(frame_actions) & _WASD_KEYS) for frame_actions in actions
+    )
+
+
 def actions_to_c2ws(
     action_history: list[list[str]],
     *,
     move_speed: float = 0.05,
     rotate_speed_deg_ik: float = 4.0,
     rotate_speed_deg_jl: float = 6.0,
+    still_noise_scale: float = 0.0,
+    noise_seed: int = 0,
 ) -> list[np.ndarray]:
     rotate_speed_rad_ik = np.deg2rad(rotate_speed_deg_ik)
     rotate_speed_rad_jl = np.deg2rad(rotate_speed_deg_jl)
@@ -113,8 +166,19 @@ def actions_to_c2ws(
     current_pitch = 0.0
     pitch_limit = np.deg2rad(85)
     all_matrices = [current_c2w]
+    noise_rng = np.random.default_rng(noise_seed)
 
     for frame_keys in action_history:
+        record = current_c2w.copy()
+        if still_noise_scale > 0.0:
+            record = _jitter_pose_for_history(
+                record,
+                frame_keys,
+                still_noise_scale=still_noise_scale,
+                rng=noise_rng,
+            )
+        all_matrices.append(record)
+
         R = current_c2w[:3, :3]
         T = current_c2w[:3, 3]
 
@@ -166,7 +230,6 @@ def actions_to_c2ws(
         current_c2w = np.eye(4)
         current_c2w[:3, :3] = R_new
         current_c2w[:3, 3] = T_new
-        all_matrices.append(current_c2w)
 
     return all_matrices
 
@@ -182,12 +245,16 @@ def get_camera_control(
     move_speed: float = 0.05,
     rotate_speed_deg_ik: float = 4.0,
     rotate_speed_deg_jl: float = 6.0,
+    still_noise_scale: float = 0.0,
+    noise_seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     c2ws_list = actions_to_c2ws(
         action_history,
         move_speed=move_speed,
         rotate_speed_deg_ik=rotate_speed_deg_ik,
         rotate_speed_deg_jl=rotate_speed_deg_jl,
+        still_noise_scale=still_noise_scale,
+        noise_seed=noise_seed,
     )
     c2ws_np = np.stack(c2ws_list[1:])
     c2ws = torch.from_numpy(c2ws_np).to(device=device, dtype=dtype)
@@ -282,6 +349,9 @@ def _build_camera_condition(
     move_speed: float = 0.05,
     rotate_speed_deg_ik: float = 4.0,
     rotate_speed_deg_jl: float = 6.0,
+    still_noise_scale: float = 0.0,
+    noise_seed: int = 0,
+    normalize_trans: bool = True,
 ) -> torch.Tensor:
     c2ws_prefix, Ks = get_camera_control(
         action_history,
@@ -293,8 +363,12 @@ def _build_camera_condition(
         move_speed=move_speed,
         rotate_speed_deg_ik=rotate_speed_deg_ik,
         rotate_speed_deg_jl=rotate_speed_deg_jl,
+        still_noise_scale=still_noise_scale,
+        noise_seed=noise_seed,
     )
-    c2ws_prefix = compute_relative_poses(c2ws_prefix, framewise=True)
+    c2ws_prefix = compute_relative_poses(
+        c2ws_prefix, framewise=True, normalize_trans=normalize_trans
+    )
     if tail_chunk_size is not None:
         c2ws_prefix = c2ws_prefix[-tail_chunk_size:]
 
@@ -331,6 +405,8 @@ def prepare_lingbot_world_condition(
     move_speed = float(batch.extra.get("move_speed", 0.05))
     rotate_speed_deg_ik = float(batch.extra.get("rotate_speed_deg_ik", 4.0))
     rotate_speed_deg_jl = float(batch.extra.get("rotate_speed_deg_jl", 6.0))
+    still_noise_scale = float(batch.extra.get("still_noise_scale", 0.0))
+    noise_seed = int(batch.extra.get("camera_noise_seed", 0))
 
     normalized_actions = _validate_actions(actions)
     if len(normalized_actions) == 0:
@@ -358,6 +434,11 @@ def prepare_lingbot_world_condition(
             move_speed=move_speed,
             rotate_speed_deg_ik=rotate_speed_deg_ik,
             rotate_speed_deg_jl=rotate_speed_deg_jl,
+            still_noise_scale=still_noise_scale,
+            noise_seed=noise_seed,
+            normalize_trans=_chunk_should_normalize_trans(
+                normalized_actions, still_noise_scale=still_noise_scale
+            ),
         )
         logger.info(
             "LingBot action condition prepared: session_id=%s, block_idx=%s, new_actions=%s, total_history=%s",
@@ -384,6 +465,11 @@ def prepare_lingbot_world_condition(
                 move_speed=move_speed,
                 rotate_speed_deg_ik=rotate_speed_deg_ik,
                 rotate_speed_deg_jl=rotate_speed_deg_jl,
+                still_noise_scale=still_noise_scale,
+                noise_seed=noise_seed,
+                normalize_trans=_chunk_should_normalize_trans(
+                    normalized_actions, still_noise_scale=still_noise_scale
+                ),
             ),
             resolved_num_frames,
         )

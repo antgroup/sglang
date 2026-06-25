@@ -8,6 +8,8 @@ These stages align the realtime LingBot path with lingbot_fast_server:
 - decode chunk latents with a persistent causal VAE cache
 """
 
+import os
+
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -24,7 +26,17 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+
+logger = init_logger(__name__)
+
+
+def _lazy_vae_black_frames() -> int:
+    try:
+        return max(0, int(os.environ.get("SGLANG_LINGBOT_LAZY_VAE_BLACK_FRAMES", "0")))
+    except ValueError:
+        return 0
 
 
 class LingBotWorldRealtimeVAEState(BaseRealtimeState):
@@ -59,7 +71,30 @@ class LingBotWorldRealtimeImageVAEEncodingStage(ImageVAEEncodingStage):
                 batch.image_latent = state.image_latent
             return batch
 
-        batch = super().forward(batch, server_args)
+        original_num_frames = batch.num_frames
+        lazy_black_frames = _lazy_vae_black_frames()
+        if lazy_black_frames > 0:
+            temporal_ratio = int(
+                server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
+            )
+            encode_frames = 1 + lazy_black_frames
+            if (encode_frames - 1) % temporal_ratio != 0:
+                encode_frames = (
+                    (encode_frames - 1) // temporal_ratio + 1
+                ) * temporal_ratio + 1
+            batch.num_frames = encode_frames
+            logger.info(
+                "LingBot lazy VAE condition encode: first frame + %s black frames, "
+                "snapped to %s frames (original request num_frames=%s)",
+                lazy_black_frames,
+                encode_frames,
+                original_num_frames,
+            )
+
+        try:
+            batch = super().forward(batch, server_args)
+        finally:
+            batch.num_frames = original_num_frames
 
         if state is not None and batch.image_latent is not None:
             state.image_latent = batch.image_latent

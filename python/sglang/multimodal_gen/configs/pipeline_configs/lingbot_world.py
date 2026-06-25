@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import html
+import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -11,6 +12,13 @@ import torch
 from sglang.multimodal_gen.configs.models import DiTConfig
 from sglang.multimodal_gen.configs.models.dits import LingBotWorldVideoConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_I2V_A14B_Config
+
+
+def _lazy_vae_black_frames() -> int:
+    try:
+        return max(0, int(os.environ.get("SGLANG_LINGBOT_LAZY_VAE_BLACK_FRAMES", "0")))
+    except ValueError:
+        return 0
 
 
 def lingbot_prompt_clean(text: str) -> str:
@@ -69,8 +77,17 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
 
         # Align num_latent_frames to chunk_size
         num_latent_frames = latent_condition.shape[2]
-        num_latent_frames = num_latent_frames - (num_latent_frames % chunk_size)
-        latent_condition = latent_condition[:, :, :num_latent_frames, :, :]
+        remainder = num_latent_frames % chunk_size
+        lazy_black_frames = _lazy_vae_black_frames()
+        if remainder:
+            if lazy_black_frames > 0 and num_latent_frames > 0:
+                pad_frames = chunk_size - remainder
+                tail = latent_condition[:, :, -1:, :, :].repeat(1, 1, pad_frames, 1, 1)
+                latent_condition = torch.cat([latent_condition, tail], dim=2)
+                num_latent_frames += pad_frames
+            else:
+                num_latent_frames = num_latent_frames - remainder
+                latent_condition = latent_condition[:, :, :num_latent_frames, :, :]
 
         # Number of initial frames that have actual image content
         # (latent_condition from VAE encode of [image, zeros...])

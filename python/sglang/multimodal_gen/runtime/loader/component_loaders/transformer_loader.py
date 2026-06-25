@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any
 
 import torch
@@ -56,6 +57,27 @@ class TransformerLoader(ComponentLoader):
         dit_config = getattr(server_args.pipeline_config, pipeline_dit_config_attr)
         dit_config.update_model_arch(config)
         arch_config = dit_config.arch_config
+        realtime_env_overrides = {
+            "num_frames_per_block": "SGLANG_LINGBOT_NUM_FRAMES_PER_BLOCK",
+            "sliding_window_num_frames": "SGLANG_LINGBOT_SLIDING_WINDOW_NUM_FRAMES",
+            "local_attn_size": "SGLANG_LINGBOT_LOCAL_ATTN_SIZE",
+            "sink_size": "SGLANG_LINGBOT_SINK_SIZE",
+        }
+        for field, env_name in realtime_env_overrides.items():
+            env_value = os.environ.get(env_name)
+            if env_value is None or env_value == "":
+                continue
+            if not hasattr(arch_config, field):
+                continue
+            value = int(env_value)
+            setattr(arch_config, field, value)
+            config[field] = value
+            logger.info(
+                "Transformer realtime config override: %s=%s from %s",
+                field,
+                value,
+                env_name,
+            )
         realtime_config_fields = (
             "num_frames_per_block",
             "sliding_window_num_frames",

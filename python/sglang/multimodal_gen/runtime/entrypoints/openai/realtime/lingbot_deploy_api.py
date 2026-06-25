@@ -57,6 +57,9 @@ DEFAULT_NUM_FRAMES = 117
 DEFAULT_MOVE_SPEED = 0.05
 DEFAULT_ROTATE_SPEED_DEG_IK = 4.0
 DEFAULT_ROTATE_SPEED_DEG_JL = 6.0
+DEFAULT_STILL_NOISE_SCALE = float(
+    os.environ.get("SGLANG_LINGBOT_STILL_NOISE_SCALE", "0.0005")
+)
 DEFAULT_ENABLE_UPSCALING = True
 DEFAULT_UPSCALING_SCALE = 2
 DEFAULT_UPSCALING_MODEL_PATH = (
@@ -218,6 +221,7 @@ class LingBotDeployCompatSession(GenerateSession):
         self.move_speed = DEFAULT_MOVE_SPEED
         self.rotate_speed_deg_ik = DEFAULT_ROTATE_SPEED_DEG_IK
         self.rotate_speed_deg_jl = DEFAULT_ROTATE_SPEED_DEG_JL
+        self.still_noise_scale = DEFAULT_STILL_NOISE_SCALE
         self.debug_video_path: str | None = None
         self.debug_video_recorder: LingBotDebugVideoRecorder | None = None
         self.output_width = DEFAULT_WIDTH
@@ -239,6 +243,7 @@ class LingBotDeployCompatSession(GenerateSession):
         self.move_speed = DEFAULT_MOVE_SPEED
         self.rotate_speed_deg_ik = DEFAULT_ROTATE_SPEED_DEG_IK
         self.rotate_speed_deg_jl = DEFAULT_ROTATE_SPEED_DEG_JL
+        self.still_noise_scale = DEFAULT_STILL_NOISE_SCALE
         self.debug_video_path = None
         self.output_width = DEFAULT_WIDTH
         self.output_height = DEFAULT_HEIGHT
@@ -258,10 +263,12 @@ class LingBotDeployCompatSession(GenerateSession):
         move_speed: float,
         rotate_speed_deg_ik: float,
         rotate_speed_deg_jl: float,
+        still_noise_scale: float,
     ) -> None:
         self.move_speed = move_speed
         self.rotate_speed_deg_ik = rotate_speed_deg_ik
         self.rotate_speed_deg_jl = rotate_speed_deg_jl
+        self.still_noise_scale = still_noise_scale
 
     def set_resolution_config(
         self,
@@ -280,6 +287,7 @@ class LingBotDeployCompatSession(GenerateSession):
         batch.extra["move_speed"] = self.move_speed
         batch.extra["rotate_speed_deg_ik"] = self.rotate_speed_deg_ik
         batch.extra["rotate_speed_deg_jl"] = self.rotate_speed_deg_jl
+        batch.extra["still_noise_scale"] = self.still_noise_scale
 
     def reset_control_sampler(self, *, timestamp: float | None = None) -> None:
         self.control_queue.clear()
@@ -564,10 +572,14 @@ def _build_start_request(
     rotate_speed_deg_jl = _parse_float_field(
         data, "rotate_speed_deg_jl", DEFAULT_ROTATE_SPEED_DEG_JL
     )
+    still_noise_scale = _parse_float_field(
+        data, "still_noise_scale", DEFAULT_STILL_NOISE_SCALE
+    )
     session.set_camera_config(
         move_speed=move_speed,
         rotate_speed_deg_ik=rotate_speed_deg_ik,
         rotate_speed_deg_jl=rotate_speed_deg_jl,
+        still_noise_scale=still_noise_scale,
     )
 
     first_frame = data.get("image_path")
@@ -1612,6 +1624,7 @@ async def _handle_message(
                 "move_speed": session.move_speed,
                 "rotate_speed_deg_ik": session.rotate_speed_deg_ik,
                 "rotate_speed_deg_jl": session.rotate_speed_deg_jl,
+                "still_noise_scale": session.still_noise_scale,
                 "enable_upscaling": request.enable_upscaling,
                 "upscaling_scale": request.upscaling_scale,
                 "upscaling_model_path": request.upscaling_model_path,
