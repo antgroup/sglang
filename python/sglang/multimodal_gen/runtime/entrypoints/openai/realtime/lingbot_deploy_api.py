@@ -7,11 +7,13 @@ import tempfile
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import numpy as np
 import torch
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeVideoGenerationsRequest,
@@ -33,6 +35,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 
 logger = init_logger(__name__)
 router = APIRouter(tags=["lingbot-realtime"])
+_WEBUI_HTML_PATH = Path(__file__).with_name("lingbot_webui.html")
 
 
 class _ControlEvent(NamedTuple):
@@ -1695,6 +1698,12 @@ async def _handle_message(
 
     await _send_error(ws, f"unsupported message type: {msg_type}")
     return generate_task
+
+
+@router.get("/webui", response_class=HTMLResponse)
+@router.get("/v1/lingbot/realtime/webui", response_class=HTMLResponse)
+async def lingbot_realtime_webui():
+    return HTMLResponse(_WEBUI_HTML_PATH.read_text(encoding="utf-8"))
 
 
 @router.websocket("/")

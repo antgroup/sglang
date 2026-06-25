@@ -17,6 +17,62 @@ from sglang.srt.environ import envs
 logger = init_logger(__name__)
 
 
+def _is_lingbot_model(server_args: ServerArgs) -> bool:
+    pipeline_config_name = (
+        server_args.pipeline_config.__class__.__name__
+        if server_args.pipeline_config is not None
+        else None
+    )
+    values = (
+        server_args.model_path,
+        server_args.model_id,
+        server_args.pipeline_class_name,
+        pipeline_config_name,
+    )
+    return any("lingbot" in str(value).lower() for value in values if value)
+
+
+def _server_base_url(server_args: ServerArgs) -> str:
+    scheme = "https" if server_args.ssl_certfile else "http"
+    host = server_args.host or "127.0.0.1"
+    if host in {"0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    return f"{scheme}://{host}:{server_args.port}"
+
+
+def run_lingbot_realtime_webui(server_args: ServerArgs):
+    import gradio as gr
+
+    lingbot_url = f"{_server_base_url(server_args)}/v1/lingbot/realtime/webui"
+    with gr.Blocks() as demo:
+        gr.Markdown("# LingBot Realtime WebUI")
+        gr.HTML(f"""
+            <iframe
+              src="{lingbot_url}"
+              style="width:100%;height:calc(100vh - 120px);min-height:760px;border:0;border-radius:8px;"
+              allow="clipboard-read; clipboard-write"
+            ></iframe>
+            """)
+
+        _, local_url, _ = demo.launch(
+            server_port=server_args.webui_port,
+            quiet=True,
+            prevent_thread_lock=True,
+            show_error=True,
+        )
+
+        delimiter = "=" * 80
+        url = local_url or f"http://localhost:{server_args.webui_port}"
+        print(f"""
+{delimiter}
+\033[1mLingBot Realtime WebUI available at:\033[0m \033[1;4;92m{url}\033[0m
+\033[1mDirect LingBot page:\033[0m \033[1;4;92m{lingbot_url}\033[0m
+{delimiter}
+""")
+
+        demo.block_thread()
+
+
 def add_webui_args(parser: argparse.ArgumentParser):
     """Add the arguments for the generate command."""
     parser = ServerArgs.add_cli_args(parser)
@@ -28,6 +84,9 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
     # import gradio in function to avoid CI crash
 
     import gradio as gr
+
+    if _is_lingbot_model(server_args):
+        return run_lingbot_realtime_webui(server_args)
 
     def resolve_model_repo_id(model_path: str) -> str:
         from pathlib import Path

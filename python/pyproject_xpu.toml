@@ -106,7 +106,8 @@ sglang = "sglang.cli.main:main"
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
-  "jit_kernel/**/*"
+  "jit_kernel/**/*",
+  "multimodal_gen/runtime/entrypoints/openai/realtime/*.html"
 ]
 
 [tool.setuptools.packages.find]
