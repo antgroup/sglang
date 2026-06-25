@@ -374,7 +374,7 @@ class Model:
             )
 
         # Crop back to original resolution
-        return merged[3][:, :, :h, :w]
+        return merged[-1][:, :, :h, :w]
 
 
 # ---------------------------------------------------------------------------
