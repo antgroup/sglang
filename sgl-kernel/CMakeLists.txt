@@ -187,6 +187,7 @@ option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
 option(SGL_KERNEL_DISABLE_FA3             "Force disable FA3"       OFF)
+option(SGL_KERNEL_DISABLE_FLASHMLA        "Force disable FlashMLA"  OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 
@@ -520,7 +521,11 @@ target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Extra Install: FLashMLA ============================= #
-include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
+if (SGL_KERNEL_DISABLE_FLASHMLA)
+    message(STATUS "FlashMLA disabled by SGL_KERNEL_DISABLE_FLASHMLA")
+else()
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
+endif()
 
 # ============================ Extra Install: DeepGEMM (JIT) ============================= #
 # Create a separate library for DeepGEMM's Python API.
