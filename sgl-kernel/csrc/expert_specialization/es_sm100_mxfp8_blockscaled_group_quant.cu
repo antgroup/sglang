@@ -1,10 +1,6 @@
 #include <torch/all.h>
 
-#if defined(__CUDACC_VER_MAJOR__) && \
-    (__CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 8))
-#define SGL_KERNEL_ENABLE_SM100_MXFP8 1
 #include "es_sm100_mxfp8_blockscaled_group_quant.cuh"
-#endif
 
 void es_sm100_mxfp8_blockscaled_grouped_quant(
     const torch::Tensor& input,
@@ -13,7 +9,7 @@ void es_sm100_mxfp8_blockscaled_grouped_quant(
     const torch::Tensor& blockscale_offsets,
     torch::Tensor& quant_output,
     torch::Tensor& scale_factor) {
-#if defined(SGL_KERNEL_ENABLE_SM100_MXFP8) && defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   TORCH_CHECK(input.dim() == 2, "input must be 2D tensor");
   TORCH_CHECK(input.size(1) % 128 == 0, "k must align to 128");
   TORCH_CHECK(input.strides()[1] == 1, "input must be row major");

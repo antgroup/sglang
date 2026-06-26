@@ -1,10 +1,6 @@
 #include <torch/all.h>
 
-#if defined(__CUDACC_VER_MAJOR__) && \
-    (__CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 8))
-#define SGL_KERNEL_ENABLE_SM100_MXFP8 1
 #include "es_sm100_mxfp8_blockscaled_launcher.cuh"
-#endif
 
 void es_sm100_mxfp8_blockscaled_grouped_mm(
     const torch::Tensor& a,
@@ -15,7 +11,7 @@ void es_sm100_mxfp8_blockscaled_grouped_mm(
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& blockscale_offsets) {
-#if defined(SGL_KERNEL_ENABLE_SM100_MXFP8) && defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
   TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
   TORCH_CHECK(problem_sizes.size(1) == 3, "problem_sizes must have shape (num_experts, 3)");
   TORCH_CHECK(
