@@ -403,6 +403,10 @@ class LingBotDeployCompatSession(GenerateSession):
         self.output_height = DEFAULT_HEIGHT
         self.model_width = DEFAULT_WIDTH
         self.model_height = DEFAULT_HEIGHT
+        self.enable_rife = DEFAULT_ENABLE_RIFE
+        self.rife_model_path = DEFAULT_RIFE_MODEL_PATH
+        self.rife_exp = DEFAULT_RIFE_EXP
+        self.rife_scale = DEFAULT_RIFE_SCALE
         self.preview_transport = DEFAULT_PREVIEW_TRANSPORT
         self.preview_jpeg_quality = DEFAULT_PREVIEW_JPEG_QUALITY
         self.preview_fps = DEFAULT_FPS
@@ -430,6 +434,10 @@ class LingBotDeployCompatSession(GenerateSession):
         self.output_height = DEFAULT_HEIGHT
         self.model_width = DEFAULT_WIDTH
         self.model_height = DEFAULT_HEIGHT
+        self.enable_rife = DEFAULT_ENABLE_RIFE
+        self.rife_model_path = DEFAULT_RIFE_MODEL_PATH
+        self.rife_exp = DEFAULT_RIFE_EXP
+        self.rife_scale = DEFAULT_RIFE_SCALE
         self.preview_transport = DEFAULT_PREVIEW_TRANSPORT
         self.preview_jpeg_quality = DEFAULT_PREVIEW_JPEG_QUALITY
         self.preview_fps = DEFAULT_FPS
@@ -465,6 +473,19 @@ class LingBotDeployCompatSession(GenerateSession):
         self.output_height = output_height
         self.model_width = model_width
         self.model_height = model_height
+
+    def set_rife_config(
+        self,
+        *,
+        enable_rife: bool,
+        rife_model_path: str | None,
+        rife_exp: int,
+        rife_scale: float,
+    ) -> None:
+        self.enable_rife = bool(enable_rife)
+        self.rife_model_path = rife_model_path
+        self.rife_exp = int(rife_exp)
+        self.rife_scale = float(rife_scale)
 
     def set_preview_config(
         self,
@@ -839,6 +860,23 @@ def _build_start_request(
     if upscaling_scale <= 0:
         raise ValueError("upscaling_scale must be positive")
 
+    enable_rife = _parse_bool_field(data, "enable_rife", DEFAULT_ENABLE_RIFE)
+    rife_exp = _parse_int_field(data, "rife_exp", DEFAULT_RIFE_EXP)
+    rife_scale = _parse_float_field(data, "rife_scale", DEFAULT_RIFE_SCALE)
+    rife_model_path = data.get("rife_model_path", DEFAULT_RIFE_MODEL_PATH)
+    if rife_exp < 0:
+        raise ValueError("rife_exp must be non-negative")
+    if rife_scale <= 0:
+        raise ValueError("rife_scale must be positive")
+    if rife_model_path is not None and not isinstance(rife_model_path, str):
+        raise ValueError("rife_model_path must be a string")
+    session.set_rife_config(
+        enable_rife=enable_rife,
+        rife_model_path=rife_model_path,
+        rife_exp=rife_exp,
+        rife_scale=rife_scale,
+    )
+
     model_width = output_width
     model_height = output_height
     if enable_upscaling:
@@ -880,7 +918,7 @@ def _build_start_request(
         )
     if debug_video_path is not None and not isinstance(debug_video_path, str):
         raise ValueError("debug_video_path must be a string")
-    debug_video_fps = fps * (2**DEFAULT_RIFE_EXP if DEFAULT_ENABLE_RIFE else 1)
+    debug_video_fps = fps * (2**rife_exp if enable_rife else 1)
     session.set_debug_video(
         debug_video_path if debug_save_video else None,
         fps=debug_video_fps,
@@ -899,9 +937,9 @@ def _build_start_request(
         output_height,
         model_width,
         model_height,
-        DEFAULT_ENABLE_RIFE,
-        DEFAULT_RIFE_EXP,
-        DEFAULT_RIFE_SCALE,
+        session.enable_rife,
+        session.rife_exp,
+        session.rife_scale,
         session.preview_transport,
         session.preview_jpeg_quality,
     )
@@ -1993,6 +2031,10 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                 upscaling_model_path=batch.upscaling_model_path,
                 upscaling_scale=int(batch.upscaling_scale),
                 half_precision=server_args.realesrgan_half_precision,
+                enable_rife=session.enable_rife,
+                rife_model_path=session.rife_model_path,
+                rife_exp=session.rife_exp,
+                rife_scale=session.rife_scale,
                 timings=timings,
             )
             timings["postprocess_ms"] = (time.perf_counter() - stage_start) * 1000.0
@@ -2114,10 +2156,10 @@ async def _handle_message(
                 "enable_upscaling": request.enable_upscaling,
                 "upscaling_scale": request.upscaling_scale,
                 "upscaling_model_path": request.upscaling_model_path,
-                "enable_rife": DEFAULT_ENABLE_RIFE,
-                "rife_model_path": DEFAULT_RIFE_MODEL_PATH,
-                "rife_exp": DEFAULT_RIFE_EXP,
-                "rife_scale": DEFAULT_RIFE_SCALE,
+                "enable_rife": session.enable_rife,
+                "rife_model_path": session.rife_model_path,
+                "rife_exp": session.rife_exp,
+                "rife_scale": session.rife_scale,
                 "preview_transport": session.preview_transport,
                 "preview_jpeg_quality": session.preview_jpeg_quality,
                 "width": session.output_width,

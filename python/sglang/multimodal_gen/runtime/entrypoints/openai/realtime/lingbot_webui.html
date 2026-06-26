@@ -436,6 +436,10 @@
           <label for="enableUpscaling">Enable SR</label>
         </div>
         <div class="check-row">
+          <input id="enableRife" type="checkbox" checked>
+          <label for="enableRife">Enable RIFE</label>
+        </div>
+        <div class="check-row">
           <input id="debugSaveVideo" type="checkbox">
           <label for="debugSaveVideo">Debug MP4</label>
         </div>
@@ -527,6 +531,7 @@
       previewTransport: document.getElementById("previewTransport"),
       previewJpegQuality: document.getElementById("previewJpegQuality"),
       enableUpscaling: document.getElementById("enableUpscaling"),
+      enableRife: document.getElementById("enableRife"),
       debugSaveVideo: document.getElementById("debugSaveVideo"),
       debugVideoPath: document.getElementById("debugVideoPath"),
       eventRows: document.getElementById("eventRows"),
@@ -719,6 +724,7 @@
         preview_jpeg_quality: numberValue(els.previewJpegQuality, 85),
         enable_upscaling: els.enableUpscaling.checked,
         upscaling_scale: numberValue(els.upscalingScale, 2),
+        enable_rife: els.enableRife.checked,
         debug_save_video: els.debugSaveVideo.checked,
       };
 
