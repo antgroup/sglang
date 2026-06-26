@@ -1,8 +1,10 @@
 import asyncio
+import io
 import json
 import os
 import queue
 import random
+import struct
 import tempfile
 import threading
 import time
@@ -52,6 +54,23 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _normalize_preview_transport(value: Any, *, default: str = "raw") -> str:
+    aliases = {
+        "": default,
+        "jpeg": "ctk1",
+        "jpg": "ctk1",
+        "mjpeg": "ctk1",
+        "h264": "ctv1",
+        "h264_zerolatency": "ctv1",
+        "h264-zero-latency": "ctv1",
+    }
+    normalized = str(value if value is not None else default).strip().lower()
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"raw", "ctk1", "ctv1", "auto"}:
+        return default
+    return normalized
+
+
 DEFAULT_PROMPT = "A cinematic video with smooth camera motion"
 DEFAULT_WIDTH = 832
 DEFAULT_HEIGHT = 480
@@ -83,6 +102,16 @@ DEFAULT_DEBUG_VIDEO_QUEUE_SIZE = max(
 )
 DEFAULT_PINNED_D2H = _env_bool("SGLANG_LINGBOT_PINNED_D2H", False)
 DEFAULT_SEND_MEMORYVIEW = _env_bool("SGLANG_LINGBOT_SEND_MEMORYVIEW", False)
+DEFAULT_PREVIEW_TRANSPORT = _normalize_preview_transport(
+    os.environ.get("SGLANG_LINGBOT_PREVIEW_TRANSPORT", "raw"),
+    default="raw",
+)
+DEFAULT_PREVIEW_JPEG_QUALITY = max(
+    1, min(100, int(os.environ.get("SGLANG_LINGBOT_PREVIEW_JPEG_QUALITY", "85")))
+)
+DEFAULT_PREVIEW_H264_QP = max(
+    0, min(51, int(os.environ.get("SGLANG_LINGBOT_PREVIEW_H264_QP", "23")))
+)
 STARTUP_WARMUP_CHUNKS = int(os.environ.get("SGLANG_LINGBOT_STARTUP_WARMUP_CHUNKS", "0"))
 STARTUP_WARMUP_IMAGE_PATH = os.environ.get("SGLANG_LINGBOT_STARTUP_WARMUP_IMAGE_PATH")
 STARTUP_WARMUP_SIZES = os.environ.get("SGLANG_LINGBOT_STARTUP_WARMUP_SIZES")
@@ -101,6 +130,153 @@ STARTUP_WARMUP_HEIGHT = int(
 STARTUP_WARMUP_PROMPT = os.environ.get(
     "SGLANG_LINGBOT_STARTUP_WARMUP_PROMPT", DEFAULT_PROMPT
 )
+_CHUNK_PREVIEW_MAGIC_MAIN = b"CTK1"
+_CHUNK_PREVIEW_MAGIC_VIDEO = b"CTV1"
+
+
+class H264EncoderUnavailable(RuntimeError):
+    """Raised when PyAV/libx264 cannot provide the low-latency preview path."""
+
+
+def _annexb_has_idr(buf: bytes) -> bool:
+    if not buf:
+        return False
+    n = len(buf)
+    i = 0
+    while i + 4 < n:
+        if buf[i] == 0 and buf[i + 1] == 0 and buf[i + 2] == 1:
+            if (buf[i + 3] & 0x1F) == 5:
+                return True
+            i += 4
+        elif buf[i] == 0 and buf[i + 1] == 0 and buf[i + 2] == 0 and buf[i + 3] == 1:
+            if (buf[i + 4] & 0x1F) == 5:
+                return True
+            i += 5
+        else:
+            i += 1
+    return False
+
+
+class H264ZerolatencyStreamEncoder:
+    """Persistent libx264 zerolatency encoder for CTV1 preview packets."""
+
+    def __init__(self, width: int, height: int, fps: int, qp: int):
+        try:
+            import av  # type: ignore
+            from av.video.frame import PictureType  # type: ignore
+        except ImportError as exc:
+            raise H264EncoderUnavailable(
+                "PyAV is not installed; falling back to CTK1 JPEG preview"
+            ) from exc
+        self._av = av
+        self._picture_type = PictureType
+        self._width = int(width)
+        self._height = int(height)
+        self._fps = int(fps)
+        self._qp = int(qp)
+        self._frames_total = 0
+        self._ctx = None
+        self._open()
+
+    def _open(self) -> None:
+        from fractions import Fraction
+
+        try:
+            codec = self._av.codec.Codec("libx264", "w")
+        except Exception as exc:
+            raise H264EncoderUnavailable(
+                f"libx264 is not available in this FFmpeg build: {exc}"
+            ) from exc
+
+        option_candidates = [
+            {
+                "crf": str(self._qp),
+                "g": "1000",
+                "annexb": "1",
+                "preset": "ultrafast",
+                "tune": "zerolatency",
+                "bf": "0",
+                "bframes": "0",
+                "rc-lookahead": "0",
+                "sync-lookahead": "0",
+                "x264-params": "repeat-headers=1:forced-idr=1",
+            },
+            {
+                "crf": str(self._qp),
+                "g": "1000",
+                "annexb": "1",
+                "preset": "ultrafast",
+                "tune": "zerolatency",
+                "bf": "0",
+                "bframes": "0",
+                "rc-lookahead": "0",
+                "sync-lookahead": "0",
+            },
+            {
+                "crf": str(self._qp),
+                "g": "1000",
+                "annexb": "1",
+                "preset": "ultrafast",
+                "tune": "zerolatency",
+                "bf": "0",
+            },
+        ]
+        errors: list[str] = []
+        for options in option_candidates:
+            ctx = codec.create()
+            ctx.width = self._width
+            ctx.height = self._height
+            ctx.pix_fmt = "yuv420p"
+            ctx.framerate = Fraction(self._fps, 1)
+            ctx.time_base = Fraction(1, self._fps)
+            ctx.options = options
+            try:
+                ctx.open()
+                self._ctx = ctx
+                return
+            except Exception as exc:
+                errors.append(f"options={options}: {exc}")
+        raise H264EncoderUnavailable(
+            "libx264 zerolatency open failed: " + " | ".join(errors)
+        )
+
+    def close(self) -> None:
+        try:
+            if self._ctx is not None:
+                self._ctx.close()
+        except Exception:
+            pass
+        self._ctx = None
+        self._frames_total = 0
+
+    def encode_chunk(
+        self,
+        frames_hwc_uint8: list[np.ndarray],
+        *,
+        force_first_keyframe: bool = True,
+    ) -> list[tuple[bytes, bool]]:
+        if self._ctx is None:
+            self._open()
+        out: list[tuple[bytes, bool]] = []
+        for i, frame in enumerate(frames_hwc_uint8):
+            if frame.ndim != 3 or frame.shape[-1] != 3:
+                raise ValueError(f"expected HWC RGB uint8, got shape {frame.shape}")
+            if frame.dtype != np.uint8:
+                frame = frame.astype(np.uint8)
+            if not frame.flags["C_CONTIGUOUS"]:
+                frame = np.ascontiguousarray(frame)
+            av_frame = self._av.VideoFrame.from_ndarray(frame, format="rgb24")
+            av_frame = av_frame.reformat(format="yuv420p")
+            av_frame.pts = self._frames_total
+            if i == 0 and force_first_keyframe:
+                av_frame.pict_type = self._picture_type.I
+            else:
+                av_frame.pict_type = self._picture_type.NONE
+            packets = self._ctx.encode(av_frame)
+            buf = b"".join(bytes(packet) for packet in packets)
+            out.append((buf, i == 0 or _annexb_has_idr(buf)))
+            self._frames_total += 1
+        return out
 
 
 class LingBotDebugVideoRecorder:
@@ -227,6 +403,12 @@ class LingBotDeployCompatSession(GenerateSession):
         self.output_height = DEFAULT_HEIGHT
         self.model_width = DEFAULT_WIDTH
         self.model_height = DEFAULT_HEIGHT
+        self.preview_transport = DEFAULT_PREVIEW_TRANSPORT
+        self.preview_jpeg_quality = DEFAULT_PREVIEW_JPEG_QUALITY
+        self.preview_fps = DEFAULT_FPS
+        self._h264_encoder: H264ZerolatencyStreamEncoder | None = None
+        self._h264_encoder_shape: tuple[int, int, int] | None = None
+        self._h264_fallback_logged = False
         self._control_events: deque[_ControlEvent] = deque(maxlen=512)
         self._control_sample_cursor: float | None = None
         self._control_sample_base_actions: list[str] = []
@@ -234,6 +416,7 @@ class LingBotDeployCompatSession(GenerateSession):
 
     def dispose(self):
         self.close_debug_video()
+        self.close_preview_encoder()
         super().dispose()
         self.current_keys.clear()
         self.selected_image_id = None
@@ -247,6 +430,10 @@ class LingBotDeployCompatSession(GenerateSession):
         self.output_height = DEFAULT_HEIGHT
         self.model_width = DEFAULT_WIDTH
         self.model_height = DEFAULT_HEIGHT
+        self.preview_transport = DEFAULT_PREVIEW_TRANSPORT
+        self.preview_jpeg_quality = DEFAULT_PREVIEW_JPEG_QUALITY
+        self.preview_fps = DEFAULT_FPS
+        self._h264_fallback_logged = False
         self.reset_control_sampler()
 
     def build_sampling_params(self):
@@ -278,6 +465,56 @@ class LingBotDeployCompatSession(GenerateSession):
         self.output_height = output_height
         self.model_width = model_width
         self.model_height = model_height
+
+    def set_preview_config(
+        self,
+        *,
+        transport: str,
+        jpeg_quality: int,
+        fps: int,
+    ) -> None:
+        normalized = _normalize_preview_transport(
+            transport, default=DEFAULT_PREVIEW_TRANSPORT
+        )
+        if normalized != self.preview_transport:
+            self.close_preview_encoder()
+            self._h264_fallback_logged = False
+        self.preview_transport = normalized
+        self.preview_jpeg_quality = max(1, min(100, int(jpeg_quality)))
+        self.preview_fps = max(1, int(fps))
+
+    def close_preview_encoder(self) -> None:
+        encoder = self._h264_encoder
+        self._h264_encoder = None
+        self._h264_encoder_shape = None
+        if encoder is not None:
+            encoder.close()
+
+    def mark_h264_unavailable(self, reason: Exception) -> None:
+        self.close_preview_encoder()
+        if self._h264_fallback_logged:
+            return
+        self._h264_fallback_logged = True
+        logger.warning(
+            "LingBot deploy CTV1 preview unavailable; falling back to CTK1 JPEG: session_id=%s error=%s",
+            self.id,
+            reason,
+        )
+
+    def h264_encoder_for(
+        self, *, width: int, height: int, fps: int
+    ) -> H264ZerolatencyStreamEncoder:
+        shape = (int(width), int(height), int(fps))
+        if self._h264_encoder is None or self._h264_encoder_shape != shape:
+            self.close_preview_encoder()
+            self._h264_encoder = H264ZerolatencyStreamEncoder(
+                width=width,
+                height=height,
+                fps=fps,
+                qp=DEFAULT_PREVIEW_H264_QP,
+            )
+            self._h264_encoder_shape = shape
+        return self._h264_encoder
 
     def apply_camera_config(self, batch) -> None:
         batch.extra["move_speed"] = self.move_speed
@@ -585,6 +822,18 @@ def _build_start_request(
         raise ValueError(f"image_path is not a valid file: {first_frame}")
 
     fps = _parse_int_field(data, "fps", DEFAULT_FPS)
+    preview_transport = _normalize_preview_transport(
+        data.get("preview_transport", DEFAULT_PREVIEW_TRANSPORT),
+        default=DEFAULT_PREVIEW_TRANSPORT,
+    )
+    preview_jpeg_quality = _parse_int_field(
+        data, "preview_jpeg_quality", DEFAULT_PREVIEW_JPEG_QUALITY
+    )
+    session.set_preview_config(
+        transport=preview_transport,
+        jpeg_quality=preview_jpeg_quality,
+        fps=fps,
+    )
     upscaling_scale = _parse_int_field(data, "upscaling_scale", DEFAULT_UPSCALING_SCALE)
     enable_upscaling = _resolve_enable_upscaling(data, output_width, output_height)
     if upscaling_scale <= 0:
@@ -640,7 +889,8 @@ def _build_start_request(
     prompt = str(data.get("prompt") or DEFAULT_PROMPT)
     logger.info(
         "LingBot START request: session_id=%s prompt=%r image_path=%s "
-        "seed=%s output=%sx%s model=%sx%s rife=%s rife_exp=%s rife_scale=%s",
+        "seed=%s output=%sx%s model=%sx%s rife=%s rife_exp=%s rife_scale=%s "
+        "preview_transport=%s preview_jpeg_quality=%s",
         session.id,
         prompt,
         first_frame,
@@ -652,6 +902,8 @@ def _build_start_request(
         DEFAULT_ENABLE_RIFE,
         DEFAULT_RIFE_EXP,
         DEFAULT_RIFE_SCALE,
+        session.preview_transport,
+        session.preview_jpeg_quality,
     )
 
     request = RealtimeVideoGenerationsRequest(
@@ -917,6 +1169,234 @@ def _payload_nbytes(payload: bytes | bytearray | memoryview) -> int:
     if isinstance(payload, memoryview):
         return payload.nbytes
     return len(payload)
+
+
+class _PreviewPayload(NamedTuple):
+    payload: bytes | memoryview
+    transport: str
+    payload_bytes: int
+
+
+def _frames_as_hwc_uint8_array(frames: list[np.ndarray] | np.ndarray) -> np.ndarray:
+    if isinstance(frames, np.ndarray):
+        arr = frames
+    else:
+        arr = np.stack(frames, axis=0)
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.uint8, copy=False)
+    return _normalize_rgb_array(arr)
+
+
+def _encode_jpeg_frame(frame: np.ndarray, *, quality: int) -> bytes:
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.fromarray(np.ascontiguousarray(frame), "RGB").save(
+        buf,
+        format="JPEG",
+        quality=max(1, min(100, int(quality))),
+    )
+    return buf.getvalue()
+
+
+def _build_chunk_jpeg_packet(
+    *,
+    eval_idx: int,
+    chunk_id: int,
+    chunk_index: int | None,
+    chunk_total: int | None,
+    chunk_progress: str | None,
+    jpeg_by_frame: list[tuple[int, bytes]],
+) -> bytes:
+    version = 1
+    flags = 0
+    ci = int(chunk_index) if chunk_index is not None else 0xFFFFFFFF
+    ct = int(chunk_total) if chunk_total is not None else 0xFFFFFFFF
+    prog_bytes = (chunk_progress or "").encode("utf-8")
+    if len(prog_bytes) > 65535:
+        prog_bytes = prog_bytes[:65535]
+    nframes = len(jpeg_by_frame)
+    if nframes > 65535:
+        raise ValueError("CTK1 preview chunk has too many frames")
+    header = struct.pack(
+        "<4sBBiiIIHH",
+        _CHUNK_PREVIEW_MAGIC_MAIN,
+        version,
+        flags,
+        int(eval_idx),
+        int(chunk_id),
+        ci,
+        ct,
+        nframes,
+        len(prog_bytes),
+    )
+    parts: list[bytes] = [header, prog_bytes]
+    for frame_id, raw in jpeg_by_frame:
+        if len(raw) > 0xFFFFFFFF:
+            raise ValueError("CTK1 preview frame is too large")
+        parts.append(struct.pack("<HI", int(frame_id), len(raw)))
+        parts.append(raw)
+    return b"".join(parts)
+
+
+def _build_chunk_h264_packet(
+    *,
+    eval_idx: int,
+    chunk_id: int,
+    chunk_index: int | None,
+    chunk_total: int | None,
+    chunk_progress: str | None,
+    frames: list[tuple[int, bytes, bool]],
+) -> bytes:
+    version = 1
+    flags = 0
+    ci = int(chunk_index) if chunk_index is not None else 0xFFFFFFFF
+    ct = int(chunk_total) if chunk_total is not None else 0xFFFFFFFF
+    prog_bytes = (chunk_progress or "").encode("utf-8")
+    if len(prog_bytes) > 65535:
+        prog_bytes = prog_bytes[:65535]
+    nframes = len(frames)
+    if nframes > 65535:
+        raise ValueError("CTV1 preview chunk has too many frames")
+    header = struct.pack(
+        "<4sBBiiIIHH",
+        _CHUNK_PREVIEW_MAGIC_VIDEO,
+        version,
+        flags,
+        int(eval_idx),
+        int(chunk_id),
+        ci,
+        ct,
+        nframes,
+        len(prog_bytes),
+    )
+    parts: list[bytes] = [header, prog_bytes]
+    for frame_id, nal, is_key in frames:
+        if len(nal) > 0xFFFFFFFF:
+            raise ValueError("CTV1 preview frame is too large")
+        parts.append(struct.pack("<HIB3x", int(frame_id), len(nal), 1 if is_key else 0))
+        parts.append(nal)
+    return b"".join(parts)
+
+
+def _pack_ctk1_preview_payload(
+    frame_array: np.ndarray,
+    *,
+    chunk_idx: int,
+    jpeg_quality: int,
+) -> bytes:
+    jpeg_by_frame = [
+        (frame_id, _encode_jpeg_frame(frame, quality=jpeg_quality))
+        for frame_id, frame in enumerate(frame_array)
+    ]
+    return _build_chunk_jpeg_packet(
+        eval_idx=0,
+        chunk_id=chunk_idx,
+        chunk_index=None,
+        chunk_total=None,
+        chunk_progress=None,
+        jpeg_by_frame=jpeg_by_frame,
+    )
+
+
+def _pack_ctv1_preview_payload(
+    session: LingBotDeployCompatSession,
+    frame_array: np.ndarray,
+    *,
+    chunk_idx: int,
+) -> bytes:
+    if frame_array.ndim != 4 or frame_array.shape[-1] != 3:
+        raise H264EncoderUnavailable(
+            f"unsupported CTV1 frame shape {frame_array.shape}"
+        )
+    height = int(frame_array.shape[1])
+    width = int(frame_array.shape[2])
+    if width % 2 != 0 or height % 2 != 0:
+        raise H264EncoderUnavailable(
+            f"CTV1 requires even dimensions, got {width}x{height}"
+        )
+    encoder = session.h264_encoder_for(
+        width=width,
+        height=height,
+        fps=session.preview_fps,
+    )
+    encoded = encoder.encode_chunk(
+        [np.ascontiguousarray(frame) for frame in frame_array],
+        force_first_keyframe=True,
+    )
+    if any(len(nal) == 0 for nal, _is_key in encoded):
+        raise H264EncoderUnavailable("libx264 returned delayed empty packets")
+    h264_by_frame = [
+        (frame_id, nal, is_key) for frame_id, (nal, is_key) in enumerate(encoded)
+    ]
+    return _build_chunk_h264_packet(
+        eval_idx=0,
+        chunk_id=chunk_idx,
+        chunk_index=None,
+        chunk_total=None,
+        chunk_progress=None,
+        frames=h264_by_frame,
+    )
+
+
+def _build_preview_payload(
+    session: LingBotDeployCompatSession,
+    frames: list[np.ndarray] | np.ndarray,
+    *,
+    chunk_idx: int,
+) -> _PreviewPayload:
+    frame_array = _frames_as_hwc_uint8_array(frames)
+    requested_transport = session.preview_transport
+
+    if requested_transport in {"auto", "ctv1"}:
+        try:
+            payload = _pack_ctv1_preview_payload(
+                session,
+                frame_array,
+                chunk_idx=chunk_idx,
+            )
+            return _PreviewPayload(
+                payload=payload,
+                transport="ctv1",
+                payload_bytes=len(payload),
+            )
+        except H264EncoderUnavailable as exc:
+            session.mark_h264_unavailable(exc)
+        except Exception as exc:
+            session.mark_h264_unavailable(exc)
+            logger.warning(
+                "LingBot deploy CTV1 preview encode failed; falling back to CTK1 JPEG: session_id=%s chunk_idx=%s",
+                session.id,
+                chunk_idx,
+                exc_info=True,
+            )
+
+    if requested_transport in {"auto", "ctv1", "ctk1"}:
+        try:
+            payload = _pack_ctk1_preview_payload(
+                frame_array,
+                chunk_idx=chunk_idx,
+                jpeg_quality=session.preview_jpeg_quality,
+            )
+            return _PreviewPayload(
+                payload=payload,
+                transport="ctk1",
+                payload_bytes=len(payload),
+            )
+        except Exception:
+            logger.warning(
+                "LingBot deploy CTK1 preview encode failed; falling back to raw RGB: session_id=%s chunk_idx=%s",
+                session.id,
+                chunk_idx,
+                exc_info=True,
+            )
+
+    payload = rgb_frames_to_bytes(frame_array)
+    return _PreviewPayload(
+        payload=payload,
+        transport="raw",
+        payload_bytes=_payload_nbytes(payload),
+    )
 
 
 def output_to_rgb_tensor_for_send(
@@ -1366,12 +1846,23 @@ async def _send_chunk_item(
     frame_shape = tuple(frames[0].shape) if frame_count else None
 
     stage_start = time.perf_counter()
-    payload = rgb_frames_to_bytes(frames)
+    preview_payload = await asyncio.to_thread(
+        _build_preview_payload,
+        session,
+        frames,
+        chunk_idx=chunk_idx,
+    )
     item["frames"] = None
     del frames
     timings["pack_bytes_ms"] = (time.perf_counter() - stage_start) * 1000.0
-    payload_bytes = _payload_nbytes(payload)
-    logger.info("LingBot deploy raw chunk prepared: bytes=%d", payload_bytes)
+    payload = preview_payload.payload
+    payload_bytes = preview_payload.payload_bytes
+    timings["preview_transport"] = preview_payload.transport
+    logger.info(
+        "LingBot deploy preview chunk prepared: transport=%s bytes=%d",
+        preview_payload.transport,
+        payload_bytes,
+    )
 
     stage_start = time.perf_counter()
     await ws.send_bytes(payload)
@@ -1385,7 +1876,7 @@ async def _send_chunk_item(
         "finalize=%.2fms finalize_cuda=%.2fms postprocess=%.2fms "
         "debug_video=%.2fms send_queue_wait=%.2fms pack_bytes=%.2fms "
         "ws_send=%.2fms produce=%.2fms total=%.2fms frames=%d frame_shape=%s "
-        "payload_bytes=%d rife_multiplier=%.1f",
+        "payload_bytes=%d preview_transport=%s rife_multiplier=%.1f",
         session.id,
         chunk_idx,
         timings["prepare_ms"],
@@ -1405,6 +1896,7 @@ async def _send_chunk_item(
         frame_count,
         frame_shape,
         payload_bytes,
+        preview_payload.transport,
         timings["rife_multiplier"],
     )
     await _send_json(
@@ -1421,9 +1913,13 @@ async def _send_chunk_item(
             "queue_size": queue_size,
             "frames": frame_count,
             "frame_shape": list(frame_shape) if frame_shape is not None else None,
+            "preview_transport": preview_payload.transport,
+            "payload_bytes": payload_bytes,
             "rife_multiplier": timings["rife_multiplier"],
             "stage_timings_ms": {
-                key: round(value, 3) for key, value in timings.items()
+                key: round(value, 3)
+                for key, value in timings.items()
+                if isinstance(value, (int, float))
             },
         },
     )
@@ -1622,6 +2118,8 @@ async def _handle_message(
                 "rife_model_path": DEFAULT_RIFE_MODEL_PATH,
                 "rife_exp": DEFAULT_RIFE_EXP,
                 "rife_scale": DEFAULT_RIFE_SCALE,
+                "preview_transport": session.preview_transport,
+                "preview_jpeg_quality": session.preview_jpeg_quality,
                 "width": session.output_width,
                 "height": session.output_height,
                 "output_width": session.output_width,

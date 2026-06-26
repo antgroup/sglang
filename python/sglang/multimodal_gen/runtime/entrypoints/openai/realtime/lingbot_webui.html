@@ -1,0 +1,1441 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LingBot Realtime WebUI</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --surface-alt: #eef2f5;
+      --border: #d7dee7;
+      --text: #1f2933;
+      --muted: #667085;
+      --accent: #0f766e;
+      --accent-2: #1d4ed8;
+      --warn: #b45309;
+      --danger: #b42318;
+      --shadow: 0 1px 2px rgba(16, 24, 40, 0.08);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    button,
+    input,
+    textarea,
+    select {
+      font: inherit;
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: minmax(360px, 460px) minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    .sidebar {
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      padding: 18px;
+    }
+
+    .main {
+      min-width: 0;
+      padding: 18px;
+      overflow: auto;
+    }
+
+    .topbar,
+    .toolbar,
+    .status-row,
+    .button-row,
+    .key-grid,
+    .event-buttons {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .topbar {
+      justify-content: space-between;
+      margin-bottom: 16px;
+    }
+
+    h1,
+    h2 {
+      margin: 0;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      font-size: 20px;
+      line-height: 1.25;
+    }
+
+    h2 {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      margin-top: 18px;
+      margin-bottom: 10px;
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    input,
+    textarea,
+    select {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--text);
+      outline: none;
+    }
+
+    input,
+    select {
+      height: 36px;
+      padding: 0 10px;
+    }
+
+    textarea {
+      min-height: 82px;
+      padding: 10px;
+      resize: vertical;
+      line-height: 1.35;
+    }
+
+    textarea.large {
+      min-height: 132px;
+    }
+
+    input:focus,
+    textarea:focus,
+    select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.14);
+    }
+
+    input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+
+    .field-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .field-row.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .check-row {
+      display: flex;
+      min-height: 36px;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 36px;
+      padding: 0 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--text);
+      box-shadow: var(--shadow);
+      cursor: pointer;
+      white-space: nowrap;
+      user-select: none;
+    }
+
+    .btn.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #ffffff;
+    }
+
+    .btn.secondary {
+      background: var(--accent-2);
+      border-color: var(--accent-2);
+      color: #ffffff;
+    }
+
+    .btn.danger {
+      background: #fff7f5;
+      border-color: #f2b8b5;
+      color: var(--danger);
+    }
+
+    .btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      box-shadow: none;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 0 10px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .badge.ok {
+      color: var(--accent);
+      border-color: rgba(15, 118, 110, 0.35);
+      background: #ecfdf3;
+    }
+
+    .badge.warn {
+      color: var(--warn);
+      border-color: rgba(180, 83, 9, 0.35);
+      background: #fffbeb;
+    }
+
+    .badge.error {
+      color: var(--danger);
+      border-color: rgba(180, 35, 24, 0.35);
+      background: #fff1f0;
+    }
+
+    .preview-wrap {
+      display: grid;
+      gap: 10px;
+    }
+
+    .preview-shell {
+      background: #111827;
+      border: 1px solid #0f172a;
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      min-height: 360px;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+    }
+
+    canvas {
+      width: 100%;
+      max-height: calc(100vh - 240px);
+      object-fit: contain;
+      background: #111827;
+    }
+
+    .event-table {
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .event-table th,
+    .event-table td {
+      border-bottom: 1px solid var(--border);
+      padding: 8px;
+      vertical-align: top;
+      font-size: 13px;
+      text-align: left;
+    }
+
+    .event-table th {
+      background: var(--surface-alt);
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .event-table tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .event-id {
+      min-width: 96px;
+    }
+
+    .event-prompt {
+      min-height: 58px;
+    }
+
+    .key-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(58px, 1fr));
+      max-width: 360px;
+    }
+
+    .key-btn {
+      min-height: 44px;
+      font-weight: 750;
+    }
+
+    .key-btn.active {
+      background: #e0f2fe;
+      border-color: #38bdf8;
+      color: #075985;
+    }
+
+    .log {
+      height: 230px;
+      overflow: auto;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #0b1020;
+      color: #d1d5db;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
+    @media (max-width: 980px) {
+      .app {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="topbar">
+        <h1>LingBot Realtime</h1>
+        <span id="socketStatus" class="badge">idle</span>
+      </div>
+
+      <h2>Connection</h2>
+      <div class="field">
+        <label for="wsUrl">WebSocket URL</label>
+        <input id="wsUrl" autocomplete="off">
+      </div>
+
+      <h2>Input</h2>
+      <div class="field">
+        <label for="imagePath">Image Path or URL</label>
+        <input id="imagePath" autocomplete="off" value="http://mdn.alipayobjects.com/recquality/afts/file/A*fGUZS5JwT7YAAAAASWAAAAgAegAAAQ">
+      </div>
+      <div class="field">
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt" class="large">This is a third-person-view video of a colossal dragon &mdash; its neck a column of dense obsidian-black scales rippling with muscle, its enormous bat-like wings veined with pulsing crimson, leading edges sharp and dark. Ahead, a towering ancient castle of crumbling stone spires and moss-covered battlements rises above dense jungle canopy, gothic arches half-swallowed by creeping vines. A vast primordial forest stretches in every direction, pale mist drifting between trunks, dappled golden sunlight filtering through humid air, winding river gorges far below.</textarea>
+      </div>
+      <div class="field">
+        <label for="staticPrompt">Static Prompt</label>
+        <textarea id="staticPrompt">Strict centered third-person rear view where the dragon is locked at the exact center of the frame; the camera tracks from above and behind and never rotates independently, ensuring the rear-view framing is perfectly preserved as the dragon's heading turns. The dragon remains pinned to a single fixed point in mid-air at a constant altitude and heading, beating its enormous bat-like wings in steady, rhythmic strokes&mdash;sweeping high until membranes nearly meet, then driving downward in powerful arcs. Despite the powerful wing-beats, the dragon does NOT translate forward, upward, downward, or backward; it must never slide, glide, drift, or recede from the camera, maintaining an absolutely constant apparent size and distance with its neck arched gently forward in the calm air.</textarea>
+      </div>
+      <div class="field">
+        <label for="dynamicPrompt">Dynamic Prompt</label>
+        <textarea id="dynamicPrompt">Strict centered third-person rear view where the dragon is locked at the exact center of the frame; the camera tracks from above and behind as the dragon drives forward through the sky, never rotating independently so that the rear-view framing is preserved at all times even as the heading turns. The dragon's wings beat the air with powerful rhythmic strokes&mdash;sweeping high on the upstroke until the membranes nearly meet overhead, then driving downward in a thunderous arc. The neck stretches forward into the wind as air streams past the leading edges of the wings, emphasizing the dragon's continuous, powerful forward momentum through the sky.</textarea>
+      </div>
+
+      <h2>Generation</h2>
+      <div class="field-row three">
+        <div class="field">
+          <label for="width">Width</label>
+          <input id="width" type="number" value="1664">
+        </div>
+        <div class="field">
+          <label for="height">Height</label>
+          <input id="height" type="number" value="960">
+        </div>
+        <div class="field">
+          <label for="fps">FPS</label>
+          <input id="fps" type="number" value="16">
+        </div>
+      </div>
+      <div class="field-row three">
+        <div class="field">
+          <label for="numFrames">Frames</label>
+          <input id="numFrames" type="number" value="117">
+        </div>
+        <div class="field">
+          <label for="seed">Seed</label>
+          <input id="seed" type="number" value="42">
+        </div>
+        <div class="field">
+          <label for="eventChunk">Event Chunk</label>
+          <input id="eventChunk" type="number" value="4">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="eventMode">Event Mode</label>
+          <select id="eventMode">
+            <option value="overwrite">overwrite</option>
+            <option value="append">append</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="upscalingScale">Upscaling Scale</label>
+          <input id="upscalingScale" type="number" value="2">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="previewTransport">Preview Transport</label>
+          <select id="previewTransport">
+            <option value="auto">Auto H.264/JPEG</option>
+            <option value="ctv1" selected>H.264 CTV1</option>
+            <option value="ctk1">JPEG CTK1</option>
+            <option value="raw">Raw RGB</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="previewJpegQuality">JPEG Quality</label>
+          <input id="previewJpegQuality" type="number" value="85" min="1" max="100">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="check-row">
+          <input id="enableUpscaling" type="checkbox" checked>
+          <label for="enableUpscaling">Enable SR</label>
+        </div>
+        <div class="check-row">
+          <input id="debugSaveVideo" type="checkbox">
+          <label for="debugSaveVideo">Debug MP4</label>
+        </div>
+      </div>
+      <div class="field">
+        <label for="debugVideoPath">Debug Video Path</label>
+        <input id="debugVideoPath" autocomplete="off" value="/tmp/sglang_lingbot_debug/webui.mp4">
+      </div>
+
+      <h2>Events</h2>
+      <table class="event-table">
+        <thead>
+          <tr>
+            <th>Id</th>
+            <th>Prompt</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="eventRows"></tbody>
+      </table>
+      <div class="button-row" style="margin-top: 10px;">
+        <button id="addEventBtn" class="btn">Add Event</button>
+        <button id="loadEventsBtn" class="btn">Load JSON</button>
+      </div>
+      <div class="field" style="margin-top: 10px;">
+        <label for="eventsJson">Events JSON</label>
+        <textarea id="eventsJson">{
+  "event1": "as a massive burst of brilliant fireworks erupts across the entire sky &mdash; a dazzling explosion of red, gold, violet, and emerald green light blooming in spectacular fashion, the radiant blast filling the screen completely with cascading sparks and shimmering trails. At the peak of the explosion, the fireworks coalesce into a luminous tear in the fabric of reality, a glowing fissure splitting open through the heart of the brilliance, crackling with chromatic energy along its jagged edges. As the fireworks disperse and the sparks fade away in spiraling ribbons of smoke, the dragon emerges through the closing rift to find itself before a sprawling expanse of ancient castles &mdash; towering stone spires, weathered battlements, and gothic arches stretching across the horizon, their silhouettes rising majestically against a new sky. The colorful afterglow of the dimensional passage still dances across the dragon's enormous outstretched wings and glints off its obsidian-black armored scales, faint embers from the dissipating rift lingering in the air around the beast as it soars toward the castle landscape ahead.",
+  "event2": "From this open mouth, a tightly collimated cylindrical column of brilliant fire shoots horizontally forward along the dragon's flight axis, parallel to the ground far below &mdash; NOT angled upward into the sky &mdash; projecting straight into the far distance like a focused beam, a narrow cohesive pillar of flame that maintains a consistent diameter along its entire length, NOT a fan, cone, or diffuse spray. The fire column is white-hot at the core with blazing orange and gold edges. The dragon's obsidian-black scales glow molten-red along its neck and back from the sheer radiance. Sparks and glowing embers cascade outward. A dense forest far below is bathed in intense flickering firelight."
+}</textarea>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="toolbar" style="justify-content: space-between; margin-bottom: 14px;">
+        <div class="status-row">
+          <span id="sessionStatus" class="badge">session idle</span>
+          <span id="frameStatus" class="badge">frames 0</span>
+          <span id="timingStatus" class="badge">timing --</span>
+        </div>
+        <div class="button-row">
+          <button id="startBtn" class="btn primary">Start</button>
+          <button id="stopBtn" class="btn danger">Stop</button>
+          <button id="clearBtn" class="btn">Clear Log</button>
+        </div>
+      </div>
+
+      <div class="preview-wrap">
+        <div class="preview-shell">
+          <canvas id="preview" width="1664" height="960"></canvas>
+        </div>
+      </div>
+
+      <h2>Control</h2>
+      <div class="key-grid">
+        <button class="btn key-btn" data-key="w">W</button>
+        <button class="btn key-btn" data-key="a">A</button>
+        <button class="btn key-btn" data-key="s">S</button>
+        <button class="btn key-btn" data-key="d">D</button>
+        <button class="btn key-btn" data-key="i">I</button>
+        <button class="btn key-btn" data-key="j">J</button>
+        <button class="btn key-btn" data-key="k">K</button>
+        <button class="btn key-btn" data-key="l">L</button>
+      </div>
+
+      <h2>Event Triggers</h2>
+      <div id="eventButtons" class="event-buttons"></div>
+
+      <h2>Log</h2>
+      <div id="log" class="log"></div>
+    </main>
+  </div>
+
+  <script>
+    const els = {
+      wsUrl: document.getElementById("wsUrl"),
+      imagePath: document.getElementById("imagePath"),
+      prompt: document.getElementById("prompt"),
+      staticPrompt: document.getElementById("staticPrompt"),
+      dynamicPrompt: document.getElementById("dynamicPrompt"),
+      width: document.getElementById("width"),
+      height: document.getElementById("height"),
+      fps: document.getElementById("fps"),
+      numFrames: document.getElementById("numFrames"),
+      seed: document.getElementById("seed"),
+      eventChunk: document.getElementById("eventChunk"),
+      eventMode: document.getElementById("eventMode"),
+      upscalingScale: document.getElementById("upscalingScale"),
+      previewTransport: document.getElementById("previewTransport"),
+      previewJpegQuality: document.getElementById("previewJpegQuality"),
+      enableUpscaling: document.getElementById("enableUpscaling"),
+      debugSaveVideo: document.getElementById("debugSaveVideo"),
+      debugVideoPath: document.getElementById("debugVideoPath"),
+      eventRows: document.getElementById("eventRows"),
+      eventsJson: document.getElementById("eventsJson"),
+      eventButtons: document.getElementById("eventButtons"),
+      socketStatus: document.getElementById("socketStatus"),
+      sessionStatus: document.getElementById("sessionStatus"),
+      frameStatus: document.getElementById("frameStatus"),
+      timingStatus: document.getElementById("timingStatus"),
+      startBtn: document.getElementById("startBtn"),
+      stopBtn: document.getElementById("stopBtn"),
+      addEventBtn: document.getElementById("addEventBtn"),
+      loadEventsBtn: document.getElementById("loadEventsBtn"),
+      clearBtn: document.getElementById("clearBtn"),
+      preview: document.getElementById("preview"),
+      log: document.getElementById("log"),
+    };
+
+    let ws = null;
+    let outputWidth = numberValue(els.width, 1664);
+    let outputHeight = numberValue(els.height, 960);
+    let frameCount = 0;
+    const activeKeys = new Set();
+    const keyNames = new Set(["w", "a", "s", "d", "i", "j", "k", "l"]);
+    const frameQueue = [];
+    const TARGET_QUEUE_FRAMES = 32;
+    const WARMUP_TARGET_FRAMES = 12;
+    const WARMUP_MAX_WAIT_MS = 350;
+    const MIN_DISPLAY_FPS = 12;
+    const MAX_DISPLAY_FPS = 90;
+    const MIN_ADAPTIVE_FPS_FACTOR = 0.85;
+    const MAX_ADAPTIVE_FPS_FACTOR = 2.8;
+    const ADAPTIVE_QUEUE_GAIN = 0.02;
+    let displayRafId = null;
+    let displayWarmed = false;
+    let displayWarmupStartedAtMs = 0;
+    let lastDisplayWallMs = 0;
+    let sourceDisplayFps = 32;
+    let displayFps = 32;
+    let lastPacketArrivalMs = 0;
+    let adaptiveFpsReady = false;
+    let lastQueuedMainChunkKey = "";
+    let videoDecoder = null;
+    let videoDecoderState = "unconfigured";
+    let videoChunkSeq = 0;
+    const pendingVideoFrames = new Map();
+    const useCreateImageBitmap = typeof createImageBitmap === "function";
+
+    function defaultWsUrl() {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const proxyMatch = window.location.pathname.match(/^\/proxy\/([^/:]+):(\d+)(?:\/|$)/);
+      if (proxyMatch) {
+        return `${protocol}//${window.location.host}/proxy/${proxyMatch[1]}:8043/v1/lingbot/realtime`;
+      }
+      const host = window.location.hostname || "127.0.0.1";
+      const port = window.location.port && window.location.port !== "8043" ? "8043" : window.location.port;
+      const portPart = port ? `:${port}` : "";
+      return `${protocol}//${host}${portPart}/v1/lingbot/realtime`;
+    }
+
+    function numberValue(input, fallback) {
+      const value = Number.parseInt(input.value, 10);
+      return Number.isFinite(value) && value > 0 ? value : fallback;
+    }
+
+    function optionalText(input) {
+      const value = input.value.trim();
+      return value ? value : undefined;
+    }
+
+    function setBadge(el, text, tone) {
+      el.textContent = text;
+      el.className = `badge${tone ? ` ${tone}` : ""}`;
+    }
+
+    function logLine(message) {
+      const time = new Date().toLocaleTimeString();
+      els.log.textContent += `[${time}] ${message}\n`;
+      const lines = els.log.textContent.split("\n");
+      if (lines.length > 420) {
+        els.log.textContent = lines.slice(lines.length - 420).join("\n");
+      }
+      els.log.scrollTop = els.log.scrollHeight;
+    }
+
+    function parseEventsJson() {
+      const raw = els.eventsJson.value.trim();
+      if (!raw) {
+        return {};
+      }
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("events JSON must be an object");
+      }
+      return parsed;
+    }
+
+    function eventRowsToObject() {
+      const events = {};
+      for (const row of els.eventRows.querySelectorAll("tr")) {
+        const id = row.querySelector(".event-id").value.trim();
+        const prompt = row.querySelector(".event-prompt").value.trim();
+        if (id && prompt) {
+          events[id] = prompt;
+        }
+      }
+      return events;
+    }
+
+    function syncEventsJsonFromRows() {
+      els.eventsJson.value = JSON.stringify(eventRowsToObject(), null, 2);
+      renderEventButtons();
+    }
+
+    function addEventRow(id = "", prompt = "") {
+      const row = document.createElement("tr");
+      row.innerHTML = `
+        <td><input class="event-id mono" value="${escapeAttr(id)}"></td>
+        <td><textarea class="event-prompt">${escapeText(prompt)}</textarea></td>
+        <td><button class="btn danger" type="button">Delete</button></td>
+      `;
+      row.querySelector(".event-id").addEventListener("input", syncEventsJsonFromRows);
+      row.querySelector(".event-prompt").addEventListener("input", syncEventsJsonFromRows);
+      row.querySelector("button").addEventListener("click", () => {
+        row.remove();
+        syncEventsJsonFromRows();
+      });
+      els.eventRows.appendChild(row);
+      syncEventsJsonFromRows();
+    }
+
+    function escapeAttr(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }
+
+    function escapeText(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }
+
+    function loadEventsFromJson() {
+      const events = parseEventsJson();
+      els.eventRows.textContent = "";
+      for (const [id, prompt] of Object.entries(events)) {
+        addEventRow(id, String(prompt));
+      }
+      renderEventButtons();
+    }
+
+    function renderEventButtons() {
+      const events = eventRowsToObject();
+      els.eventButtons.textContent = "";
+      for (const id of Object.keys(events)) {
+        const button = document.createElement("button");
+        button.className = "btn secondary";
+        button.type = "button";
+        button.textContent = id;
+        button.addEventListener("click", () => sendControl({ type: "CONTROL", event: id }));
+        els.eventButtons.appendChild(button);
+      }
+      if (!Object.keys(events).length) {
+        const badge = document.createElement("span");
+        badge.className = "badge";
+        badge.textContent = "events 0";
+        els.eventButtons.appendChild(badge);
+      }
+    }
+
+    function buildStartPayload() {
+      const payload = {
+        type: "START",
+        stream_id: `webui_${Date.now()}`,
+        prompt: els.prompt.value.trim(),
+        image_path: els.imagePath.value.trim(),
+        width: numberValue(els.width, 1664),
+        height: numberValue(els.height, 960),
+        fps: numberValue(els.fps, 16),
+        num_frames: numberValue(els.numFrames, 117),
+        seed: numberValue(els.seed, 42),
+        events: eventRowsToObject(),
+        event_mode: els.eventMode.value,
+        event_chunk: numberValue(els.eventChunk, 4),
+        preview_transport: els.previewTransport.value,
+        preview_jpeg_quality: numberValue(els.previewJpegQuality, 85),
+        enable_upscaling: els.enableUpscaling.checked,
+        upscaling_scale: numberValue(els.upscalingScale, 2),
+        debug_save_video: els.debugSaveVideo.checked,
+      };
+
+      const staticPrompt = optionalText(els.staticPrompt);
+      const dynamicPrompt = optionalText(els.dynamicPrompt);
+      const debugVideoPath = optionalText(els.debugVideoPath);
+      if (staticPrompt) {
+        payload.movement_static = staticPrompt;
+      }
+      if (dynamicPrompt) {
+        payload.movement_dynamic = dynamicPrompt;
+      }
+      if (debugVideoPath) {
+        payload.debug_video_path = debugVideoPath;
+      }
+      return payload;
+    }
+
+    function connectWebSocket(onOpen) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        if (onOpen) {
+          onOpen();
+        }
+        return;
+      }
+
+      const url = els.wsUrl.value.trim();
+      ws = new WebSocket(url);
+      ws.binaryType = "arraybuffer";
+      setBadge(els.socketStatus, "connecting", "warn");
+      logLine(`CONNECT ${url}`);
+
+      ws.onopen = () => {
+        setBadge(els.socketStatus, "connected", "ok");
+        logLine("CONNECTED");
+        if (onOpen) {
+          onOpen();
+        }
+      };
+
+      ws.onclose = event => {
+        setBadge(els.socketStatus, "closed", "");
+        setBadge(els.sessionStatus, "session idle", "");
+        resetPlaybackQueue();
+        activeKeys.clear();
+        renderKeyState();
+        logLine(`CLOSED code=${event.code} reason=${event.reason || ""}`);
+      };
+
+      ws.onerror = () => {
+        setBadge(els.socketStatus, "error", "error");
+        logLine("SOCKET ERROR");
+      };
+
+      ws.onmessage = event => {
+        if (typeof event.data === "string") {
+          handleJsonMessage(event.data);
+        } else if (event.data instanceof Blob) {
+          event.data.arrayBuffer().then(renderBinaryFrames);
+        } else {
+          renderBinaryFrames(event.data);
+        }
+      };
+    }
+
+    function sendJson(payload) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        logLine("SEND skipped: socket is not open");
+        return false;
+      }
+      ws.send(JSON.stringify(payload));
+      return true;
+    }
+
+    function startSession() {
+      try {
+        syncEventsJsonFromRows();
+        const payload = buildStartPayload();
+        outputWidth = payload.width;
+        outputHeight = payload.height;
+        frameCount = 0;
+        configureCanvas(outputWidth, outputHeight);
+        resetPlaybackQueue();
+        setBadge(els.frameStatus, "frames 0", "");
+        connectWebSocket(() => {
+          sendJson(payload);
+          setBadge(els.sessionStatus, "starting", "warn");
+          logLine(`START ${payload.width}x${payload.height} seed=${payload.seed} preview=${payload.preview_transport}`);
+        });
+      } catch (error) {
+        setBadge(els.sessionStatus, "invalid input", "error");
+        logLine(`ERROR ${error.message}`);
+      }
+    }
+
+    function stopSession() {
+      if (sendJson({ type: "STOP" })) {
+        setBadge(els.sessionStatus, "stopping", "warn");
+        logLine("STOP");
+      }
+    }
+
+    function sendControl(payload) {
+      if (sendJson(payload)) {
+        logLine(`CONTROL ${JSON.stringify(payload)}`);
+      }
+    }
+
+    function handleJsonMessage(raw) {
+      let message;
+      try {
+        message = JSON.parse(raw);
+      } catch {
+        logLine(`TEXT ${raw}`);
+        return;
+      }
+
+      const type = String(message.type || "").toUpperCase();
+      if (type === "STARTED") {
+        outputWidth = Number(message.output_width || message.width || outputWidth);
+        outputHeight = Number(message.output_height || message.height || outputHeight);
+        configureCanvas(outputWidth, outputHeight);
+        const baseFps = Number(message.fps || els.fps.value || 16);
+        const rifeExp = Number(message.rife_exp || 0);
+        const rifeMultiplier = message.enable_rife ? Math.pow(2, Math.max(0, rifeExp)) : 1;
+        sourceDisplayFps = Math.max(
+          MIN_DISPLAY_FPS,
+          Math.min(MAX_DISPLAY_FPS, baseFps * rifeMultiplier),
+        );
+        displayFps = sourceDisplayFps;
+        adaptiveFpsReady = false;
+        setBadge(els.sessionStatus, "running", "ok");
+        logLine(`STARTED output=${outputWidth}x${outputHeight} model=${message.model_width}x${message.model_height} preview=${message.preview_transport || "raw"}`);
+        if (message.debug_video_path) {
+          logLine(`DEBUG_VIDEO ${message.debug_video_path}`);
+        }
+        return;
+      }
+
+      if (type === "TIMING") {
+        const ms = Number(message.chunk_time_ms || 0);
+        const chunk = message.chunk_idx ?? "--";
+        const transport = message.preview_transport || "raw";
+        setBadge(els.timingStatus, `chunk ${chunk} ${ms.toFixed(1)} ms`, "");
+        logLine(`TIMING chunk=${chunk} frames=${message.frames} ms=${ms.toFixed(1)} preview=${transport} bytes=${message.payload_bytes || 0}`);
+        return;
+      }
+
+      if (type === "ERROR") {
+        setBadge(els.sessionStatus, "error", "error");
+        logLine(`ERROR ${message.message || raw}`);
+        return;
+      }
+
+      if (type === "FINISH") {
+        setBadge(els.sessionStatus, "finished", "ok");
+        logLine("FINISH");
+        return;
+      }
+
+      logLine(`MESSAGE ${raw}`);
+    }
+
+    function configureCanvas(width, height) {
+      if (els.preview.width !== width || els.preview.height !== height) {
+        els.preview.width = width;
+        els.preview.height = height;
+      }
+    }
+
+    function releaseQueueRecord(rec) {
+      if (!rec) {
+        return;
+      }
+      if (rec.bitmap) {
+        try { rec.bitmap.close && rec.bitmap.close(); } catch (_) {}
+        rec.bitmap = null;
+      }
+      if (rec.bitmapPromise) {
+        rec.bitmapPromise.then(bitmap => {
+          try { bitmap && bitmap.close && bitmap.close(); } catch (_) {}
+        }).catch(() => {});
+        rec.bitmapPromise = null;
+      }
+    }
+
+    function resetVideoDecoder() {
+      if (videoDecoder) {
+        try { videoDecoder.reset(); } catch (_) {}
+      }
+      pendingVideoFrames.forEach(slot => {
+        if (slot && typeof slot.resolve === "function") {
+          slot.resolve(null);
+        }
+      });
+      pendingVideoFrames.clear();
+      videoDecoderState = "unconfigured";
+    }
+
+    function resetPlaybackQueue() {
+      for (const rec of frameQueue) {
+        releaseQueueRecord(rec);
+      }
+      frameQueue.length = 0;
+      if (displayRafId !== null) {
+        try { cancelAnimationFrame(displayRafId); } catch (_) {}
+        displayRafId = null;
+      }
+      resetVideoDecoder();
+      displayWarmed = false;
+      displayWarmupStartedAtMs = 0;
+      lastDisplayWallMs = 0;
+      lastQueuedMainChunkKey = "";
+      lastPacketArrivalMs = 0;
+      adaptiveFpsReady = false;
+      displayFps = sourceDisplayFps;
+    }
+
+    function scheduleDisplayFlush() {
+      if (displayRafId !== null) {
+        return;
+      }
+      displayRafId = requestAnimationFrame(displayLoop);
+    }
+
+    function drawRecord(rec) {
+      const ctx = els.preview.getContext("2d", { alpha: false });
+      if (rec.imageData) {
+        ctx.putImageData(rec.imageData, 0, 0);
+        return true;
+      }
+      if (rec.bitmap) {
+        ctx.drawImage(rec.bitmap, 0, 0, els.preview.width, els.preview.height);
+        releaseQueueRecord(rec);
+        return true;
+      }
+      if (rec.jpegBytes) {
+        const blob = new Blob([rec.jpegBytes], { type: "image/jpeg" });
+        const image = new Image();
+        image.onload = () => {
+          ctx.drawImage(image, 0, 0, els.preview.width, els.preview.height);
+        };
+        image.src = URL.createObjectURL(blob);
+        return true;
+      }
+      return false;
+    }
+
+    function displayLoop(tMs) {
+      displayRafId = null;
+      if (frameQueue.length === 0) {
+        return;
+      }
+
+      if (!displayWarmed) {
+        if (!displayWarmupStartedAtMs) {
+          displayWarmupStartedAtMs = tMs;
+        }
+        const waitedMs = tMs - displayWarmupStartedAtMs;
+        if (frameQueue.length < WARMUP_TARGET_FRAMES && waitedMs < WARMUP_MAX_WAIT_MS) {
+          scheduleDisplayFlush();
+          return;
+        }
+        displayWarmed = true;
+      }
+
+      updateDisplayFpsFromBuffer();
+      const intervalMs = 1000 / Math.max(1, displayFps);
+      if (
+        lastDisplayWallMs > 0 &&
+        tMs - lastDisplayWallMs < intervalMs
+      ) {
+        scheduleDisplayFlush();
+        return;
+      }
+
+      const rec = frameQueue.shift();
+      if (rec && rec.bitmapPromise && !rec.bitmap) {
+        rec.bitmapPromise.then(() => {
+          if (rec.bitmap) {
+            frameQueue.unshift(rec);
+          } else {
+            releaseQueueRecord(rec);
+          }
+          scheduleDisplayFlush();
+        }).catch(() => {
+          releaseQueueRecord(rec);
+          scheduleDisplayFlush();
+        });
+        return;
+      }
+
+      if (drawRecord(rec)) {
+        lastDisplayWallMs = tMs;
+        frameCount++;
+        setBadge(els.frameStatus, `frames ${frameCount} q${frameQueue.length} ${displayFps.toFixed(1)}fps`, "ok");
+      } else {
+        releaseQueueRecord(rec);
+      }
+
+      if (frameQueue.length > 0) {
+        scheduleDisplayFlush();
+      }
+    }
+
+    function queueRecord(rec) {
+      frameQueue.push(rec);
+      scheduleDisplayFlush();
+    }
+
+    function markFirstPacketOfMainChunk(parsed) {
+      const key = `${parsed.eval_idx}:${parsed.chunk_id}`;
+      const first = key !== lastQueuedMainChunkKey || parsed.chunk_index === 0;
+      lastQueuedMainChunkKey = key;
+      return first;
+    }
+
+    function updateDisplayFpsFromBuffer() {
+      const depth = frameQueue.length;
+      const error = depth - TARGET_QUEUE_FRAMES;
+      const factor = Math.max(
+        MIN_ADAPTIVE_FPS_FACTOR,
+        Math.min(MAX_ADAPTIVE_FPS_FACTOR, 1 + error * ADAPTIVE_QUEUE_GAIN),
+      );
+      const targetFps = Math.max(
+        MIN_DISPLAY_FPS,
+        Math.min(MAX_DISPLAY_FPS, sourceDisplayFps * factor),
+      );
+      displayFps = adaptiveFpsReady
+        ? displayFps * 0.85 + targetFps * 0.15
+        : targetFps;
+      adaptiveFpsReady = true;
+    }
+
+    function notePacketPacing(_frameCount) {
+      lastPacketArrivalMs = performance.now();
+    }
+
+    function parseCtk1ChunkPacket(ab) {
+      if (!ab || ab.byteLength < 26) {
+        return null;
+      }
+      const dv = new DataView(ab);
+      if (dv.getUint8(0) !== 67 || dv.getUint8(1) !== 84 || dv.getUint8(2) !== 75 || dv.getUint8(3) !== 49) {
+        return null;
+      }
+      let o = 4;
+      const version = dv.getUint8(o++);
+      if (version !== 1) {
+        return null;
+      }
+      o++;
+      const eval_idx = dv.getInt32(o, true); o += 4;
+      const chunk_id = dv.getInt32(o, true); o += 4;
+      let chunk_index = dv.getUint32(o, true); o += 4;
+      if (chunk_index === 0xFFFFFFFF) {
+        chunk_index = null;
+      }
+      let chunk_total = dv.getUint32(o, true); o += 4;
+      if (chunk_total === 0xFFFFFFFF) {
+        chunk_total = null;
+      }
+      const frame_count = dv.getUint16(o, true); o += 2;
+      const prog_len = dv.getUint16(o, true); o += 2;
+      if (o + prog_len > ab.byteLength) {
+        return null;
+      }
+      let chunk_progress = "";
+      if (prog_len > 0) {
+        chunk_progress = new TextDecoder("utf-8").decode(new Uint8Array(ab, o, prog_len));
+        o += prog_len;
+      }
+      const frames = [];
+      for (let i = 0; i < frame_count; i++) {
+        if (o + 6 > ab.byteLength) {
+          return null;
+        }
+        const frame = dv.getUint16(o, true); o += 2;
+        const jpeg_len = dv.getUint32(o, true); o += 4;
+        if (o + jpeg_len > ab.byteLength) {
+          return null;
+        }
+        const jpeg = new Uint8Array(ab.slice(o, o + jpeg_len));
+        o += jpeg_len;
+        frames.push({ frame, jpeg });
+      }
+      return { eval_idx, chunk_id, chunk_index, chunk_total, chunk_progress, frames };
+    }
+
+    function ingestCtk1ChunkFrames(parsed) {
+      notePacketPacing(parsed.frames.length);
+      const firstPacketOfChunk = markFirstPacketOfMainChunk(parsed);
+      for (let i = 0; i < parsed.frames.length; i++) {
+        const jpegBytes = parsed.frames[i].jpeg;
+        const rec = {
+          jpegBytes,
+          bitmap: null,
+          bitmapPromise: null,
+          firstOfChunk: firstPacketOfChunk && i === 0,
+          meta: parsed.frames[i],
+        };
+        if (useCreateImageBitmap) {
+          try {
+            const blob = new Blob([jpegBytes], { type: "image/jpeg" });
+            rec.bitmapPromise = createImageBitmap(blob)
+              .then(bitmap => {
+                rec.bitmap = bitmap;
+                rec.bitmapPromise = null;
+                return bitmap;
+              })
+              .catch(() => {
+                rec.bitmap = null;
+                rec.bitmapPromise = null;
+                return null;
+              });
+          } catch (_) {
+            rec.bitmapPromise = null;
+          }
+        }
+        queueRecord(rec);
+      }
+    }
+
+    function makeVideoDecoder() {
+      if (typeof VideoDecoder === "undefined") {
+        videoDecoderState = "unsupported";
+        logLine("CTV1 unsupported: WebCodecs VideoDecoder is not available");
+        return null;
+      }
+      return new VideoDecoder({
+        output: videoFrame => {
+          const slot = pendingVideoFrames.get(videoFrame.timestamp);
+          if (!slot) {
+            try { videoFrame.close(); } catch (_) {}
+            return;
+          }
+          pendingVideoFrames.delete(videoFrame.timestamp);
+          slot.rec.bitmap = videoFrame;
+          slot.rec.bitmapPromise = null;
+          slot.resolve(videoFrame);
+        },
+        error: error => {
+          videoDecoderState = "errored";
+          logLine(`CTV1 decoder error ${error.message || error}`);
+        },
+      });
+    }
+
+    function ensureVideoDecoderConfigured() {
+      if (videoDecoderState === "unsupported") {
+        return false;
+      }
+      if (!videoDecoder) {
+        videoDecoder = makeVideoDecoder();
+        if (!videoDecoder) {
+          return false;
+        }
+      }
+      if (videoDecoderState === "configured") {
+        return true;
+      }
+      try {
+        videoDecoder.configure({
+          codec: "avc1.640028",
+          avc: { format: "annexb" },
+          optimizeForLatency: true,
+          hardwareAcceleration: "prefer-hardware",
+          codedWidth: outputWidth,
+          codedHeight: outputHeight,
+        });
+        videoDecoderState = "configured";
+        return true;
+      } catch (error) {
+        videoDecoderState = "errored";
+        logLine(`CTV1 configure failed ${error.message || error}`);
+        return false;
+      }
+    }
+
+    function parseCtv1ChunkPacket(ab) {
+      if (!ab || ab.byteLength < 26) {
+        return null;
+      }
+      const dv = new DataView(ab);
+      if (dv.getUint8(0) !== 67 || dv.getUint8(1) !== 84 || dv.getUint8(2) !== 86 || dv.getUint8(3) !== 49) {
+        return null;
+      }
+      let o = 4;
+      const version = dv.getUint8(o++);
+      if (version !== 1) {
+        return null;
+      }
+      o++;
+      const eval_idx = dv.getInt32(o, true); o += 4;
+      const chunk_id = dv.getInt32(o, true); o += 4;
+      let chunk_index = dv.getUint32(o, true); o += 4;
+      if (chunk_index === 0xFFFFFFFF) {
+        chunk_index = null;
+      }
+      let chunk_total = dv.getUint32(o, true); o += 4;
+      if (chunk_total === 0xFFFFFFFF) {
+        chunk_total = null;
+      }
+      const frame_count = dv.getUint16(o, true); o += 2;
+      const prog_len = dv.getUint16(o, true); o += 2;
+      if (o + prog_len > ab.byteLength) {
+        return null;
+      }
+      let chunk_progress = "";
+      if (prog_len > 0) {
+        chunk_progress = new TextDecoder("utf-8").decode(new Uint8Array(ab, o, prog_len));
+        o += prog_len;
+      }
+      const frames = [];
+      for (let i = 0; i < frame_count; i++) {
+        if (o + 10 > ab.byteLength) {
+          return null;
+        }
+        const frame = dv.getUint16(o, true); o += 2;
+        const nal_len = dv.getUint32(o, true); o += 4;
+        const flags = dv.getUint8(o); o += 4;
+        if (o + nal_len > ab.byteLength) {
+          return null;
+        }
+        const nal = new Uint8Array(ab.slice(o, o + nal_len));
+        o += nal_len;
+        frames.push({ frame, nal, is_key: (flags & 1) !== 0 });
+      }
+      return { eval_idx, chunk_id, chunk_index, chunk_total, chunk_progress, frames };
+    }
+
+    function ingestCtv1ChunkFrames(parsed) {
+      if (!ensureVideoDecoderConfigured()) {
+        return;
+      }
+      notePacketPacing(parsed.frames.length);
+      const firstPacketOfChunk = markFirstPacketOfMainChunk(parsed);
+      for (let i = 0; i < parsed.frames.length; i++) {
+        const item = parsed.frames[i];
+        videoChunkSeq++;
+        const timestamp = videoChunkSeq;
+        const rec = {
+          jpegBytes: null,
+          bitmap: null,
+          bitmapPromise: null,
+          firstOfChunk: firstPacketOfChunk && i === 0,
+          meta: item,
+        };
+        rec.bitmapPromise = new Promise(resolve => {
+          pendingVideoFrames.set(timestamp, { resolve, rec });
+        });
+        try {
+          videoDecoder.decode(new EncodedVideoChunk({
+            type: item.is_key ? "key" : "delta",
+            timestamp,
+            data: item.nal,
+          }));
+          queueRecord(rec);
+        } catch (error) {
+          pendingVideoFrames.delete(timestamp);
+          rec.bitmapPromise = null;
+          releaseQueueRecord(rec);
+          logLine(`CTV1 decode submit failed ${error.message || error}`);
+        }
+      }
+    }
+
+    function renderRawRgbFrames(ab) {
+      const bytesPerFrame = outputWidth * outputHeight * 3;
+      if (!bytesPerFrame || ab.byteLength < bytesPerFrame) {
+        logLine(`FRAME skipped bytes=${ab.byteLength}`);
+        return;
+      }
+      const count = Math.floor(ab.byteLength / bytesPerFrame);
+      notePacketPacing(count);
+      const ctx = els.preview.getContext("2d", { alpha: false });
+      for (let frameIdx = 0; frameIdx < count; frameIdx++) {
+        const offset = frameIdx * bytesPerFrame;
+        const rgb = new Uint8Array(ab, offset, bytesPerFrame);
+        const image = ctx.createImageData(outputWidth, outputHeight);
+        const rgba = image.data;
+        for (let i = 0, j = 0; i < rgb.length; i += 3, j += 4) {
+          rgba[j] = rgb[i];
+          rgba[j + 1] = rgb[i + 1];
+          rgba[j + 2] = rgb[i + 2];
+          rgba[j + 3] = 255;
+        }
+        queueRecord({
+          imageData: image,
+          bitmap: null,
+          bitmapPromise: null,
+          firstOfChunk: frameIdx === 0,
+          meta: { frame: frameIdx },
+        });
+      }
+    }
+
+    function renderBinaryFrames(buffer) {
+      const ab = buffer instanceof ArrayBuffer
+        ? buffer
+        : buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+      if (!ab || ab.byteLength < 4) {
+        logLine(`FRAME skipped bytes=${ab ? ab.byteLength : 0}`);
+        return;
+      }
+
+      const dv = new DataView(ab);
+      const m0 = dv.getUint8(0);
+      const m1 = dv.getUint8(1);
+      const m2 = dv.getUint8(2);
+      const m3 = dv.getUint8(3);
+      if (m0 === 67 && m1 === 84 && m2 === 75 && m3 === 49) {
+        const parsed = parseCtk1ChunkPacket(ab);
+        if (parsed) {
+          ingestCtk1ChunkFrames(parsed);
+        }
+        return;
+      }
+      if (m0 === 67 && m1 === 84 && m2 === 86 && m3 === 49) {
+        const parsed = parseCtv1ChunkPacket(ab);
+        if (parsed) {
+          ingestCtv1ChunkFrames(parsed);
+        }
+        return;
+      }
+
+      renderRawRgbFrames(ab);
+    }
+
+    function isTextInput(target) {
+      const tag = target && target.tagName ? target.tagName.toUpperCase() : "";
+      return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable;
+    }
+
+    function setKey(key, action) {
+      key = String(key || "").toLowerCase();
+      if (!keyNames.has(key)) {
+        return;
+      }
+      if (action === "down") {
+        if (activeKeys.has(key)) {
+          return;
+        }
+        activeKeys.add(key);
+      } else {
+        if (!activeKeys.has(key)) {
+          return;
+        }
+        activeKeys.delete(key);
+      }
+      renderKeyState();
+      sendControl({ type: "CONTROL", key, action });
+    }
+
+    function renderKeyState() {
+      document.querySelectorAll(".key-btn").forEach(button => {
+        const key = button.dataset.key;
+        button.classList.toggle("active", activeKeys.has(key));
+      });
+    }
+
+    function initKeys() {
+      document.querySelectorAll(".key-btn").forEach(button => {
+        const key = button.dataset.key;
+        button.addEventListener("pointerdown", event => {
+          event.preventDefault();
+          button.setPointerCapture(event.pointerId);
+          setKey(key, "down");
+        });
+        for (const eventName of ["pointerup", "pointerleave", "pointercancel"]) {
+          button.addEventListener(eventName, () => setKey(key, "up"));
+        }
+      });
+
+      window.addEventListener("keydown", event => {
+        if (isTextInput(event.target)) {
+          return;
+        }
+        const key = event.key.toLowerCase();
+        if (keyNames.has(key)) {
+          event.preventDefault();
+          setKey(key, "down");
+        }
+      });
+
+      window.addEventListener("keyup", event => {
+        if (isTextInput(event.target)) {
+          return;
+        }
+        const key = event.key.toLowerCase();
+        if (keyNames.has(key)) {
+          event.preventDefault();
+          setKey(key, "up");
+        }
+      });
+    }
+
+    function init() {
+      els.wsUrl.value = defaultWsUrl();
+      els.startBtn.addEventListener("click", startSession);
+      els.stopBtn.addEventListener("click", stopSession);
+      els.clearBtn.addEventListener("click", () => { els.log.textContent = ""; });
+      els.addEventBtn.addEventListener("click", () => addEventRow(`event${els.eventRows.children.length + 1}`, ""));
+      els.loadEventsBtn.addEventListener("click", () => {
+        try {
+          loadEventsFromJson();
+          logLine("EVENTS loaded");
+        } catch (error) {
+          logLine(`ERROR ${error.message}`);
+        }
+      });
+      loadEventsFromJson();
+      configureCanvas(outputWidth, outputHeight);
+      initKeys();
+    }
+
+    init();
+  </script>
+</body>
+</html>
