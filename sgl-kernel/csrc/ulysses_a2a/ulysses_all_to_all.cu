@@ -21,6 +21,8 @@ static_assert(sizeof(void*) == sizeof(fptr_t));
 
 namespace sglang {
 
+constexpr int kUlyssesA2AThreads = 256;
+
 class UlyssesA2A {
  public:
   int rank_;
@@ -108,7 +110,7 @@ ulysses_a2a_move(const T* __restrict__ local_in, RankData out_ptrs, int rank, in
 }
 
 template <typename T, int NGPUS>
-__global__ void __launch_bounds__(kDefaultThreads, 1) ulysses_a2a_push_kernel(
+__global__ void __launch_bounds__(kUlyssesA2AThreads, 1) ulysses_a2a_push_kernel(
     const T* __restrict__ local_in,
     RankData out_ptrs,
     RankSignals sg,
@@ -129,7 +131,7 @@ __global__ void __launch_bounds__(kDefaultThreads, 1) ulysses_a2a_push_kernel(
 }
 
 template <typename T, int NGPUS, int MODE>
-__global__ void __launch_bounds__(kDefaultThreads, 1) ulysses_a2a_tk_style_kernel(
+__global__ void __launch_bounds__(kUlyssesA2AThreads, 1) ulysses_a2a_tk_style_kernel(
     const T* __restrict__ local_in,
     RankData out_ptrs,
     RankSignals sg,
@@ -198,7 +200,7 @@ void ulysses_a2a(
   const int H_local = static_cast<int>(H / W);
   const int64_t num_copy_blocks = B * S_local * W;
   const int blocks = static_cast<int>(std::max<int64_t>(1, std::min<int64_t>(sglang::kMaxBlocks, num_copy_blocks)));
-  const int threads = sglang::kDefaultThreads;
+  const int threads = sglang::kUlyssesA2AThreads;
   const size_t out_bytes = out.numel() * out.element_size();
 
 #define LAUNCH_ULYSSES_A2A(T, NG)                                         \
@@ -282,7 +284,7 @@ void ulysses_a2a_tk(
   const int H_local = static_cast<int>(H / W);
   const int64_t num_rows = B * static_cast<int64_t>(W) * S_local;
   const int blocks = static_cast<int>(std::max<int64_t>(1, std::min<int64_t>(sglang::kMaxBlocks, num_rows)));
-  const int threads = sglang::kDefaultThreads;
+  const int threads = sglang::kUlyssesA2AThreads;
   const size_t out_bytes = out.numel() * out.element_size();
 
 #define LAUNCH_ULYSSES_A2A_TK(T, NG, MD)                                          \
