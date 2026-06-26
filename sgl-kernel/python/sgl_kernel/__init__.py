@@ -106,6 +106,12 @@ from sgl_kernel.top_k import (
     fast_topk_transform_ragged_fused,
     fast_topk_v2,
 )
+from sgl_kernel.ulysses_a2a import (
+    dispose_ulysses_a2a,
+    init_ulysses_a2a,
+    ulysses_a2a,
+    ulysses_a2a_tk,
+)
 from sgl_kernel.version import __version__
 
 if torch.version.hip is not None:
@@ -125,6 +131,7 @@ _DEBUG_EXPORT_NAMES = [
     "copy_to_gpu_no_ce",
     "cutlass_mla_decode",
     "cutlass_mla_get_workspace_size",
+    "dispose_ulysses_a2a",
     "dsv3_fused_a_gemm",
     "dsv3_router_gemm",
     "es_fp8_blockwise_scaled_grouped_mm",
@@ -145,6 +152,7 @@ _DEBUG_EXPORT_NAMES = [
     "gemma_rmsnorm",
     "gptq_gemm",
     "gptq_shuffle",
+    "init_ulysses_a2a",
     "int8_scaled_mm",
     "kimi_k2_moe_fused_gate",
     "merge_state_v2",
@@ -174,6 +182,8 @@ _DEBUG_EXPORT_NAMES = [
     "transfer_kv_per_layer",
     "transfer_kv_per_layer_mla",
     "tree_speculative_sampling_target_only",
+    "ulysses_a2a",
+    "ulysses_a2a_tk",
     "verify_tree_greedy",
     "weak_ref_tensor",
 ]

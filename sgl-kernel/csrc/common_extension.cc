@@ -38,6 +38,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int reg_buffer_sz_bytes) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
 
+  /*
+   * From csrc/ulysses_a2a
+   */
+  m.def("init_ulysses_a2a", &init_ulysses_a2a);
+  m.def("dispose_ulysses_a2a", &dispose_ulysses_a2a);
+  m.def("ulysses_a2a(int fa, Tensor inp, Tensor! out, int B, int S_local, int H, int D, int mode) -> ()");
+  m.impl("ulysses_a2a", torch::kCUDA, &ulysses_a2a);
+  m.def("ulysses_a2a_tk(int fa, Tensor inp, Tensor! out, int B, int S_local, int H, int D, int mode) -> ()");
+  m.impl("ulysses_a2a_tk", torch::kCUDA, &ulysses_a2a_tk);
+
   m.def("mscclpp_generate_unique_id", &mscclpp_generate_unique_id);
   m.def(
       "mscclpp_init_context(Tensor unique_id, int rank, int world_size, Tensor scratch, Tensor put_buffer, "

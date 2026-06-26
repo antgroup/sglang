@@ -431,6 +431,15 @@ class Envs:
     # Set to 1: force enable (even without --enable-deterministic-inference)
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
+    # Use the fused-transpose NVLink-P2P all-to-all for Ulysses sequence parallel
+    # in multimodal diffusion. Opt-in; unsupported shapes/topologies fall back
+    # to the default all_to_all path.
+    SGLANG_ENABLE_ULYSSES_P2P_A2A = EnvBool(False)
+    # Use the coalesced task-index decomposition implementation by default.
+    SGLANG_ENABLE_ULYSSES_P2P_A2A_TK_STYLE = EnvBool(True)
+    # LingBot-side compatibility gates used by existing deployment scripts.
+    LINGBOT_FORCE_P2P = EnvBool(False)
+    LINGBOT_ULYSSES_JIT = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
