@@ -25,6 +25,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _maybe_p2p_all_to_all(x: torch.Tensor, mode: int) -> torch.Tensor | None:
+    """Try the fused-transpose NVLink-P2P all-to-all for head_dim == 2."""
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ulysses_p2p_a2a import (
+        get_ulysses_p2p_a2a,
+    )
+
+    group = get_sp_group().ulysses_group
+    if group is None:
+        return None
+    if x.is_cuda and torch.cuda.is_current_stream_capturing():
+        return None
+
+    mgr = get_ulysses_p2p_a2a(group, x.device)
+    if mgr is None:
+        return None
+    return mgr.all_to_all(x, mode)
+
+
 def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     """
     When tracing the code, the result tensor is not an AsyncCollectiveTensor,
@@ -91,6 +109,11 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+
+    if head_dim == 2:
+        fast = _maybe_p2p_all_to_all(x, mode=0)
+        if fast is not None:
+            return fast
 
     # Move the dimension to be split (h_global) to dim 0 for all_to_all_single
     if head_dim == 1:
@@ -224,6 +247,11 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+
+    if head_dim == 2:
+        fast = _maybe_p2p_all_to_all(x, mode=1)
+        if fast is not None:
+            return fast
 
     # Move the dimension to be split (s_global) to dim 0 for all_to_all_single
     if head_dim == 1:

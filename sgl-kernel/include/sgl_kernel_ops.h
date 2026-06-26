@@ -101,6 +101,21 @@ void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, 
 #endif
 
 /*
+ * From csrc/ulysses_a2a
+ */
+fptr_t init_ulysses_a2a(
+    const std::vector<fptr_t>& out_ipc_ptrs,
+    const std::vector<fptr_t>& signal_ipc_ptrs,
+    int64_t rank,
+    int64_t world_size,
+    bool full_nvlink);
+void dispose_ulysses_a2a(fptr_t _fa);
+void ulysses_a2a(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int64_t B, int64_t S_local, int64_t H, int64_t D, int64_t mode);
+void ulysses_a2a_tk(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int64_t B, int64_t S_local, int64_t H, int64_t D, int64_t mode);
+
+/*
  * From csrc/attention
  */
 void merge_state_v2(
