@@ -186,7 +186,6 @@ option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
-option(SGL_KERNEL_DISABLE_FA3             "Force disable FA3"       OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 
@@ -243,16 +242,11 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND NOT SGL_KERNEL_DISABLE_FA3)
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
     set(SGL_KERNEL_ENABLE_FA3 ON)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
-endif()
-
-if (SGL_KERNEL_DISABLE_FA3)
-    message(STATUS "FA3 disabled by SGL_KERNEL_DISABLE_FA3")
-    set(SGL_KERNEL_ENABLE_FA3 OFF)
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
