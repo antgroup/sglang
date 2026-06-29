@@ -213,7 +213,7 @@ async def edits(
     enable_teacache: Optional[bool] = Form(False),
     enable_upscaling: Optional[bool] = Form(False),
     upscaling_model_path: Optional[str] = Form(None),
-    upscaling_scale: Optional[int] = Form(4),
+    upscaling_scale: Optional[float] = Form(4.0),
     num_frames: int = Form(1),
 ):
     request_id = generate_request_id()

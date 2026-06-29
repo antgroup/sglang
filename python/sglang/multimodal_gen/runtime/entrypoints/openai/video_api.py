@@ -189,7 +189,7 @@ async def create_video(
     frame_interpolation_model_path: Optional[str] = Form(None),
     enable_upscaling: Optional[bool] = Form(False),
     upscaling_model_path: Optional[str] = Form(None),
-    upscaling_scale: Optional[int] = Form(4),
+    upscaling_scale: Optional[float] = Form(4.0),
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     extra_body: Optional[str] = Form(None),

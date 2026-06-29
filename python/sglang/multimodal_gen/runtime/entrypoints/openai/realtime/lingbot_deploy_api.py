@@ -58,7 +58,7 @@ DEFAULT_MOVE_SPEED = 0.05
 DEFAULT_ROTATE_SPEED_DEG_IK = 4.0
 DEFAULT_ROTATE_SPEED_DEG_JL = 6.0
 DEFAULT_ENABLE_UPSCALING = True
-DEFAULT_UPSCALING_SCALE = 2
+DEFAULT_UPSCALING_SCALE = 2.0
 DEFAULT_UPSCALING_MODEL_PATH = (
     "/home/admin/realesr-general-x4v3/realesr-general-x4v3.pth"
 )
@@ -86,13 +86,13 @@ STARTUP_WARMUP_SIZES = os.environ.get("SGLANG_LINGBOT_STARTUP_WARMUP_SIZES")
 STARTUP_WARMUP_WIDTH = int(
     os.environ.get(
         "SGLANG_LINGBOT_STARTUP_WARMUP_WIDTH",
-        str(DEFAULT_WIDTH * DEFAULT_UPSCALING_SCALE),
+        str(int(DEFAULT_WIDTH * DEFAULT_UPSCALING_SCALE)),
     )
 )
 STARTUP_WARMUP_HEIGHT = int(
     os.environ.get(
         "SGLANG_LINGBOT_STARTUP_WARMUP_HEIGHT",
-        str(DEFAULT_HEIGHT * DEFAULT_UPSCALING_SCALE),
+        str(int(DEFAULT_HEIGHT * DEFAULT_UPSCALING_SCALE)),
     )
 )
 STARTUP_WARMUP_PROMPT = os.environ.get(
@@ -527,6 +527,28 @@ def _resolve_enable_upscaling(data: dict[str, Any], width: int, height: int) -> 
     return width * height > DEFAULT_WIDTH * DEFAULT_HEIGHT
 
 
+def _same_float(left: float, right: float, *, tol: float = 1e-6) -> bool:
+    return abs(left - right) <= tol
+
+
+def _resolve_upscaling_scale(
+    data: dict[str, Any], output_width: int, output_height: int
+) -> float:
+    if "upscaling_scale" in data:
+        return _parse_float_field(data, "upscaling_scale", DEFAULT_UPSCALING_SCALE)
+
+    for base_width, base_height in (
+        (DEFAULT_WIDTH, DEFAULT_HEIGHT),
+        (DEFAULT_HEIGHT, DEFAULT_WIDTH),
+    ):
+        width_scale = output_width / base_width
+        height_scale = output_height / base_height
+        if width_scale > 0 and _same_float(width_scale, height_scale):
+            return float(width_scale)
+
+    return DEFAULT_UPSCALING_SCALE
+
+
 def _parse_resolution(data: dict[str, Any]) -> tuple[int, int]:
     width = data.get("width")
     height = data.get("height")
@@ -582,7 +604,7 @@ def _build_start_request(
         raise ValueError(f"image_path is not a valid file: {first_frame}")
 
     fps = _parse_int_field(data, "fps", DEFAULT_FPS)
-    upscaling_scale = _parse_int_field(data, "upscaling_scale", DEFAULT_UPSCALING_SCALE)
+    upscaling_scale = _resolve_upscaling_scale(data, output_width, output_height)
     enable_upscaling = _resolve_enable_upscaling(data, output_width, output_height)
     if upscaling_scale <= 0:
         raise ValueError("upscaling_scale must be positive")
@@ -590,13 +612,17 @@ def _build_start_request(
     model_width = output_width
     model_height = output_height
     if enable_upscaling:
-        if output_width % upscaling_scale != 0 or output_height % upscaling_scale != 0:
+        model_width_float = output_width / upscaling_scale
+        model_height_float = output_height / upscaling_scale
+        model_width = int(round(model_width_float))
+        model_height = int(round(model_height_float))
+        if not _same_float(model_width * upscaling_scale, float(output_width)) or not (
+            _same_float(model_height * upscaling_scale, float(output_height))
+        ):
             raise ValueError(
-                "width and height must be divisible by upscaling_scale "
+                "width and height must resolve to integer model dimensions "
                 "when enable_upscaling is true"
             )
-        model_width = output_width // upscaling_scale
-        model_height = output_height // upscaling_scale
 
     session.set_resolution_config(
         output_width=output_width,
@@ -921,7 +947,7 @@ def output_to_rgb_tensor_for_send(
     *,
     enable_upscaling: bool = False,
     upscaling_model_path: str | None = None,
-    upscaling_scale: int = 4,
+    upscaling_scale: float = 4.0,
     half_precision: bool = False,
     enable_rife: bool = DEFAULT_ENABLE_RIFE,
     rife_model_path: str | None = DEFAULT_RIFE_MODEL_PATH,
@@ -1024,7 +1050,7 @@ def output_to_rgb_array_for_send(
     *,
     enable_upscaling: bool = False,
     upscaling_model_path: str | None = None,
-    upscaling_scale: int = 4,
+    upscaling_scale: float = 4.0,
     half_precision: bool = False,
     enable_rife: bool = DEFAULT_ENABLE_RIFE,
     rife_model_path: str | None = DEFAULT_RIFE_MODEL_PATH,
@@ -1065,7 +1091,7 @@ def output_to_rgb_frames_for_send(
     *,
     enable_upscaling: bool = False,
     upscaling_model_path: str | None = None,
-    upscaling_scale: int = 4,
+    upscaling_scale: float = 4.0,
     half_precision: bool = False,
     enable_rife: bool = DEFAULT_ENABLE_RIFE,
     rife_model_path: str | None = DEFAULT_RIFE_MODEL_PATH,
@@ -1094,7 +1120,7 @@ def output_to_rgb_bytes(
     *,
     enable_upscaling: bool = False,
     upscaling_model_path: str | None = None,
-    upscaling_scale: int = 4,
+    upscaling_scale: float = 4.0,
     half_precision: bool = False,
 ) -> bytes | memoryview:
     frames = output_to_rgb_array_for_send(
@@ -1249,7 +1275,7 @@ async def run_startup_warmup_if_enabled(server_args) -> None:
                     result.output,
                     enable_upscaling=bool(batch.enable_upscaling),
                     upscaling_model_path=batch.upscaling_model_path,
-                    upscaling_scale=int(batch.upscaling_scale),
+                    upscaling_scale=float(batch.upscaling_scale),
                     half_precision=server_args.realesrgan_half_precision,
                 )
                 logger.info(
@@ -1492,7 +1518,7 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                 result.output,
                 enable_upscaling=bool(batch.enable_upscaling),
                 upscaling_model_path=batch.upscaling_model_path,
-                upscaling_scale=int(batch.upscaling_scale),
+                upscaling_scale=float(batch.upscaling_scale),
                 half_precision=server_args.realesrgan_half_precision,
                 timings=timings,
             )

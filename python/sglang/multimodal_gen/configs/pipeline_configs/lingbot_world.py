@@ -28,7 +28,7 @@ def lingbot_prompt_clean(text: str) -> str:
 @dataclass
 class LingBotWorldI2VConfig(Wan2_2_I2V_A14B_Config):
     dit_config: DiTConfig = field(default_factory=LingBotWorldVideoConfig)
-    flow_shift: float | None = 10.0
+    flow_shift: float | None = 5.0
     boundary_ratio: float | None = 0.947
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
@@ -48,7 +48,7 @@ class LingBotWorldI2VConfig(Wan2_2_I2V_A14B_Config):
 class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
     is_causal: bool = True
     dmd_denoising_steps: list[int] | None = field(
-        default_factory=lambda: [1000, 821, 642, 321]
+        default_factory=lambda: [1000, 750, 500, 250]
     )
     warp_denoising_step: bool = True
 

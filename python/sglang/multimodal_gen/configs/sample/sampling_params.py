@@ -124,7 +124,7 @@ class SamplingParams:
     upscaling_model_path: str | None = (
         None  # local .pth, HF repo ID, or repo_id:filename (default: ai-forever/Real-ESRGAN)
     )
-    upscaling_scale: int = 4
+    upscaling_scale: float = 4.0
 
     # Batch info
     num_outputs_per_prompt: int = 1

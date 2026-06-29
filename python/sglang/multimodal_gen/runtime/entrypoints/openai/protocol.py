@@ -51,7 +51,7 @@ class ImageGenerationsRequest(BaseModel):
     # Upscaling
     enable_upscaling: Optional[bool] = False
     upscaling_model_path: Optional[str] = None
-    upscaling_scale: Optional[int] = 4
+    upscaling_scale: Optional[float] = 4.0
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
@@ -108,7 +108,7 @@ class VideoGenerationsRequest(BaseModel):
     # Upscaling
     enable_upscaling: Optional[bool] = False
     upscaling_model_path: Optional[str] = None
-    upscaling_scale: Optional[int] = 4
+    upscaling_scale: Optional[float] = 4.0
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     output_path: Optional[str] = None

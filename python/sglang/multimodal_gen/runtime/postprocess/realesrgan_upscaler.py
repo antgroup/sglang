@@ -368,8 +368,8 @@ class UpscalerModel:
         # If the desired outscale differs from the model's native scale,
         # resize to (h * outscale, w * outscale).
         if outscale is not None and outscale != self.scale:
-            target_h = int(h * outscale)
-            target_w = int(w * outscale)
+            target_h = int(round(h * outscale))
+            target_w = int(round(w * outscale))
             out = F.interpolate(
                 out, size=(target_h, target_w), mode="bicubic", align_corners=False
             )
@@ -417,8 +417,8 @@ class UpscalerModel:
         if outscale is not None and outscale != self.scale:
             start_time = time.perf_counter()
             resize_timer = self._start_cuda_timer()
-            target_h = int(h * outscale)
-            target_w = int(w * outscale)
+            target_h = int(round(h * outscale))
+            target_w = int(round(w * outscale))
             out = F.interpolate(
                 out, size=(target_h, target_w), mode="bicubic", align_corners=False
             )
@@ -495,8 +495,8 @@ class UpscalerModel:
             out = self.net(imgs_t)
 
         if outscale is not None and outscale != self.scale:
-            target_h = int(h * outscale)
-            target_w = int(w * outscale)
+            target_h = int(round(h * outscale))
+            target_w = int(round(w * outscale))
             out = F.interpolate(
                 out, size=(target_h, target_w), mode="bicubic", align_corners=False
             )
@@ -520,7 +520,7 @@ class ImageUpscaler:
     def __init__(
         self,
         model_path: Optional[str] = None,
-        scale: int = 4,
+        scale: float = 4.0,
         half_precision: bool = False,
     ):
         self._model_path = model_path
@@ -720,7 +720,7 @@ def _resolve_model_path(model_path: str) -> str:
 def upscale_frames(
     frames: list[np.ndarray],
     model_path: Optional[str] = None,
-    scale: int = 4,
+    scale: float = 4.0,
     half_precision: bool = False,
 ) -> list[np.ndarray]:
     """
@@ -737,7 +737,7 @@ def upscale_frames(
                         ``repo_id:filename`` for a custom weight file.
                         None → default ``ai-forever/Real-ESRGAN`` with
                         ``RealESRGAN_x4.pth``.
-        scale:          Desired final upscaling factor (e.g. 2, 3, 4).
+        scale:          Desired final upscaling factor (e.g. 1.5, 2, 4).
                         The 4× model is used internally; the output is
                         resized to match *scale* when it differs.
         half_precision: Use fp16 inference (faster on supported GPUs).
@@ -756,7 +756,7 @@ def upscale_frames(
 def upscale_tensor(
     frames: torch.Tensor,
     model_path: Optional[str] = None,
-    scale: int = 4,
+    scale: float = 4.0,
     half_precision: bool = False,
 ) -> torch.Tensor:
     """

@@ -361,7 +361,7 @@ def save_outputs(
     frame_interpolation_model_path: Optional[str] = None,
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
-    upscaling_scale: int = 4,
+    upscaling_scale: float = 4.0,
 ) -> list[str]:
     """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
@@ -420,7 +420,7 @@ def post_process_sample(
     frame_interpolation_model_path: Optional[str] = None,
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
-    upscaling_scale: int = 4,
+    upscaling_scale: float = 4.0,
 ):
     """
     Process sample output, optionally interpolate video frames, and save.
