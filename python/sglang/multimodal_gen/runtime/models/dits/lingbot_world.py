@@ -209,6 +209,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         current_start: int = 0,
         cache_start: int | None = None,
         frame_seq_length: int | None = None,
+        kv_cache_sample_num_frames: int | None = None,
         update_cache_only: bool = False,
     ):
         if cache_start is None:
@@ -360,16 +361,45 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         if update_cache_only:
             return v
 
-        attn_start_index = (
-            0
-            if self.local_attn_size == -1
-            else max(0, visible_local_end - self.max_attention_size)
-        )
+        if kv_cache_sample_num_frames is not None and kv_cache_sample_num_frames > 0:
+            sample_tokens = int(kv_cache_sample_num_frames) * frame_seqlen
+            sink_end = min(sink_tokens, visible_local_end)
+            recent_start = max(sink_end, local_start_index - sample_tokens)
+            if recent_start <= sink_end:
+                key_states = kv_cache["k"][:, :visible_local_end]
+                value_states = kv_cache["v"][:, :visible_local_end]
+            elif sink_end > 0:
+                key_states = torch.cat(
+                    [
+                        kv_cache["k"][:, :sink_end],
+                        kv_cache["k"][:, recent_start:visible_local_end],
+                    ],
+                    dim=1,
+                )
+                value_states = torch.cat(
+                    [
+                        kv_cache["v"][:, :sink_end],
+                        kv_cache["v"][:, recent_start:visible_local_end],
+                    ],
+                    dim=1,
+                )
+            else:
+                key_states = kv_cache["k"][:, recent_start:visible_local_end]
+                value_states = kv_cache["v"][:, recent_start:visible_local_end]
+        else:
+            attn_start_index = (
+                0
+                if self.local_attn_size == -1
+                else max(0, visible_local_end - self.max_attention_size)
+            )
+            key_states = kv_cache["k"][:, attn_start_index:visible_local_end]
+            value_states = kv_cache["v"][:, attn_start_index:visible_local_end]
+
         attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
         x = attn_impl(
             roped_query,
-            kv_cache["k"][:, attn_start_index:visible_local_end],
-            kv_cache["v"][:, attn_start_index:visible_local_end],
+            key_states,
+            value_states,
         )
         if sequence_shard_enabled:
             assert seq_splits is not None
@@ -1112,6 +1142,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         cam_conditioner_scale_shift: tuple[torch.Tensor, torch.Tensor] | None = None,
         update_cache_only: bool = False,
         frame_seq_length: int | None = None,
+        kv_cache_sample_num_frames: int | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -1169,6 +1200,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             current_start,
             cache_start,
             frame_seq_length=cache_frame_seqlen,
+            kv_cache_sample_num_frames=kv_cache_sample_num_frames,
             update_cache_only=update_cache_only,
         )
         if update_cache_only:
@@ -1557,6 +1589,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         cache_start: int = 0,
         start_frame: int = 0,
         c2ws_plucker_emb: torch.Tensor | None = None,
+        kv_cache_sample_num_frames: int | None = None,
         skip_final_projection: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -1676,6 +1709,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                     if cam_conditioner_scale_shifts is None
                     else cam_conditioner_scale_shifts[block_index]
                 ),
+                kv_cache_sample_num_frames=kv_cache_sample_num_frames,
                 update_cache_only=skip_final_projection
                 and block_index == len(self.blocks) - 1,
                 frame_seq_length=frame_seq_length,

@@ -51,6 +51,11 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
         default_factory=lambda: [1000, 750, 500, 250]
     )
     warp_denoising_step: bool = True
+    lazy_vae_encode_black_frames: int = 60
+    interactive_kv_window_enable: bool = True
+    interactive_kv_still_window: int = 3
+    interactive_kv_moving_window: int = 12
+    interactive_kv_still_chunks: int = 2
 
     def postprocess_image_latent(self, latent_condition, batch):
         """Build condition tensor aligned to chunk_size (num_frames_per_block).
@@ -79,7 +84,7 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
 
         # Build mask: [B, temporal_ratio, num_latent_frames, H, W]
         mask = torch.ones(
-            1,
+            latent_condition.shape[0],
             temporal_ratio,
             num_latent_frames,
             latent_height,

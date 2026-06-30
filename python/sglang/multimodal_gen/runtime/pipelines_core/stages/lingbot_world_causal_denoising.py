@@ -48,6 +48,8 @@ class LingBotWorldCausalDMDRealtimeState(BaseRealtimeState):
         super().__init__()
         self.current_chunk_start_frame: int = 0
         self.chunk_idx: int = 0
+        self.interactive_kv_consecutive_still_chunks: int = 0
+        self.interactive_kv_sample_num_frames: int | None = None
 
 
 class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
@@ -85,6 +87,8 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         dtype,
         device,
         *,
+        server_args: ServerArgs,
+        interactive_kv_window_active: bool = False,
         sequence_shard_enabled: bool = False,
     ) -> None:
         kv_cache1 = []
@@ -107,17 +111,25 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         attention_head_dim = self.transformer.attention_head_dim
         if self.local_attn_size != -1:
             kv_cache_size = self.local_attn_size * self.frame_seq_length
+            effective_sliding_window_num_frames = self.sliding_window_num_frames
         else:
-            kv_cache_size = self.frame_seq_length * self.sliding_window_num_frames
+            effective_sliding_window_num_frames = (
+                self._effective_sliding_window_num_frames(
+                    server_args,
+                    interactive_kv_window_active=interactive_kv_window_active,
+                )
+            )
+            kv_cache_size = self.frame_seq_length * effective_sliding_window_num_frames
         logger.info(
             "LingBot KV cache init: batch=%s layers=%s frame_seq_length=%s "
-            "num_frames_per_block=%s sliding_window_num_frames=%s local_attn_size=%s "
+            "num_frames_per_block=%s sliding_window_num_frames=%s effective_sliding_window_num_frames=%s local_attn_size=%s "
             "sink_size=%s kv_cache_tokens=%s heads=%s head_dim=%s sequence_shard=%s",
             batch_size,
             self.num_transformer_blocks,
             self.frame_seq_length,
             self.num_frames_per_block,
             self.sliding_window_num_frames,
+            effective_sliding_window_num_frames,
             self.local_attn_size,
             self.transformer.config.arch_config.sink_size,
             kv_cache_size,
@@ -161,6 +173,93 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             )
 
         self.kv_cache1 = kv_cache1
+
+    def _uses_interactive_kv_window(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> bool:
+        pipeline_config = server_args.pipeline_config
+        if not bool(getattr(pipeline_config, "interactive_kv_window_enable", False)):
+            return False
+        batch_extra = getattr(batch, "extra", None)
+        return bool(batch_extra is not None and "actions" in batch_extra)
+
+    def _effective_sliding_window_num_frames(
+        self,
+        server_args: ServerArgs,
+        *,
+        interactive_kv_window_active: bool,
+    ) -> int:
+        window = int(self.sliding_window_num_frames)
+        if not interactive_kv_window_active:
+            return window
+        if self.local_attn_size != -1:
+            return window
+
+        pipeline_config = server_args.pipeline_config
+        sink_size = int(getattr(self.transformer.config.arch_config, "sink_size", 0))
+        moving_window = max(
+            0, int(getattr(pipeline_config, "interactive_kv_moving_window", 0))
+        )
+        current_chunk = int(self.num_frames_per_block)
+        return max(window, sink_size + moving_window + current_chunk)
+
+    def _base_kv_sample_num_frames(self) -> int | None:
+        sink_size = int(getattr(self.transformer.config.arch_config, "sink_size", 0))
+        sample_frames = (
+            int(self.sliding_window_num_frames)
+            - sink_size
+            - int(self.num_frames_per_block)
+        )
+        return sample_frames if sample_frames > 0 else None
+
+    @staticmethod
+    def _chunk_has_camera_motion(actions) -> bool:
+        if not actions:
+            return False
+        for frame_actions in actions:
+            if frame_actions:
+                return True
+        return False
+
+    def _get_interactive_kv_sample_num_frames(
+        self,
+        cache_state: LingBotWorldCausalDMDRealtimeState,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> int | None:
+        pipeline_config = server_args.pipeline_config
+        if not bool(getattr(pipeline_config, "interactive_kv_window_enable", False)):
+            return None
+        if not self._uses_interactive_kv_window(batch, server_args):
+            return self._base_kv_sample_num_frames()
+
+        moving_window = int(
+            getattr(pipeline_config, "interactive_kv_moving_window", 12)
+        )
+        still_window = int(getattr(pipeline_config, "interactive_kv_still_window", 3))
+        still_chunks_threshold = max(
+            1, int(getattr(pipeline_config, "interactive_kv_still_chunks", 2))
+        )
+        if cache_state.interactive_kv_sample_num_frames is None:
+            cache_state.interactive_kv_sample_num_frames = moving_window
+
+        batch_extra = getattr(batch, "extra", None)
+        assert batch_extra is not None
+        actions = batch_extra.get("actions")
+        if self._chunk_has_camera_motion(actions):
+            cache_state.interactive_kv_consecutive_still_chunks = 0
+            cache_state.interactive_kv_sample_num_frames = moving_window
+        else:
+            cache_state.interactive_kv_consecutive_still_chunks += 1
+            if (
+                cache_state.interactive_kv_consecutive_still_chunks
+                >= still_chunks_threshold
+            ):
+                cache_state.interactive_kv_sample_num_frames = still_window
+
+        return cache_state.interactive_kv_sample_num_frames
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         target_dtype = torch.bfloat16
@@ -250,6 +349,19 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 )
             expected_cache_heads //= get_ulysses_parallel_world_size()
 
+        interactive_kv_window_active = self._uses_interactive_kv_window(
+            batch, server_args
+        )
+        required_kv_cache_size = None
+        if interactive_kv_window_active and self.local_attn_size == -1:
+            required_kv_cache_size = (
+                self.frame_seq_length
+                * self._effective_sliding_window_num_frames(
+                    server_args,
+                    interactive_kv_window_active=True,
+                )
+            )
+
         should_reset_cache = (
             batch.block_idx == 0
             or kv_cache1 is None
@@ -257,6 +369,10 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             or len(kv_cache1) != self.num_transformer_blocks
             or len(crossattn_cache) != self.num_transformer_blocks
             or kv_cache1[0]["k"].shape[2] != expected_cache_heads
+            or (
+                required_kv_cache_size is not None
+                and kv_cache1[0]["k"].shape[1] < required_kv_cache_size
+            )
         )
 
         if should_reset_cache:
@@ -264,6 +380,8 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 batch_size=b,
                 dtype=target_dtype,
                 device=device,
+                server_args=server_args,
+                interactive_kv_window_active=interactive_kv_window_active,
                 sequence_shard_enabled=sequence_shard_enabled,
             )
             self._initialize_crossattn_cache(
@@ -279,6 +397,8 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             # Reset frame position on cache reset
             cache_state.current_chunk_start_frame = 0
             cache_state.chunk_idx = 0
+            cache_state.interactive_kv_consecutive_still_chunks = 0
+            cache_state.interactive_kv_sample_num_frames = None
         elif getattr(batch, "update_prompt_embeds", False):
             for block_cache in crossattn_cache:
                 block_cache["is_init"] = False
@@ -293,6 +413,11 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         # conditions are session-static and are invalidated by the cache reset above.
 
         current_start_frame = cache_state.current_chunk_start_frame
+        kv_cache_sample_num_frames = self._get_interactive_kv_sample_num_frames(
+            cache_state,
+            batch,
+            server_args,
+        )
 
         # Slice condition to current chunk
         condition_chunks = condition_full.split(t, dim=2)
@@ -357,6 +482,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                         crossattn_cache=crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                         start_frame=current_start_frame,
+                        kv_cache_sample_num_frames=kv_cache_sample_num_frames,
                         **image_kwargs,
                         **pos_cond_kwargs,
                     )
@@ -422,6 +548,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 crossattn_cache=crossattn_cache,
                 current_start=current_start_frame * self.frame_seq_length,
                 start_frame=current_start_frame,
+                kv_cache_sample_num_frames=kv_cache_sample_num_frames,
                 skip_final_projection=True,
                 **image_kwargs,
                 **pos_cond_kwargs,
