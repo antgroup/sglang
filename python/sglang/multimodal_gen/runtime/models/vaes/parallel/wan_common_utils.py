@@ -7,6 +7,35 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
+def causal_t_pad(x: torch.Tensor, t_pad: int) -> torch.Tensor:
+    """Pad or crop the front of temporal dim to match causal conv input."""
+    if t_pad == 0:
+        return x
+    if t_pad < 0:
+        return x[:, :, -t_pad:, :, :]
+    return F.pad(x, (0, 0, 0, 0, t_pad, 0))
+
+
+def _channels_last_3d_supported_by_platform() -> bool:
+    return hasattr(torch, "channels_last_3d") and (
+        current_platform.is_cuda() or current_platform.is_rocm()
+    )
+
+
+def _conv3d_weight_is_channels_last_3d(weight: torch.Tensor) -> bool:
+    return (
+        weight.dim() == 5
+        and _channels_last_3d_supported_by_platform()
+        and weight.is_contiguous(memory_format=torch.channels_last_3d)
+    )
+
+
+def match_conv3d_input_format(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if x.dim() == 5 and _conv3d_weight_is_channels_last_3d(weight):
+        return x.contiguous(memory_format=torch.channels_last_3d)
+    return x
+
+
 class AvgDown3D(nn.Module):
     def __init__(
         self,
@@ -130,27 +159,21 @@ class WanCausalConv3d(nn.Conv3d):
             padding=padding,
         )
         self.padding: tuple[int, int, int]
-        # Set up causal padding
-        self._padding: tuple[int, ...] = (
-            self.padding[2],
-            self.padding[2],
-            self.padding[1],
-            self.padding[1],
-            2 * self.padding[0],
-            0,
-        )
-        self.padding = (0, 0, 0)
+        pt, ph, pw = self.padding
+        self._t_pad = 2 * pt
+        self.padding = (0, ph, pw)
 
     def forward(self, x, cache_x=None):
-        padding = list(self._padding)
-        if cache_x is not None and self._padding[4] > 0:
+        t_pad = self._t_pad
+        if cache_x is not None and self._t_pad > 0:
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
-            padding[4] -= cache_x.shape[2]
-        x = F.pad(x, padding)
+            t_pad -= cache_x.shape[2]
+        x = causal_t_pad(x, t_pad)
         x = (
             x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
         )  # casting needed if amp isn't supported
+        x = match_conv3d_input_format(x, self.weight)
         return super().forward(x)
 
 
