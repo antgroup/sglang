@@ -600,7 +600,20 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         if not bool(getattr(pipeline_config, "interactive_kv_window_enable", False)):
             return None
         if not self._uses_interactive_kv_window(batch, server_args):
-            return self._base_kv_sample_num_frames()
+            kv_cache_sample_num_frames = self._base_kv_sample_num_frames()
+            batch_extra = getattr(batch, "extra", None)
+            logger.info(
+                "LingBot interactive KV window: session_id=%s block_idx=%s "
+                "active=false kv_cache_sample_num_frames=%s",
+                (
+                    batch_extra.get("realtime_session_id")
+                    if isinstance(batch_extra, dict)
+                    else None
+                ),
+                getattr(batch, "block_idx", None),
+                kv_cache_sample_num_frames,
+            )
+            return kv_cache_sample_num_frames
 
         moving_window = int(
             getattr(pipeline_config, "interactive_kv_moving_window", 12)
@@ -615,7 +628,8 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         batch_extra = getattr(batch, "extra", None)
         assert batch_extra is not None
         actions = batch_extra.get("actions")
-        if self._chunk_has_camera_motion(actions):
+        has_motion = self._chunk_has_camera_motion(actions)
+        if has_motion:
             cache_state.interactive_kv_consecutive_still_chunks = 0
             cache_state.interactive_kv_sample_num_frames = moving_window
         else:
@@ -626,6 +640,29 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             ):
                 cache_state.interactive_kv_sample_num_frames = still_window
 
+        mode = (
+            "moving"
+            if has_motion
+            else (
+                "still"
+                if cache_state.interactive_kv_sample_num_frames == still_window
+                else "pending_still"
+            )
+        )
+        logger.info(
+            "LingBot interactive KV window: session_id=%s block_idx=%s "
+            "active=true has_motion=%s mode=%s still_chunks=%s/%s "
+            "moving_window=%s still_window=%s kv_cache_sample_num_frames=%s",
+            batch_extra.get("realtime_session_id"),
+            getattr(batch, "block_idx", None),
+            has_motion,
+            mode,
+            cache_state.interactive_kv_consecutive_still_chunks,
+            still_chunks_threshold,
+            moving_window,
+            still_window,
+            cache_state.interactive_kv_sample_num_frames,
+        )
         return cache_state.interactive_kv_sample_num_frames
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
