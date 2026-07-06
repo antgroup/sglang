@@ -8,6 +8,8 @@ Extends CausalDMDDenoisingStage with:
 - Session-persistent KV cache with cumulative frame position tracking
 """
 
+from typing import Any
+
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
@@ -50,6 +52,12 @@ class LingBotWorldCausalDMDRealtimeState(BaseRealtimeState):
         self.chunk_idx: int = 0
         self.interactive_kv_consecutive_still_chunks: int = 0
         self.interactive_kv_sample_num_frames: int | None = None
+        self.kv_cache_valid_local_start_frame: int = 0
+        self.kv_reset_replay_chunks: dict[int, dict[str, Any]] = {}
+
+    def dispose(self):
+        super().dispose()
+        self.kv_reset_replay_chunks.clear()
 
 
 class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
@@ -179,11 +187,20 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> bool:
-        pipeline_config = server_args.pipeline_config
-        if not bool(getattr(pipeline_config, "interactive_kv_window_enable", False)):
+        if not self._interactive_kv_window_enabled(server_args):
             return False
         batch_extra = getattr(batch, "extra", None)
         return bool(batch_extra is not None and "actions" in batch_extra)
+
+    @staticmethod
+    def _interactive_kv_window_enabled(server_args: ServerArgs) -> bool:
+        return bool(
+            getattr(
+                server_args.pipeline_config,
+                "interactive_kv_window_enable",
+                False,
+            )
+        )
 
     def _effective_sliding_window_num_frames(
         self,
@@ -192,18 +209,23 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         interactive_kv_window_active: bool,
     ) -> int:
         window = int(self.sliding_window_num_frames)
-        if not interactive_kv_window_active:
-            return window
         if self.local_attn_size != -1:
             return window
 
         pipeline_config = server_args.pipeline_config
         sink_size = int(getattr(self.transformer.config.arch_config, "sink_size", 0))
-        moving_window = max(
-            0, int(getattr(pipeline_config, "interactive_kv_moving_window", 0))
-        )
         current_chunk = int(self.num_frames_per_block)
-        return max(window, sink_size + moving_window + current_chunk)
+        if interactive_kv_window_active:
+            moving_window = max(
+                0, int(getattr(pipeline_config, "interactive_kv_moving_window", 0))
+            )
+            window = max(window, sink_size + moving_window + current_chunk)
+        if self._kv_cache_reset_enabled(server_args):
+            reset_replay_chunks = self._kv_cache_reset_keep_prev_chunks(server_args) + 1
+            reset_replay_frames = reset_replay_chunks * current_chunk
+            reset_gap = self._resolve_kv_cache_reset_rope_gap_latent_frames(server_args)
+            window = max(window, sink_size + reset_gap + reset_replay_frames)
+        return window
 
     def _base_kv_sample_num_frames(self) -> int | None:
         sink_size = int(getattr(self.transformer.config.arch_config, "sink_size", 0))
@@ -213,6 +235,351 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             - int(self.num_frames_per_block)
         )
         return sample_frames if sample_frames > 0 else None
+
+    def _kv_cache_reset_enabled(self, server_args: ServerArgs) -> bool:
+        return (
+            bool(getattr(server_args.pipeline_config, "kv_cache_reset_enable", False))
+            and self.local_attn_size == -1
+        )
+
+    def _kv_cache_reset_max_window_latent_frames(self, server_args: ServerArgs) -> int:
+        return int(
+            getattr(
+                server_args.pipeline_config,
+                "kv_cache_reset_max_window_latent_frames",
+                88,
+            )
+        )
+
+    def _kv_cache_reset_keep_prev_chunks(self, server_args: ServerArgs) -> int:
+        return max(
+            0,
+            int(
+                getattr(
+                    server_args.pipeline_config,
+                    "kv_cache_reset_keep_prev_chunks",
+                    1,
+                )
+            ),
+        )
+
+    def _resolve_kv_cache_reset_rope_gap_latent_frames(
+        self,
+        server_args: ServerArgs,
+    ) -> int:
+        configured = int(
+            getattr(
+                server_args.pipeline_config,
+                "kv_cache_reset_rope_gap_latent_frames",
+                -1,
+            )
+        )
+        if configured >= 0:
+            return configured
+        chunk_frames = max(1, int(self.num_frames_per_block))
+        max_window = max(0, self._kv_cache_reset_max_window_latent_frames(server_args))
+        return max(chunk_frames, min(max_window // 4, 2 * chunk_frames))
+
+    def _should_reset_kv_rope_for_next_chunk(
+        self,
+        server_args: ServerArgs,
+        *,
+        current_start_frame: int,
+        current_chunk_frames: int,
+    ) -> bool:
+        if not self._kv_cache_reset_enabled(server_args):
+            return False
+        max_window = self._kv_cache_reset_max_window_latent_frames(server_args)
+        if max_window <= 0:
+            return False
+        next_chunk_frames = int(self.num_frames_per_block)
+        return (
+            int(current_start_frame) + int(current_chunk_frames) + next_chunk_frames
+            > max_window
+        )
+
+    @staticmethod
+    def _detach_replay_value(value: Any) -> Any:
+        if torch.is_tensor(value):
+            return value.detach()
+        if isinstance(value, tuple):
+            return tuple(
+                LingBotWorldCausalDMDDenoisingStage._detach_replay_value(item)
+                for item in value
+            )
+        if isinstance(value, list):
+            return [
+                LingBotWorldCausalDMDDenoisingStage._detach_replay_value(item)
+                for item in value
+            ]
+        if isinstance(value, dict):
+            return {
+                key: LingBotWorldCausalDMDDenoisingStage._detach_replay_value(item)
+                for key, item in value.items()
+            }
+        return value
+
+    def _remember_kv_replay_chunk(
+        self,
+        cache_state: LingBotWorldCausalDMDRealtimeState,
+        server_args: ServerArgs,
+        *,
+        chunk_idx: int,
+        latents: torch.Tensor,
+        condition: torch.Tensor,
+        pos_cond_kwargs: dict[str, Any],
+    ) -> None:
+        if not self._kv_cache_reset_enabled(server_args):
+            return
+        chunk_idx = int(chunk_idx)
+        cache_state.kv_reset_replay_chunks[chunk_idx] = {
+            "latents": latents.detach(),
+            "condition": condition.detach(),
+            "pos_cond_kwargs": self._detach_replay_value(pos_cond_kwargs),
+        }
+        min_keep_chunk = chunk_idx - self._kv_cache_reset_keep_prev_chunks(server_args)
+        for old_chunk_idx in list(cache_state.kv_reset_replay_chunks):
+            if old_chunk_idx < min_keep_chunk:
+                del cache_state.kv_reset_replay_chunks[old_chunk_idx]
+
+    @staticmethod
+    def _kv_replay_condition_mask_channels(
+        server_args: ServerArgs,
+        *,
+        latents: torch.Tensor,
+        condition: torch.Tensor,
+    ) -> int:
+        pipeline_config = getattr(server_args, "pipeline_config", None)
+        vae_config = getattr(pipeline_config, "vae_config", None)
+        vae_arch_config = getattr(vae_config, "arch_config", None)
+        mask_channels = getattr(vae_arch_config, "temporal_compression_ratio", None)
+        if mask_channels is None:
+            mask_channels = int(condition.shape[1]) - int(latents.shape[1])
+        return max(0, int(mask_channels))
+
+    def _anchor_kv_replay_first_frame(
+        self,
+        server_args: ServerArgs,
+        *,
+        latents: torch.Tensor,
+        condition: torch.Tensor,
+    ) -> torch.Tensor:
+        if latents.shape[2] <= 0 or condition.shape[2] <= 0:
+            return condition
+
+        latent_channels = int(latents.shape[1])
+        mask_channels = self._kv_replay_condition_mask_channels(
+            server_args,
+            latents=latents,
+            condition=condition,
+        )
+        if (
+            mask_channels <= 0
+            or latent_channels <= 0
+            or int(condition.shape[1]) < mask_channels + latent_channels
+        ):
+            return condition
+
+        anchored_condition = condition.clone()
+        anchored_condition[:, :mask_channels, 0:1] = 1.0
+        anchored_condition[
+            :, mask_channels : mask_channels + latent_channels, 0:1
+        ] = latents[:, :, 0:1].to(
+            device=anchored_condition.device,
+            dtype=anchored_condition.dtype,
+        )
+        return anchored_condition
+
+    @staticmethod
+    def _set_kv_cache_indices(kv_cache, end_tokens: int) -> None:
+        end_tokens = int(end_tokens)
+        for block_cache in kv_cache:
+            block_cache["global_end_index"].fill_(end_tokens)
+            block_cache["local_end_index"].fill_(end_tokens)
+            block_cache["global_end_index_int"] = end_tokens
+            block_cache["local_end_index_int"] = end_tokens
+
+    def _copy_kv_sink_prefix(self, old_kv_cache, new_kv_cache) -> int:
+        if old_kv_cache is None:
+            return 0
+        sink_tokens = int(
+            getattr(self.transformer.config.arch_config, "sink_size", 0)
+        ) * int(self.frame_seq_length)
+        if sink_tokens <= 0:
+            return 0
+        old_local_end = int(old_kv_cache[0].get("local_end_index_int", 0))
+        sink_tokens = min(
+            sink_tokens,
+            old_local_end,
+            int(old_kv_cache[0]["k"].shape[1]),
+            int(new_kv_cache[0]["k"].shape[1]),
+        )
+        if sink_tokens <= 0:
+            return 0
+        for old_block, new_block in zip(old_kv_cache, new_kv_cache):
+            new_block["k"][:, :sink_tokens].copy_(old_block["k"][:, :sink_tokens])
+            new_block["v"][:, :sink_tokens].copy_(old_block["v"][:, :sink_tokens])
+        self._set_kv_cache_indices(new_kv_cache, sink_tokens)
+        return sink_tokens
+
+    def _write_kv_context_chunk(
+        self,
+        batch: Req,
+        *,
+        latents: torch.Tensor,
+        condition: torch.Tensor,
+        prompt_embeds,
+        image_kwargs: dict[str, Any],
+        pos_cond_kwargs: dict[str, Any],
+        kv_cache,
+        crossattn_cache,
+        current_start_frame: int,
+        kv_cache_sample_num_frames: int | None,
+        kv_cache_valid_local_start_frame: int,
+        t_context: torch.Tensor,
+        attn_metadata,
+        target_dtype: torch.dtype,
+        autocast_enabled: bool,
+    ) -> None:
+        context_input = torch.cat([latents, condition], dim=1).to(target_dtype)
+        with (
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=target_dtype,
+                enabled=autocast_enabled,
+            ),
+            set_forward_context(
+                current_timestep=-1,
+                attn_metadata=attn_metadata,
+                forward_batch=batch,
+            ),
+        ):
+            _ = self.transformer(
+                context_input,
+                prompt_embeds,
+                t_context.unsqueeze(1),
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start=int(current_start_frame) * self.frame_seq_length,
+                start_frame=int(current_start_frame),
+                kv_cache_sample_num_frames=kv_cache_sample_num_frames,
+                kv_cache_valid_local_start_frame=kv_cache_valid_local_start_frame,
+                skip_final_projection=True,
+                **image_kwargs,
+                **pos_cond_kwargs,
+            )
+
+    def _maybe_reset_kv_rope_for_next_chunk(
+        self,
+        cache_state: LingBotWorldCausalDMDRealtimeState,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        old_kv_cache,
+        crossattn_cache,
+        current_chunk_idx: int,
+        current_start_frame: int,
+        current_chunk_frames: int,
+        batch_size: int,
+        device,
+        target_dtype: torch.dtype,
+        sequence_shard_enabled: bool,
+        prompt_embeds,
+        image_kwargs: dict[str, Any],
+        kv_cache_sample_num_frames: int | None,
+        t_context: torch.Tensor,
+        attn_metadata,
+        autocast_enabled: bool,
+    ) -> None:
+        if not self._should_reset_kv_rope_for_next_chunk(
+            server_args,
+            current_start_frame=current_start_frame,
+            current_chunk_frames=current_chunk_frames,
+        ):
+            return
+
+        self._initialize_kv_cache(
+            batch_size=batch_size,
+            dtype=target_dtype,
+            device=device,
+            server_args=server_args,
+            interactive_kv_window_active=self._interactive_kv_window_enabled(
+                server_args
+            ),
+            sequence_shard_enabled=sequence_shard_enabled,
+        )
+        new_kv_cache = self.kv_cache1
+        preserved_sink_tokens = self._copy_kv_sink_prefix(old_kv_cache, new_kv_cache)
+        preserved_sink_frames = preserved_sink_tokens // int(self.frame_seq_length)
+        rope_gap_frames = self._resolve_kv_cache_reset_rope_gap_latent_frames(
+            server_args
+        )
+        replay_start_frame = int(preserved_sink_frames) + int(rope_gap_frames)
+        valid_local_start_frame = (
+            replay_start_frame if replay_start_frame > int(preserved_sink_frames) else 0
+        )
+        cache_state.kv_cache = new_kv_cache
+        cache_state.kv_cache_valid_local_start_frame = valid_local_start_frame
+
+        keep_prev_chunks = self._kv_cache_reset_keep_prev_chunks(server_args)
+        replay_start_chunk = max(0, int(current_chunk_idx) - keep_prev_chunks)
+        replay_chunk_ids = [
+            chunk_idx
+            for chunk_idx in range(replay_start_chunk, int(current_chunk_idx) + 1)
+            if chunk_idx in cache_state.kv_reset_replay_chunks
+        ]
+
+        replay_frame = replay_start_frame
+        for replay_index, replay_chunk_id in enumerate(replay_chunk_ids):
+            replay_entry = cache_state.kv_reset_replay_chunks[replay_chunk_id]
+            replay_latents = replay_entry["latents"]
+            replay_condition = replay_entry["condition"]
+            if replay_index == 0:
+                replay_condition = self._anchor_kv_replay_first_frame(
+                    server_args,
+                    latents=replay_latents,
+                    condition=replay_condition,
+                )
+            self._write_kv_context_chunk(
+                batch,
+                latents=replay_latents,
+                condition=replay_condition,
+                prompt_embeds=prompt_embeds,
+                image_kwargs=image_kwargs,
+                pos_cond_kwargs=replay_entry["pos_cond_kwargs"],
+                kv_cache=new_kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start_frame=replay_frame,
+                kv_cache_sample_num_frames=kv_cache_sample_num_frames,
+                kv_cache_valid_local_start_frame=valid_local_start_frame,
+                t_context=t_context,
+                attn_metadata=attn_metadata,
+                target_dtype=target_dtype,
+                autocast_enabled=autocast_enabled,
+            )
+            replay_frame += int(replay_latents.shape[2])
+
+        cache_state.current_chunk_start_frame = replay_frame
+        logger.info(
+            "LingBot KV/RoPE reset: session_id=%s block_idx=%s "
+            "replay_chunks=%s local_start_before=%s local_start_after=%s "
+            "max_window=%s keep_prev_chunks=%s sink_frames=%s "
+            "rope_gap_frames=%s valid_local_start=%s",
+            (
+                getattr(batch, "extra", {}).get("realtime_session_id")
+                if isinstance(getattr(batch, "extra", None), dict)
+                else None
+            ),
+            getattr(batch, "block_idx", None),
+            replay_chunk_ids,
+            current_start_frame,
+            replay_frame,
+            self._kv_cache_reset_max_window_latent_frames(server_args),
+            keep_prev_chunks,
+            preserved_sink_frames,
+            rope_gap_frames,
+            valid_local_start_frame,
+        )
 
     @staticmethod
     def _chunk_has_camera_motion(actions) -> bool:
@@ -349,16 +716,16 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 )
             expected_cache_heads //= get_ulysses_parallel_world_size()
 
-        interactive_kv_window_active = self._uses_interactive_kv_window(
-            batch, server_args
-        )
+        interactive_kv_window_enabled = self._interactive_kv_window_enabled(server_args)
         required_kv_cache_size = None
-        if interactive_kv_window_active and self.local_attn_size == -1:
+        if self.local_attn_size == -1 and (
+            interactive_kv_window_enabled or self._kv_cache_reset_enabled(server_args)
+        ):
             required_kv_cache_size = (
                 self.frame_seq_length
                 * self._effective_sliding_window_num_frames(
                     server_args,
-                    interactive_kv_window_active=True,
+                    interactive_kv_window_active=interactive_kv_window_enabled,
                 )
             )
 
@@ -381,7 +748,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 dtype=target_dtype,
                 device=device,
                 server_args=server_args,
-                interactive_kv_window_active=interactive_kv_window_active,
+                interactive_kv_window_active=interactive_kv_window_enabled,
                 sequence_shard_enabled=sequence_shard_enabled,
             )
             self._initialize_crossattn_cache(
@@ -399,9 +766,13 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             cache_state.chunk_idx = 0
             cache_state.interactive_kv_consecutive_still_chunks = 0
             cache_state.interactive_kv_sample_num_frames = None
+            cache_state.kv_cache_valid_local_start_frame = 0
+            cache_state.kv_reset_replay_chunks.clear()
         elif getattr(batch, "update_prompt_embeds", False):
             for block_cache in crossattn_cache:
                 block_cache["is_init"] = False
+            # Match torchtitan: keep replay chunks across prompt switches so a later
+            # KV/RoPE reset can rebuild the local window from the same history.
             logger.info(
                 "LingBot cross-attention cache reset for prompt embedding change: "
                 "session_id=%s block_idx=%s event_ids=%s",
@@ -413,6 +784,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         # conditions are session-static and are invalidated by the cache reset above.
 
         current_start_frame = cache_state.current_chunk_start_frame
+        kv_cache_valid_local_start_frame = cache_state.kv_cache_valid_local_start_frame
         kv_cache_sample_num_frames = self._get_interactive_kv_sample_num_frames(
             cache_state,
             batch,
@@ -483,6 +855,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                         current_start=current_start_frame * self.frame_seq_length,
                         start_frame=current_start_frame,
                         kv_cache_sample_num_frames=kv_cache_sample_num_frames,
+                        kv_cache_valid_local_start_frame=kv_cache_valid_local_start_frame,
                         **image_kwargs,
                         **pos_cond_kwargs,
                     )
@@ -527,36 +900,56 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         t_context = torch.ones([b], device=device, dtype=torch.long) * int(
             context_noise
         )
-        context_input = torch.cat([current_latents, condition], dim=1).to(target_dtype)
-        with (
-            torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=target_dtype,
-                enabled=autocast_enabled,
-            ),
-            set_forward_context(
-                current_timestep=-1,
-                attn_metadata=attn_metadata,
-                forward_batch=batch,
-            ),
-        ):
-            _ = self.transformer(
-                context_input,
-                prompt_embeds,
-                t_context.unsqueeze(1),
-                kv_cache=kv_cache1,
-                crossattn_cache=crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-                start_frame=current_start_frame,
-                kv_cache_sample_num_frames=kv_cache_sample_num_frames,
-                skip_final_projection=True,
-                **image_kwargs,
-                **pos_cond_kwargs,
-            )
+        self._write_kv_context_chunk(
+            batch,
+            latents=current_latents,
+            condition=condition,
+            prompt_embeds=prompt_embeds,
+            image_kwargs=image_kwargs,
+            pos_cond_kwargs=pos_cond_kwargs,
+            kv_cache=kv_cache1,
+            crossattn_cache=crossattn_cache,
+            current_start_frame=current_start_frame,
+            kv_cache_sample_num_frames=kv_cache_sample_num_frames,
+            kv_cache_valid_local_start_frame=kv_cache_valid_local_start_frame,
+            t_context=t_context,
+            attn_metadata=attn_metadata,
+            target_dtype=target_dtype,
+            autocast_enabled=autocast_enabled,
+        )
 
         # Advance cumulative frame position
+        current_chunk_idx = cache_state.chunk_idx
+        self._remember_kv_replay_chunk(
+            cache_state,
+            server_args,
+            chunk_idx=current_chunk_idx,
+            latents=current_latents,
+            condition=condition,
+            pos_cond_kwargs=pos_cond_kwargs,
+        )
         cache_state.current_chunk_start_frame += t
         cache_state.chunk_idx += 1
+        self._maybe_reset_kv_rope_for_next_chunk(
+            cache_state,
+            batch,
+            server_args,
+            old_kv_cache=kv_cache1,
+            crossattn_cache=crossattn_cache,
+            current_chunk_idx=current_chunk_idx,
+            current_start_frame=current_start_frame,
+            current_chunk_frames=t,
+            batch_size=b,
+            device=device,
+            target_dtype=target_dtype,
+            sequence_shard_enabled=sequence_shard_enabled,
+            prompt_embeds=prompt_embeds,
+            image_kwargs=image_kwargs,
+            kv_cache_sample_num_frames=kv_cache_sample_num_frames,
+            t_context=t_context,
+            attn_metadata=attn_metadata,
+            autocast_enabled=autocast_enabled,
+        )
 
         # Output denoised latents for decoder
         batch.latents = current_latents

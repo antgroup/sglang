@@ -56,6 +56,10 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
     interactive_kv_still_window: int = 3
     interactive_kv_moving_window: int = 12
     interactive_kv_still_chunks: int = 2
+    kv_cache_reset_enable: bool = True
+    kv_cache_reset_max_window_latent_frames: int = 88
+    kv_cache_reset_keep_prev_chunks: int = 1
+    kv_cache_reset_rope_gap_latent_frames: int = -1
 
     def postprocess_image_latent(self, latent_condition, batch):
         """Build condition tensor aligned to chunk_size (num_frames_per_block).

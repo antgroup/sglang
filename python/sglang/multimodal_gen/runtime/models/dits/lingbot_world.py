@@ -210,6 +210,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         cache_start: int | None = None,
         frame_seq_length: int | None = None,
         kv_cache_sample_num_frames: int | None = None,
+        kv_cache_valid_local_start_frame: int = 0,
         update_cache_only: bool = False,
     ):
         if cache_start is None:
@@ -361,11 +362,35 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         if update_cache_only:
             return v
 
+        valid_local_start_index = max(
+            0, int(kv_cache_valid_local_start_frame) * frame_seqlen
+        )
+        valid_local_start_index = min(valid_local_start_index, visible_local_end)
         if kv_cache_sample_num_frames is not None and kv_cache_sample_num_frames > 0:
             sample_tokens = int(kv_cache_sample_num_frames) * frame_seqlen
             sink_end = min(sink_tokens, visible_local_end)
             recent_start = max(sink_end, local_start_index - sample_tokens)
-            if recent_start <= sink_end:
+            if valid_local_start_index > sink_end:
+                recent_start = max(recent_start, valid_local_start_index)
+                parts_k = []
+                parts_v = []
+                if sink_end > 0:
+                    parts_k.append(kv_cache["k"][:, :sink_end])
+                    parts_v.append(kv_cache["v"][:, :sink_end])
+                if recent_start < visible_local_end:
+                    parts_k.append(kv_cache["k"][:, recent_start:visible_local_end])
+                    parts_v.append(kv_cache["v"][:, recent_start:visible_local_end])
+                if not parts_k:
+                    fallback_start = max(0, min(local_start_index, visible_local_end))
+                    key_states = kv_cache["k"][:, fallback_start:visible_local_end]
+                    value_states = kv_cache["v"][:, fallback_start:visible_local_end]
+                elif len(parts_k) == 1:
+                    key_states = parts_k[0]
+                    value_states = parts_v[0]
+                else:
+                    key_states = torch.cat(parts_k, dim=1)
+                    value_states = torch.cat(parts_v, dim=1)
+            elif recent_start <= sink_end:
                 key_states = kv_cache["k"][:, :visible_local_end]
                 value_states = kv_cache["v"][:, :visible_local_end]
             elif sink_end > 0:
@@ -392,8 +417,30 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 if self.local_attn_size == -1
                 else max(0, visible_local_end - self.max_attention_size)
             )
-            key_states = kv_cache["k"][:, attn_start_index:visible_local_end]
-            value_states = kv_cache["v"][:, attn_start_index:visible_local_end]
+            sink_end = min(sink_tokens, visible_local_end)
+            if valid_local_start_index > sink_end:
+                recent_start = max(attn_start_index, valid_local_start_index)
+                parts_k = []
+                parts_v = []
+                if sink_end > 0:
+                    parts_k.append(kv_cache["k"][:, :sink_end])
+                    parts_v.append(kv_cache["v"][:, :sink_end])
+                if recent_start < visible_local_end:
+                    parts_k.append(kv_cache["k"][:, recent_start:visible_local_end])
+                    parts_v.append(kv_cache["v"][:, recent_start:visible_local_end])
+                if not parts_k:
+                    fallback_start = max(0, min(local_start_index, visible_local_end))
+                    key_states = kv_cache["k"][:, fallback_start:visible_local_end]
+                    value_states = kv_cache["v"][:, fallback_start:visible_local_end]
+                elif len(parts_k) == 1:
+                    key_states = parts_k[0]
+                    value_states = parts_v[0]
+                else:
+                    key_states = torch.cat(parts_k, dim=1)
+                    value_states = torch.cat(parts_v, dim=1)
+            else:
+                key_states = kv_cache["k"][:, attn_start_index:visible_local_end]
+                value_states = kv_cache["v"][:, attn_start_index:visible_local_end]
 
         attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
         x = attn_impl(
@@ -1143,6 +1190,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         update_cache_only: bool = False,
         frame_seq_length: int | None = None,
         kv_cache_sample_num_frames: int | None = None,
+        kv_cache_valid_local_start_frame: int = 0,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -1201,6 +1249,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             cache_start,
             frame_seq_length=cache_frame_seqlen,
             kv_cache_sample_num_frames=kv_cache_sample_num_frames,
+            kv_cache_valid_local_start_frame=kv_cache_valid_local_start_frame,
             update_cache_only=update_cache_only,
         )
         if update_cache_only:
@@ -1590,6 +1639,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         start_frame: int = 0,
         c2ws_plucker_emb: torch.Tensor | None = None,
         kv_cache_sample_num_frames: int | None = None,
+        kv_cache_valid_local_start_frame: int = 0,
         skip_final_projection: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -1710,6 +1760,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                     else cam_conditioner_scale_shifts[block_index]
                 ),
                 kv_cache_sample_num_frames=kv_cache_sample_num_frames,
+                kv_cache_valid_local_start_frame=kv_cache_valid_local_start_frame,
                 update_cache_only=skip_final_projection
                 and block_index == len(self.blocks) - 1,
                 frame_seq_length=frame_seq_length,
