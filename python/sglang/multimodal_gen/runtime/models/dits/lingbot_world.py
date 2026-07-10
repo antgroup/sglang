@@ -141,6 +141,318 @@ def _sequence_all_gather_variable(
     )
 
 
+def _lingbot_ring_kv_state(
+    kv_cache: dict, sink_tokens: int
+) -> tuple[int, int, int, int, int]:
+    """Return host-side indices, migrating a legacy linear cache if necessary."""
+    global_end = kv_cache.get("global_end_index_int")
+    local_end = kv_cache.get("local_end_index_int")
+    if global_end is None or local_end is None:
+        global_end = int(kv_cache["global_end_index"].item())
+        local_end = int(kv_cache["local_end_index"].item())
+        kv_cache["global_end_index_int"] = global_end
+        kv_cache["local_end_index_int"] = local_end
+    global_end = int(global_end)
+    local_end = int(local_end)
+
+    sink_end = min(sink_tokens, local_end)
+    tail_span = int(kv_cache.get("tail_span_tokens_int", local_end - sink_end))
+    tail_start = int(kv_cache.get("tail_start_index_int", 0))
+    tail_global_start = int(
+        kv_cache.get("tail_global_start_index_int", global_end - tail_span)
+    )
+    kv_cache["tail_span_tokens_int"] = tail_span
+    kv_cache["tail_start_index_int"] = tail_start
+    kv_cache["tail_global_start_index_int"] = tail_global_start
+    return global_end, local_end, tail_start, tail_global_start, tail_span
+
+
+def _lingbot_advance_ring_kv(
+    *,
+    global_end: int,
+    tail_start: int,
+    tail_global_start: int,
+    tail_span: int,
+    current_end: int,
+    sink_tokens: int,
+    tail_capacity: int,
+) -> tuple[int, int, int, int, int]:
+    if current_end <= global_end:
+        sink_end = min(sink_tokens, global_end)
+        return (
+            global_end,
+            sink_end + tail_span,
+            tail_start,
+            tail_global_start,
+            tail_span,
+        )
+
+    visible_global_end = current_end
+    if visible_global_end <= sink_tokens:
+        return visible_global_end, visible_global_end, 0, sink_tokens, 0
+
+    new_tail_global_start = max(sink_tokens, visible_global_end - tail_capacity)
+    new_tail_span = visible_global_end - new_tail_global_start
+    if tail_span > 0:
+        evicted_tokens = max(0, new_tail_global_start - tail_global_start)
+        new_tail_start = (tail_start + evicted_tokens) % tail_capacity
+    else:
+        new_tail_start = 0
+    visible_local_end = sink_tokens + new_tail_span
+    return (
+        visible_global_end,
+        visible_local_end,
+        new_tail_start,
+        new_tail_global_start,
+        new_tail_span,
+    )
+
+
+def _lingbot_copy_to_ring(
+    cache: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    current_start: int,
+    sink_tokens: int,
+    tail_capacity: int,
+    tail_start: int,
+    tail_global_start: int,
+) -> None:
+    """Write a contiguous logical range into a fixed sink plus circular tail."""
+    current_end = current_start + values.shape[1]
+    source_start = 0
+    logical_start = current_start
+
+    if logical_start < sink_tokens:
+        sink_write_end = min(current_end, sink_tokens)
+        sink_write_tokens = sink_write_end - logical_start
+        if sink_write_tokens > 0:
+            cache[:, logical_start:sink_write_end].copy_(values[:, :sink_write_tokens])
+            source_start += sink_write_tokens
+            logical_start = sink_write_end
+
+    logical_start = max(logical_start, tail_global_start)
+    source_start = logical_start - current_start
+    tail_tokens = current_end - logical_start
+    if tail_tokens <= 0:
+        return
+    if tail_capacity <= 0:
+        raise RuntimeError("LingBot KV ring has no capacity beyond the sink")
+
+    physical_tail_start = (
+        tail_start + logical_start - tail_global_start
+    ) % tail_capacity
+    first_tokens = min(tail_tokens, tail_capacity - physical_tail_start)
+    cache[
+        :,
+        sink_tokens
+        + physical_tail_start : sink_tokens
+        + physical_tail_start
+        + first_tokens,
+    ].copy_(values[:, source_start : source_start + first_tokens])
+    remaining_tokens = tail_tokens - first_tokens
+    if remaining_tokens > 0:
+        cache[:, sink_tokens : sink_tokens + remaining_tokens].copy_(
+            values[
+                :,
+                source_start
+                + first_tokens : source_start
+                + first_tokens
+                + remaining_tokens,
+            ]
+        )
+
+
+def _lingbot_kv_attention_ranges(
+    *,
+    visible_local_end: int,
+    current_local_start: int,
+    sink_tokens: int,
+    valid_local_start: int,
+    sample_tokens: int | None,
+    local_attn_size: int,
+    max_attention_size: int,
+) -> list[tuple[int, int]]:
+    """Select logical cache ranges in the same order as the linear implementation."""
+    sink_end = min(sink_tokens, visible_local_end)
+    valid_local_start = min(max(0, valid_local_start), visible_local_end)
+
+    if sample_tokens is not None and sample_tokens > 0:
+        recent_start = max(sink_end, current_local_start - sample_tokens)
+        if valid_local_start > sink_end:
+            recent_start = max(recent_start, valid_local_start)
+            ranges = []
+            if sink_end > 0:
+                ranges.append((0, sink_end))
+            if recent_start < visible_local_end:
+                ranges.append((recent_start, visible_local_end - recent_start))
+            if not ranges:
+                fallback_start = max(0, min(current_local_start, visible_local_end))
+                ranges.append((fallback_start, visible_local_end - fallback_start))
+            return ranges
+        if recent_start <= sink_end:
+            return [(0, visible_local_end)]
+        if sink_end > 0:
+            return [
+                (0, sink_end),
+                (recent_start, visible_local_end - recent_start),
+            ]
+        return [(recent_start, visible_local_end - recent_start)]
+
+    attention_start = (
+        0 if local_attn_size == -1 else max(0, visible_local_end - max_attention_size)
+    )
+    if valid_local_start > sink_end:
+        recent_start = max(attention_start, valid_local_start)
+        ranges = []
+        if sink_end > 0:
+            ranges.append((0, sink_end))
+        if recent_start < visible_local_end:
+            ranges.append((recent_start, visible_local_end - recent_start))
+        if not ranges:
+            fallback_start = max(0, min(current_local_start, visible_local_end))
+            ranges.append((fallback_start, visible_local_end - fallback_start))
+        return ranges
+    return [(attention_start, visible_local_end - attention_start)]
+
+
+def _lingbot_ring_physical_ranges(
+    logical_ranges: list[tuple[int, int]],
+    *,
+    sink_tokens: int,
+    tail_capacity: int,
+    tail_start: int,
+) -> list[tuple[int, int]]:
+    physical_ranges = []
+
+    def append_range(start: int, length: int) -> None:
+        if length <= 0:
+            return
+        if physical_ranges:
+            previous_start, previous_length = physical_ranges[-1]
+            if previous_start + previous_length == start:
+                physical_ranges[-1] = (previous_start, previous_length + length)
+                return
+        physical_ranges.append((start, length))
+
+    for logical_start, logical_length in logical_ranges:
+        logical_end = logical_start + logical_length
+        if logical_start < sink_tokens:
+            sink_end = min(logical_end, sink_tokens)
+            if sink_end > logical_start:
+                append_range(logical_start, sink_end - logical_start)
+            logical_start = sink_end
+        if logical_start >= logical_end:
+            continue
+        relative_start = (tail_start + logical_start - sink_tokens) % tail_capacity
+        first_length = min(logical_end - logical_start, tail_capacity - relative_start)
+        append_range(sink_tokens + relative_start, first_length)
+        remaining = logical_end - logical_start - first_length
+        if remaining > 0:
+            append_range(sink_tokens, remaining)
+    return physical_ranges
+
+
+def _lingbot_gather_ring_kv(
+    kv_cache: dict,
+    logical_ranges: list[tuple[int, int]],
+    *,
+    sink_tokens: int,
+    tail_start: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    k_cache = kv_cache["k"]
+    v_cache = kv_cache["v"]
+    tail_capacity = k_cache.shape[1] - sink_tokens
+    physical_ranges = _lingbot_ring_physical_ranges(
+        logical_ranges,
+        sink_tokens=sink_tokens,
+        tail_capacity=tail_capacity,
+        tail_start=tail_start,
+    )
+    if len(physical_ranges) == 1:
+        start, length = physical_ranges[0]
+        return (
+            k_cache[:, start : start + length],
+            v_cache[:, start : start + length],
+        )
+
+    output_tokens = sum(length for _, length in logical_ranges)
+    k_scratch = kv_cache.get("k_attn_scratch")
+    v_scratch = kv_cache.get("v_attn_scratch")
+    if k_scratch is None or v_scratch is None:
+        k_scratch = torch.empty_like(k_cache)
+        v_scratch = torch.empty_like(v_cache)
+        kv_cache["k_attn_scratch"] = k_scratch
+        kv_cache["v_attn_scratch"] = v_scratch
+
+    row_elements = math.prod(k_cache.shape[2:])
+    row_bytes = row_elements * k_cache.element_size()
+    if k_cache.is_cuda and k_cache.shape[0] == 1 and row_bytes % 16 == 0:
+        from sglang.jit_kernel.ring_kv_cache import (
+            can_use_ring_kv_gather,
+            gather_ring_kv,
+        )
+
+        if can_use_ring_kv_gather(row_bytes):
+            batch_size = k_cache.shape[0]
+            k_cache_rows = k_cache.view(batch_size, k_cache.shape[1], row_elements)
+            v_cache_rows = v_cache.view(batch_size, v_cache.shape[1], row_elements)
+            k_out = k_scratch[:, :output_tokens].view(
+                batch_size, output_tokens, row_elements
+            )
+            v_out = v_scratch[:, :output_tokens].view(
+                batch_size, output_tokens, row_elements
+            )
+            first_start, first_length = logical_ranges[0]
+            second_start, second_length = (
+                logical_ranges[1] if len(logical_ranges) > 1 else (0, 0)
+            )
+            gather_ring_kv(
+                k_cache_rows,
+                v_cache_rows,
+                k_out,
+                v_out,
+                sink_tokens=sink_tokens,
+                tail_start=tail_start,
+                first_start=first_start,
+                first_length=first_length,
+                second_start=second_start,
+                second_length=second_length,
+            )
+            return (
+                k_scratch[:, :output_tokens],
+                v_scratch[:, :output_tokens],
+            )
+
+    k_parts = [k_cache[:, start : start + length] for start, length in physical_ranges]
+    v_parts = [v_cache[:, start : start + length] for start, length in physical_ranges]
+    return torch.cat(k_parts, dim=1), torch.cat(v_parts, dim=1)
+
+
+def _lingbot_linearize_ring_tail(
+    kv_cache: dict,
+    *,
+    sink_tokens: int,
+    visible_local_end: int,
+    tail_start: int,
+) -> None:
+    """Make a wrapped tail contiguous once before full-window attention reuse."""
+    if tail_start == 0:
+        return
+    tail_tokens = visible_local_end - min(sink_tokens, visible_local_end)
+    if tail_tokens <= 0:
+        return
+    tail_k, tail_v = _lingbot_gather_ring_kv(
+        kv_cache,
+        [(sink_tokens, tail_tokens)],
+        sink_tokens=sink_tokens,
+        tail_start=tail_start,
+    )
+    kv_cache["k"][:, sink_tokens : sink_tokens + tail_tokens].copy_(tail_k)
+    kv_cache["v"][:, sink_tokens : sink_tokens + tail_tokens].copy_(tail_v)
+    kv_cache["tail_start_index_int"] = 0
+
+
 class LingBotWorldCamConditioner(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
@@ -283,164 +595,125 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         sink_tokens = self.sink_size * frame_seqlen
         kv_cache_size = kv_cache["k"].shape[1]
         num_new_tokens = roped_query.shape[1]
-        global_end_index = kv_cache.get("global_end_index_int")
-        local_end_index_prev = kv_cache.get("local_end_index_int")
-        if global_end_index is None or local_end_index_prev is None:
-            global_end_index = int(kv_cache["global_end_index"].item())
-            local_end_index_prev = int(kv_cache["local_end_index"].item())
-            kv_cache["global_end_index_int"] = global_end_index
-            kv_cache["local_end_index_int"] = local_end_index_prev
-        window_start = global_end_index - local_end_index_prev
-
-        if current_end <= global_end_index:
-            local_start_index = current_start - window_start
-            local_end_index = local_start_index + num_new_tokens
-            visible_local_end = local_end_index_prev
-            visible_global_end = global_end_index
+        valid_local_start_index = max(
+            0, int(kv_cache_valid_local_start_frame) * frame_seqlen
+        )
+        sample_tokens = (
+            int(kv_cache_sample_num_frames) * frame_seqlen
+            if kv_cache_sample_num_frames is not None and kv_cache_sample_num_frames > 0
+            else None
+        )
+        tail_capacity = kv_cache_size - sink_tokens
+        if tail_capacity <= 0:
+            raise RuntimeError(
+                "LingBot KV cache must be larger than its fixed sink: "
+                f"kv_cache_size={kv_cache_size}, sink_tokens={sink_tokens}"
+            )
+        (
+            global_end_index,
+            local_end_index_prev,
+            tail_start_index,
+            tail_global_start_index,
+            tail_span_tokens,
+        ) = _lingbot_ring_kv_state(kv_cache, sink_tokens)
+        (
+            visible_global_end,
+            visible_local_end,
+            tail_start_index,
+            tail_global_start_index,
+            tail_span_tokens,
+        ) = _lingbot_advance_ring_kv(
+            global_end=global_end_index,
+            tail_start=tail_start_index,
+            tail_global_start=tail_global_start_index,
+            tail_span=tail_span_tokens,
+            current_end=current_end,
+            sink_tokens=sink_tokens,
+            tail_capacity=tail_capacity,
+        )
+        if current_start < sink_tokens:
+            current_local_start = current_start
         else:
-            appended_tokens = current_end - global_end_index
-            if local_end_index_prev + appended_tokens > kv_cache_size:
-                num_evicted_tokens = (
-                    local_end_index_prev + appended_tokens - kv_cache_size
-                )
-                num_rolled_tokens = max(
-                    0,
-                    local_end_index_prev - num_evicted_tokens - sink_tokens,
-                )
-                if num_rolled_tokens > 0:
-                    kv_cache["k"][
-                        :, sink_tokens : sink_tokens + num_rolled_tokens
-                    ] = kv_cache["k"][
-                        :,
-                        sink_tokens
-                        + num_evicted_tokens : sink_tokens
-                        + num_evicted_tokens
-                        + num_rolled_tokens,
-                    ].clone()
-                    kv_cache["v"][
-                        :, sink_tokens : sink_tokens + num_rolled_tokens
-                    ] = kv_cache["v"][
-                        :,
-                        sink_tokens
-                        + num_evicted_tokens : sink_tokens
-                        + num_evicted_tokens
-                        + num_rolled_tokens,
-                    ].clone()
-                local_end_index = (
-                    local_end_index_prev + appended_tokens - num_evicted_tokens
-                )
-            else:
-                local_end_index = local_end_index_prev + appended_tokens
-            local_start_index = local_end_index - num_new_tokens
-            visible_local_end = local_end_index
-            visible_global_end = current_end
+            current_local_start = sink_tokens + current_start - tail_global_start_index
+        kv_cache["k"] = kv_cache["k"].detach()
+        kv_cache["v"] = kv_cache["v"].detach()
+        _lingbot_copy_to_ring(
+            kv_cache["k"],
+            roped_key,
+            current_start=current_start,
+            sink_tokens=sink_tokens,
+            tail_capacity=tail_capacity,
+            tail_start=tail_start_index,
+            tail_global_start=tail_global_start_index,
+        )
+        _lingbot_copy_to_ring(
+            kv_cache["v"],
+            v,
+            current_start=current_start,
+            sink_tokens=sink_tokens,
+            tail_capacity=tail_capacity,
+            tail_start=tail_start_index,
+            tail_global_start=tail_global_start_index,
+        )
+        current_local_end = current_local_start + num_new_tokens
 
         if (
-            local_start_index < 0
-            or local_end_index > kv_cache_size
-            or local_end_index - local_start_index != num_new_tokens
+            current_local_start < 0
+            or current_local_end > kv_cache_size
+            or current_end > visible_global_end
+            or (
+                current_start >= sink_tokens and current_start < tail_global_start_index
+            )
         ):
             raise RuntimeError(
                 "Invalid LingBot KV cache write range: "
-                f"local=[{local_start_index}, {local_end_index}), "
+                f"local=[{current_local_start}, {current_local_end}), "
                 f"global_end={global_end_index}, "
                 f"prev_local_end={local_end_index_prev}, "
                 f"kv_cache_size={kv_cache_size}, "
                 f"num_new_tokens={num_new_tokens}, "
-                f"current_start={current_start}, current_end={current_end}"
+                f"current_start={current_start}, current_end={current_end}, "
+                f"tail_global_start={tail_global_start_index}, "
+                f"tail_start={tail_start_index}"
             )
 
-        kv_cache["k"] = kv_cache["k"].detach()
-        kv_cache["v"] = kv_cache["v"].detach()
-        kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-        kv_cache["v"][:, local_start_index:local_end_index] = v
         kv_cache["global_end_index_int"] = visible_global_end
         kv_cache["local_end_index_int"] = visible_local_end
+        kv_cache["tail_start_index_int"] = tail_start_index
+        kv_cache["tail_global_start_index_int"] = tail_global_start_index
+        kv_cache["tail_span_tokens_int"] = tail_span_tokens
         kv_cache["global_end_index"].fill_(visible_global_end)
         kv_cache["local_end_index"].fill_(visible_local_end)
 
         if update_cache_only:
             return v
 
-        valid_local_start_index = max(
-            0, int(kv_cache_valid_local_start_frame) * frame_seqlen
+        logical_ranges = _lingbot_kv_attention_ranges(
+            visible_local_end=visible_local_end,
+            current_local_start=current_local_start,
+            sink_tokens=sink_tokens,
+            valid_local_start=valid_local_start_index,
+            sample_tokens=sample_tokens,
+            local_attn_size=self.local_attn_size,
+            max_attention_size=self.max_attention_size,
         )
-        valid_local_start_index = min(valid_local_start_index, visible_local_end)
-        if kv_cache_sample_num_frames is not None and kv_cache_sample_num_frames > 0:
-            sample_tokens = int(kv_cache_sample_num_frames) * frame_seqlen
-            sink_end = min(sink_tokens, visible_local_end)
-            recent_start = max(sink_end, local_start_index - sample_tokens)
-            if valid_local_start_index > sink_end:
-                recent_start = max(recent_start, valid_local_start_index)
-                parts_k = []
-                parts_v = []
-                if sink_end > 0:
-                    parts_k.append(kv_cache["k"][:, :sink_end])
-                    parts_v.append(kv_cache["v"][:, :sink_end])
-                if recent_start < visible_local_end:
-                    parts_k.append(kv_cache["k"][:, recent_start:visible_local_end])
-                    parts_v.append(kv_cache["v"][:, recent_start:visible_local_end])
-                if not parts_k:
-                    fallback_start = max(0, min(local_start_index, visible_local_end))
-                    key_states = kv_cache["k"][:, fallback_start:visible_local_end]
-                    value_states = kv_cache["v"][:, fallback_start:visible_local_end]
-                elif len(parts_k) == 1:
-                    key_states = parts_k[0]
-                    value_states = parts_v[0]
-                else:
-                    key_states = torch.cat(parts_k, dim=1)
-                    value_states = torch.cat(parts_v, dim=1)
-            elif recent_start <= sink_end:
-                key_states = kv_cache["k"][:, :visible_local_end]
-                value_states = kv_cache["v"][:, :visible_local_end]
-            elif sink_end > 0:
-                key_states = torch.cat(
-                    [
-                        kv_cache["k"][:, :sink_end],
-                        kv_cache["k"][:, recent_start:visible_local_end],
-                    ],
-                    dim=1,
-                )
-                value_states = torch.cat(
-                    [
-                        kv_cache["v"][:, :sink_end],
-                        kv_cache["v"][:, recent_start:visible_local_end],
-                    ],
-                    dim=1,
-                )
-            else:
-                key_states = kv_cache["k"][:, recent_start:visible_local_end]
-                value_states = kv_cache["v"][:, recent_start:visible_local_end]
-        else:
-            attn_start_index = (
-                0
-                if self.local_attn_size == -1
-                else max(0, visible_local_end - self.max_attention_size)
+        uses_full_cache = logical_ranges == [(0, visible_local_end)]
+        if uses_full_cache and tail_start_index != 0:
+            # Moving/action mode consumes all 24 frames. Linearize the tail once
+            # on the appending forward so later denoise steps use a direct view.
+            _lingbot_linearize_ring_tail(
+                kv_cache,
+                sink_tokens=sink_tokens,
+                visible_local_end=visible_local_end,
+                tail_start=tail_start_index,
             )
-            sink_end = min(sink_tokens, visible_local_end)
-            if valid_local_start_index > sink_end:
-                recent_start = max(attn_start_index, valid_local_start_index)
-                parts_k = []
-                parts_v = []
-                if sink_end > 0:
-                    parts_k.append(kv_cache["k"][:, :sink_end])
-                    parts_v.append(kv_cache["v"][:, :sink_end])
-                if recent_start < visible_local_end:
-                    parts_k.append(kv_cache["k"][:, recent_start:visible_local_end])
-                    parts_v.append(kv_cache["v"][:, recent_start:visible_local_end])
-                if not parts_k:
-                    fallback_start = max(0, min(local_start_index, visible_local_end))
-                    key_states = kv_cache["k"][:, fallback_start:visible_local_end]
-                    value_states = kv_cache["v"][:, fallback_start:visible_local_end]
-                elif len(parts_k) == 1:
-                    key_states = parts_k[0]
-                    value_states = parts_v[0]
-                else:
-                    key_states = torch.cat(parts_k, dim=1)
-                    value_states = torch.cat(parts_v, dim=1)
-            else:
-                key_states = kv_cache["k"][:, attn_start_index:visible_local_end]
-                value_states = kv_cache["v"][:, attn_start_index:visible_local_end]
+            tail_start_index = 0
+        key_states, value_states = _lingbot_gather_ring_kv(
+            kv_cache,
+            logical_ranges,
+            sink_tokens=sink_tokens,
+            tail_start=tail_start_index,
+        )
 
         attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
         x = attn_impl(

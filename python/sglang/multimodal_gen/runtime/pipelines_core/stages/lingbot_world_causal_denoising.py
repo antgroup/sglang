@@ -146,29 +146,23 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             sequence_shard_enabled,
         )
 
+        cache_shape = [
+            batch_size,
+            kv_cache_size,
+            num_attention_heads,
+            attention_head_dim,
+        ]
+        # Transformer blocks execute on the same CUDA stream, so one pair of
+        # attention gather buffers can be safely reused by every layer.
+        k_attn_scratch = torch.empty(cache_shape, dtype=dtype, device=device)
+        v_attn_scratch = torch.empty(cache_shape, dtype=dtype, device=device)
         for _ in range(self.num_transformer_blocks):
             kv_cache1.append(
                 {
-                    "k": torch.zeros(
-                        [
-                            batch_size,
-                            kv_cache_size,
-                            num_attention_heads,
-                            attention_head_dim,
-                        ],
-                        dtype=dtype,
-                        device=device,
-                    ),
-                    "v": torch.zeros(
-                        [
-                            batch_size,
-                            kv_cache_size,
-                            num_attention_heads,
-                            attention_head_dim,
-                        ],
-                        dtype=dtype,
-                        device=device,
-                    ),
+                    "k": torch.zeros(cache_shape, dtype=dtype, device=device),
+                    "v": torch.zeros(cache_shape, dtype=dtype, device=device),
+                    "k_attn_scratch": k_attn_scratch,
+                    "v_attn_scratch": v_attn_scratch,
                     "global_end_index": torch.tensor(
                         [0], dtype=torch.long, device=device
                     ),
@@ -177,6 +171,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                     ),
                     "global_end_index_int": 0,
                     "local_end_index_int": 0,
+                    "tail_start_index_int": 0,
+                    "tail_global_start_index_int": 0,
+                    "tail_span_tokens_int": 0,
                 }
             )
 
@@ -398,6 +395,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             block_cache["local_end_index"].fill_(end_tokens)
             block_cache["global_end_index_int"] = end_tokens
             block_cache["local_end_index_int"] = end_tokens
+            block_cache["tail_start_index_int"] = 0
+            block_cache["tail_global_start_index_int"] = end_tokens
+            block_cache["tail_span_tokens_int"] = 0
 
     def _copy_kv_sink_prefix(self, old_kv_cache, new_kv_cache) -> int:
         if old_kv_cache is None:
