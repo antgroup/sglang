@@ -148,10 +148,15 @@ def _run_transfer_roundtrip_mha(layout: str, element_dim: int) -> None:
 
     load_pages = torch.tensor([4, 5, 6], device=DEVICE, dtype=torch.int64)
     load_indices = _token_indices_for_pages(load_pages)
-    for layer_id in range(NUM_LAYERS):
-        host_pool.load_to_device_per_layer(
-            device_pool, host_indices, load_indices, layer_id, "kernel"
+    if layout == "layer_first":
+        host_pool.load_to_device_all_layer(
+            device_pool, host_indices, load_indices, "kernel"
         )
+    else:
+        for layer_id in range(NUM_LAYERS):
+            host_pool.load_to_device_per_layer(
+                device_pool, host_indices, load_indices, layer_id, "kernel"
+            )
     torch.cuda.synchronize()
 
     for layer_id in range(NUM_LAYERS):
@@ -232,10 +237,15 @@ def _run_transfer_roundtrip_mla(layout: str, element_dim: int) -> None:
 
     load_pages = torch.tensor([4, 5, 6], device=DEVICE, dtype=torch.int64)
     load_indices = _token_indices_for_pages(load_pages)
-    for layer_id in range(NUM_LAYERS):
-        host_pool.load_to_device_per_layer(
-            device_pool, host_indices, load_indices, layer_id, "kernel"
+    if layout == "layer_first":
+        host_pool.load_to_device_all_layer(
+            device_pool, host_indices, load_indices, "kernel"
         )
+    else:
+        for layer_id in range(NUM_LAYERS):
+            host_pool.load_to_device_per_layer(
+                device_pool, host_indices, load_indices, layer_id, "kernel"
+            )
     torch.cuda.synchronize()
 
     for layer_id in range(NUM_LAYERS):

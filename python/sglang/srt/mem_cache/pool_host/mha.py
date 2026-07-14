@@ -323,6 +323,24 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def load_to_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        assert io_backend == "kernel" and self.layout == "layer_first"
+        assert self.can_use_jit
+
+        jit_transfer_hicache_all_layer(
+            k_ptr_dst=device_pool.k_data_ptrs,
+            v_ptr_dst=device_pool.v_data_ptrs,
+            indices_dst=device_indices,
+            k_ptr_src=self.k_data_ptrs,
+            v_ptr_src=self.v_data_ptrs,
+            indices_src=host_indices,
+            kv_cache_dst_stride_bytes=self.token_stride_size,
+            kv_cache_src_stride_bytes=self.token_stride_size,
+            element_size=self.element_dim * self.dtype.itemsize,
+        )
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):

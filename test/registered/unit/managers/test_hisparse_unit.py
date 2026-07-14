@@ -167,6 +167,7 @@ class TestHiSparseUnit(unittest.TestCase):
         Without this, a mid-test assertion failure skips cleanup and leaks
         resources, causing unrelated failures in later tests.
         """
+        self.coordinator.direct_load_stream.synchronize()
         self.allocator.clear()
         self.req_to_token_pool.clear()
         self.coordinator.mem_pool_host.clear()
@@ -179,6 +180,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.req_device_buffer_token_locs.fill_(-1)
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
         self.coordinator.ack_staging_queue.clear()
+        self.coordinator.direct_load_queue.clear()
         self.coordinator._has_pending_backup = False
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
@@ -703,6 +705,34 @@ class TestHiSparseUnit(unittest.TestCase):
     # ==================================================================
     # Test: Direct-to-host (PD separated) path
     # ==================================================================
+    def test_request_lifecycle_direct_short_path(self):
+        """Short direct requests wait for the async all-layer preload."""
+        initial = self._get_initial_sizes()
+        fill_len = self.page_size
+        req = _make_req("direct-short-req", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len, logical_only=True)
+        self._populate_host_pool(req, fill_len)
+
+        self.assertFalse(self.coordinator.admit_request_direct(req))
+        self.assertTrue(req.hisparse_staging)
+        self.assertFalse(self.coordinator._skip_first_backup[req.req_pool_idx])
+        self.assertEqual(len(self.coordinator.direct_load_queue), 1)
+
+        torch.cuda.synchronize()
+        self.assertEqual(self.coordinator.collect_ready_direct_reqs(), [req])
+        self.assertFalse(req.hisparse_staging)
+        self.assertTrue(self.coordinator._skip_first_backup[req.req_pool_idx])
+
+        tokens = torch.arange(fill_len, dtype=torch.int32, device="cuda")
+        locs = self.coordinator.req_to_device_buffer[req.req_pool_idx, :fill_len]
+        for lid in range(LAYER_NUM):
+            self._assert_kv_correct(locs, tokens, lid, fill_len, msg="Direct: ")
+
+        self._cleanup_req(req, kv_loc, logical_only=True)
+        self._assert_sizes_restored(initial, "direct_short_path")
+
     def test_request_lifecycle_direct_path(self):
         """alloc_logical_only -> host write -> admit_direct -> swap-in -> finish."""
         initial = self._get_initial_sizes()
@@ -712,7 +742,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
         kv_loc = self._alloc_kv(req, fill_len, logical_only=True)
         self._populate_host_pool(req, fill_len)
-        self.coordinator.admit_request_direct(req)
+        self.assertTrue(self.coordinator.admit_request_direct(req))
 
         self.assertFalse(req.staging)
         self.assertTrue(self.coordinator._skip_first_backup[req.req_pool_idx])

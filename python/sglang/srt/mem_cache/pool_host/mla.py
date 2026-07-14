@@ -308,6 +308,27 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def load_to_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        assert io_backend == "kernel" and self.layout == "layer_first"
+        assert self.can_use_jit
+
+        device_ptrs = device_pool.data_ptrs
+        if self._is_device_layer_sharded(device_pool):
+            start, end = self._device_owned_layer_range(device_pool)
+            device_ptrs = device_ptrs[start:end]
+
+        jit_transfer_hicache_all_layer_mla(
+            ptr_dst=device_ptrs,
+            indices_dst=device_indices,
+            ptr_src=self.data_ptrs,
+            indices_src=host_indices,
+            cache_dst_stride_bytes=self.token_stride_size,
+            cache_src_stride_bytes=self.token_stride_size,
+            element_size=self.kv_cache_dim * self.dtype.itemsize,
+        )
+
     def _backup_from_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):

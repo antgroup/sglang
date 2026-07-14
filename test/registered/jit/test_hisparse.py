@@ -83,8 +83,10 @@ def _read_dsv4_token(cache: torch.Tensor, loc: int) -> torch.Tensor:
     return torch.cat([value, scale])
 
 
-def _dsv4_ptrs(cache: torch.Tensor) -> torch.Tensor:
-    return torch.tensor([cache.data_ptr()], dtype=torch.uint64, device=DEVICE)
+def _dsv4_ptrs(*caches: torch.Tensor) -> torch.Tensor:
+    return torch.tensor(
+        [cache.data_ptr() for cache in caches], dtype=torch.uint64, device=DEVICE
+    )
 
 
 def _run_kernel(
@@ -184,27 +186,35 @@ def _make_state(
 
 
 @pytest.mark.skipif(is_hip(), reason="DSV4 paged-layout HiSparse test is CUDA-only.")
-def test_transfer_cache_dsv4_mla_copies_paged_token() -> None:
-    src_cache = torch.zeros((2, DSV4_PAGE_BYTES), dtype=torch.uint8, device=DEVICE)
-    dst_cache = torch.zeros(
-        (2, DSV4_PAGE_BYTES), dtype=torch.uint8, device="cpu", pin_memory=True
-    )
+def test_transfer_cache_dsv4_mla_copies_paged_token_all_layers() -> None:
+    src_caches = [
+        torch.zeros((2, DSV4_PAGE_BYTES), dtype=torch.uint8, device=DEVICE)
+        for _ in range(2)
+    ]
+    dst_caches = [
+        torch.zeros(
+            (2, DSV4_PAGE_BYTES), dtype=torch.uint8, device="cpu", pin_memory=True
+        )
+        for _ in range(2)
+    ]
     src_loc = DSV4_PAGE_SIZE + 6
     dst_loc = DSV4_PAGE_SIZE + 1
-    _write_dsv4_token(src_cache, src_loc, seed=41)
+    for layer_id, src_cache in enumerate(src_caches):
+        _write_dsv4_token(src_cache, src_loc, seed=41 + layer_id)
 
     transfer_cache_dsv4_mla(
-        src_ptrs=_dsv4_ptrs(src_cache),
-        dst_ptrs=_dsv4_ptrs(dst_cache),
+        src_ptrs=_dsv4_ptrs(*src_caches),
+        dst_ptrs=_dsv4_ptrs(*dst_caches),
         src_indices=torch.tensor([src_loc], dtype=torch.int64, device=DEVICE),
         dst_indices=torch.tensor([dst_loc], dtype=torch.int64, device=DEVICE),
     )
     torch.cuda.synchronize()
 
-    assert torch.equal(
-        _read_dsv4_token(dst_cache, dst_loc).to(DEVICE),
-        _read_dsv4_token(src_cache, src_loc),
-    )
+    for src_cache, dst_cache in zip(src_caches, dst_caches):
+        assert torch.equal(
+            _read_dsv4_token(dst_cache, dst_loc).to(DEVICE),
+            _read_dsv4_token(src_cache, src_loc),
+        )
 
 
 @pytest.mark.skipif(is_hip(), reason="DSV4 paged-layout HiSparse test is CUDA-only.")

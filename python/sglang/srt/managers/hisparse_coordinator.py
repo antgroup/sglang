@@ -136,8 +136,10 @@ class HiSparseCoordinator:
         )
 
         self.write_staging_stream = device_module.Stream()
+        self.direct_load_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
         self.ack_staging_queue: List[HiSparseAct] = []
+        self.direct_load_queue: List[HiSparseAct] = []
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
@@ -193,6 +195,7 @@ class HiSparseCoordinator:
         # Drain in-flight transfers so the buffer is idle, then unregister it.
         # See HostKVCache.destroy for why the explicit unregister matters.
         self.write_staging_stream.synchronize()
+        self.direct_load_stream.synchronize()
         self.decode_backup_stream.synchronize()
         self.mem_pool_host.destroy()
 
@@ -253,12 +256,12 @@ class HiSparseCoordinator:
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
 
-    def admit_request_direct(self, req: Req) -> None:
+    def admit_request_direct(self, req: Req) -> bool:
         """Direct-to-host path: KV data already resides in host pool via RDMA.
 
-        Skips staging DMA entirely. Only allocates a small device buffer
-        (4KB) for decode-time swap-in, then marks the request as ready.
-        Host indices were already written to req_to_host_pool.
+        Returns whether the request can enter the waiting queue immediately.
+        Short requests need an asynchronous host-to-device preload first;
+        long requests can use decode-time swap-in directly.
 
         Metadata fixups after alloc_device_buffer():
         - alloc_device_buffer() sets device_buffer_tokens = [0, 1, ..., buf_size-1],
@@ -274,7 +277,25 @@ class HiSparseCoordinator:
             # returns device_buffer_locs directly without any host loading, so we
             # must preload all tokens from host pool into the device buffer
             # TODO(hzh0425): Optimize this.
-            self._preload_to_device_buffer(req)
+            req.hisparse_staging = True
+            start_event = device_module.Event()
+            finish_event = device_module.Event()
+            start_event.record()
+            with device_module.stream(self.direct_load_stream):
+                start_event.wait(self.direct_load_stream)
+                self._preload_to_device_buffer(req)
+                finish_event.record()
+
+                host_indices = self.req_to_host_pool[req.req_pool_idx, :host_len]
+                device_locs = self.req_to_device_buffer[req.req_pool_idx, :host_len]
+                if host_indices.is_cuda:
+                    host_indices.record_stream(self.direct_load_stream)
+                if device_locs.is_cuda:
+                    device_locs.record_stream(self.direct_load_stream)
+
+            self.direct_load_queue.append(HiSparseAct(start_event, finish_event, req))
+            logger.debug("HiSparse: preloading request %s directly", req.rid)
+            return False
         else:
             # Long sequence: reset device_buffer_tokens to -1 so the kernel
             # sees all slots as empty -> every top-k lookup is a miss -> host load.
@@ -285,6 +306,7 @@ class HiSparseCoordinator:
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
+        return True
 
     def host_token_len(self, kv_allocated_len: int) -> int:
         if self.is_dsv4_hisparse:
@@ -297,14 +319,12 @@ class HiSparseCoordinator:
         host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
         device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
 
-        for layer_id in range(self.mem_pool_device.layer_num):
-            self.mem_pool_host.load_to_device_per_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_locs,
-                layer_id,
-                io_backend="kernel",
-            )
+        self.mem_pool_host.load_to_device_all_layer(
+            self.mem_pool_device,
+            host_indices,
+            device_locs,
+            io_backend="kernel",
+        )
 
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
@@ -427,7 +447,7 @@ class HiSparseCoordinator:
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
     def has_ongoing_staging(self) -> bool:
-        return len(self.ack_staging_queue) > 0
+        return len(self.ack_staging_queue) > 0 or len(self.direct_load_queue) > 0
 
     def collect_ready_reqs(self) -> List[Req]:
         ready_reqs: List[Req] = []
@@ -452,6 +472,32 @@ class HiSparseCoordinator:
             _, _, req = self.ack_staging_queue.pop(0)
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
+            self._skip_first_backup[req.req_pool_idx] = True
+            req.hisparse_staging = False
+            finish_count -= 1
+            ready_reqs.append(req)
+        return ready_reqs
+
+    def collect_ready_direct_reqs(self) -> List[Req]:
+        ready_reqs: List[Req] = []
+        if len(self.direct_load_queue) == 0:
+            return ready_reqs
+
+        finish_count = 0
+        for _, finish_event, _ in self.direct_load_queue:
+            if not finish_event.query():
+                break
+            finish_count += 1
+        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                queue_size,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+        finish_count = int(queue_size.item())
+        while finish_count > 0:
+            _, _, req = self.direct_load_queue.pop(0)
             self._skip_first_backup[req.req_pool_idx] = True
             req.hisparse_staging = False
             finish_count -= 1
@@ -748,9 +794,20 @@ class HiSparseCoordinator:
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
 
+    def abort_direct_load_request(self, req: Req) -> None:
+        self.direct_load_queue = [
+            act for act in self.direct_load_queue if act.req is not req
+        ]
+        self.direct_load_stream.synchronize()
+        req.hisparse_staging = False
+        self.request_finished(req)
+
     def retract_req(self, req: Req) -> None:
         if req.hisparse_staging:
-            self.abort_staging_request(req)
+            if any(act.req is req for act in self.direct_load_queue):
+                self.abort_direct_load_request(req)
+            else:
+                self.abort_staging_request(req)
         else:
             self.request_finished(req)
 

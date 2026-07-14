@@ -2043,6 +2043,11 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
+        if self.enable_hisparse:
+            self.waiting_queue.extend(
+                self.hisparse_coordinator.collect_ready_direct_reqs()
+            )
+
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
@@ -2169,7 +2174,9 @@ class SchedulerDisaggregationDecodeMixin:
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
             if self.enable_hisparse:
+                ready_reqs = []
                 for req in transferred_reqs:
-                    # Direct-to-host: KV data already in host pool, skip staging
-                    self.hisparse_coordinator.admit_request_direct(req)
+                    if self.hisparse_coordinator.admit_request_direct(req):
+                        ready_reqs.append(req)
+                transferred_reqs = ready_reqs
             self.waiting_queue.extend(transferred_reqs)

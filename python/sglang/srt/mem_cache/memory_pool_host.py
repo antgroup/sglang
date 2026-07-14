@@ -1053,6 +1053,20 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"Unsupported V4 paged host layout/backend: {self.layout}/{io_backend}"
             )
 
+    def load_to_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        if not self._has_transfer_indices(host_indices, device_indices):
+            return
+        assert io_backend == "kernel" and self.layout == "layer_first"
+
+        transfer_cache_dsv4_mla(
+            src_ptrs=self.data_ptrs,
+            dst_ptrs=self.device_ptrs,
+            src_indices=host_indices.to(dtype=torch.int64),
+            dst_indices=device_indices.to(dtype=torch.int64),
+        )
+
     def get_data_page(self, index, flat=True):
         index = int(index) // self.slot_page_size
         if self.layout == "layer_first":
