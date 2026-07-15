@@ -11,7 +11,12 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelslim import ModelSlimConfig
 
-QuantizationMethods = Literal["fp8", "modelopt_fp4", "modelslim"]
+QuantizationMethods = Literal[
+    "fp8",
+    "modelopt_fp4",
+    "modelslim",
+    "compressed-tensors",
+]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -42,7 +47,7 @@ def register_quantization_config(quantization: str):
             )
         if not issubclass(quant_config_cls, QuantizationConfig):
             raise ValueError(
-                "The quantization config must be a subclass of " "`QuantizationConfig`."
+                "The quantization config must be a subclass of `QuantizationConfig`."
             )
         _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization] = quant_config_cls
         QUANTIZATION_METHODS.append(quantization)
@@ -54,6 +59,13 @@ def register_quantization_config(quantization: str):
 def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(f"Invalid quantization method: {quantization}")
+
+    if quantization == "compressed-tensors":
+        from sglang.multimodal_gen.runtime.layers.quantization.compressed_tensors import (
+            CompressedTensorsConfig,
+        )
+
+        return CompressedTensorsConfig
 
     method_to_config: dict[str, type[QuantizationConfig]] = {}
     # Update the `method_to_config` with customized quantization methods.

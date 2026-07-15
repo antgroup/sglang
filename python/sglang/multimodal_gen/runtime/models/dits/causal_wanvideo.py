@@ -272,11 +272,35 @@ class CausalWanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
-        self.to_k = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
-        self.to_v = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
+        self.to_q = ReplicatedLinear(
+            dim,
+            dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_q" if prefix else "to_q",
+        )
+        self.to_k = ReplicatedLinear(
+            dim,
+            dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_k" if prefix else "to_k",
+        )
+        self.to_v = ReplicatedLinear(
+            dim,
+            dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_v" if prefix else "to_v",
+        )
 
-        self.to_out = ReplicatedLinear(dim, dim, bias=True, quant_config=quant_config)
+        self.to_out = ReplicatedLinear(
+            dim,
+            dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_out" if prefix else "to_out",
+        )
         self.attn1 = CausalWanSelfAttention(
             dim,
             num_heads,
@@ -314,6 +338,7 @@ class CausalWanTransformerBlock(nn.Module):
             num_heads,
             qk_norm=qk_norm,
             eps=eps,
+            prefix=f"{prefix}.attn2" if prefix else "attn2",
             supported_attention_backends=cross_attn_backends,
             quant_config=quant_config,
         )
@@ -323,7 +348,11 @@ class CausalWanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         self.ffn = MLP(
-            dim, ffn_dim, act_type="gelu_pytorch_tanh", quant_config=quant_config
+            dim,
+            ffn_dim,
+            act_type="gelu_pytorch_tanh",
+            prefix=f"{prefix}.ffn" if prefix else "ffn",
+            quant_config=quant_config,
         )
         self.mlp_residual = MulAdd()
 
