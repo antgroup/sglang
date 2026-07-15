@@ -118,6 +118,160 @@ class TestMultimodalCompressedTensors(CustomTestCase):
         self.assertIsNone(layer.input_scale)
         torch.testing.assert_close(layer.weight_scale, loaded_scale)
 
+    def test_fp8_dynamic_fuses_output_partitions_column_major(self):
+        config = CompressedTensorsConfig.from_config(self._fp8_dynamic_config())
+        config._check_scheme_supported = Mock(return_value=True)
+        layers = [
+            ReplicatedLinear(
+                4,
+                6,
+                bias=True,
+                params_dtype=torch.bfloat16,
+                quant_config=config,
+                prefix=f"blocks.0.to_{name}",
+            )
+            for name in ("q", "k", "v")
+        ]
+
+        loaded_weights = []
+        loaded_scales = []
+        loaded_biases = []
+        for index, layer in enumerate(layers):
+            loaded_weight = (
+                torch.arange(24, dtype=torch.float32).reshape(6, 4) + index * 32
+            ).to(torch.float8_e4m3fn)
+            loaded_scale = (
+                torch.arange(1, 7, dtype=torch.float32).reshape(6, 1) + index * 8
+            )
+            loaded_bias = (torch.arange(6, dtype=torch.float32) + index * 8).to(
+                torch.bfloat16
+            )
+            layer.weight_loader(layer.weight, loaded_weight)
+            layer.weight_loader(layer.weight_scale, loaded_scale)
+            layer.weight_loader(layer.bias, loaded_bias)
+            layer.quant_method.process_weights_after_loading(layer)
+            loaded_weights.append(loaded_weight)
+            loaded_scales.append(loaded_scale)
+            loaded_biases.append(loaded_bias)
+
+        method = layers[0].quant_method
+        self.assertTrue(method.can_fuse_output_partitions(layers))
+        self.assertTrue(method.fuse_output_partitions(layers))
+
+        fused = layers[0]
+        expected_weight = torch.cat(loaded_weights, dim=0).t()
+        expected_scale = torch.cat(loaded_scales, dim=0)
+        expected_bias = torch.cat(loaded_biases, dim=0)
+        self.assertEqual(fused.weight.shape, (4, 18))
+        self.assertEqual(fused.weight.stride(), (1, 4))
+        self.assertFalse(fused.weight.is_contiguous())
+        torch.testing.assert_close(fused.weight.float(), expected_weight.float())
+        torch.testing.assert_close(fused.weight_scale, expected_scale)
+        torch.testing.assert_close(fused.bias, expected_bias)
+        self.assertEqual(fused.logical_widths, [6, 6, 6])
+        self.assertEqual(fused.output_size, 18)
+        self.assertFalse(fused.weight.requires_grad)
+        self.assertFalse(fused.weight_scale.requires_grad)
+        self.assertFalse(fused.bias.requires_grad)
+
+        sentinel = torch.arange(36, dtype=torch.bfloat16).reshape(2, 18)
+        fused.scheme.apply_weights = Mock(return_value=sentinel)
+        hidden_states = torch.zeros(2, 4, dtype=torch.bfloat16)
+        fused_output, output_bias = fused(hidden_states)
+        fused.scheme.apply_weights.assert_called_once_with(
+            fused, hidden_states, bias=fused.bias
+        )
+        self.assertIsNone(output_bias)
+        for actual, expected in zip(
+            fused_output.chunk(3, dim=-1), sentinel.chunk(3, dim=-1), strict=True
+        ):
+            torch.testing.assert_close(actual, expected)
+
+    def test_fp8_dynamic_output_fusion_rejects_unprocessed_weights(self):
+        config = CompressedTensorsConfig.from_config(self._fp8_dynamic_config())
+        config._check_scheme_supported = Mock(return_value=True)
+        layers = [
+            ReplicatedLinear(
+                4,
+                4,
+                bias=True,
+                params_dtype=torch.bfloat16,
+                quant_config=config,
+                prefix=f"blocks.0.to_{name}",
+            )
+            for name in ("q", "k", "v")
+        ]
+
+        original_parameters = [layer.weight for layer in layers]
+        method = layers[0].quant_method
+        self.assertFalse(method.can_fuse_output_partitions(layers))
+        self.assertFalse(method.fuse_output_partitions(layers))
+        self.assertTrue(
+            all(
+                layer.weight is original
+                for layer, original in zip(layers, original_parameters, strict=True)
+            )
+        )
+
+    def test_lingbot_quantized_qkv_projection_uses_one_linear(self):
+        from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
+            CausalLingBotWorldTransformerBlock,
+        )
+
+        sentinel = torch.arange(18, dtype=torch.float32).reshape(1, 18)
+
+        class FakeLinear(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(6, 6))
+                self.bias = torch.nn.Parameter(torch.zeros(6))
+                self.quant_config = object()
+                self.quant_method = None
+                self.output = None
+                self.call_count = 0
+
+            def forward(self, hidden_states):
+                self.call_count += 1
+                return self.output, None
+
+        class FakeQuantMethod:
+            @staticmethod
+            def can_fuse_output_partitions(layers):
+                return True
+
+            @staticmethod
+            def fuse_output_partitions(layers):
+                layers[0].output = sentinel
+                return True
+
+        block = CausalLingBotWorldTransformerBlock.__new__(
+            CausalLingBotWorldTransformerBlock
+        )
+        torch.nn.Module.__init__(block)
+        block._fused_qkv_weight = None
+        block._fused_qkv_bias = None
+        block._fused_qkv_quantized = False
+        block.to_q = FakeLinear()
+        block.to_k = FakeLinear()
+        block.to_v = FakeLinear()
+        block.to_q.quant_method = FakeQuantMethod()
+
+        query, key, value = block._project_qkv(torch.zeros(1, 6))
+
+        self.assertTrue(block._fused_qkv_quantized)
+        self.assertEqual(block.to_q.call_count, 1)
+        self.assertFalse(hasattr(block, "to_k"))
+        self.assertFalse(hasattr(block, "to_v"))
+        for actual, expected in zip(
+            (query, key, value), sentinel.chunk(3, dim=-1), strict=True
+        ):
+            torch.testing.assert_close(actual, expected)
+
+        fused_weight = block.to_q.weight
+        self.assertTrue(block.fuse_qkv_projection())
+        self.assertIs(block.to_q.weight, fused_weight)
+        self.assertEqual(block.to_q.call_count, 1)
+
     def test_generic_loaders_accept_srt_weight_and_scale_parameters(self):
         column_layer = SimpleNamespace(tp_rank=1)
         column_weight = ModelWeightParameter(

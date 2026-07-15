@@ -1030,6 +1030,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         self.cam_conditioner = LingBotWorldCamConditioner(self.hidden_dim)
         self._fused_qkv_weight = None
         self._fused_qkv_bias = None
+        self._fused_qkv_quantized = False
         norm1_eps = getattr(self.norm1, "variance_epsilon", None)
         if norm1_eps is None:
             norm1_eps = getattr(self.norm1, "eps", 1e-6)
@@ -1041,12 +1042,12 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         )
 
     def _can_fuse_qkv_projection(self) -> bool:
-        if self._fused_qkv_weight is not None:
+        if self._fused_qkv_weight is not None or self._fused_qkv_quantized:
             return True
 
         layers = (self.to_q, self.to_k, self.to_v)
         biases = [layer.bias for layer in layers]
-        return (
+        can_fuse_unquantized = (
             all(bias is None for bias in biases)
             or all(bias is not None for bias in biases)
         ) and all(
@@ -1055,14 +1056,28 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             and layer.weight is not None
             for layer in layers
         )
+        if can_fuse_unquantized:
+            return True
+
+        quant_method = getattr(self.to_q, "quant_method", None)
+        can_fuse_quantized = getattr(quant_method, "can_fuse_output_partitions", None)
+        return callable(can_fuse_quantized) and can_fuse_quantized(layers)
 
     def fuse_qkv_projection(self) -> bool:
         if not self._can_fuse_qkv_projection():
             return False
-        if self._fused_qkv_weight is not None:
+        if self._fused_qkv_weight is not None or self._fused_qkv_quantized:
             return True
 
         layers = (self.to_q, self.to_k, self.to_v)
+        quant_method = getattr(self.to_q, "quant_method", None)
+        fuse_quantized = getattr(quant_method, "fuse_output_partitions", None)
+        if callable(fuse_quantized) and fuse_quantized(layers):
+            self._fused_qkv_quantized = True
+            del self.to_k
+            del self.to_v
+            return True
+
         with torch.no_grad():
             self._fused_qkv_weight = nn.Parameter(
                 torch.cat([layer.weight.detach() for layer in layers], dim=0)
@@ -1087,7 +1102,12 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.fuse_qkv_projection():
-            qkv = F.linear(hidden_states, self._fused_qkv_weight, self._fused_qkv_bias)
+            if self._fused_qkv_quantized:
+                qkv, _ = self.to_q(hidden_states)
+            else:
+                qkv = F.linear(
+                    hidden_states, self._fused_qkv_weight, self._fused_qkv_bias
+                )
             return qkv.chunk(3, dim=-1)
 
         query, _ = self.to_q(hidden_states)
@@ -1351,8 +1371,15 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
 
     def post_load_weights(self) -> None:
         super().post_load_weights()
+        quantized_qkv_fusions = 0
         for block in self.blocks:
             block.fuse_qkv_projection()
+            quantized_qkv_fusions += int(block._fused_qkv_quantized)
+        if quantized_qkv_fusions:
+            logger.info(
+                "Enabled compressed-tensors FP8 fused QKV in %d LingBot blocks",
+                quantized_qkv_fusions,
+            )
 
     @lru_cache(maxsize=8)
     def _compute_rope_for_sequence_shard_with_offset(
