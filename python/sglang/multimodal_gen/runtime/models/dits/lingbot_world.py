@@ -94,6 +94,30 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+_skip_unused_self_attn_norm = _env_bool("SGLANG_LINGBOT_SKIP_UNUSED_SELF_ATTN_NORM")
+if _skip_unused_self_attn_norm:
+    from sglang.jit_kernel.gated_residual import gated_residual as _gated_residual
+else:
+    _gated_residual = None
+
+
+def _can_use_gated_residual(
+    residual: torch.Tensor, x: torch.Tensor, gate: torch.Tensor
+) -> bool:
+    return (
+        _gated_residual is not None
+        and _is_cuda
+        and residual.is_cuda
+        and x.is_cuda
+        and gate.is_cuda
+        and residual.dtype in (torch.float16, torch.bfloat16)
+        and x.dtype == residual.dtype
+        and gate.dtype == torch.float32
+        and residual.is_contiguous()
+        and x.is_contiguous()
+    )
+
+
 if _use_aiter:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
 
@@ -671,15 +695,18 @@ class LingBotWorldTransformerBlock(nn.Module):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
-        )
-        null_scale = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
-        )
-        norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, null_shift, null_scale
-        )
+        if _can_use_gated_residual(hidden_states, attn_output, gate_msa):
+            hidden_states = _gated_residual(hidden_states, attn_output, gate_msa)
+        else:
+            null_shift = torch.zeros(
+                (1,), device=hidden_states.device, dtype=hidden_states.dtype
+            )
+            null_scale = torch.zeros(
+                (1,), device=hidden_states.device, dtype=hidden_states.dtype
+            )
+            _, hidden_states = self.self_attn_residual_norm(
+                hidden_states, attn_output, gate_msa, null_shift, null_scale
+            )
         hidden_states = self.cam_conditioner(
             hidden_states.to(orig_dtype), c2ws_plucker_emb
         )
@@ -1278,15 +1305,18 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
-        )
-        null_scale = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
-        )
-        norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, null_shift, null_scale
-        )
+        if _can_use_gated_residual(hidden_states, attn_output, gate_msa):
+            hidden_states = _gated_residual(hidden_states, attn_output, gate_msa)
+        else:
+            null_shift = torch.zeros(
+                (1,), device=hidden_states.device, dtype=hidden_states.dtype
+            )
+            null_scale = torch.zeros(
+                (1,), device=hidden_states.device, dtype=hidden_states.dtype
+            )
+            _, hidden_states = self.self_attn_residual_norm(
+                hidden_states, attn_output, gate_msa, null_shift, null_scale
+            )
         hidden_states = self.cam_conditioner(
             hidden_states.to(orig_dtype),
             c2ws_plucker_emb,
