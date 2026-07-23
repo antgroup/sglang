@@ -562,13 +562,17 @@ class ServerArgs:
             "auto",
         }:
             raise ValueError(
-                "--ulysses-a2a-backend must be one of "
-                "nccl, sgl_p2p, fast_ulysses, auto"
+                "--ulysses-a2a-backend must be one of nccl, sgl_p2p, fast_ulysses, auto"
             )
         if self.ulysses_a2a_transfer not in {"auto", "sm", "tma", "ce"}:
             raise ValueError("--ulysses-a2a-transfer must be one of auto, sm, tma, ce")
         if self.ulysses_a2a_qkv_overlap not in {"off", "auto", "on"}:
             raise ValueError("--ulysses-a2a-qkv-overlap must be one of off, auto, on")
+        if self.ulysses_a2a_qkv_overlap != "off":
+            raise ValueError(
+                "--ulysses-a2a-qkv-overlap currently supports only off; "
+                "grouped asynchronous QKV is not implemented"
+            )
         if (
             self.ulysses_a2a_transfer != "auto"
             and self.ulysses_a2a_backend != "fast_ulysses"
@@ -576,13 +580,6 @@ class ServerArgs:
             raise ValueError(
                 "--ulysses-a2a-transfer is only valid with forced "
                 "--ulysses-a2a-backend=fast_ulysses"
-            )
-        if self.ulysses_a2a_qkv_overlap == "on" and self.ulysses_a2a_backend in {
-            "nccl",
-            "sgl_p2p",
-        }:
-            raise ValueError(
-                "--ulysses-a2a-qkv-overlap=on requires a grouped-async backend"
             )
 
     def _adjust_platform_specific(self):

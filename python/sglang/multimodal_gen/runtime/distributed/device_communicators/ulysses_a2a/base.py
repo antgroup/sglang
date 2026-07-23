@@ -55,9 +55,19 @@ class UlyssesA2AConfig:
             raise ValueError(f"Unsupported Ulysses A2A backend: {self.backend}")
         if self.transfer not in {"auto", "sm", "tma", "ce"}:
             raise ValueError(f"Unsupported Ulysses A2A transfer: {self.transfer}")
+        if self.transfer != "auto" and self.backend != "fast_ulysses":
+            raise ValueError(
+                "A non-default Ulysses A2A transfer is valid only for "
+                "the fast_ulysses backend"
+            )
         if self.qkv_overlap not in {"off", "auto", "on"}:
             raise ValueError(
                 f"Unsupported Ulysses A2A QKV overlap mode: {self.qkv_overlap}"
+            )
+        if self.qkv_overlap != "off":
+            raise ValueError(
+                "Ulysses A2A grouped QKV overlap is not implemented; "
+                "qkv_overlap must be 'off'"
             )
 
 

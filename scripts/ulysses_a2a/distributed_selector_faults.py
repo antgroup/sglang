@@ -60,7 +60,7 @@ def main() -> None:
     x = make_tensor((1, 4, world_size * 2, 16), rank)
 
     original_ops_available = p2p_module._ops_available
-    p2p_module._ops_available = lambda: rank == 0
+    p2p_module._ops_available = lambda **_kwargs: rank == 0
     try:
         auto = UlyssesA2ARouter(
             dist.group.WORLD, device, UlyssesA2AConfig(backend="auto")
@@ -167,6 +167,31 @@ def main() -> None:
     assert len(set(errors)) == 1 and "variable_split" in errors[0]
     forced_variable.close()
 
+    skewed_seq_lens = [3, 5] if rank == 0 else [4, 4]
+    skewed_variable_x = make_tensor(
+        (1, skewed_seq_lens[rank], world_size * 2, 11), rank
+    )
+    skewed_variable = UlyssesA2ARouter(
+        dist.group.WORLD, device, UlyssesA2AConfig(backend="auto")
+    )
+    try:
+        skewed_variable.input_all_to_all(
+            skewed_variable_x,
+            head_dim=2,
+            seq_lens=skewed_seq_lens,
+            slot=A2ASlot.PACKED_QKV,
+        )
+    except UlyssesA2AUnsupportedError as exc:
+        error = str(exc)
+    else:
+        raise AssertionError("rank-skewed variable split reached the NCCL data path")
+    errors = gather_errors(error)
+    assert len(set(errors)) == 1
+    assert "rank_descriptor_mismatch" in errors[0]
+    assert skewed_variable.stats.nccl_calls == 0
+    assert skewed_variable.stats.sgl_p2p_calls == 0
+    skewed_variable.close()
+
     fast = UlyssesA2ARouter(
         dist.group.WORLD,
         device,
@@ -188,7 +213,8 @@ def main() -> None:
         print(
             "DISTRIBUTED_SELECTOR_FAULTS_OK "
             "rank_miss=auto_fallback+forced_error "
-            "descriptor=config=fail_fast variable=auto+forced fast=closed"
+            "descriptor=config=fail_fast "
+            "variable=auto+forced+rank_skew fast=closed"
         )
     dist.destroy_process_group()
 

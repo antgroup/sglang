@@ -41,7 +41,7 @@ class UlyssesA2ARouter:
         self.fast_ulysses = None
         self.stats = UlyssesA2AStats()
         self.closed = False
-        self._logged_selection = False
+        self._logged_backends: set[str] = set()
         self._p2p_route_cache: dict[tuple[object, ...], tuple[bool, str]] = {}
         self._validate_config_consensus()
 
@@ -96,6 +96,12 @@ class UlyssesA2ARouter:
         transaction: UlyssesA2ATransaction | None,
     ) -> torch.Tensor:
         self._ensure_open()
+        if x.device.type != self.device.type or (
+            self.device.index is not None and x.device.index != self.device.index
+        ):
+            raise UlyssesA2ATransactionError(
+                f"Ulysses A2A router is bound to {self.device}, got {x.device}"
+            )
         spec = A2ASpec.from_tensor(
             x,
             mode=mode,
@@ -225,7 +231,7 @@ class UlyssesA2ARouter:
         )
         if not supported:
             return supported, reason
-        return UlyssesP2PAllToAll.runtime_available()
+        return UlyssesP2PAllToAll.runtime_available(tk_style=self.config.p2p_tk_style)
 
     def _p2p_support_consensus(
         self, spec: A2ASpec, local_supported: bool, local_reason: str
@@ -243,29 +249,33 @@ class UlyssesA2ARouter:
 
         self.stats.route_cache_misses += 1
         self.stats.control_consensus_calls += 1
+        descriptor, descriptor_error = self._consensus_descriptor(spec)
         local_descriptor = (
-            repr(spec.signature),
+            descriptor,
             bool(local_supported),
             local_reason,
+            descriptor_error,
         )
         gathered: list[object] = [None] * self.nccl.world_size
         dist.all_gather_object(gathered, local_descriptor, group=self.group)
 
         support_flags = [bool(item[1]) for item in gathered]
         reasons = [str(item[2]) for item in gathered if not bool(item[1])]
-        if not any(support_flags) and set(reasons) == {"variable_split"}:
-            # A valid variable-split collective has different local shapes by
-            # construction. It is excluded from P2P before transport commit
-            # and remains safe to route through the variable NCCL adapter.
-            decision = (False, "variable_split")
-            self._p2p_route_cache[cache_key] = decision
-            return decision
-
         descriptors = [item[0] for item in gathered]
-        if len(set(descriptors)) != 1:
+        descriptor_errors = [str(item[3]) for item in gathered if item[3]]
+        if descriptor_errors or len(set(descriptors)) != 1:
             # Do not cache a mismatch: if ranks realign on a later call, each
             # rank must participate in a fresh consensus.
             return False, "rank_descriptor_mismatch"
+
+        if not any(support_flags) and set(reasons) == {"variable_split"}:
+            # A valid variable-split collective has different local sequence
+            # dimensions by construction. _consensus_descriptor normalizes
+            # that dimension while still requiring every rank to agree on the
+            # complete seq_lens vector and all other semantics.
+            decision = (False, "variable_split")
+            self._p2p_route_cache[cache_key] = decision
+            return decision
 
         if all(support_flags):
             decision = (True, "")
@@ -275,6 +285,51 @@ class UlyssesA2ARouter:
             decision = (False, "rank_capability_miss")
         self._p2p_route_cache[cache_key] = decision
         return decision
+
+    def _consensus_descriptor(self, spec: A2ASpec) -> tuple[str, str]:
+        """Return a rank-comparable descriptor and a local validation error."""
+        if not spec.is_variable:
+            return repr(spec.signature), ""
+
+        shape = list(spec.shape)
+        errors: list[str] = []
+        if len(shape) != 4:
+            errors.append(f"rank_not_four:{len(shape)}")
+        if spec.head_dim not in (1, 2):
+            errors.append(f"invalid_head_dim:{spec.head_dim}")
+
+        seq_lens = spec.seq_lens
+        if seq_lens is None or len(seq_lens) != self.nccl.world_size:
+            actual = 0 if seq_lens is None else len(seq_lens)
+            errors.append(f"seq_lens_size:{actual}:expected:{self.nccl.world_size}")
+        elif any(seq_len < 0 for seq_len in seq_lens):
+            errors.append("negative_seq_len")
+
+        if not errors:
+            assert seq_lens is not None
+            seq_dim = 2 if spec.head_dim == 1 else 1
+            expected_seq = (
+                seq_lens[self.nccl.rank]
+                if spec.mode == A2AMode.INPUT
+                else sum(seq_lens)
+            )
+            if shape[seq_dim] != expected_seq:
+                errors.append(f"sequence_dim:{shape[seq_dim]}:expected:{expected_seq}")
+            # Local input sequence lengths legitimately differ by rank. Replace
+            # the dimension only after validating it against the shared vector.
+            shape[seq_dim] = "<sequence_from_seq_lens>"
+
+        descriptor = (
+            int(spec.mode),
+            tuple(shape),
+            str(spec.dtype),
+            spec.device.type,
+            spec.head_dim,
+            seq_lens,
+            spec.capturing,
+            spec.slot.value,
+        )
+        return repr(descriptor), ",".join(errors)
 
     def _validate_config_consensus(self) -> None:
         descriptor = (
@@ -324,15 +379,18 @@ class UlyssesA2ARouter:
             raise RuntimeError("Ulysses A2A router is closed")
 
     def _log_selection_once(self, backend_name: str) -> None:
-        if self._logged_selection:
+        if backend_name in self._logged_backends:
             return
         logger.info(
-            "Ulysses A2A router selected backend=%s transfer=%s qkv_overlap=%s",
+            "Ulysses A2A router selected backend=%s transfer=%s "
+            "qkv_overlap=%s p2p_tk_style=%s legacy_prefer_p2p=%s",
             backend_name,
             self.config.transfer,
             self.config.qkv_overlap,
+            self.config.p2p_tk_style,
+            self.config.legacy_prefer_p2p,
         )
-        self._logged_selection = True
+        self._logged_backends.add(backend_name)
 
     def close(self) -> None:
         if self.closed:
@@ -344,4 +402,5 @@ class UlyssesA2ARouter:
             self.sgl_p2p.close()
             self.sgl_p2p = None
         self.nccl.close()
+        self._p2p_route_cache.clear()
         self.closed = True

@@ -2,9 +2,6 @@
 
 from typing import Literal, get_args
 
-from sglang.multimodal_gen.runtime.layers.quantization.compressed_tensors import (
-    CompressedTensorsConfig,
-)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -14,13 +11,12 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelslim import ModelSlimConfig
 
-QuantizationMethods = Literal["compressed-tensors", "fp8", "modelopt_fp4", "modelslim"]
+QuantizationMethods = Literal["fp8", "modelopt_fp4", "modelslim"]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
 # The customized quantization methods which will be added to this dict.
 _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
-    "compressed-tensors": CompressedTensorsConfig,
     "modelopt_fp4": ModelOptFp4Config,
     "modelslim": ModelSlimConfig,
     "fp8": Fp8Config,

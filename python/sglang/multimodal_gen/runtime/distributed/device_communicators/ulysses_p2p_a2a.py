@@ -31,13 +31,22 @@ _SUPPORTED_WORLD_SIZES = (2, 4, 6, 8)
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
-def _ops_available() -> bool:
+def _ops_available(*, tk_style: bool = True) -> bool:
     if not _is_cuda:
         return False
     try:
-        import sgl_kernel  # noqa: F401  # pyright: ignore[reportMissingImports]
+        import sgl_kernel  # pyright: ignore[reportMissingImports]
 
-        return hasattr(torch.ops.sgl_kernel, "ulysses_a2a")
+        op_name = "ulysses_a2a_tk" if tk_style else "ulysses_a2a"
+        required_symbols = (
+            "meta_size",
+            "init_ulysses_a2a",
+            "dispose_ulysses_a2a",
+            op_name,
+        )
+        if not all(hasattr(sgl_kernel, name) for name in required_symbols):
+            return False
+        return all(hasattr(torch.ops.sgl_kernel, name) for name in required_symbols)
     except Exception:
         return False
 
@@ -74,8 +83,9 @@ class UlyssesP2PAllToAll:
         self._last_done_event: torch.cuda.Event | None = None
         self._next_event_index = 0
 
-        if not _ops_available():
-            self.disabled_reason = "sgl_kernel_ulysses_a2a_op_unavailable"
+        if not _ops_available(tk_style=self.tk_style):
+            style = "tk" if self.tk_style else "legacy"
+            self.disabled_reason = f"sgl_kernel_ulysses_a2a_{style}_ops_unavailable"
             return
 
         self.rank = dist.get_rank(group=group)
@@ -157,9 +167,10 @@ class UlyssesP2PAllToAll:
         return True, ""
 
     @staticmethod
-    def runtime_available() -> tuple[bool, str]:
-        if not _ops_available():
-            return False, "sgl_kernel_ulysses_a2a_op_unavailable"
+    def runtime_available(*, tk_style: bool = True) -> tuple[bool, str]:
+        if not _ops_available(tk_style=tk_style):
+            style = "tk" if tk_style else "legacy"
+            return False, f"sgl_kernel_ulysses_a2a_{style}_ops_unavailable"
         return True, ""
 
     @classmethod
@@ -170,6 +181,8 @@ class UlyssesP2PAllToAll:
         device: torch.device,
         mode: int,
         world_size: int,
+        *,
+        tk_style: bool = True,
     ) -> tuple[bool, str]:
         supported, reason = cls.supports_semantics(
             shape,
@@ -180,7 +193,7 @@ class UlyssesP2PAllToAll:
         )
         if not supported:
             return supported, reason
-        return cls.runtime_available()
+        return cls.runtime_available(tk_style=tk_style)
 
     @staticmethod
     def _node_identity() -> str:
@@ -319,15 +332,33 @@ class UlyssesP2PAllToAll:
             from sglang.srt.distributed.device_communicators.custom_all_reduce import (
                 CustomAllreduce,
             )
-
-            if self.fa is not None:
-                sgl_kernel.dispose_ulysses_a2a(self.fa)
-            if self.out_ptrs is not None:
-                CustomAllreduce.free_shared_buffer(self.out_ptrs, group=self.group)
-            if self.signal_ptrs is not None:
-                CustomAllreduce.free_shared_buffer(self.signal_ptrs, group=self.group)
         except Exception:
-            pass
+            if any(
+                resource is not None
+                for resource in (self.fa, self.out_ptrs, self.signal_ptrs)
+            ):
+                logger.exception("Unable to import Ulysses P2P cleanup dependencies")
+            self.fa = None
+            self.out_ptrs = None
+            self.signal_ptrs = None
+            self.max_bytes = 0
+            return
+
+        if self.fa is not None:
+            try:
+                sgl_kernel.dispose_ulysses_a2a(self.fa)
+            except Exception:
+                logger.exception("Failed to dispose the Ulysses P2P kernel handle")
+        if self.out_ptrs is not None:
+            try:
+                CustomAllreduce.free_shared_buffer(self.out_ptrs, group=self.group)
+            except Exception:
+                logger.exception("Failed to free the Ulysses P2P output buffer")
+        if self.signal_ptrs is not None:
+            try:
+                CustomAllreduce.free_shared_buffer(self.signal_ptrs, group=self.group)
+            except Exception:
+                logger.exception("Failed to free the Ulysses P2P signal buffer")
         self.fa = None
         self.out_ptrs = None
         self.signal_ptrs = None
@@ -370,29 +401,37 @@ class UlyssesP2PAllToAll:
 
     def all_to_all(self, x: torch.Tensor, mode: int) -> Optional[torch.Tensor]:
         with self._launch_lock:
-            prepared = self._prepare_call(x, mode)
-            if prepared is None:
-                return None
-            x, out_shape, B, S_local, H, D = prepared
+            try:
+                prepared = self._prepare_call(x, mode)
+                if prepared is None:
+                    return None
+                x, out_shape, B, S_local, H, D = prepared
 
-            import sgl_kernel  # pyright: ignore[reportMissingImports]
+                import sgl_kernel  # pyright: ignore[reportMissingImports]
 
-            current_stream = torch.cuda.current_stream(device=x.device)
-            if self._last_done_event is not None:
-                current_stream.wait_event(self._last_done_event)
+                current_stream = torch.cuda.current_stream(device=x.device)
+                if self._last_done_event is not None:
+                    current_stream.wait_event(self._last_done_event)
 
-            out = torch.empty(out_shape, dtype=x.dtype, device=x.device)
-            if self.tk_style:
-                sgl_kernel.ulysses_a2a_tk(self.fa, x, out, B, S_local, H, D, mode)
-            else:
-                sgl_kernel.ulysses_a2a(self.fa, x, out, B, S_local, H, D, mode)
-            done_event = self._done_events[self._next_event_index]
-            self._next_event_index = (self._next_event_index + 1) % len(
-                self._done_events
-            )
-            done_event.record(current_stream)
-            self._last_done_event = done_event
-            return out
+                out = torch.empty(out_shape, dtype=x.dtype, device=x.device)
+                if self.tk_style:
+                    sgl_kernel.ulysses_a2a_tk(self.fa, x, out, B, S_local, H, D, mode)
+                else:
+                    sgl_kernel.ulysses_a2a(self.fa, x, out, B, S_local, H, D, mode)
+                done_event = self._done_events[self._next_event_index]
+                self._next_event_index = (self._next_event_index + 1) % len(
+                    self._done_events
+                )
+                done_event.record(current_stream)
+                self._last_done_event = done_event
+                return out
+            except UlyssesA2ACommitError:
+                raise
+            except Exception as exc:
+                raise UlyssesA2ACommitError(
+                    "sgl_p2p launch failed after backend commit: "
+                    f"mode={mode}, error={exc!r}"
+                ) from exc
 
     def close(self) -> None:
         """Collectively drain and release backend-owned resources."""

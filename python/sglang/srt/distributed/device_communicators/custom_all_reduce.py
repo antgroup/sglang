@@ -172,9 +172,10 @@ class CustomAllreduce:
     ) -> None:
         rank = dist.get_rank(group=group)
         lib = CudaRTLibrary()
-        for peer_rank, pointer in enumerate(pointers):
-            if peer_rank != rank:
-                lib.cudaIpcCloseMemHandle(ctypes.c_void_p(pointer))
+        if not _is_musa:
+            for peer_rank, pointer in enumerate(pointers):
+                if peer_rank != rank:
+                    lib.cudaIpcCloseMemHandle(ctypes.c_void_p(pointer))
         lib.cudaFree(ctypes.c_void_p(pointers[rank]))
 
     @contextmanager
