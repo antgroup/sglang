@@ -41,10 +41,16 @@ sys.modules.setdefault(
 )
 sys.modules.setdefault("partial_json_parser.core.options", partial_json_parser_options)
 
-from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
+from sglang.multimodal_gen.runtime.layers.quantization import (  # noqa: E402
+    get_quantization_config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.compressed_tensors import (  # noqa: E402
+    CompressedTensorsConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (  # noqa: E402
     NunchakuConfig,
 )
-from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (  # noqa: E402
     _filter_duplicate_precision_variant_safetensors,
     _Flux2Nvfp4FallbackAdapter,
     resolve_transformer_quant_load_spec,
@@ -175,6 +181,88 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         self.assertFalse(server_args.dit_cpu_offload)
         self.assertFalse(server_args.text_encoder_cpu_offload)
+
+
+class TestDiffusionCompressedTensorsConfig(unittest.TestCase):
+    def _fp8_dynamic_config(self):
+        return {
+            "quant_method": "compressed-tensors",
+            "format": "float-quantized",
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "format": "float-quantized",
+                    "weights": {
+                        "type": "float",
+                        "num_bits": 8,
+                        "strategy": "channel",
+                        "dynamic": False,
+                        "symmetric": True,
+                    },
+                    "input_activations": {
+                        "type": "float",
+                        "num_bits": 8,
+                        "strategy": "token",
+                        "dynamic": True,
+                        "symmetric": True,
+                    },
+                    "output_activations": None,
+                }
+            },
+            "ignore": ["patch_embedding"],
+            "kv_cache_scheme": None,
+            "sparsity_config": {},
+        }
+
+    def test_fp8_dynamic_config_is_registered_and_parsed(self):
+        config_cls = get_quantization_config("compressed-tensors")
+        self.assertIs(config_cls, CompressedTensorsConfig)
+
+        config = config_cls.from_config(self._fp8_dynamic_config())
+
+        self.assertEqual(config.get_name(), "compressed_tensors")
+        self.assertEqual(set(config.target_scheme_map), {"Linear"})
+        self.assertEqual(config.ignore, ["patch_embedding"])
+        scheme_parts = config.target_scheme_map["Linear"]
+        scheme = config._get_scheme_from_parts(
+            scheme_parts["weights"],
+            scheme_parts["input_activations"],
+        )
+        self.assertEqual(type(scheme).__name__, "_DiffusionCompressedTensorsW8A8Fp8")
+
+    def test_unsupported_compressed_tensors_formats_fail_closed(self):
+        mutations = (
+            ("format", ("format",), "int-quantized"),
+            (
+                "weight_bits",
+                ("config_groups", "group_0", "weights", "num_bits"),
+                4,
+            ),
+            (
+                "weight_strategy",
+                ("config_groups", "group_0", "weights", "strategy"),
+                "tensor",
+            ),
+            (
+                "activation_strategy",
+                ("config_groups", "group_0", "input_activations", "strategy"),
+                "tensor",
+            ),
+            (
+                "static_activations",
+                ("config_groups", "group_0", "input_activations", "dynamic"),
+                False,
+            ),
+        )
+        for name, path, value in mutations:
+            with self.subTest(name=name):
+                config = self._fp8_dynamic_config()
+                target = config
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                with self.assertRaisesRegex(ValueError, "FP8_DYNAMIC"):
+                    CompressedTensorsConfig.from_config(config)
 
 
 if __name__ == "__main__":
