@@ -17,6 +17,7 @@ class ProcessGroupSingleton(Singleton):
     def __init__(self):
         self.ULYSSES_PG = None
         self.RING_PG = None
+        self.OWNED_PGS = []
 
 
 PROCESS_GROUP = ProcessGroupSingleton()
@@ -89,3 +90,19 @@ def set_seq_parallel_pg_by_sp_groups(
 
     PROCESS_GROUP.ULYSSES_PG = ulyssess_pg
     PROCESS_GROUP.RING_PG = ring_pg
+    PROCESS_GROUP.OWNED_PGS = []
+    for group in (ulyssess_pg, ring_pg):
+        if group is not None and all(
+            group is not item for item in PROCESS_GROUP.OWNED_PGS
+        ):
+            PROCESS_GROUP.OWNED_PGS.append(group)
+
+
+def get_owned_seq_parallel_pgs() -> list:
+    return list(PROCESS_GROUP.OWNED_PGS)
+
+
+def reset_seq_parallel_pgs() -> None:
+    PROCESS_GROUP.ULYSSES_PG = None
+    PROCESS_GROUP.RING_PG = None
+    PROCESS_GROUP.OWNED_PGS = []

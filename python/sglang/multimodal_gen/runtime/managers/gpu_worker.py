@@ -66,6 +66,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.srt.environ import envs as srt_envs
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -138,6 +139,15 @@ class GPUWorker:
                 "127.0.0.1", self.master_port
             ).to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
+            ulysses_a2a_backend=self.server_args.ulysses_a2a_backend,
+            ulysses_a2a_transfer=self.server_args.ulysses_a2a_transfer,
+            ulysses_a2a_qkv_overlap=self.server_args.ulysses_a2a_qkv_overlap,
+            ulysses_a2a_p2p_tk_style=(
+                srt_envs.SGLANG_ENABLE_ULYSSES_P2P_A2A_TK_STYLE.get()
+            ),
+            ulysses_a2a_legacy_prefer_p2p=(
+                self.server_args.ulysses_a2a_legacy_prefer_p2p
+            ),
         )
 
         # set proc title

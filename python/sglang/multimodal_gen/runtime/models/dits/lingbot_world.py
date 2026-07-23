@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     sequence_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ulysses_a2a import (
+    A2ASlot,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,
@@ -238,6 +241,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         forward_batch = get_forward_context().forward_batch
         seq_splits = None
         uniform_seq_splits = False
+        a2a_transaction = None
         sequence_shard_enabled = (
             kv_cache is not None
             and forward_batch is not None
@@ -269,12 +273,24 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 )
             seq_splits = list(seq_splits)
             uniform_seq_splits = _sequence_splits_are_uniform(seq_splits)
+            a2a_transaction = get_sp_group().begin_ulysses_a2a_transaction(q.device)
             # Pack Q/K/V to avoid launching three Ulysses all-to-all collectives.
             qkv = torch.cat([roped_query, roped_key, v], dim=-1)
             qkv = (
-                _usp_input_all_to_all(qkv, head_dim=2)
+                _usp_input_all_to_all(
+                    qkv,
+                    head_dim=2,
+                    transaction=a2a_transaction,
+                    slot=A2ASlot.PACKED_QKV,
+                )
                 if uniform_seq_splits
-                else _usp_input_all_to_all_variable(qkv, seq_splits, head_dim=2)
+                else _usp_input_all_to_all_variable(
+                    qkv,
+                    seq_splits,
+                    head_dim=2,
+                    transaction=a2a_transaction,
+                    slot=A2ASlot.PACKED_QKV,
+                )
             )
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
 
@@ -450,11 +466,24 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         )
         if sequence_shard_enabled:
             assert seq_splits is not None
+            assert a2a_transaction is not None
             x = (
-                _usp_output_all_to_all(x, head_dim=2)
+                _usp_output_all_to_all(
+                    x,
+                    head_dim=2,
+                    transaction=a2a_transaction,
+                    slot=A2ASlot.OUT,
+                )
                 if uniform_seq_splits
-                else _usp_output_all_to_all_variable(x, seq_splits, head_dim=2)
+                else _usp_output_all_to_all_variable(
+                    x,
+                    seq_splits,
+                    head_dim=2,
+                    transaction=a2a_transaction,
+                    slot=A2ASlot.OUT,
+                )
             )
+            a2a_transaction.close()
         return x
 
 

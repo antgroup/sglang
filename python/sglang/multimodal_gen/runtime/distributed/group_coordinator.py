@@ -1207,11 +1207,11 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         ring_group = kwargs.get("ring_group", None)
         if ulysses_group is None:
             raise RuntimeError(
-                f"Please pass argument 'ulysses_group' when calling init func of SequenceParallelGroupCoordinator"
+                "Please pass argument 'ulysses_group' when calling init func of SequenceParallelGroupCoordinator"
             )
         if ring_group is None:
             raise RuntimeError(
-                f"Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
+                "Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
             )
         self.ulysses_group = ulysses_group
         self.ring_group = ring_group
@@ -1220,3 +1220,69 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.ulysses_rank = torch.distributed.get_rank(self.ulysses_group)
         self.ring_world_size = torch.distributed.get_world_size(self.ring_group)
         self.ring_rank = torch.distributed.get_rank(self.ring_group)
+        self._ulysses_a2a_router = None
+        self._ulysses_a2a_device = None
+        self._owned_subgroups = list(kwargs.get("owned_subgroups", []))
+
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.ulysses_a2a import (
+            UlyssesA2AConfig,
+        )
+
+        self.ulysses_a2a_config = UlyssesA2AConfig(
+            backend=kwargs.get("ulysses_a2a_backend", "nccl"),
+            transfer=kwargs.get("ulysses_a2a_transfer", "auto"),
+            qkv_overlap=kwargs.get("ulysses_a2a_qkv_overlap", "off"),
+            p2p_tk_style=kwargs.get("ulysses_a2a_p2p_tk_style", True),
+            legacy_prefer_p2p=kwargs.get("ulysses_a2a_legacy_prefer_p2p", False),
+        )
+
+    def get_ulysses_a2a_router(self, device: torch.device):
+        if self._ulysses_a2a_router is None:
+            from sglang.multimodal_gen.runtime.distributed.device_communicators.ulysses_a2a import (
+                UlyssesA2ARouter,
+            )
+
+            self._ulysses_a2a_device = torch.device(device)
+            self._ulysses_a2a_router = UlyssesA2ARouter(
+                self.ulysses_group,
+                self._ulysses_a2a_device,
+                self.ulysses_a2a_config,
+            )
+        elif torch.device(device) != self._ulysses_a2a_device:
+            raise RuntimeError(
+                "Ulysses A2A router is already bound to "
+                f"{self._ulysses_a2a_device}, got {device}"
+            )
+        return self._ulysses_a2a_router
+
+    def begin_ulysses_a2a_transaction(self, device: torch.device):
+        return self.get_ulysses_a2a_router(device).begin_transaction()
+
+    def destroy(self) -> None:
+        # Backend resources depend on the Ulysses subgroup and must close first.
+        if self._ulysses_a2a_router is not None:
+            self._ulysses_a2a_router.close()
+            self._ulysses_a2a_router = None
+            self._ulysses_a2a_device = None
+
+        seen = set()
+        for group in self._owned_subgroups:
+            if group is None or group is torch.distributed.group.WORLD:
+                continue
+            if group is torch.distributed.GroupMember.NON_GROUP_MEMBER:
+                continue
+            key = id(group)
+            if key in seen:
+                continue
+            seen.add(key)
+            torch.distributed.destroy_process_group(group)
+        self._owned_subgroups = []
+        self.ulysses_group = None
+        self.ring_group = None
+
+        try:
+            from .parallel_groups import reset_seq_parallel_pgs
+
+            reset_seq_parallel_pgs()
+        finally:
+            super().destroy()

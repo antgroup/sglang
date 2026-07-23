@@ -105,6 +105,18 @@ class CudaRTLibrary:
             cudaError_t,
             [ctypes.POINTER(ctypes.c_void_p), cudaIpcMemHandle_t, ctypes.c_uint],
         ),
+        *(
+            []
+            if _is_musa
+            else [
+                # cudaError_t cudaIpcCloseMemHandle ( void* devPtr )
+                Function(
+                    "cudaIpcCloseMemHandle",
+                    cudaError_t,
+                    [ctypes.c_void_p],
+                )
+            ]
+        ),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -185,3 +197,6 @@ class CudaRTLibrary:
             )
         )
         return devPtr
+
+    def cudaIpcCloseMemHandle(self, devPtr: ctypes.c_void_p) -> None:
+        self.CUDART_CHECK(self.funcs["cudaIpcCloseMemHandle"](devPtr))

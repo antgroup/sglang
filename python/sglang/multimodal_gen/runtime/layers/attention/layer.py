@@ -10,6 +10,9 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
     sequence_model_parallel_all_to_all_4D,
 )
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ulysses_a2a import (
+    A2ASlot,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_sequence_parallel_world_size,
@@ -441,11 +444,28 @@ class USPAttention(nn.Module):
             )
 
         # Ulysses-style All-to-All for sequence/head sharding
+        a2a_transaction = None
         if sp_size > 1:
+            a2a_transaction = get_sp_group().begin_ulysses_a2a_transaction(q.device)
             # -> [B, S, H_local, D]
-            q = _usp_input_all_to_all(q, head_dim=2)
-            k = _usp_input_all_to_all(k, head_dim=2)
-            v = _usp_input_all_to_all(v, head_dim=2)
+            q = _usp_input_all_to_all(
+                q,
+                head_dim=2,
+                transaction=a2a_transaction,
+                slot=A2ASlot.Q,
+            )
+            k = _usp_input_all_to_all(
+                k,
+                head_dim=2,
+                transaction=a2a_transaction,
+                slot=A2ASlot.K,
+            )
+            v = _usp_input_all_to_all(
+                v,
+                head_dim=2,
+                transaction=a2a_transaction,
+                slot=A2ASlot.V,
+            )
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
@@ -463,8 +483,15 @@ class USPAttention(nn.Module):
 
         # Ulysses-style All-to-All to restore original sharding
         if sp_size > 1:
+            assert a2a_transaction is not None
             # -> [B, S_local, H, D]
-            out = _usp_output_all_to_all(out, head_dim=2)
+            out = _usp_output_all_to_all(
+                out,
+                head_dim=2,
+                transaction=a2a_transaction,
+                slot=A2ASlot.OUT,
+            )
+            a2a_transaction.close()
 
         return out
 
@@ -494,9 +521,25 @@ class USPAttention(nn.Module):
         k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
         v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
 
-        q_shard = _usp_input_all_to_all(q_shard, head_dim=2)
-        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
-        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+        a2a_transaction = get_sp_group().begin_ulysses_a2a_transaction(q.device)
+        q_shard = _usp_input_all_to_all(
+            q_shard,
+            head_dim=2,
+            transaction=a2a_transaction,
+            slot=A2ASlot.Q,
+        )
+        k_shard = _usp_input_all_to_all(
+            k_shard,
+            head_dim=2,
+            transaction=a2a_transaction,
+            slot=A2ASlot.K,
+        )
+        v_shard = _usp_input_all_to_all(
+            v_shard,
+            head_dim=2,
+            transaction=a2a_transaction,
+            slot=A2ASlot.V,
+        )
 
         h_local = q_shard.shape[2]
         h_start = sp_rank * h_local
@@ -514,7 +557,13 @@ class USPAttention(nn.Module):
         out_rep = out[:, :num_rep]
         out_shard = out[:, num_rep:]
 
-        out_shard = _usp_output_all_to_all(out_shard, head_dim=2)
+        out_shard = _usp_output_all_to_all(
+            out_shard,
+            head_dim=2,
+            transaction=a2a_transaction,
+            slot=A2ASlot.OUT,
+        )
+        a2a_transaction.close()
 
         gathered = [torch.empty_like(out_rep) for _ in range(sp_size)]
         torch.distributed.all_gather(

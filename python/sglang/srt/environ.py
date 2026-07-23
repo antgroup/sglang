@@ -440,6 +440,11 @@ class Envs:
     # LingBot-side compatibility gates used by existing deployment scripts.
     LINGBOT_FORCE_P2P = EnvBool(False)
     LINGBOT_ULYSSES_JIT = EnvBool(False)
+    # Backend-neutral Ulysses A2A selection. Empty means the ServerArgs
+    # compatibility resolver should consult legacy flags and then default NCCL.
+    SGLANG_ULYSSES_A2A_BACKEND = EnvStr("")
+    SGLANG_ULYSSES_A2A_TRANSFER = EnvStr("")
+    SGLANG_ULYSSES_A2A_ASYNC_QKV = EnvStr("")
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
@@ -656,7 +661,7 @@ def example_with_implicit_bool_avoidance():
             assert message_matcher in str(e), f"{e=}"
             print(f"assert_throws find expected error: {e}")
             return
-        raise AssertionError(f"assert_throws do not see exceptions")
+        raise AssertionError("assert_throws do not see exceptions")
 
     with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
         if envs.SGLANG_TEST_RETRACT:

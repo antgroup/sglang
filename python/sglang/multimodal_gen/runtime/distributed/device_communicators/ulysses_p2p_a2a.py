@@ -8,16 +8,19 @@ all_to_all implementation.
 import ctypes
 import logging
 import os
-from typing import Dict, List, Optional
+import threading
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ulysses_a2a.base import (
+    UlyssesA2ACommitError,
+)
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     is_full_nvlink,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
@@ -26,7 +29,6 @@ _is_cuda = is_cuda()
 _BUFFER_GROW_PADDING = 1 << 20
 _SUPPORTED_WORLD_SIZES = (2, 4, 6, 8)
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-_INSTANCES: Dict[int, "UlyssesP2PAllToAll"] = {}
 
 
 def _ops_available() -> bool:
@@ -40,34 +42,49 @@ def _ops_available() -> bool:
         return False
 
 
-def _feature_enabled() -> bool:
-    if not envs.SGLANG_ENABLE_ULYSSES_P2P_A2A.get():
-        return False
-    if envs.LINGBOT_FORCE_P2P.is_set() and not envs.LINGBOT_FORCE_P2P.get():
-        return False
-    if envs.LINGBOT_ULYSSES_JIT.is_set() and not envs.LINGBOT_ULYSSES_JIT.get():
-        return False
-    return True
-
-
 class UlyssesP2PAllToAll:
-    def __init__(self, group: ProcessGroup, device: torch.device) -> None:
-        self.disabled = True
+    """One coordinator-owned IPC/NVLink Ulysses communicator.
+
+    The kernel has one signal/output staging area, so calls are stream-ordered
+    with ``max_inflight=1``. Capability misses happen before shared allocation;
+    failures after allocation starts are fatal and must not fall back to NCCL.
+    """
+
+    max_inflight = 1
+
+    def __init__(
+        self,
+        group: ProcessGroup,
+        device: torch.device,
+        *,
+        tk_style: bool = True,
+    ) -> None:
+        self.enabled = False
+        self.disabled_reason = "not_initialized"
+        self.closed = False
         self.group = group
         self.device = device
+        self.tk_style = tk_style
         self.fa: Optional[int] = None
         self.out_ptrs: Optional[List[int]] = None
         self.signal_ptrs: Optional[List[int]] = None
         self.max_bytes = 0
+        self._launch_lock = threading.Lock()
+        self._done_events: list[torch.cuda.Event] = []
+        self._last_done_event: torch.cuda.Event | None = None
+        self._next_event_index = 0
 
         if not _ops_available():
+            self.disabled_reason = "sgl_kernel_ulysses_a2a_op_unavailable"
             return
 
         self.rank = dist.get_rank(group=group)
         self.world_size = dist.get_world_size(group=group)
         if self.world_size == 1:
+            self.disabled_reason = "world_size_one"
             return
         if self.world_size not in _SUPPORTED_WORLD_SIZES:
+            self.disabled_reason = f"unsupported_world_size:{self.world_size}"
             logger.debug(
                 "UlyssesP2PAllToAll disabled: unsupported world size %d.",
                 self.world_size,
@@ -76,6 +93,7 @@ class UlyssesP2PAllToAll:
 
         full_nvlink = self._check_intra_node_p2p()
         if not full_nvlink:
+            self.disabled_reason = "topology_not_single_node_full_nvlink"
             logger.debug("UlyssesP2PAllToAll disabled: not intra-node NVLink/P2P.")
             return
 
@@ -99,11 +117,70 @@ class UlyssesP2PAllToAll:
             )
             dist.barrier(group=group)
         except Exception as e:
-            logger.warning("UlyssesP2PAllToAll disabled: signal alloc failed: %r", e)
-            self._teardown()
-            return
+            self._teardown_local()
+            raise UlyssesA2ACommitError(
+                f"sgl_p2p signal allocation failed after backend commit: {e!r}"
+            ) from e
 
-        self.disabled = False
+        self._done_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.enabled = True
+        self.disabled_reason = ""
+
+    @property
+    def disabled(self) -> bool:
+        return not self.enabled
+
+    @staticmethod
+    def supports_semantics(
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        mode: int,
+        world_size: int,
+    ) -> tuple[bool, str]:
+        if len(shape) != 4:
+            return False, "rank_not_four"
+        if device.type != "cuda":
+            return False, "device_not_cuda"
+        if dtype not in _SUPPORTED_DTYPES:
+            return False, f"unsupported_dtype:{dtype}"
+        if world_size not in _SUPPORTED_WORLD_SIZES:
+            return False, f"unsupported_world_size:{world_size}"
+        if mode == 0:
+            if shape[2] % world_size != 0:
+                return False, "heads_not_divisible"
+        elif mode == 1:
+            if shape[1] % world_size != 0:
+                return False, "sequence_not_divisible"
+        else:
+            return False, f"unsupported_mode:{mode}"
+        return True, ""
+
+    @staticmethod
+    def runtime_available() -> tuple[bool, str]:
+        if not _ops_available():
+            return False, "sgl_kernel_ulysses_a2a_op_unavailable"
+        return True, ""
+
+    @classmethod
+    def supports_tensor(
+        cls,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        mode: int,
+        world_size: int,
+    ) -> tuple[bool, str]:
+        supported, reason = cls.supports_semantics(
+            shape,
+            dtype,
+            device,
+            mode,
+            world_size,
+        )
+        if not supported:
+            return supported, reason
+        return cls.runtime_available()
 
     @staticmethod
     def _node_identity() -> str:
@@ -178,10 +255,22 @@ class UlyssesP2PAllToAll:
             return False
 
     def _ensure_capacity(self, nbytes: int) -> bool:
-        if self.disabled:
+        if not self.enabled or self.closed:
             return False
         if self.fa is not None and nbytes <= self.max_bytes:
             return True
+
+        self._drain_inflight()
+        requested = torch.tensor([nbytes], dtype=torch.int64, device=self.device)
+        maximum = requested.clone()
+        minimum = requested.clone()
+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=self.group)
+        dist.all_reduce(minimum, op=dist.ReduceOp.MIN, group=self.group)
+        if int(maximum.item()) != int(minimum.item()):
+            raise UlyssesA2ACommitError(
+                "sgl_p2p capacity request diverged across ranks: "
+                f"min={int(minimum.item())}, max={int(maximum.item())}"
+            )
 
         new_bytes = max(nbytes, self.max_bytes) + _BUFFER_GROW_PADDING
         try:
@@ -211,14 +300,19 @@ class UlyssesP2PAllToAll:
             self.max_bytes = new_bytes
             return True
         except Exception as e:
-            logger.warning(
-                "UlyssesP2PAllToAll disabled: out buffer alloc failed: %r", e
-            )
-            self._teardown()
-            return False
+            self._teardown_local()
+            raise UlyssesA2ACommitError(
+                f"sgl_p2p output allocation failed after backend commit: {e!r}"
+            ) from e
 
-    def _teardown(self) -> None:
-        self.disabled = True
+    def _drain_inflight(self) -> None:
+        if self._last_done_event is not None:
+            self._last_done_event.synchronize()
+            self._last_done_event = None
+
+    def _teardown_local(self) -> None:
+        """Best-effort cleanup for partially initialized/fatal paths."""
+        self.enabled = False
         try:
             import sgl_kernel  # pyright: ignore[reportMissingImports]
 
@@ -237,11 +331,12 @@ class UlyssesP2PAllToAll:
         self.fa = None
         self.out_ptrs = None
         self.signal_ptrs = None
+        self.max_bytes = 0
 
     def _prepare_call(
         self, x: torch.Tensor, mode: int
     ) -> Optional[tuple[torch.Tensor, tuple[int, int, int, int], int, int, int, int]]:
-        if self.disabled:
+        if not self.enabled or self.closed:
             return None
         if x.dim() != 4 or not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES:
             return None
@@ -274,32 +369,45 @@ class UlyssesP2PAllToAll:
         return x, out_shape, B, S_local, H, D
 
     def all_to_all(self, x: torch.Tensor, mode: int) -> Optional[torch.Tensor]:
-        prepared = self._prepare_call(x, mode)
-        if prepared is None:
-            return None
-        x, out_shape, B, S_local, H, D = prepared
+        with self._launch_lock:
+            prepared = self._prepare_call(x, mode)
+            if prepared is None:
+                return None
+            x, out_shape, B, S_local, H, D = prepared
 
-        import sgl_kernel  # pyright: ignore[reportMissingImports]
+            import sgl_kernel  # pyright: ignore[reportMissingImports]
 
-        out = torch.empty(out_shape, dtype=x.dtype, device=x.device)
-        if envs.SGLANG_ENABLE_ULYSSES_P2P_A2A_TK_STYLE.get():
-            sgl_kernel.ulysses_a2a_tk(self.fa, x, out, B, S_local, H, D, mode)
-        else:
-            sgl_kernel.ulysses_a2a(self.fa, x, out, B, S_local, H, D, mode)
-        return out
+            current_stream = torch.cuda.current_stream(device=x.device)
+            if self._last_done_event is not None:
+                current_stream.wait_event(self._last_done_event)
 
+            out = torch.empty(out_shape, dtype=x.dtype, device=x.device)
+            if self.tk_style:
+                sgl_kernel.ulysses_a2a_tk(self.fa, x, out, B, S_local, H, D, mode)
+            else:
+                sgl_kernel.ulysses_a2a(self.fa, x, out, B, S_local, H, D, mode)
+            done_event = self._done_events[self._next_event_index]
+            self._next_event_index = (self._next_event_index + 1) % len(
+                self._done_events
+            )
+            done_event.record(current_stream)
+            self._last_done_event = done_event
+            return out
 
-def get_ulysses_p2p_a2a(
-    group: ProcessGroup, device: torch.device
-) -> Optional["UlyssesP2PAllToAll"]:
-    if not _feature_enabled():
-        return None
-    if not _is_cuda:
-        return None
+    def close(self) -> None:
+        """Collectively drain and release backend-owned resources."""
+        if self.closed:
+            return
+        self.closed = True
+        if not self.enabled:
+            self._teardown_local()
+            return
 
-    key = id(group)
-    inst = _INSTANCES.get(key)
-    if inst is None:
-        inst = UlyssesP2PAllToAll(group, device)
-        _INSTANCES[key] = inst
-    return None if inst.disabled else inst
+        self._drain_inflight()
+        try:
+            dist.barrier(group=self.group)
+            self._teardown_local()
+            dist.barrier(group=self.group)
+        finally:
+            self.enabled = False
+            self._done_events.clear()

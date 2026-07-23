@@ -49,6 +49,7 @@ from sglang.multimodal_gen.utils import (
     StoreBoolean,
     expand_path_fields,
 )
+from sglang.srt.environ import envs as srt_envs
 
 logger = init_logger(__name__)
 
@@ -125,6 +126,11 @@ class ServerArgs:
     # sequence parallelism
     ulysses_degree: Optional[int] = None
     ring_degree: Optional[int] = None
+    # Ulysses all-to-all transport. None means resolve env/legacy/default policy.
+    ulysses_a2a_backend: str | None = None
+    ulysses_a2a_transfer: str | None = None
+    ulysses_a2a_qkv_overlap: str | None = None
+    ulysses_a2a_legacy_prefer_p2p: bool = field(default=False, init=False, repr=False)
     # data parallelism
     # number of data parallelism groups
     dp_size: int = 1
@@ -274,6 +280,7 @@ class ServerArgs:
         self._adjust_network_ports()
         # adjust parallelism before attention backend
         self._adjust_parallelism()
+        self._adjust_ulysses_a2a()
         self._adjust_attention_backend()
         self._adjust_platform_specific()
         self._adjust_autocast()
@@ -285,6 +292,7 @@ class ServerArgs:
         self._validate_pipeline()
         self._validate_offload()
         self._validate_parallelism()
+        self._validate_ulysses_a2a()
         self._validate_cfg_parallel()
 
     def _adjust_save_paths(self):
@@ -478,6 +486,104 @@ class ServerArgs:
         if self.ring_degree is None:
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
+
+    def _adjust_ulysses_a2a(self) -> None:
+        """Resolve CLI > new env > legacy env > NCCL defaults."""
+        explicit_backend = self.ulysses_a2a_backend is not None
+        if self.ulysses_a2a_backend is None:
+            if srt_envs.SGLANG_ULYSSES_A2A_BACKEND.is_set():
+                self.ulysses_a2a_backend = (
+                    srt_envs.SGLANG_ULYSSES_A2A_BACKEND.get().strip().lower()
+                )
+            else:
+                legacy_enabled = (
+                    srt_envs.SGLANG_ENABLE_ULYSSES_P2P_A2A.is_set()
+                    and srt_envs.SGLANG_ENABLE_ULYSSES_P2P_A2A.get()
+                )
+                legacy_vetoes = [
+                    name
+                    for name, flag in (
+                        ("LINGBOT_FORCE_P2P", srt_envs.LINGBOT_FORCE_P2P),
+                        ("LINGBOT_ULYSSES_JIT", srt_envs.LINGBOT_ULYSSES_JIT),
+                    )
+                    if flag.is_set() and not flag.get()
+                ]
+                if legacy_enabled and legacy_vetoes:
+                    raise ValueError(
+                        "Legacy Ulysses P2P flags conflict: "
+                        "SGLANG_ENABLE_ULYSSES_P2P_A2A enables P2P while "
+                        f"{', '.join(legacy_vetoes)} veto it"
+                    )
+                if legacy_enabled:
+                    self.ulysses_a2a_backend = "auto"
+                    self.ulysses_a2a_legacy_prefer_p2p = True
+                else:
+                    self.ulysses_a2a_backend = "nccl"
+        else:
+            self.ulysses_a2a_backend = self.ulysses_a2a_backend.strip().lower()
+
+        if self.ulysses_a2a_transfer is None:
+            self.ulysses_a2a_transfer = (
+                srt_envs.SGLANG_ULYSSES_A2A_TRANSFER.get().strip().lower()
+                if srt_envs.SGLANG_ULYSSES_A2A_TRANSFER.is_set()
+                else "auto"
+            )
+        else:
+            self.ulysses_a2a_transfer = self.ulysses_a2a_transfer.strip().lower()
+
+        if self.ulysses_a2a_qkv_overlap is None:
+            self.ulysses_a2a_qkv_overlap = (
+                srt_envs.SGLANG_ULYSSES_A2A_ASYNC_QKV.get().strip().lower()
+                if srt_envs.SGLANG_ULYSSES_A2A_ASYNC_QKV.is_set()
+                else "off"
+            )
+        else:
+            self.ulysses_a2a_qkv_overlap = self.ulysses_a2a_qkv_overlap.strip().lower()
+
+        if explicit_backend and any(
+            flag.is_set()
+            for flag in (
+                srt_envs.SGLANG_ENABLE_ULYSSES_P2P_A2A,
+                srt_envs.LINGBOT_FORCE_P2P,
+                srt_envs.LINGBOT_ULYSSES_JIT,
+            )
+        ):
+            logger.info(
+                "Explicit --ulysses-a2a-backend=%s takes precedence over "
+                "legacy Ulysses P2P environment flags",
+                self.ulysses_a2a_backend,
+            )
+
+    def _validate_ulysses_a2a(self) -> None:
+        if self.ulysses_a2a_backend not in {
+            "nccl",
+            "sgl_p2p",
+            "fast_ulysses",
+            "auto",
+        }:
+            raise ValueError(
+                "--ulysses-a2a-backend must be one of "
+                "nccl, sgl_p2p, fast_ulysses, auto"
+            )
+        if self.ulysses_a2a_transfer not in {"auto", "sm", "tma", "ce"}:
+            raise ValueError("--ulysses-a2a-transfer must be one of auto, sm, tma, ce")
+        if self.ulysses_a2a_qkv_overlap not in {"off", "auto", "on"}:
+            raise ValueError("--ulysses-a2a-qkv-overlap must be one of off, auto, on")
+        if (
+            self.ulysses_a2a_transfer != "auto"
+            and self.ulysses_a2a_backend != "fast_ulysses"
+        ):
+            raise ValueError(
+                "--ulysses-a2a-transfer is only valid with forced "
+                "--ulysses-a2a-backend=fast_ulysses"
+            )
+        if self.ulysses_a2a_qkv_overlap == "on" and self.ulysses_a2a_backend in {
+            "nccl",
+            "sgl_p2p",
+        }:
+            raise ValueError(
+                "--ulysses-a2a-qkv-overlap=on requires a grouped-async backend"
+            )
 
     def _adjust_platform_specific(self):
         if current_platform.is_mps():
@@ -674,6 +780,30 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ring_degree,
             help="Ring sequence parallel degree. Used in attention layer.",
+        )
+        parser.add_argument(
+            "--ulysses-a2a-backend",
+            type=str,
+            default=ServerArgs.ulysses_a2a_backend,
+            choices=["nccl", "sgl_p2p", "fast_ulysses", "auto"],
+            help=(
+                "Ulysses all-to-all backend. Explicit values are strict except "
+                "auto; default resolution is new env, legacy env, then NCCL."
+            ),
+        )
+        parser.add_argument(
+            "--ulysses-a2a-transfer",
+            type=str,
+            default=ServerArgs.ulysses_a2a_transfer,
+            choices=["auto", "sm", "tma", "ce"],
+            help="Transfer engine for the forced fast_ulysses backend.",
+        )
+        parser.add_argument(
+            "--ulysses-a2a-qkv-overlap",
+            type=str,
+            default=ServerArgs.ulysses_a2a_qkv_overlap,
+            choices=["off", "auto", "on"],
+            help="Backend-neutral grouped QKV scheduling policy.",
         )
         parser.add_argument(
             "--enable-cfg-parallel",

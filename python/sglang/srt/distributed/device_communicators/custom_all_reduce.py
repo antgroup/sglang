@@ -172,6 +172,9 @@ class CustomAllreduce:
     ) -> None:
         rank = dist.get_rank(group=group)
         lib = CudaRTLibrary()
+        for peer_rank, pointer in enumerate(pointers):
+            if peer_rank != rank:
+                lib.cudaIpcCloseMemHandle(ctypes.c_void_p(pointer))
         lib.cudaFree(ctypes.c_void_p(pointers[rank]))
 
     @contextmanager
@@ -328,8 +331,8 @@ class CustomAllreduce:
         if not self.disabled and self._ptr:
             ops.dispose(self._ptr)
             if _is_cuda:
-                self.free_shared_buffer(self.meta_ptrs)
-                self.free_shared_buffer(self.buffer_ptrs)
+                self.free_shared_buffer(self.meta_ptrs, group=self.group)
+                self.free_shared_buffer(self.buffer_ptrs, group=self.group)
             self._ptr = 0
 
     def __del__(self):

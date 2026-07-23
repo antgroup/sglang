@@ -276,6 +276,11 @@ def initialize_model_parallel(
     pipeline_parallel_degree: int = 1,
     vae_parallel_size: int = 0,
     backend: Optional[str] = None,
+    ulysses_a2a_backend: str = "nccl",
+    ulysses_a2a_transfer: str = "auto",
+    ulysses_a2a_qkv_overlap: str = "off",
+    ulysses_a2a_p2p_tk_style: bool = True,
+    ulysses_a2a_legacy_prefer_p2p: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -385,10 +390,16 @@ def initialize_model_parallel(
     try:
         from .parallel_groups import PROCESS_GROUP as _YC_PROCESS_GROUP
         from .parallel_groups import (
+            get_owned_seq_parallel_pgs as _get_owned_seq_parallel_pgs,
+        )
+        from .parallel_groups import (
             set_seq_parallel_pg_by_sp_groups as _set_seq_parallel_pg_by_sp_groups,
         )
     except ImportError:
         _set_seq_parallel_pg_by_sp_groups = None
+
+        def _get_owned_seq_parallel_pgs():
+            return []
 
         class _DummyProcessGroup:
             ULYSSES_PG = torch.distributed.group.WORLD
@@ -415,6 +426,12 @@ def initialize_model_parallel(
         parallel_mode="sequence",
         ulysses_group=PROCESS_GROUP.ULYSSES_PG,
         ring_group=PROCESS_GROUP.RING_PG,
+        owned_subgroups=_get_owned_seq_parallel_pgs(),
+        ulysses_a2a_backend=ulysses_a2a_backend,
+        ulysses_a2a_transfer=ulysses_a2a_transfer,
+        ulysses_a2a_qkv_overlap=ulysses_a2a_qkv_overlap,
+        ulysses_a2a_p2p_tk_style=ulysses_a2a_p2p_tk_style,
+        ulysses_a2a_legacy_prefer_p2p=ulysses_a2a_legacy_prefer_p2p,
     )
 
     global _TP
@@ -470,6 +487,11 @@ def maybe_init_distributed_environment_and_model_parallel(
     dp_size: int = 1,
     distributed_init_method: str = "env://",
     dist_timeout: int | None = None,
+    ulysses_a2a_backend: str = "nccl",
+    ulysses_a2a_transfer: str = "auto",
+    ulysses_a2a_qkv_overlap: str = "off",
+    ulysses_a2a_p2p_tk_style: bool = True,
+    ulysses_a2a_legacy_prefer_p2p: bool = False,
 ):
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -510,6 +532,11 @@ def maybe_init_distributed_environment_and_model_parallel(
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
+        ulysses_a2a_backend=ulysses_a2a_backend,
+        ulysses_a2a_transfer=ulysses_a2a_transfer,
+        ulysses_a2a_qkv_overlap=ulysses_a2a_qkv_overlap,
+        ulysses_a2a_p2p_tk_style=ulysses_a2a_p2p_tk_style,
+        ulysses_a2a_legacy_prefer_p2p=ulysses_a2a_legacy_prefer_p2p,
     )
 
     # Only set CUDA device if we're on a CUDA platform
