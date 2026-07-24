@@ -273,7 +273,12 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 )
             seq_splits = list(seq_splits)
             uniform_seq_splits = _sequence_splits_are_uniform(seq_splits)
-            a2a_transaction = get_sp_group().begin_ulysses_a2a_transaction(q.device)
+            sp_group = get_sp_group()
+            if sp_group.ulysses_a2a_config.backend not in {
+                "nccl",
+                "fast_ulysses",
+            }:
+                a2a_transaction = sp_group.begin_ulysses_a2a_transaction(q.device)
             # Pack Q/K/V to avoid launching three Ulysses all-to-all collectives.
             qkv = torch.cat([roped_query, roped_key, v], dim=-1)
             qkv = (
@@ -466,7 +471,6 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         )
         if sequence_shard_enabled:
             assert seq_splits is not None
-            assert a2a_transaction is not None
             x = (
                 _usp_output_all_to_all(
                     x,
@@ -483,7 +487,8 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                     slot=A2ASlot.OUT,
                 )
             )
-            a2a_transaction.close()
+            if a2a_transaction is not None:
+                a2a_transaction.close()
         return x
 
 

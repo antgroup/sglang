@@ -1,0 +1,54 @@
+{
+  "environment": {
+    "gpu": "8 x NVIDIA L20X",
+    "model": "/home/admin/lingbot-world-fast-diffusers",
+    "client": "/ossfs/workspace/test_fusion_ling.py",
+    "fast_ulysses_commit": "6e5dcb24dc44e781ac3091d1d9b3f9fef314fb87",
+    "nvshmem": "3.7.2-cu12",
+    "tag_pool_size": 32
+  },
+  "method": {
+    "client_repetitions": 3,
+    "client_duration_seconds": 90,
+    "drop_initial_chunks": 1,
+    "mode": "moving",
+    "comparison": "same-host NCCL-fast_ulysses-NCCL bracket"
+  },
+  "moving_mean_ms": {
+    "nccl_before": {
+      "denoise": 349.265909,
+      "scheduler": 563.473059,
+      "deploy_total": 692.926471
+    },
+    "fast_ulysses": {
+      "denoise": 333.928571,
+      "scheduler": 538.976932,
+      "deploy_total": 667.789432
+    },
+    "nccl_after": {
+      "denoise": 347.023596,
+      "scheduler": 555.786628,
+      "deploy_total": 684.609767
+    },
+    "nccl_bracket_mean": {
+      "denoise": 348.144752,
+      "scheduler": 559.629843,
+      "deploy_total": 688.768119
+    }
+  },
+  "fast_ulysses_improvement_vs_nccl_bracket_percent": {
+    "denoise": 4.083411,
+    "scheduler": 3.690459,
+    "deploy_total": 3.045827
+  },
+  "microbenchmark": {
+    "shape": [1, 585, 40, 384],
+    "dtype": "bfloat16",
+    "round_trip_iterations": 200,
+    "nccl_critical_rank_mean_ms": 0.251014,
+    "fast_ulysses_critical_rank_mean_ms": 0.215712,
+    "speedup": 1.163652,
+    "rank_skew_tag_reuse_iterations": 40,
+    "correctness": "bitwise pass"
+  }
+}

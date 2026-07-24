@@ -43,6 +43,7 @@ class UlyssesA2ARouter:
         self.closed = False
         self._logged_backends: set[str] = set()
         self._p2p_route_cache: dict[tuple[object, ...], tuple[bool, str]] = {}
+        self._fixed_fast_signatures: set[tuple[object, ...]] = set()
         self._validate_config_consensus()
 
     def begin_transaction(self) -> UlyssesA2ATransaction:
@@ -85,6 +86,67 @@ class UlyssesA2ARouter:
             transaction=transaction,
         )
 
+    def fixed_backend_all_to_all(
+        self,
+        x: torch.Tensor,
+        *,
+        mode: A2AMode,
+        head_dim: int,
+        seq_lens: Optional[list[int]],
+        slot: A2ASlot,
+    ) -> torch.Tensor:
+        """Low-overhead path for model code pinned to one strict backend.
+
+        NCCL needs no per-call routing. fast_ulysses validates and reaches
+        consensus once for each semantic signature, then calls the transport
+        directly on subsequent transformer layers and denoising steps.
+        """
+        self._ensure_open()
+        self._validate_device(x)
+        if self.config.backend == "nccl":
+            self.stats.selected_backend = "nccl"
+            self.stats.nccl_calls += 1
+            self._log_selection_once("nccl")
+            if mode == A2AMode.INPUT:
+                return self.nccl.input_all_to_all(
+                    x, head_dim=head_dim, seq_lens=seq_lens
+                )
+            return self.nccl.output_all_to_all(x, head_dim=head_dim, seq_lens=seq_lens)
+
+        if self.config.backend != "fast_ulysses":
+            return self._run(
+                x,
+                mode=mode,
+                head_dim=head_dim,
+                seq_lens=seq_lens,
+                slot=slot,
+                transaction=None,
+            )
+
+        spec = A2ASpec.from_tensor(
+            x,
+            mode=mode,
+            head_dim=head_dim,
+            seq_lens=seq_lens,
+            slot=slot,
+        )
+        if spec.signature not in self._fixed_fast_signatures:
+            supported, reason = self._accelerated_supports("fast_ulysses", spec)
+            supported, reason = self._p2p_support_consensus(spec, supported, reason)
+            if not supported:
+                self.stats.strict_backend_violation_count += 1
+                raise UlyssesA2AUnsupportedError(
+                    f"forced fast_ulysses backend rejected operation: {reason}"
+                )
+            self._get_fast_ulysses()
+            self._fixed_fast_signatures.add(spec.signature)
+
+        self.stats.selected_backend = "fast_ulysses"
+        self.stats.fast_ulysses_calls += 1
+        self._log_selection_once("fast_ulysses")
+        assert self.fast_ulysses is not None
+        return self.fast_ulysses.all_to_all(x, int(mode), slot=slot)
+
     def _run(
         self,
         x: torch.Tensor,
@@ -96,12 +158,7 @@ class UlyssesA2ARouter:
         transaction: UlyssesA2ATransaction | None,
     ) -> torch.Tensor:
         self._ensure_open()
-        if x.device.type != self.device.type or (
-            self.device.index is not None and x.device.index != self.device.index
-        ):
-            raise UlyssesA2ATransactionError(
-                f"Ulysses A2A router is bound to {self.device}, got {x.device}"
-            )
+        self._validate_device(x)
         spec = A2ASpec.from_tensor(
             x,
             mode=mode,
@@ -145,9 +202,20 @@ class UlyssesA2ARouter:
             return out
 
         self.stats.fast_ulysses_calls += 1
-        raise UlyssesA2AUnsupportedError(
-            "fast_ulysses execution is unavailable in this adapter revision"
+        assert self.fast_ulysses is not None
+        return self.fast_ulysses.all_to_all(
+            x,
+            int(mode),
+            slot=slot,
         )
+
+    def _validate_device(self, x: torch.Tensor) -> None:
+        if x.device.type != self.device.type or (
+            self.device.index is not None and x.device.index != self.device.index
+        ):
+            raise UlyssesA2ATransactionError(
+                f"Ulysses A2A router is bound to {self.device}, got {x.device}"
+            )
 
     def _select_backend(
         self,
@@ -173,6 +241,13 @@ class UlyssesA2ARouter:
         if requested == "nccl":
             return "nccl"
         if requested == "fast_ulysses":
+            supported, reason = self._accelerated_supports("fast_ulysses", spec)
+            supported, reason = self._p2p_support_consensus(spec, supported, reason)
+            if not supported:
+                self.stats.strict_backend_violation_count += 1
+                raise UlyssesA2AUnsupportedError(
+                    f"forced fast_ulysses backend rejected operation: {reason}"
+                )
             self._get_fast_ulysses()
             return "fast_ulysses"
         if requested == "sgl_p2p":
@@ -216,7 +291,16 @@ class UlyssesA2ARouter:
         if spec.capturing:
             return False, "cuda_graph_capture"
         if backend_name == "fast_ulysses":
-            return False, "fast_ulysses_reclaim_unavailable"
+            from .fast_ulysses import FastUlyssesA2ABackend
+
+            return FastUlyssesA2ABackend.supports_semantics(
+                spec.shape,
+                spec.dtype,
+                spec.device,
+                int(spec.mode),
+                self.nccl.world_size,
+                head_dim=spec.head_dim,
+            )
 
         from sglang.multimodal_gen.runtime.distributed.device_communicators.ulysses_p2p_a2a import (
             UlyssesP2PAllToAll,
@@ -403,4 +487,5 @@ class UlyssesA2ARouter:
             self.sgl_p2p = None
         self.nccl.close()
         self._p2p_route_cache.clear()
+        self._fixed_fast_signatures.clear()
         self.closed = True

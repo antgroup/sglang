@@ -7,6 +7,7 @@ import torch
 from torch.distributed.tensor.experimental._attention import _cp_options
 
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ulysses_a2a import (
+    A2AMode,
     A2ASlot,
     UlyssesA2ATransaction,
 )
@@ -41,6 +42,14 @@ def _usp_input_all_to_all(
     if transaction is not None:
         return transaction.input_all_to_all(x, head_dim=head_dim, slot=semantic_slot)
     router = get_sp_group().get_ulysses_a2a_router(x.device)
+    if router.config.backend in {"nccl", "fast_ulysses"}:
+        return router.fixed_backend_all_to_all(
+            x,
+            mode=A2AMode.INPUT,
+            head_dim=head_dim,
+            seq_lens=None,
+            slot=semantic_slot,
+        )
     return router.input_all_to_all(x, head_dim=head_dim, slot=semantic_slot)
 
 
@@ -62,6 +71,14 @@ def _usp_input_all_to_all_variable(
             slot=semantic_slot,
         )
     router = get_sp_group().get_ulysses_a2a_router(x.device)
+    if router.config.backend in {"nccl", "fast_ulysses"}:
+        return router.fixed_backend_all_to_all(
+            x,
+            mode=A2AMode.INPUT,
+            head_dim=head_dim,
+            seq_lens=seq_lens,
+            slot=semantic_slot,
+        )
     return router.input_all_to_all(
         x,
         head_dim=head_dim,
@@ -82,6 +99,14 @@ def _usp_output_all_to_all(
     if transaction is not None:
         return transaction.output_all_to_all(x, head_dim=head_dim, slot=semantic_slot)
     router = get_sp_group().get_ulysses_a2a_router(x.device)
+    if router.config.backend in {"nccl", "fast_ulysses"}:
+        return router.fixed_backend_all_to_all(
+            x,
+            mode=A2AMode.OUTPUT,
+            head_dim=head_dim,
+            seq_lens=None,
+            slot=semantic_slot,
+        )
     return router.output_all_to_all(x, head_dim=head_dim, slot=semantic_slot)
 
 
@@ -103,6 +128,14 @@ def _usp_output_all_to_all_variable(
             slot=semantic_slot,
         )
     router = get_sp_group().get_ulysses_a2a_router(x.device)
+    if router.config.backend in {"nccl", "fast_ulysses"}:
+        return router.fixed_backend_all_to_all(
+            x,
+            mode=A2AMode.OUTPUT,
+            head_dim=head_dim,
+            seq_lens=seq_lens,
+            slot=semantic_slot,
+        )
     return router.output_all_to_all(
         x,
         head_dim=head_dim,

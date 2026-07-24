@@ -2,6 +2,7 @@ import os
 import sys
 import threading
 import unittest
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -14,6 +15,10 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.ulysses_a2a 
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ulysses_a2a.base import (
     A2ASpec,
     UlyssesA2ACommitError,
+    UlyssesA2AStats,
+)
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ulysses_a2a.fast_ulysses import (
+    FastUlyssesA2ABackend,
 )
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ulysses_a2a.router import (
     UlyssesA2ARouter,
@@ -107,6 +112,136 @@ class TestDiffusionUlyssesA2A(CustomTestCase):
                 self._resolve_args(backend="nccl", transfer="sm")
         with self.assertRaisesRegex(ValueError, "only"):
             UlyssesA2AConfig(backend="nccl", transfer="sm")
+
+    def test_fast_ulysses_semantic_envelope(self):
+        with patch(
+            "sglang.multimodal_gen.runtime.distributed.device_communicators."
+            "ulysses_a2a.fast_ulysses.importlib.util.find_spec",
+            return_value=object(),
+        ):
+            supported, reason = FastUlyssesA2ABackend.supports_semantics(
+                (1, 585, 40, 384),
+                p2p_module.torch.bfloat16,
+                p2p_module.torch.device("cuda", 0),
+                int(A2AMode.INPUT),
+                8,
+                head_dim=2,
+            )
+        self.assertTrue(supported, reason)
+
+        supported, reason = FastUlyssesA2ABackend.supports_semantics(
+            (1, 585, 40, 383),
+            p2p_module.torch.bfloat16,
+            p2p_module.torch.device("cuda", 0),
+            int(A2AMode.INPUT),
+            8,
+            head_dim=2,
+        )
+        self.assertFalse(supported)
+        self.assertIn(reason, {"fast_ulysses_not_installed", "row_alignment"})
+
+    def test_fixed_nccl_path_bypasses_per_call_spec_routing(self):
+        router = object.__new__(UlyssesA2ARouter)
+        router.closed = False
+        router.device = p2p_module.torch.device("cpu")
+        router.config = UlyssesA2AConfig(backend="nccl")
+        router.nccl = Mock()
+        router.stats = UlyssesA2AStats()
+        router._logged_backends = set()
+        tensor = p2p_module.torch.zeros(1, 2, 4, 8)
+        expected = object()
+        router.nccl.input_all_to_all.return_value = expected
+
+        with patch.object(
+            A2ASpec,
+            "from_tensor",
+            side_effect=AssertionError("fixed NCCL path must not build A2ASpec"),
+        ):
+            actual = router.fixed_backend_all_to_all(
+                tensor,
+                mode=A2AMode.INPUT,
+                head_dim=2,
+                seq_lens=None,
+                slot=A2ASlot.PACKED_QKV,
+            )
+
+        self.assertIs(actual, expected)
+        router.nccl.input_all_to_all.assert_called_once_with(
+            tensor,
+            head_dim=2,
+            seq_lens=None,
+        )
+
+    def test_fixed_fast_path_reuses_collective_validation(self):
+        router = object.__new__(UlyssesA2ARouter)
+        router.closed = False
+        router.device = p2p_module.torch.device("cpu")
+        router.config = UlyssesA2AConfig(backend="fast_ulysses")
+        router.fast_ulysses = Mock()
+        router.stats = UlyssesA2AStats()
+        router._logged_backends = set()
+        router._fixed_fast_signatures = set()
+        tensor = p2p_module.torch.zeros(1, 2, 4, 8)
+
+        with (
+            patch.object(
+                router,
+                "_accelerated_supports",
+                return_value=(True, ""),
+            ) as supports,
+            patch.object(
+                router,
+                "_p2p_support_consensus",
+                return_value=(True, ""),
+            ) as consensus,
+            patch.object(router, "_get_fast_ulysses"),
+        ):
+            for _ in range(2):
+                router.fixed_backend_all_to_all(
+                    tensor,
+                    mode=A2AMode.INPUT,
+                    head_dim=2,
+                    seq_lens=None,
+                    slot=A2ASlot.PACKED_QKV,
+                )
+
+        supports.assert_called_once()
+        consensus.assert_called_once()
+        self.assertEqual(router.fast_ulysses.all_to_all.call_count, 2)
+
+    def test_fast_tag_pool_barriers_only_when_reusing_a_cycle(self):
+        backend = object.__new__(FastUlyssesA2ABackend)
+        backend._closed = False
+        backend._group = Mock()
+        backend._group.all_to_all_single_4d.side_effect = lambda tensor, **_: tensor
+        backend.transfer = "sm"
+        backend.tag_pool_size = 2
+        backend._slot_calls = defaultdict(int)
+        backend._logged_signatures = set()
+        tensor = p2p_module.torch.zeros(1, 2, 4, 8)
+
+        for _ in range(5):
+            backend.all_to_all(
+                tensor,
+                int(A2AMode.INPUT),
+                slot=A2ASlot.PACKED_QKV,
+            )
+
+        tags = [
+            call.kwargs["tag"]
+            for call in backend._group.all_to_all_single_4d.call_args_list
+        ]
+        self.assertEqual(
+            tags,
+            [
+                "sglang:packed_qkv:0",
+                "sglang:packed_qkv:1",
+                "sglang:packed_qkv:0",
+                "sglang:packed_qkv:1",
+                "sglang:packed_qkv:0",
+            ],
+        )
+        self.assertEqual(backend._group.pre_write_barrier.call_count, 2)
 
     def test_free_shared_buffer_closes_peer_ipc_mappings(self):
         library = Mock()

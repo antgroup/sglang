@@ -1,0 +1,40 @@
+diff --git a/fast_ulysses/comm.py b/fast_ulysses/comm.py
+index ffe43da..7fdcbe4 100644
+--- a/fast_ulysses/comm.py
++++ b/fast_ulysses/comm.py
+@@ -182,0 +183,9 @@ class UlyssesGroup:
++    def pre_write_barrier(self, stream_anchor: torch.Tensor) -> None:
++        """Prevent peers from overwriting a reused tag before local consumers finish.
++
++        The barrier is enqueued on the caller's current stream, after all earlier
++        consumers on that stream. Every rank must call it in the same sequence,
++        immediately before reusing any tag-scoped output buffer.
++        """
++        torch.ops.fast_ulysses.pre_write_barrier(self._group, stream_anchor)
++
+diff --git a/fast_ulysses/csrc/bindings.cpp b/fast_ulysses/csrc/bindings.cpp
+index 605c643..17a3c08 100644
+--- a/fast_ulysses/csrc/bindings.cpp
++++ b/fast_ulysses/csrc/bindings.cpp
+@@ -20,0 +21,9 @@ int64_t nvshmem_uniqueid_nbytes()
++at::Tensor pre_write_barrier(
++    const c10::intrusive_ptr<UlyssesGroup>& group, at::Tensor stream_anchor)
++{
++    TORCH_CHECK(stream_anchor.is_cuda(), "stream_anchor must be a CUDA tensor");
++    const at::cuda::CUDAGuard guard(stream_anchor.device());
++    group->fast_barrier(at::cuda::getCurrentCUDAStream());
++    return stream_anchor;
++}
++
+@@ -163,0 +173,4 @@ TORCH_LIBRARY(fast_ulysses, m)
++
++    m.def("pre_write_barrier(__torch__.torch.classes.fast_ulysses.UlyssesGroup group, "
++          "Tensor stream_anchor) -> Tensor");
++    m.impl("pre_write_barrier", c10::DispatchKey::CompositeExplicitAutograd, &ulysses::pre_write_barrier);
+diff --git a/pyproject.toml b/pyproject.toml
+index 1d1362d..c489214 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -10 +10 @@ requires-python = ">=3.10"
+-license = "Apache-2.0"
++license = { text = "Apache-2.0" }
