@@ -144,6 +144,39 @@ bash /home/admin/sglang/scripts/fast_ulysses/run_microbenchmark.sh \
 `sm` 和 `ce` 更快，因此生产配置保留 `auto`。microbenchmark 仍不能替代整模型
 steady-state A/B。
 
+### 任意 degree / N / H / D 的独立对比
+
+下面的入口与上游 `bench_uniform.py` 使用相同定义：B 固定为 1、BF16，N 和 H
+都是全局维度，D 是单头维度；mode0 输入为 `[1,N/degree,H,D]`，mode1 输入为
+`[1,N,H/degree,D]`。
+
+```bash
+bash scripts/fast_ulysses/run_bhd_benchmark.sh \
+  <ulysses_degree> <N> <H> <D>
+
+# 上游文档中的 8 卡 Wan2.2 形状
+bash scripts/fast_ulysses/run_bhd_benchmark.sh 8 75600 40 128
+```
+
+输出会分别报告 Fast/NCCL 的 mode0、mode1 critical-rank median latency、
+per-rank remote GB/s 和 latency speedup，并给出 `mode0 + mode1` 的耗时和
+加速比。脚本自动检查 N、H 能被 degree 整除，以及 BF16 行宽满足 16-byte
+alignment。默认 warmup 5 次、测量 20 次，可通过
+`FAST_ULYSSES_BENCH_WARMUP` 和 `FAST_ULYSSES_BENCH_ITERATIONS` 调整，但正常
+使用只需要四个位置参数。
+
+在 8×L20X 上用上述 Wan2.2 形状验收的结果：
+
+| direction | Fast median | Fast GB/s | NCCL median | NCCL GB/s | latency speedup |
+|---|---:|---:|---:|---:|---:|
+| mode0 | 288.9 us | 293.0 | 409.9 us | 206.6 | 1.419× |
+| mode1 | 290.5 us | 291.5 | 410.1 us | 206.5 | 1.412× |
+| mode0 + mode1 | 579.4 us | — | 820.0 us | — | 1.415× |
+
+该独立 kernel benchmark 与整模型生产 A/B 的目标不同：它复现上游 uniform A2A
+口径，不包含 Attention、调度、RIFE/SR，也不使用 LingBot 的 packed-QKV `3D`
+输入。生产收益仍以同机整模型 NCCL–Fast–NCCL 夹逼为准。
+
 ## 生产启动参数
 
 删除旧的三项 `sgl_p2p` 开关：
