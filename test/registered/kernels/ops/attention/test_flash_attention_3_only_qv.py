@@ -12,6 +12,7 @@ import torch
 from einops import rearrange, repeat
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
+from sglang.kernels.ops.attention.flash_attention_v3 import _call_fa3_kernel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -22,6 +23,35 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-l
 skip_condition = not torch.cuda.is_available() or (
     torch.cuda.get_device_capability()[0] != 9
 )
+
+
+def test_call_fa3_kernel_omits_disabled_only_qv_for_legacy_kernels():
+    calls = []
+
+    def legacy_kernel(*args, **kwargs):
+        calls.append((args, kwargs))
+        if "only_qv" in kwargs:
+            raise TypeError(
+                "flash_attn_varlen_func() got an unexpected keyword argument "
+                "'only_qv'"
+            )
+        return "legacy-result"
+
+    assert _call_fa3_kernel(legacy_kernel, "q", only_qv=False) == "legacy-result"
+    assert calls == [
+        (("q",), {"only_qv": False}),
+        (("q",), {}),
+    ]
+
+
+def test_call_fa3_kernel_requires_only_qv_support_when_enabled():
+    def legacy_kernel(*args, **kwargs):
+        raise TypeError(
+            "flash_attn_varlen_func() got an unexpected keyword argument 'only_qv'"
+        )
+
+    with pytest.raises(TypeError, match="only_qv"):
+        _call_fa3_kernel(legacy_kernel, "q", only_qv=True)
 
 
 def _only_qv_reference(qv, v_cache, page_table, batch_size, nheads_q):

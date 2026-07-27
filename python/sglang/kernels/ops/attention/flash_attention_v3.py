@@ -17,14 +17,27 @@ DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
 
 
 def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
-    if out is None:
-        return kernel(*args, **kwargs)
     try:
+        if out is None:
+            return kernel(*args, **kwargs)
         return kernel(*args, **kwargs, out=out)
     except TypeError as exc:
-        if "unexpected keyword argument 'out'" not in str(exc):
-            raise
-        return kernel(*args, **kwargs)
+        message = str(exc)
+        if (
+            kwargs.get("only_qv") is False
+            and "unexpected keyword argument 'only_qv'" in message
+        ):
+            fallback_kwargs = dict(kwargs)
+            fallback_kwargs.pop("only_qv")
+            return _call_fa3_kernel(
+                kernel,
+                *args,
+                out=out,
+                **fallback_kwargs,
+            )
+        if out is not None and "unexpected keyword argument 'out'" in message:
+            return _call_fa3_kernel(kernel, *args, **kwargs)
+        raise
 
 
 @cache_once
@@ -33,7 +46,7 @@ def _load_fa3_kernels():
     # which is expected to be more stable and compatible
     if envs.SGLANG_USE_SGL_FA3_KERNEL.get():
         logger.debug(
-            f"SGLANG_USE_SGL_FA3_KERNEL=True, use sgl-kernel implementation for FlashAttention v3 "
+            "SGLANG_USE_SGL_FA3_KERNEL=True, use sgl-kernel implementation for FlashAttention v3 "
         )
         return _load_fa3_kernel_from_sgl()
 
