@@ -286,6 +286,10 @@ _CONFIG_REGISTRY: Dict[str, ConfigInfo] = {}
 # Mappings from Hugging Face model paths to our internal model names
 _MODEL_HF_PATH_TO_NAME: Dict[str, str] = {}
 
+# Mappings for ambiguous local directory basenames. Exact Hugging Face IDs and
+# explicit --model-id values still take precedence.
+_LOCAL_MODEL_NAME_TO_NAME: Dict[str, str] = {}
+
 # Detectors to identify model families from paths or class names
 _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 
@@ -295,6 +299,7 @@ def register_configs(
     pipeline_config_cls: Type[PipelineConfig],
     hf_model_paths: Optional[List[str]] = None,
     model_detectors: Optional[List[Callable[[str], bool]]] = None,
+    local_model_names: Optional[List[str]] = None,
 ):
     """
     Registers configuration classes for a new model family.
@@ -316,6 +321,9 @@ def register_configs(
     if model_detectors:
         for detector in model_detectors:
             _MODEL_NAME_DETECTORS.append((model_id, detector))
+    if local_model_names:
+        for local_model_name in local_model_names:
+            _LOCAL_MODEL_NAME_TO_NAME[local_model_name.lower()] = model_id
 
 
 def get_model_short_name(model_id: str) -> str:
@@ -383,6 +391,18 @@ def _get_config_info(
     if model_path in _MODEL_HF_PATH_TO_NAME:
         model_id = _MODEL_HF_PATH_TO_NAME[model_path]
         logger.debug(f"Resolved model path '{model_path}' from exact path match.")
+        return _CONFIG_REGISTRY.get(model_id)
+
+    # 1b. Resolve ambiguous local directory basenames before generic partial
+    # Hugging Face path matching. Multiple LingBot repositories share the same
+    # basename, while the pre-mainline deployment uses that bare local name.
+    local_model_name = get_model_short_name(model_path).lower()
+    if local_model_name in _LOCAL_MODEL_NAME_TO_NAME:
+        model_id = _LOCAL_MODEL_NAME_TO_NAME[local_model_name]
+        logger.debug(
+            "Resolved local model name '%s' from local basename mapping.",
+            local_model_name,
+        )
         return _CONFIG_REGISTRY.get(model_id)
 
     # 2. Partial match: find the best (longest) match against all registered model hf paths.
@@ -806,6 +826,7 @@ def _register_configs():
             and "robbyant" not in hf_id.lower()
             and "ipostyellow" not in hf_id.lower()
         ],
+        local_model_names=["lingbot-world-fast-diffusers"],
     )
     register_configs(
         sampling_param_cls=LingBotWorldSamplingParams,

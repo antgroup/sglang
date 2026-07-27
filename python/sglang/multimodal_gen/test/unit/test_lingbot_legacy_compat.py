@@ -5,12 +5,14 @@ from types import SimpleNamespace
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
+    LingBotWorldCausalDMDConfig,
     LingBotWorldLegacyCompatCausalDMDConfig,
     LingBotWorldLegacyCompatI2VConfig,
 )
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
 )
+from sglang.multimodal_gen.registry import _get_config_info
 
 
 def test_legacy_lingbot_configs_preserve_pre_mainline_defaults():
@@ -34,6 +36,18 @@ def test_lingbot_sampling_params_keep_legacy_extras():
 
     assert extra["actions"] == [["w"]]
     assert extra["chunk_size"] == 3
+
+
+def test_local_lingbot_deployment_resolves_legacy_compat_config():
+    _get_config_info.cache_clear()
+
+    local_info = _get_config_info("/home/admin/lingbot-world-fast-diffusers")
+    main_info = _get_config_info("IPostYellow/lingbot-world-fast-diffusers")
+
+    assert local_info is not None
+    assert local_info.pipeline_config_cls is LingBotWorldLegacyCompatCausalDMDConfig
+    assert main_info is not None
+    assert main_info.pipeline_config_cls is LingBotWorldCausalDMDConfig
 
 
 def test_lingbot_condition_mask_preserves_batch_dimension():
