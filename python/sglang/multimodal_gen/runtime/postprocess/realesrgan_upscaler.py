@@ -12,7 +12,9 @@ The ImageUpscaler wrapper and integration code are original work.
 import math
 import os
 import time
+from hashlib import sha256
 from typing import Optional
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import torch
@@ -27,9 +29,18 @@ logger = init_logger(__name__)
 # Default HuggingFace repo and filename for Real-ESRGAN weights
 _DEFAULT_REALESRGAN_HF_REPO = "ai-forever/Real-ESRGAN"
 _DEFAULT_REALESRGAN_FILENAME = "RealESRGAN_x4.pth"
+_DEFAULT_REALESRGAN_FILENAMES_BY_SCALE = {
+    2: "RealESRGAN_x2.pth",
+    4: "RealESRGAN_x4.pth",
+    8: "RealESRGAN_x8.pth",
+}
+_LOW_MEMORY_TILED_UPSCALE_FREE_BYTES = 2 * 1024**3
+_REALESRGAN_TILE_SIZE = 256
+_REALESRGAN_TILE_PAD = 32
 
 # Module-level cache: model_path -> UpscalerModel instance
 _MODEL_CACHE: dict[str, "UpscalerModel"] = {}
+_RESOLVED_MODEL_PATH_CACHE: dict[str, str] = {}
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -37,6 +48,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _default_model_path_for_scale(scale: int) -> str:
+    filename = _DEFAULT_REALESRGAN_FILENAMES_BY_SCALE.get(
+        int(scale),
+        _DEFAULT_REALESRGAN_FILENAME,
+    )
+    return f"{_DEFAULT_REALESRGAN_HF_REPO}:{filename}"
 
 
 # ---------------------------------------------------------------------------
@@ -199,20 +218,18 @@ def _build_net_from_state_dict(state_dict: dict) -> nn.Module:
     """Detect architecture from checkpoint keys and return an unloaded network."""
     if "conv_first.weight" in state_dict:
         # RRDBNet (e.g., RealESRGAN_x4plus)
-        conv_first_weight = state_dict["conv_first.weight"]
-        in_ch = conv_first_weight.shape[1]
-        if in_ch == 3:
+        num_feat = state_dict["conv_first.weight"].shape[0]
+        in_channels = state_dict["conv_first.weight"].shape[1]
+        if in_channels == 3:
             scale = 4
-        elif in_ch == 12:
+        elif in_channels == 12:
             scale = 2
-        elif in_ch == 48:
+        elif in_channels == 48:
             scale = 1
         else:
             raise ValueError(
-                "Unsupported RRDBNet checkpoint: conv_first.weight input channels "
-                f"{in_ch} do not match expected scale 1/2/4 layouts."
+                f"Unsupported RRDBNet conv_first input channels: {in_channels}"
             )
-        num_feat = state_dict["conv_first.weight"].shape[0]
         num_block = sum(
             1
             for k in state_dict
@@ -220,11 +237,11 @@ def _build_net_from_state_dict(state_dict: dict) -> nn.Module:
         )
         num_grow_ch = state_dict["body.0.rdb1.conv1.weight"].shape[0]
         logger.info(
-            "Detected RRDBNet: scale=%d, num_feat=%d, num_block=%d, num_grow_ch=%d",
-            scale,
+            "Detected RRDBNet: num_feat=%d, num_block=%d, num_grow_ch=%d, scale=%d",
             num_feat,
             num_block,
             num_grow_ch,
+            scale,
         )
         return RRDBNet(
             num_in_ch=3,
@@ -289,15 +306,11 @@ class UpscalerModel:
     def dtype(self) -> torch.dtype:
         return next(self.net.parameters()).dtype
 
-    def _prepare_input(self, frames: np.ndarray) -> torch.Tensor:
-        imgs_t = self._copy_input_to_device(frames)
-        return self._preprocess_input_tensor(imgs_t)
-
     def _copy_input_to_device(self, frames: np.ndarray) -> torch.Tensor:
         return torch.from_numpy(frames).to(self.device)
 
     def _preprocess_input_tensor(self, imgs_t: torch.Tensor) -> torch.Tensor:
-        imgs_t = imgs_t.permute(0, 3, 1, 2).to(dtype=self.dtype).mul(1.0 / 255.0)
+        imgs_t = imgs_t.permute(0, 3, 1, 2).to(dtype=self.dtype).mul_(1.0 / 255.0)
         if self.device.type == "cuda":
             imgs_t = imgs_t.contiguous(memory_format=torch.channels_last)
         return imgs_t
@@ -306,23 +319,20 @@ class UpscalerModel:
         """Prepare an NCHW RGB tensor on the model device without host copies."""
         if imgs_t.ndim != 4 or imgs_t.shape[1] != 3:
             raise ValueError(
-                f"expected NCHW RGB tensor with shape [N, 3, H, W], got {tuple(imgs_t.shape)}"
+                "expected NCHW RGB tensor with shape [N, 3, H, W], "
+                f"got {tuple(imgs_t.shape)}"
             )
         if imgs_t.dtype == torch.uint8:
-            imgs_t = imgs_t.to(device=self.device, dtype=self.dtype).mul(1.0 / 255.0)
+            imgs_t = imgs_t.to(device=self.device, dtype=self.dtype).mul_(1.0 / 255.0)
         else:
             imgs_t = imgs_t.to(device=self.device, dtype=self.dtype).clamp(0.0, 1.0)
         if self.device.type == "cuda":
             imgs_t = imgs_t.contiguous(memory_format=torch.channels_last)
         return imgs_t
 
-    def _tensor_to_uint8_frames(self, out: torch.Tensor) -> np.ndarray:
-        out = self._postprocess_output_tensor(out)
-        return self._copy_output_to_host(out)
-
     @staticmethod
     def _postprocess_output_tensor(out: torch.Tensor) -> torch.Tensor:
-        out = out.permute(0, 2, 3, 1).clamp(0.0, 1.0).mul(255.0)
+        out = out.permute(0, 2, 3, 1).clamp(0.0, 1.0).mul_(255.0)
         return out.to(torch.uint8).contiguous()
 
     @staticmethod
@@ -349,6 +359,56 @@ class UpscalerModel:
         timer[1].synchronize()
         return timer[0].elapsed_time(timer[1]) / 1000.0
 
+    def _should_use_tiled_upscale(self, h: int, w: int) -> bool:
+        if self.device.type != "cuda":
+            return False
+        free_bytes, _ = torch.cuda.mem_get_info(self.device)
+        output_bytes = h * w * self.scale * self.scale * 3 * 4
+        required_free_bytes = max(
+            _LOW_MEMORY_TILED_UPSCALE_FREE_BYTES,
+            output_bytes * 4,
+        )
+        return free_bytes < required_free_bytes
+
+    def _upscale_tiled_to_cpu(
+        self,
+        img_t: torch.Tensor,
+        tile_size: int = _REALESRGAN_TILE_SIZE,
+        tile_pad: int = _REALESRGAN_TILE_PAD,
+    ) -> torch.Tensor:
+        _, channels, h, w = img_t.shape
+        scale = self.scale
+        output = torch.empty(
+            (1, channels, h * scale, w * scale),
+            dtype=torch.float32,
+            device="cpu",
+        )
+
+        for y in range(0, h, tile_size):
+            tile_h = min(tile_size, h - y)
+            in_y0 = max(y - tile_pad, 0)
+            in_y1 = min(y + tile_h + tile_pad, h)
+            out_y0 = y * scale
+            out_y1 = (y + tile_h) * scale
+            crop_y0 = (y - in_y0) * scale
+            crop_y1 = crop_y0 + tile_h * scale
+
+            for x in range(0, w, tile_size):
+                tile_w = min(tile_size, w - x)
+                in_x0 = max(x - tile_pad, 0)
+                in_x1 = min(x + tile_w + tile_pad, w)
+                out_x0 = x * scale
+                out_x1 = (x + tile_w) * scale
+                crop_x0 = (x - in_x0) * scale
+                crop_x1 = crop_x0 + tile_w * scale
+
+                tile = img_t[..., in_y0:in_y1, in_x0:in_x1]
+                out_tile = self.net(tile)
+                out_tile = out_tile[..., crop_y0:crop_y1, crop_x0:crop_x1].float()
+                output[..., out_y0:out_y1, out_x0:out_x1].copy_(out_tile.cpu())
+
+        return output
+
     def upscale(self, frame: np.ndarray, outscale: float | None = None) -> np.ndarray:
         """Upscale a single HWC uint8 frame → HWC uint8 frame.
 
@@ -361,9 +421,35 @@ class UpscalerModel:
                       ``None`` means use the model's native scale as-is.
         """
         h, w = frame.shape[:2]
-        img_t = self._prepare_input(frame[None, ...])
-        with torch.inference_mode():
-            out = self.net(img_t)
+        img = frame.astype(np.float32) / 255.0
+        img_t = (
+            torch.from_numpy(img)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(device=self.device, dtype=self.dtype)
+        )
+        with torch.no_grad():
+            if self._should_use_tiled_upscale(h, w):
+                logger.info(
+                    "Using tiled Real-ESRGAN upscale for low GPU memory: "
+                    "frame=%dx%d, tile_size=%d, tile_pad=%d",
+                    w,
+                    h,
+                    _REALESRGAN_TILE_SIZE,
+                    _REALESRGAN_TILE_PAD,
+                )
+                out = self._upscale_tiled_to_cpu(img_t)
+            else:
+                try:
+                    out = self.net(img_t)
+                except torch.cuda.OutOfMemoryError:
+                    if self.device.type != "cuda":
+                        raise
+                    torch.cuda.empty_cache()
+                    logger.warning(
+                        "Real-ESRGAN full-frame upscale OOM; retrying with tiled upscale"
+                    )
+                    out = self._upscale_tiled_to_cpu(img_t)
 
         # If the desired outscale differs from the model's native scale,
         # resize to (h * outscale, w * outscale).
@@ -374,7 +460,8 @@ class UpscalerModel:
                 out, size=(target_h, target_w), mode="bicubic", align_corners=False
             )
 
-        return self._tensor_to_uint8_frames(out)[0]
+        out_np = out.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0).cpu().numpy()
+        return (out_np * 255.0).astype(np.uint8)
 
     def upscale_batch(
         self, frames: list[np.ndarray], outscale: float | None = None
@@ -482,25 +569,24 @@ class UpscalerModel:
         return outputs
 
     def upscale_tensor(
-        self, frames: torch.Tensor, outscale: float | None = None
+        self,
+        frames: torch.Tensor,
+        outscale: float | None = None,
     ) -> torch.Tensor:
-        """Upscale an NCHW RGB tensor and keep the result on device as float [0, 1]."""
+        """Upscale NCHW RGB frames and keep float [0, 1] output on device."""
         if frames.numel() == 0:
             return frames
-
         h, w = frames.shape[-2:]
         imgs_t = self._prepare_nchw_tensor(frames)
-
         with torch.inference_mode():
             out = self.net(imgs_t)
-
         if outscale is not None and outscale != self.scale:
-            target_h = int(round(h * outscale))
-            target_w = int(round(w * outscale))
             out = F.interpolate(
-                out, size=(target_h, target_w), mode="bicubic", align_corners=False
+                out,
+                size=(int(round(h * outscale)), int(round(w * outscale))),
+                mode="bicubic",
+                align_corners=False,
             )
-
         return out.clamp(0.0, 1.0).contiguous()
 
 
@@ -529,7 +615,7 @@ class ImageUpscaler:
 
     def _ensure_model_loaded(self) -> UpscalerModel:
         """Download/load Real-ESRGAN weights, detect arch, and cache globally."""
-        model_path = self._model_path or _DEFAULT_REALESRGAN_HF_REPO
+        model_path = self._model_path or _default_model_path_for_scale(self._scale)
 
         # Resolve: local .pth pass-through, or HF repo → download single file
         resolved_path = _resolve_model_path(model_path)
@@ -583,7 +669,8 @@ class ImageUpscaler:
 
         if _env_bool("SGLANG_REALESRGAN_TORCH_COMPILE"):
             compile_mode = os.environ.get(
-                "SGLANG_REALESRGAN_TORCH_COMPILE_MODE", "reduce-overhead"
+                "SGLANG_REALESRGAN_TORCH_COMPILE_MODE",
+                "reduce-overhead",
             )
             logger.info(
                 "Compiling Real-ESRGAN model with torch.compile mode=%s",
@@ -594,7 +681,8 @@ class ImageUpscaler:
         model = UpscalerModel(net=net, scale=native_scale)
         _MODEL_CACHE[resolved_path] = model
         logger.info(
-            "Real-ESRGAN model loaded on device: %s (dtype=%s, native_scale=%dx, outscale=%s)",
+            "Real-ESRGAN model loaded on device: %s "
+            "(dtype=%s, native_scale=%dx, outscale=%s)",
             device,
             next(net.parameters()).dtype,
             native_scale,
@@ -610,10 +698,18 @@ class ImageUpscaler:
         """
         if not frames:
             return frames
+        model = self._ensure_model_loaded()
+        outscale = self._scale if self._scale != model.scale else None
+        return [model.upscale(frame, outscale=outscale) for frame in frames]
+
+    def upscale_batched(self, frames: list[np.ndarray]) -> list[np.ndarray]:
+        """Upscale HWC uint8 frames with batched forwards grouped by resolution."""
+        if not frames:
+            return frames
         total_start_time = time.perf_counter()
         model = self._ensure_model_loaded()
         outscale = self._scale if self._scale != model.scale else None
-        output_frames: list[np.ndarray] = [None] * len(frames)
+        output_frames: list[np.ndarray | None] = [None] * len(frames)
         groups: dict[tuple[int, ...], list[int]] = {}
         for idx, frame in enumerate(frames):
             groups.setdefault(tuple(frame.shape), []).append(idx)
@@ -626,31 +722,56 @@ class ImageUpscaler:
                 indices,
             )
             group_frames = [frames[idx] for idx in indices]
-            group_outputs = model.upscale_batch(group_frames, outscale=outscale)
+            height, width = group_frames[0].shape[:2]
+            if model._should_use_tiled_upscale(height, width):
+                group_outputs = [
+                    model.upscale(frame, outscale=outscale) for frame in group_frames
+                ]
+            else:
+                try:
+                    group_outputs = model.upscale_batch(
+                        group_frames,
+                        outscale=outscale,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    if model.device.type != "cuda":
+                        raise
+                    torch.cuda.empty_cache()
+                    logger.warning(
+                        "RealESRGAN batch upscale OOM; retrying per frame with "
+                        "the tiled low-memory path"
+                    )
+                    group_outputs = [
+                        model.upscale(frame, outscale=outscale)
+                        for frame in group_frames
+                    ]
             for idx, output in zip(indices, group_outputs):
                 output_frames[idx] = output
 
+        if any(frame is None for frame in output_frames):
+            raise RuntimeError("RealESRGAN batch upscale did not produce all frames")
+
         total_duration_s = time.perf_counter() - total_start_time
         logger.info(
-            "RealESRGAN upscale_frames completed in %.3f seconds for %d frames across %d groups",
+            "RealESRGAN batch_upscale_frames completed in %.3f seconds for %d frames across %d groups",
             total_duration_s,
             len(frames),
             len(groups),
         )
-        return output_frames
+        return [frame for frame in output_frames if frame is not None]
 
     def upscale_tensor(self, frames: torch.Tensor) -> torch.Tensor:
-        """Upscale an NCHW RGB tensor without converting through numpy."""
+        """Upscale an NCHW RGB tensor without converting through NumPy."""
         if frames.numel() == 0:
             return frames
         total_start_time = time.perf_counter()
         model = self._ensure_model_loaded()
         outscale = self._scale if self._scale != model.scale else None
         output = model.upscale_tensor(frames, outscale=outscale)
-        total_duration_s = time.perf_counter() - total_start_time
         logger.info(
-            "RealESRGAN upscale_tensor completed in %.3f seconds for %d frames shape=%s dtype=%s",
-            total_duration_s,
+            "RealESRGAN upscale_tensor completed in %.3f seconds "
+            "for %d frames shape=%s dtype=%s",
+            time.perf_counter() - total_start_time,
             frames.shape[0],
             tuple(output.shape),
             output.dtype,
@@ -668,13 +789,38 @@ def _resolve_model_path(model_path: str) -> str:
 
     Accepts:
     - An existing local file path (pass-through).
+    - An http(s) URL to a .pth file, downloaded into the local cache.
     - A HuggingFace ``repo_id`` → downloads the default weight file
       (``RealESRGAN_x4.pth``).
     - A HuggingFace ``repo_id:filename`` → downloads *filename* from *repo_id*,
       allowing users to specify custom weight files hosted on HF.
     """
+    cached_path = _RESOLVED_MODEL_PATH_CACHE.get(model_path)
+    if cached_path is not None:
+        return cached_path
+
     if os.path.isfile(model_path):
+        _RESOLVED_MODEL_PATH_CACHE[model_path] = model_path
         return model_path
+
+    parsed_url = urlparse(model_path)
+    if parsed_url.scheme in ("http", "https"):
+        filename = (
+            os.path.basename(unquote(parsed_url.path)) or _DEFAULT_REALESRGAN_FILENAME
+        )
+        cache_dir = os.path.join(
+            os.path.expanduser("~"), ".cache", "sglang", "realesrgan"
+        )
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_key = sha256(model_path.encode("utf-8")).hexdigest()[:12]
+        local_path = os.path.join(cache_dir, f"{cache_key}-{filename}")
+        if not os.path.isfile(local_path):
+            tmp_path = f"{local_path}.tmp"
+            logger.info("Downloading Real-ESRGAN weights from URL %s", model_path)
+            torch.hub.download_url_to_file(model_path, tmp_path, progress=False)
+            os.replace(tmp_path, local_path)
+        _RESOLVED_MODEL_PATH_CACHE[model_path] = local_path
+        return local_path
 
     # Parse optional "repo_id:filename" syntax; fall back to default filename.
     if ":" in model_path and not model_path.startswith("/"):
@@ -709,6 +855,7 @@ def _resolve_model_path(model_path: str) -> str:
             f"'repo_id:filename' format (e.g. 'my-org/my-esrgan:weights.pth'). "
             f"Original error: {e}"
         ) from e
+    _RESOLVED_MODEL_PATH_CACHE[model_path] = local_path
     return local_path
 
 
@@ -737,7 +884,7 @@ def upscale_frames(
                         ``repo_id:filename`` for a custom weight file.
                         None → default ``ai-forever/Real-ESRGAN`` with
                         ``RealESRGAN_x4.pth``.
-        scale:          Desired final upscaling factor (e.g. 1.5, 2, 4).
+        scale:          Desired final upscaling factor (e.g. 2, 3, 4).
                         The 4× model is used internally; the output is
                         resized to match *scale* when it differs.
         half_precision: Use fp16 inference (faster on supported GPUs).
@@ -750,7 +897,7 @@ def upscale_frames(
         scale=scale,
         half_precision=half_precision,
     )
-    return upscaler.upscale(frames)
+    return upscaler.upscale_batched(frames)
 
 
 def upscale_tensor(
@@ -759,24 +906,30 @@ def upscale_tensor(
     scale: float = 4.0,
     half_precision: bool = False,
 ) -> torch.Tensor:
-    """
-    Convenience wrapper around ImageUpscaler for NCHW RGB tensors.
-
-    Args:
-        frames:         Tensor with shape [N, 3, H, W], either float in [0, 1]
-                        or uint8 in [0, 255].
-        model_path:     Local .pth file, HuggingFace repo ID, or
-                        ``repo_id:filename`` for a custom weight file.
-        scale:          Desired final upscaling factor.
-        half_precision: Use fp16 inference (faster on supported GPUs).
-
-    Returns:
-        Upscaled tensor with shape [N, 3, H * scale, W * scale], float in [0, 1],
-        on the Real-ESRGAN model device.
-    """
+    """Upscale NCHW RGB frames without a GPU-to-CPU round trip."""
     upscaler = ImageUpscaler(
         model_path=model_path,
         scale=scale,
         half_precision=half_precision,
     )
     return upscaler.upscale_tensor(frames)
+
+
+def batch_upscale_frames(
+    frames: list[np.ndarray],
+    model_path: Optional[str] = None,
+    scale: float = 4.0,
+) -> list[np.ndarray]:
+    """
+    Batched Real-ESRGAN upscaling for realtime video paths.
+
+    The default ``upscale_frames`` API intentionally keeps its original
+    per-frame behavior. Call this helper only when the caller can tolerate
+    batched execution and same-shape grouping semantics.
+    """
+    upscaler = ImageUpscaler(
+        model_path=model_path,
+        scale=scale,
+        half_precision=current_platform.is_cuda(),
+    )
+    return upscaler.upscale_batched(frames)

@@ -1,63 +1,19 @@
-import asyncio
 import pickle
-from typing import Any
+import time
+from typing import Any, Optional
 
 import zmq
 import zmq.asyncio
 
-from sglang.multimodal_gen.runtime.entrypoints.utils import Notification
+from sglang.multimodal_gen.runtime.ipc_array import materialize_file_refs
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.request_logger import (
+    DiffusionRequestLogger,
+)
 
 logger = init_logger(__name__)
-
-# --- Notification listener registry ---
-_notification_registry: dict[str, asyncio.Queue] = {}
-
-
-def register_notification_listener(dispatch_id: str) -> asyncio.Queue:
-    """Register a per-session asyncio.Queue to receive file-ready notifications."""
-    q: asyncio.Queue = asyncio.Queue()
-    _notification_registry[dispatch_id] = q
-    logger.debug(f"Registered notification listener for session {dispatch_id}")
-    return q
-
-
-def unregister_notification_listener(dispatch_id: str) -> None:
-    """Remove the per-session notification queue."""
-    _notification_registry.pop(dispatch_id, None)
-    logger.debug(f"Unregistered notification listener for dispatch_id={dispatch_id}")
-
-
-def _dispatch_notification(notification: Notification) -> None:
-    """Dispatch a notification to the matching session's asyncio.Queue."""
-    dispatch_id = notification.dispatch_id
-    q = _notification_registry.get(dispatch_id)
-    if q is not None:
-        q.put_nowait(notification)
-    else:
-        logger.warning(
-            f"No listener for notification dispatch_id={dispatch_id}, dropping"
-        )
-
-
-async def run_notification_listener(server_args: ServerArgs) -> None:
-    """Background coroutine that connects a ZMQ PULL socket to the scheduler's
-    PUSH socket and dispatches incoming file-ready notifications."""
-    ctx = zmq.asyncio.Context()
-    socket = ctx.socket(zmq.PULL)
-    socket.setsockopt(zmq.LINGER, 0)
-    endpoint = server_args.notification_endpoint
-    socket.connect(endpoint)
-    logger.info(f"Notification listener connected to {endpoint}")
-
-    while True:
-        try:
-            payload = await socket.recv()
-            notification = pickle.loads(payload)
-            _dispatch_notification(notification)
-        except Exception as e:
-            logger.error(f"Error in notification listener: {e}", exc_info=True)
 
 
 async def run_zeromq_broker(server_args: ServerArgs):
@@ -103,6 +59,7 @@ class SchedulerClient:
         self.context = None
         self.scheduler_socket = None
         self.server_args = None
+        self.request_logger: Optional[DiffusionRequestLogger] = None
 
     def initialize(self, server_args: ServerArgs):
         if self.context is not None and not self.context.closed:
@@ -110,6 +67,7 @@ class SchedulerClient:
             self.close()
 
         self.server_args = server_args
+        self.request_logger = DiffusionRequestLogger.from_server_args(server_args)
         self.context = zmq.Context()
         self.scheduler_socket = self.context.socket(zmq.REQ)
 
@@ -125,15 +83,25 @@ class SchedulerClient:
             f"SchedulerClient connected to backend scheduler at {scheduler_endpoint}"
         )
 
-    def forward(self, batch: Any) -> Any:
+    def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
         """Sends a batch or request to the scheduler and waits for the response."""
+        self.request_logger.log_received_request(batch)
+        previous_timeout_ms = None
+        if timeout_ms is not None:
+            previous_timeout_ms = self.scheduler_socket.getsockopt(zmq.RCVTIMEO)
+            self.scheduler_socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
         try:
             self.scheduler_socket.send_pyobj(batch)
             output_batch = self.scheduler_socket.recv_pyobj()
+            _materialize_output_batch_file_refs(output_batch)
+            self.request_logger.log_finished_request(batch, output_batch)
             return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
             raise TimeoutError("Scheduler did not respond in time.")
+        finally:
+            if previous_timeout_ms is not None and self.scheduler_socket is not None:
+                self.scheduler_socket.setsockopt(zmq.RCVTIMEO, previous_timeout_ms)
 
     def ping(self) -> bool:
         """
@@ -181,6 +149,7 @@ class AsyncSchedulerClient:
     def __init__(self):
         self.context = None
         self.server_args = None
+        self.request_logger: Optional[DiffusionRequestLogger] = None
 
     def initialize(self, server_args: ServerArgs):
         if self.context is not None and not self.context.closed:
@@ -190,11 +159,13 @@ class AsyncSchedulerClient:
             self.close()
 
         self.server_args = server_args
+        self.request_logger = DiffusionRequestLogger.from_server_args(server_args)
         self.context = zmq.asyncio.Context()
         logger.debug("AsyncSchedulerClient initialized with zmq.asyncio.Context")
 
     async def forward(self, batch: Any) -> Any:
         """Sends a batch or request to the scheduler and waits for the response."""
+        self.request_logger.log_received_request(batch)
         if self.context is None:
             raise RuntimeError(
                 "AsyncSchedulerClient is not initialized. Call initialize() first."
@@ -212,7 +183,10 @@ class AsyncSchedulerClient:
         try:
             await socket.send(pickle.dumps(batch))
             payload = await socket.recv()
-            return pickle.loads(payload)
+            output_batch = pickle.loads(payload)
+            _materialize_output_batch_file_refs(output_batch)
+            self.request_logger.log_finished_request(batch, output_batch)
+            return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
             raise TimeoutError("Scheduler did not respond in time.")
@@ -253,3 +227,16 @@ class AsyncSchedulerClient:
 # Singleton instances for easy access
 async_scheduler_client = AsyncSchedulerClient()
 sync_scheduler_client = SchedulerClient()
+
+
+def _materialize_output_batch_file_refs(output_batch: Any) -> None:
+    if not isinstance(output_batch, OutputBatch):
+        return
+
+    start_time = time.perf_counter()
+    output_batch.output = materialize_file_refs(output_batch.output)
+    if output_batch.metrics is not None:
+        output_batch.metrics.record_stage(
+            "SchedulerClient.materialize_file_refs",
+            time.perf_counter() - start_time,
+        )

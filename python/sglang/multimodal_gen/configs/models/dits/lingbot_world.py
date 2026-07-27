@@ -1,4 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+# Adapted from: https://github.com/Robbyant/lingbot-world
 
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field

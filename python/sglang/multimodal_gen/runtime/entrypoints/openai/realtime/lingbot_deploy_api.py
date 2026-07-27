@@ -6,8 +6,9 @@ import random
 import tempfile
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Any, NamedTuple
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -20,6 +21,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session 
     GenerateSession,
     RealtimeVideoMode,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ReleaseRealtimeSessionReq,
     prepare_request,
@@ -33,6 +35,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 
 logger = init_logger(__name__)
 router = APIRouter(tags=["lingbot-realtime"])
+
+
+SUPPORTED_CONTROL_KEYS = {"w", "a", "s", "d", "i", "j", "k", "l"}
 
 
 class _ControlEvent(NamedTuple):
@@ -211,7 +216,19 @@ class LingBotDeployCompatSession(GenerateSession):
 
     def __init__(self):
         super().__init__()
+        self.request_id: str | None = None
+        self.mode: RealtimeVideoMode | None = None
+        self.action_queue = deque(maxlen=1)
+        self.control_queue = deque(maxlen=512)
+        self.video_frame_queue = deque(maxlen=256)
         self.current_keys: set[str] = set()
+        self.last_control_actions: list[str] = []
+        self.has_control_state = False
+        self.prompt_events: dict[str, str] = {}
+        self.prompt_event_order: list[str] = []
+        self.prompt_event_mode: str = "overwrite"
+        self.prompt_event_chunk: int = 1
+        self.active_prompt_events: OrderedDict[str, int] = OrderedDict()
         self.selected_image_id: str | None = None
         self.stop_requested = False
         self.started = False
@@ -232,7 +249,19 @@ class LingBotDeployCompatSession(GenerateSession):
     def dispose(self):
         self.close_debug_video()
         super().dispose()
+        self.request_id = None
+        self.mode = None
+        self.action_queue.clear()
+        self.control_queue.clear()
+        self.video_frame_queue.clear()
         self.current_keys.clear()
+        self.last_control_actions = []
+        self.has_control_state = False
+        self.prompt_events = {}
+        self.prompt_event_order = []
+        self.prompt_event_mode = "overwrite"
+        self.prompt_event_chunk = 1
+        self.active_prompt_events.clear()
         self.selected_image_id = None
         self.stop_requested = False
         self.started = False
@@ -246,8 +275,222 @@ class LingBotDeployCompatSession(GenerateSession):
         self.model_height = DEFAULT_HEIGHT
         self.reset_control_sampler()
 
+    def setRequest(self, request: RealtimeVideoGenerationsRequest) -> None:
+        """Compatibility alias retained for existing LingBot deploy clients."""
+        self.set_request(request)
+
+    def set_stream_id(self, stream_id: Any | None) -> None:
+        if stream_id is None:
+            return
+        if self.request_id is not None or self.generate_chunk_cnt != 0:
+            raise ValueError("stream_id must be set before generation starts")
+        if isinstance(stream_id, bytes):
+            stream_id = stream_id.decode("utf-8")
+        stream_id = str(stream_id).strip()
+        if not stream_id:
+            raise ValueError("stream_id cannot be empty")
+        if any(ch in stream_id for ch in ("/", "\\", "\x00")):
+            raise ValueError("stream_id cannot contain path separators")
+        self.id = stream_id
+
+    def set_mode(self, mode: RealtimeVideoMode | None) -> None:
+        self.mode = mode
+
+    def new_request(self) -> None:
+        self.request_id = f"{self.id}_{uuid4().hex}"
+
+    def validate_control_key_action(self, key: str, action: str) -> tuple[str, str]:
+        normalized_key = key.lower()
+        if normalized_key not in SUPPORTED_CONTROL_KEYS:
+            raise ValueError(f"unsupported control key: {key}")
+        if action not in ("down", "up"):
+            raise ValueError(f"unsupported control action: {action}")
+        return normalized_key, action
+
+    def configure_prompt_events(
+        self, request: RealtimeVideoGenerationsRequest | None
+    ) -> None:
+        if request is None:
+            self.prompt_events = {}
+            self.prompt_event_order = []
+            self.prompt_event_mode = "overwrite"
+            self.prompt_event_chunk = 1
+            self.active_prompt_events.clear()
+            return
+
+        raw_events: Any = getattr(request, "events", None) or {}
+        if isinstance(raw_events, str):
+            try:
+                raw_events = json.loads(raw_events)
+            except json.JSONDecodeError as exc:
+                raise ValueError("events must be a JSON object") from exc
+        if not isinstance(raw_events, dict):
+            raise ValueError("events must be a JSON object")
+
+        events: dict[str, str] = {}
+        for key, value in raw_events.items():
+            if value is None:
+                continue
+            event_id = str(key).strip()
+            if event_id:
+                events[event_id] = str(value)
+
+        event_mode = getattr(request, "event_mode", None) or "overwrite"
+        if event_mode not in ("overwrite", "append"):
+            raise ValueError("event_mode must be 'overwrite' or 'append'")
+        event_chunk = getattr(request, "event_chunk", None)
+        event_chunk = 1 if event_chunk is None else int(event_chunk)
+        if event_chunk <= 0:
+            raise ValueError("event_chunk must be a positive integer")
+
+        self.prompt_events = events
+        self.prompt_event_order = list(events)
+        self.prompt_event_mode = event_mode
+        self.prompt_event_chunk = event_chunk
+        self.active_prompt_events.clear()
+
+    @staticmethod
+    def _normalize_event_ids(raw_event_ids: Any) -> list[str]:
+        if raw_event_ids is None:
+            return []
+        values = (
+            raw_event_ids
+            if isinstance(raw_event_ids, (list, tuple, set))
+            else [raw_event_ids]
+        )
+        return [
+            event_id
+            for value in values
+            if value is not None and (event_id := str(value).strip())
+        ]
+
+    def resolve_event_ids(
+        self,
+        *,
+        event_id: Any = None,
+        event: Any = None,
+        event_ids: Any = None,
+        events: Any = None,
+        fallback_event: Any = None,
+    ) -> list[str]:
+        ordered_event_ids: list[str] = []
+        seen_event_ids: set[str] = set()
+        has_explicit_event = any(
+            value is not None for value in (event_id, event, event_ids, events)
+        )
+        raw_values = [event_id, event, event_ids, events]
+        if not has_explicit_event:
+            raw_values.append(fallback_event)
+        for raw_value in raw_values:
+            for normalized_event_id in self._normalize_event_ids(raw_value):
+                if normalized_event_id not in seen_event_ids:
+                    ordered_event_ids.append(normalized_event_id)
+                    seen_event_ids.add(normalized_event_id)
+        return ordered_event_ids
+
+    def validate_prompt_event_ids(self, event_ids: list[str]) -> list[str]:
+        if not event_ids:
+            raise ValueError("event id cannot be empty")
+        normalized_event_ids: list[str] = []
+        seen_event_ids: set[str] = set()
+        for event_id in event_ids:
+            event_id = str(event_id).strip()
+            if not event_id:
+                raise ValueError("event id cannot be empty")
+            if event_id not in self.prompt_events:
+                raise ValueError(f"unknown prompt event: {event_id}")
+            if event_id not in seen_event_ids:
+                normalized_event_ids.append(event_id)
+                seen_event_ids.add(event_id)
+        return normalized_event_ids
+
+    def trigger_prompt_events(self, event_ids: list[str]) -> None:
+        for event_id in self.validate_prompt_event_ids(event_ids):
+            if event_id in self.active_prompt_events:
+                del self.active_prompt_events[event_id]
+            self.active_prompt_events[event_id] = self.prompt_event_chunk
+
+    @staticmethod
+    def _append_prompt_suffix(prompt: str, suffix: Any) -> str:
+        if suffix is None:
+            return prompt
+        suffix = str(suffix)
+        if not suffix:
+            return prompt
+        return f"{prompt}{suffix}" if prompt else suffix
+
+    @staticmethod
+    def _actions_have_movement(actions: Any) -> bool:
+        return bool(actions) and any(bool(frame_actions) for frame_actions in actions)
+
+    def build_movement_prompt(self, actions: Any | None = None) -> str:
+        if self.request is None:
+            return ""
+        prompt = str(self.request.prompt)
+        suffix = (
+            getattr(self.request, "movement_dynamic", None)
+            if self._actions_have_movement(actions)
+            else getattr(self.request, "movement_static", None)
+        )
+        return self._append_prompt_suffix(prompt, suffix)
+
+    def get_movement_prompt_mode(self, actions: Any | None = None) -> str:
+        return "dynamic" if self._actions_have_movement(actions) else "static"
+
+    def build_movement_prompt_variants(self) -> list[str]:
+        prompts: list[str] = []
+        for actions in ([], [["__movement__"]]):
+            prompt = self.build_movement_prompt(actions)
+            if prompt not in prompts:
+                prompts.append(prompt)
+        return prompts
+
+    def apply_movement_prompt_to_batch(self, batch) -> None:
+        if self.request is None or "actions" not in batch.extra:
+            return
+        actions = batch.extra.get("actions")
+        batch.prompt = self.build_movement_prompt(actions)
+        batch.extra["movement_prompt_mode"] = self.get_movement_prompt_mode(actions)
+        batch.extra["movement_prompt_variants"] = self.build_movement_prompt_variants()
+
+    def apply_prompt_event_to_batch(self, batch) -> None:
+        super().apply_prompt_event_to_batch(batch)
+
     def build_sampling_params(self):
-        sampling_params = super().build_sampling_params()
+        if self.request is None or self.request_id is None:
+            raise RuntimeError("LingBot deploy request has not been initialized")
+
+        sampling_params = build_sampling_params(
+            self.request_id,
+            prompt=self.request.prompt,
+            size=self.request.size,
+            num_frames=self.request.num_frames,
+            fps=self.request.fps,
+            image_path=self.request.first_frame,
+            output_file_name=self.request_id,
+            seed=self.request.seed,
+            generator_device=self.request.generator_device,
+            num_inference_steps=self.request.num_inference_steps,
+            guidance_scale=self.request.guidance_scale,
+            guidance_scale_2=self.request.guidance_scale_2,
+            negative_prompt=self.request.negative_prompt,
+            enable_teacache=self.request.enable_teacache,
+            enable_frame_interpolation=self.request.enable_frame_interpolation,
+            frame_interpolation_exp=self.request.frame_interpolation_exp,
+            frame_interpolation_scale=self.request.frame_interpolation_scale,
+            frame_interpolation_model_path=self.request.frame_interpolation_model_path,
+            enable_upscaling=self.request.enable_upscaling,
+            upscaling_model_path=self.request.upscaling_model_path,
+            upscaling_scale=self.request.upscaling_scale,
+            diffusers_kwargs=self.request.diffusers_kwargs,
+            profile=self.request.profile,
+            num_profiled_timesteps=self.request.num_profiled_timesteps,
+            profile_all_stages=self.request.profile_all_stages,
+            perf_dump_path=self.request.perf_dump_path,
+            output_path=self.request.output_path,
+            output_compression=self.request.output_compression,
+            output_quality=self.request.output_quality,
+        )
         sampling_params.save_output = False
         sampling_params.return_file_paths_only = False
         return sampling_params
@@ -1255,11 +1498,17 @@ async def run_startup_warmup_if_enabled(server_args) -> None:
                     sampling_params=sampling_params,
                 )
                 batch.session = session.realtime_session
+                batch.realtime_session_id = session.id
                 batch.extra["realtime_session_id"] = session.id
                 session.apply_camera_config(batch)
                 batch.block_idx = session.generate_chunk_cnt
-                chunk_size = batch.extra.get("chunk_size", 1)
+                chunk_size = int(
+                    batch.realtime_chunk_size
+                    or batch.extra.get("chunk_size")
+                    or server_args.pipeline_config.dit_config.arch_config.num_frames_per_block
+                )
                 batch.extra["actions"] = [[] for _ in range(chunk_size)]
+                batch.condition_inputs["camera_actions"] = batch.extra["actions"]
                 session.apply_movement_prompt_to_batch(batch)
                 _log_chunk_movement_prompt(session, batch, chunk_size=chunk_size)
                 session.apply_prompt_event_to_batch(batch)
@@ -1485,12 +1734,17 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                 sampling_params=sampling_params,
             )
             batch.session = session.realtime_session
+            batch.realtime_session_id = session.id
             batch.extra["realtime_session_id"] = session.id
             session.apply_camera_config(batch)
             batch.block_idx = session.generate_chunk_cnt
             timings["prepare_ms"] = (time.perf_counter() - stage_start) * 1000.0
 
-            chunk_size = batch.extra.get("chunk_size", 1)
+            chunk_size = int(
+                batch.realtime_chunk_size
+                or batch.extra.get("chunk_size")
+                or server_args.pipeline_config.dit_config.arch_config.num_frames_per_block
+            )
             control_chunk = session.sample_control_chunk(chunk_size)
             if control_chunk is not None:
                 logger.info(
@@ -1501,6 +1755,7 @@ async def _generate_loop(ws: WebSocket, session: LingBotDeployCompatSession) -> 
                     control_chunk,
                 )
                 batch.extra["actions"] = control_chunk
+                batch.condition_inputs["camera_actions"] = control_chunk
 
             session.apply_movement_prompt_to_batch(batch)
             _log_chunk_movement_prompt(session, batch, chunk_size=chunk_size)

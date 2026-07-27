@@ -1,16 +1,30 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+# Adapted from: https://github.com/Robbyant/lingbot-world
 
 # SPDX-License-Identifier: Apache-2.0
 import html
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
+import numpy as np
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models import DiTConfig
 from sglang.multimodal_gen.configs.models.dits import LingBotWorldVideoConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_I2V_A14B_Config
+from sglang.multimodal_gen.runtime.realtime.session import (
+    BaseRealtimeState,
+)
+from sglang.multimodal_gen.runtime.utils.camera_geometry import (
+    camera_poses_to_plucker,
+    compute_relative_poses,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def lingbot_prompt_clean(text: str) -> str:
@@ -25,10 +39,268 @@ def lingbot_prompt_clean(text: str) -> str:
     return text.strip()
 
 
+class _LingBotWorldCameraState(BaseRealtimeState):
+    def __init__(self):
+        super().__init__()
+        self.action_history: list[list[str]] = []
+        self.last_actions: list[str] = []
+
+    def reset_camera_actions(self):
+        self.action_history.clear()
+        self.last_actions = []
+
+    def append_camera_actions(self, camera_actions: list[list[str]]) -> None:
+        for actions in camera_actions:
+            normalized = list(actions)
+            self.action_history.append(normalized)
+            self.last_actions = normalized
+
+    def dispose(self):
+        super().dispose()
+        self.reset_camera_actions()
+
+
+def _validate_actions(actions: Any) -> list[list[str]]:
+    if not isinstance(actions, list):
+        raise TypeError("actions must be a list[list[str]]")
+    result: list[list[str]] = []
+    for frame_actions in actions:
+        if not isinstance(frame_actions, list):
+            raise TypeError("actions must be a list[list[str]]")
+        result.append(list(frame_actions))
+    return result
+
+
+def _pad_actions_to_chunk(
+    action_history: list[list[str]], chunk_size: int
+) -> list[list[str]]:
+    if len(action_history) >= chunk_size:
+        return action_history
+    fill_item = action_history[-1] if action_history else []
+    return action_history + [
+        list(fill_item) for _ in range(chunk_size - len(action_history))
+    ]
+
+
+def _get_rotation_matrix(axis: str, angle_rad: float) -> np.ndarray:
+    def calculate_c_s():
+        return np.cos(angle_rad), np.sin(angle_rad)
+
+    if axis == "x":
+        c, s = calculate_c_s()
+        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+    if axis == "y":
+        c, s = calculate_c_s()
+        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+    if axis == "z":
+        c, s = calculate_c_s()
+        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+    return np.eye(3)
+
+
+def _actions_to_c2ws(
+    action_history: list[list[str]],
+    *,
+    move_speed: float = 0.05,
+    rotate_speed_deg_ik: float = 4.0,
+    rotate_speed_deg_jl: float = 6.0,
+) -> list[np.ndarray]:
+    rotate_speed_rad_ik = np.deg2rad(rotate_speed_deg_ik)
+    rotate_speed_rad_jl = np.deg2rad(rotate_speed_deg_jl)
+
+    current_c2w = np.eye(4)
+    current_pitch = 0.0
+    pitch_limit = np.deg2rad(85)
+    all_matrices = [current_c2w]
+
+    for frame_keys in action_history:
+        R = current_c2w[:3, :3]
+        T = current_c2w[:3, 3]
+
+        pitch_delta = 0.0
+        if "i" in frame_keys:
+            pitch_delta += rotate_speed_rad_ik
+        if "k" in frame_keys:
+            pitch_delta -= rotate_speed_rad_ik
+
+        new_pitch = current_pitch + pitch_delta
+        if -pitch_limit <= new_pitch <= pitch_limit:
+            current_pitch = new_pitch
+        else:
+            pitch_delta = 0.0
+
+        yaw_delta = 0.0
+        if "j" in frame_keys:
+            yaw_delta -= rotate_speed_rad_jl
+        if "l" in frame_keys:
+            yaw_delta += rotate_speed_rad_jl
+
+        R_pitch = _get_rotation_matrix("x", pitch_delta)
+        R_yaw = _get_rotation_matrix("y", yaw_delta)
+        R_new = R_yaw @ R @ R_pitch
+
+        vec_right = R_new[:, 0]
+        vec_forward = R_new[:, 2]
+        forward_flat = np.array([vec_forward[0], 0, vec_forward[2]])
+        right_flat = np.array([vec_right[0], 0, vec_right[2]])
+
+        f_norm = np.linalg.norm(forward_flat)
+        r_norm = np.linalg.norm(right_flat)
+        if f_norm > 0:
+            forward_flat = forward_flat / (f_norm + 1e-6)
+        if r_norm > 0:
+            right_flat = right_flat / (r_norm + 1e-6)
+
+        move_vec = np.zeros(3)
+        if "w" in frame_keys:
+            move_vec += forward_flat * move_speed
+        if "s" in frame_keys:
+            move_vec -= forward_flat * move_speed
+        if "d" in frame_keys:
+            move_vec += right_flat * move_speed
+        if "a" in frame_keys:
+            move_vec -= right_flat * move_speed
+
+        T_new = T + move_vec
+        current_c2w = np.eye(4)
+        current_c2w[:3, :3] = R_new
+        current_c2w[:3, 3] = T_new
+        all_matrices.append(current_c2w)
+
+    return all_matrices
+
+
+def _get_camera_control(
+    action_history: list[list[str]],
+    *,
+    chunk_size: int,
+    width: int,
+    height: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    move_speed: float,
+    rotate_speed_deg_ik: float,
+    rotate_speed_deg_jl: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    c2ws_list = _actions_to_c2ws(
+        action_history,
+        move_speed=move_speed,
+        rotate_speed_deg_ik=rotate_speed_deg_ik,
+        rotate_speed_deg_jl=rotate_speed_deg_jl,
+    )
+    c2ws_np = np.stack(c2ws_list[1:])
+    c2ws = torch.from_numpy(c2ws_np).to(device=device, dtype=dtype)
+    Ks = torch.tensor(
+        [[500.0, 500.0, width / 2, height / 2]],
+        device=device,
+        dtype=dtype,
+    ).repeat(chunk_size, 1)
+    logger.debug("prefix c2ws shape: %s, Ks shape: %s", c2ws.shape, Ks.shape)
+    return c2ws, Ks
+
+
+def _build_camera_condition(
+    *,
+    action_history: list[list[str]],
+    width: int,
+    height: int,
+    spatial_scale: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    tail_chunk_size: int,
+    move_speed: float,
+    rotate_speed_deg_ik: float,
+    rotate_speed_deg_jl: float,
+) -> torch.Tensor:
+    action_history = _pad_actions_to_chunk(action_history, tail_chunk_size)
+    c2ws_prefix, Ks = _get_camera_control(
+        action_history,
+        chunk_size=tail_chunk_size,
+        width=width,
+        height=height,
+        device=device,
+        dtype=dtype,
+        move_speed=move_speed,
+        rotate_speed_deg_ik=rotate_speed_deg_ik,
+        rotate_speed_deg_jl=rotate_speed_deg_jl,
+    )
+    c2ws_prefix = compute_relative_poses(c2ws_prefix, framewise=True)
+    c2ws_prefix = c2ws_prefix[-tail_chunk_size:]
+
+    return camera_poses_to_plucker(
+        c2ws=c2ws_prefix,
+        Ks=Ks,
+        height=height,
+        width=width,
+        spatial_scale=spatial_scale,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def _prepare_lingbot_world_condition(
+    *,
+    batch,
+    pipeline_config,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if batch.c2ws_plucker_emb is not None:
+        return batch.c2ws_plucker_emb.to(device=device, dtype=dtype)
+
+    actions = batch.condition_inputs.get("camera_actions")
+    if actions is None:
+        return None
+
+    spatial_scale = pipeline_config.vae_config.arch_config.spatial_compression_ratio
+    chunk_size = batch.realtime_chunk_size or max(
+        1,
+        int(pipeline_config.dit_config.arch_config.num_frames_per_block),
+    )
+
+    normalized_actions = _validate_actions(actions)
+    if len(normalized_actions) == 0:
+        return None
+
+    if batch.session is None:
+        action_history = normalized_actions
+    else:
+        state = batch.session.get_or_create_state(_LingBotWorldCameraState)
+        if batch.block_idx == 0:
+            state.reset_camera_actions()
+        state.append_camera_actions(normalized_actions)
+        action_history = state.action_history
+
+    if len(action_history) == 0:
+        return None
+
+    batch_extra = batch.extra or {}
+    c2ws_plucker_emb = _build_camera_condition(
+        action_history=action_history,
+        width=int(batch.width),
+        height=int(batch.height),
+        spatial_scale=spatial_scale,
+        device=device,
+        dtype=dtype,
+        tail_chunk_size=chunk_size,
+        move_speed=float(batch_extra.get("move_speed", 0.05)),
+        rotate_speed_deg_ik=float(batch_extra.get("rotate_speed_deg_ik", 4.0)),
+        rotate_speed_deg_jl=float(batch_extra.get("rotate_speed_deg_jl", 6.0)),
+    )
+    logger.debug(
+        "LingBot action condition prepared: session_id=%s, block_idx=%s, new_action_count=%s, total_history=%s",
+        batch.realtime_session_id,
+        batch.block_idx,
+        len(normalized_actions),
+        len(action_history),
+    )
+    return c2ws_plucker_emb
+
+
 @dataclass
 class LingBotWorldI2VConfig(Wan2_2_I2V_A14B_Config):
     dit_config: DiTConfig = field(default_factory=LingBotWorldVideoConfig)
-    flow_shift: float | None = 5.0
+    flow_shift: float | None = 10.0
     boundary_ratio: float | None = 0.947
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
@@ -43,23 +315,78 @@ class LingBotWorldI2VConfig(Wan2_2_I2V_A14B_Config):
             )
         return kwargs
 
+    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
+        if batch.condition_image is None:
+            return False
+        if isinstance(batch.condition_image, list):
+            batch.condition_image = batch.condition_image[0]
+
+        width = int(batch.width or 832)
+        height = int(batch.height or 480)
+        batch.condition_image = batch.condition_image.resize((width, height))
+        batch.width = width
+        batch.height = height
+        return True
+
+    def prepare_world_condition(self, batch, device, dtype):
+        c2ws_plucker_emb = _prepare_lingbot_world_condition(
+            batch=batch,
+            pipeline_config=self,
+            device=device,
+            dtype=dtype,
+        )
+        if c2ws_plucker_emb is None:
+            return None
+        return {"c2ws_plucker_emb": c2ws_plucker_emb}
+
 
 @dataclass
 class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
     is_causal: bool = True
     dmd_denoising_steps: list[int] | None = field(
-        default_factory=lambda: [1000, 750, 500, 250]
+        default_factory=lambda: [1000, 821, 642, 321]
     )
     warp_denoising_step: bool = True
-    lazy_vae_encode_black_frames: int = 60
-    interactive_kv_window_enable: bool = True
-    interactive_kv_still_window: int = 3
-    interactive_kv_moving_window: int = 12
+    realtime_causal_sink_size: int | None = None
+    realtime_causal_kv_cache_num_frames: int | None = None
+    interactive_kv_window_enable: bool = False
+    interactive_kv_still_window: int | None = 3
+    interactive_kv_moving_window: int | None = 12
     interactive_kv_still_chunks: int = 2
-    kv_cache_reset_enable: bool = True
-    kv_cache_reset_max_window_latent_frames: int = 88
-    kv_cache_reset_keep_prev_chunks: int = 1
-    kv_cache_reset_rope_gap_latent_frames: int = -1
+    lazy_vae_encode_black_frames: int = 0
+
+    def preprocess_vae_encode(self, image, vae):
+        image = super().preprocess_vae_encode(image, vae)
+        lazy_black_frames = envs.SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES
+        if lazy_black_frames is None:
+            lazy_black_frames = self.lazy_vae_encode_black_frames
+        lazy_black_frames = max(0, int(lazy_black_frames or 0))
+        if lazy_black_frames <= 0 or image.ndim != 5:
+            return image
+
+        num_frames = int(image.shape[2])
+        if num_frames <= 1:
+            return image
+
+        temporal_ratio = int(self.vae_config.arch_config.temporal_compression_ratio)
+        encode_frames = min(num_frames, 1 + lazy_black_frames)
+        if (encode_frames - 1) % temporal_ratio != 0:
+            encode_frames = (encode_frames - 1) // temporal_ratio + 1
+            encode_frames = encode_frames * temporal_ratio + 1
+            encode_frames = min(num_frames, encode_frames)
+
+        if encode_frames >= num_frames:
+            return image
+
+        logger.info(
+            "LingBot lazy VAE encode: pixel_frames=%s encode_pixel_frames=%s "
+            "black_frames=%s temporal_ratio=%s",
+            num_frames,
+            encode_frames,
+            lazy_black_frames,
+            temporal_ratio,
+        )
+        return image[:, :, :encode_frames].contiguous()
 
     def postprocess_image_latent(self, latent_condition, batch):
         """Build condition tensor aligned to chunk_size (num_frames_per_block).
@@ -77,9 +404,31 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
         latent_width = batch.width // spatial_ratio
 
         # Align num_latent_frames to chunk_size
-        num_latent_frames = latent_condition.shape[2]
-        num_latent_frames = num_latent_frames - (num_latent_frames % chunk_size)
-        latent_condition = latent_condition[:, :, :num_latent_frames, :, :]
+        target_latent_frames = (int(batch.num_frames) - 1) // temporal_ratio + 1
+        target_latent_frames = target_latent_frames - (
+            target_latent_frames % chunk_size
+        )
+        encoded_latent_frames = int(latent_condition.shape[2])
+        if encoded_latent_frames < target_latent_frames:
+            tail = latent_condition[:, :, -1:, :, :].repeat(
+                1,
+                1,
+                target_latent_frames - encoded_latent_frames,
+                1,
+                1,
+            )
+            latent_condition = torch.cat([latent_condition, tail], dim=2)
+        elif encoded_latent_frames > target_latent_frames:
+            latent_condition = latent_condition[:, :, :target_latent_frames, :, :]
+
+        num_latent_frames = int(latent_condition.shape[2])
+        if encoded_latent_frames != num_latent_frames:
+            logger.info(
+                "LingBot lazy VAE condition: encoded_latent_frames=%s "
+                "target_latent_frames=%s",
+                encoded_latent_frames,
+                num_latent_frames,
+            )
 
         # Number of initial frames that have actual image content
         # (latent_condition from VAE encode of [image, zeros...])
@@ -101,3 +450,33 @@ class LingBotWorldCausalDMDConfig(LingBotWorldI2VConfig):
             mask[:, :, initial_latent_frames:] = 0
 
         return torch.cat([mask, latent_condition], dim=1)
+
+
+@dataclass
+class LingBotWorldV2CausalDMDConfig(LingBotWorldCausalDMDConfig):
+    flow_shift: float | None = 5.0
+    dmd_denoising_steps: list[int] | None = field(
+        default_factory=lambda: [1000, 750, 500, 250]
+    )
+
+
+@dataclass
+class LingBotWorldLegacyCompatI2VConfig(LingBotWorldI2VConfig):
+    """Preserve the pre-mainline offline LingBot I2V sampling schedule."""
+
+    flow_shift: float | None = 5.0
+
+
+@dataclass
+class LingBotWorldLegacyCompatCausalDMDConfig(LingBotWorldV2CausalDMDConfig):
+    """Preserve the deployed event_test3 LingBot defaults on the main runtime."""
+
+    lazy_vae_encode_black_frames: int = 60
+    interactive_kv_window_enable: bool = True
+    interactive_kv_still_window: int | None = 3
+    interactive_kv_moving_window: int | None = 12
+    interactive_kv_still_chunks: int = 2
+    kv_cache_reset_enable: bool = True
+    kv_cache_reset_max_window_latent_frames: int = 88
+    kv_cache_reset_keep_prev_chunks: int = 1
+    kv_cache_reset_rope_gap_latent_frames: int = -1

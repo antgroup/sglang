@@ -18,12 +18,15 @@ from typing import Any
 
 import torch
 
-from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
-    BaseRealtimeState,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.constants import (
+    LINGBOT_PROMPT_UPDATED_CONDITION,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
+)
+from sglang.multimodal_gen.runtime.realtime.session import (
+    BaseRealtimeState,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -399,5 +402,7 @@ class LingBotWorldRealtimeTextEncodingStage(TextEncodingStage):
         batch.update_prompt_embeds = (
             state.last_effective_cache_key != effective_cache_key
         )
+        if batch.update_prompt_embeds:
+            batch.condition_inputs[LINGBOT_PROMPT_UPDATED_CONDITION] = True
         state.last_effective_cache_key = effective_cache_key
         return batch

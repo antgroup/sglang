@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def _maybe_p2p_all_to_all(x: torch.Tensor, mode: int) -> torch.Tensor | None:
-    """Try the fused-transpose NVLink-P2P all-to-all for head_dim == 2."""
+    """Try the fused-transpose NVLink-P2P all-to-all for supported layouts."""
     from sglang.multimodal_gen.runtime.distributed.device_communicators.ulysses_p2p_a2a import (
         get_ulysses_p2p_a2a,
     )
@@ -37,10 +37,10 @@ def _maybe_p2p_all_to_all(x: torch.Tensor, mode: int) -> torch.Tensor | None:
     if x.is_cuda and torch.cuda.is_current_stream_capturing():
         return None
 
-    mgr = get_ulysses_p2p_a2a(group, x.device)
-    if mgr is None:
+    manager = get_ulysses_p2p_a2a(group, x.device)
+    if manager is None:
         return None
-    return mgr.all_to_all(x, mode)
+    return manager.all_to_all(x, mode)
 
 
 def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
@@ -57,16 +57,15 @@ def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
-    x = x.flatten()
-    x = ft_c.all_to_all_single(
-        x, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
-    )
-    x = _maybe_wait(x)
-    x = x.reshape(x_shape)
-    return x
+    x = x.flatten().contiguous()
+    output = torch.empty_like(x)
+    # USP calls this collective many times per denoising step and waits
+    # immediately, so avoid the extra wrapper overhead of functional collectives.
+    torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+    return output.reshape(x_shape)
 
 
-def _usp_all_to_all_single_with_sizes(
+def _usp_all_to_all_single_varlen(
     x: torch.Tensor,
     output_split_sizes: list[int],
     input_split_sizes: list[int],
@@ -111,9 +110,9 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
 
     if head_dim == 2:
-        fast = _maybe_p2p_all_to_all(x, mode=0)
-        if fast is not None:
-            return fast
+        fast_output = _maybe_p2p_all_to_all(x, mode=0)
+        if fast_output is not None:
+            return fast_output
 
     # Move the dimension to be split (h_global) to dim 0 for all_to_all_single
     if head_dim == 1:
@@ -146,7 +145,7 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     return x
 
 
-def _usp_input_all_to_all_variable(
+def _usp_input_all_to_all_varlen(
     x: torch.Tensor, seq_lens: list[int], head_dim: int = 1
 ) -> torch.Tensor:
     """
@@ -203,7 +202,7 @@ def _usp_input_all_to_all_variable(
     x = x.reshape(world_size, h_local, b, s_local, d)
     input_split_sizes = [h_local * b * s_local * d] * world_size
     output_split_sizes = [h_local * b * seq_len * d for seq_len in seq_lens]
-    x = _usp_all_to_all_single_with_sizes(x, output_split_sizes, input_split_sizes)
+    x = _usp_all_to_all_single_varlen(x, output_split_sizes, input_split_sizes)
 
     chunks = []
     offset = 0
@@ -249,9 +248,9 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
 
     if head_dim == 2:
-        fast = _maybe_p2p_all_to_all(x, mode=1)
-        if fast is not None:
-            return fast
+        fast_output = _maybe_p2p_all_to_all(x, mode=1)
+        if fast_output is not None:
+            return fast_output
 
     # Move the dimension to be split (s_global) to dim 0 for all_to_all_single
     if head_dim == 1:
@@ -284,7 +283,7 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     return x
 
 
-def _usp_output_all_to_all_variable(
+def _usp_output_all_to_all_varlen(
     x: torch.Tensor, seq_lens: list[int], head_dim: int = 1
 ) -> torch.Tensor:
     """
@@ -344,7 +343,7 @@ def _usp_output_all_to_all_variable(
     x = torch.cat(input_chunks, dim=0)
     input_split_sizes = [h_local * b * seq_len * d for seq_len in seq_lens]
     output_split_sizes = [h_local * b * s_local * d] * world_size
-    x = _usp_all_to_all_single_with_sizes(x, output_split_sizes, input_split_sizes)
+    x = _usp_all_to_all_single_varlen(x, output_split_sizes, input_split_sizes)
 
     chunks = []
     offset = 0

@@ -1,4 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+# Adapted from: https://github.com/Robbyant/lingbot-world
 
 # SPDX-License-Identifier: Apache-2.0
 """
@@ -13,13 +14,21 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    AuxiliaryConditionEncodingStage,
+    DMDTimestepPreparationStage,
     ImageEncodingStage,
-    LingBotWorldCausalDecodingStage,
-    LingBotWorldCausalDMDDenoisingStage,
-    LingBotWorldInputValidationStage,
-    LingBotWorldRealtimeImageVAEEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.lingbot_world_realtime_text import (
     LingBotWorldRealtimeTextEncodingStage,
-    WorldConditioningStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.lingbot_world_causal_denoising import (
+    LingBotWorldCausalDMDDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime import (
+    CausalVaeDecodingStage,
+    RealtimeChunkLatentPreparationStage,
+    RealtimeImageVAEEncodingStage,
+    RealtimeInputValidationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -46,7 +55,7 @@ class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
     def create_pipeline_stages(self, server_args) -> None:
-        self.add_stage(LingBotWorldInputValidationStage())
+        self.add_stage(RealtimeInputValidationStage())
         self.add_stage(
             LingBotWorldRealtimeTextEncodingStage(
                 text_encoders=[self.get_module("text_encoder")],
@@ -64,10 +73,17 @@ class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
             ),
         )
 
-        self.add_stage(WorldConditioningStage())
+        self.add_stage(AuxiliaryConditionEncodingStage())
         self.add_stage(
-            LingBotWorldRealtimeImageVAEEncodingStage(
+            RealtimeImageVAEEncodingStage(
                 vae=self.get_module("vae"),
+            )
+        )
+        self.add_stage(DMDTimestepPreparationStage(self.get_module("scheduler")))
+        self.add_stage(
+            RealtimeChunkLatentPreparationStage(
+                scheduler=self.get_module("scheduler"),
+                transformer=self.get_module("transformer"),
             )
         )
         self.add_stage(
@@ -77,7 +93,7 @@ class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
             ),
         )
         self.add_stage(
-            LingBotWorldCausalDecodingStage(
+            CausalVaeDecodingStage(
                 vae=self.get_module("vae"),
                 pipeline=self,
             )
