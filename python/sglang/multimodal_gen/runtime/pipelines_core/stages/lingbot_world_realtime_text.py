@@ -51,14 +51,26 @@ def _copy_tensor_list(
     return list(value)
 
 
+def _copy_seq_lens(
+    value: list[list[int]] | None,
+) -> list[list[int]] | None:
+    if value is None:
+        return None
+    return [list(seq_lens) for seq_lens in value]
+
+
 @dataclass
 class _TextEncodingOutputs:
     prompt_embeds: list[torch.Tensor] | None = None
     pooled_embeds: list[torch.Tensor] | None = None
     prompt_attention_mask: list[torch.Tensor] | None = None
+    prompt_embeds_mask: list[torch.Tensor] | None = None
+    prompt_seq_lens: list[list[int]] | None = None
     negative_prompt_embeds: list[torch.Tensor] | None = None
     neg_pooled_embeds: list[torch.Tensor] | None = None
     negative_attention_mask: list[torch.Tensor] | None = None
+    negative_prompt_embeds_mask: list[torch.Tensor] | None = None
+    negative_prompt_seq_lens: list[list[int]] | None = None
 
 
 class LingBotWorldRealtimeTextState(BaseRealtimeState):
@@ -103,10 +115,18 @@ class LingBotWorldRealtimeTextEncodingStage(TextEncodingStage):
         batch.prompt_embeds = _copy_tensor_list(outputs.prompt_embeds) or []
         batch.pooled_embeds = _copy_tensor_list(outputs.pooled_embeds) or []
         batch.prompt_attention_mask = _copy_tensor_list(outputs.prompt_attention_mask)
+        batch.prompt_embeds_mask = _copy_tensor_list(outputs.prompt_embeds_mask)
+        batch.prompt_seq_lens = _copy_seq_lens(outputs.prompt_seq_lens)
         batch.negative_prompt_embeds = _copy_tensor_list(outputs.negative_prompt_embeds)
         batch.neg_pooled_embeds = _copy_tensor_list(outputs.neg_pooled_embeds) or []
         batch.negative_attention_mask = _copy_tensor_list(
             outputs.negative_attention_mask
+        )
+        batch.negative_prompt_embeds_mask = _copy_tensor_list(
+            outputs.negative_prompt_embeds_mask
+        )
+        batch.negative_prompt_seq_lens = _copy_seq_lens(
+            outputs.negative_prompt_seq_lens
         )
         return batch
 
@@ -139,7 +159,13 @@ class LingBotWorldRealtimeTextEncodingStage(TextEncodingStage):
         self, batch: Req, server_args: ServerArgs, prompt_text: str | list[str]
     ) -> _TextEncodingOutputs:
         all_indices: list[int] = list(range(len(self.text_encoders)))
-        prompt_embeds, prompt_masks, pooled_embeds = self.encode_text(
+        (
+            prompt_embeds,
+            prompt_masks,
+            pooled_embeds,
+            prompt_embeds_masks,
+            prompt_seq_lens,
+        ) = self.encode_text(
             prompt_text,
             server_args,
             encoder_index=all_indices,
@@ -149,24 +175,34 @@ class LingBotWorldRealtimeTextEncodingStage(TextEncodingStage):
         negative_prompt_embeds = []
         negative_attention_mask = None
         neg_pooled_embeds = []
+        negative_prompt_embeds_masks = None
+        negative_prompt_seq_lens = None
         if batch.do_classifier_free_guidance:
             assert isinstance(batch.negative_prompt, str)
-            negative_prompt_embeds, negative_attention_mask, neg_pooled_embeds = (
-                self.encode_text(
-                    batch.negative_prompt,
-                    server_args,
-                    encoder_index=all_indices,
-                    return_attention_mask=True,
-                )
+            (
+                negative_prompt_embeds,
+                negative_attention_mask,
+                neg_pooled_embeds,
+                negative_prompt_embeds_masks,
+                negative_prompt_seq_lens,
+            ) = self.encode_text(
+                batch.negative_prompt,
+                server_args,
+                encoder_index=all_indices,
+                return_attention_mask=True,
             )
 
         return _TextEncodingOutputs(
             prompt_embeds=prompt_embeds,
             pooled_embeds=pooled_embeds,
             prompt_attention_mask=prompt_masks,
+            prompt_embeds_mask=prompt_embeds_masks,
+            prompt_seq_lens=prompt_seq_lens,
             negative_prompt_embeds=negative_prompt_embeds,
             neg_pooled_embeds=neg_pooled_embeds,
             negative_attention_mask=negative_attention_mask,
+            negative_prompt_embeds_mask=negative_prompt_embeds_masks,
+            negative_prompt_seq_lens=negative_prompt_seq_lens,
         )
 
     def _normalize_prompt_events(self, batch: Req) -> dict[str, str]:

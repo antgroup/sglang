@@ -3,6 +3,9 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.pipelines_core.stages.lingbot_world_realtime_text import (
+    LingBotWorldRealtimeTextEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
@@ -100,3 +103,39 @@ def test_negative_text_cache_keeps_default_warmup():
         get_negative_embedding_twice(stage, server_args, make_req(is_warmup=True))
 
     assert stage.calls == 1
+
+
+def test_lingbot_realtime_text_cache_preserves_extended_text_outputs():
+    stage = object.__new__(LingBotWorldRealtimeTextEncodingStage)
+    stage.text_encoders = [object()]
+    prompt_embeds = [torch.ones((1, 2, 3))]
+    prompt_attention_mask = [torch.ones((1, 2), dtype=torch.int64)]
+    pooled_embeds = [torch.ones((1, 3))]
+    prompt_embeds_mask = [torch.tensor([[True, False]])]
+    prompt_seq_lens = [[1]]
+    stage.encode_text = MagicMock(
+        return_value=(
+            prompt_embeds,
+            prompt_attention_mask,
+            pooled_embeds,
+            prompt_embeds_mask,
+            prompt_seq_lens,
+        )
+    )
+
+    outputs = stage._encode_outputs(
+        SimpleNamespace(do_classifier_free_guidance=False),
+        make_server_args(),
+        "hello",
+    )
+    restored = SimpleNamespace()
+    stage._restore_outputs(restored, outputs)
+
+    assert restored.prompt_embeds == prompt_embeds
+    assert restored.prompt_attention_mask == prompt_attention_mask
+    assert restored.pooled_embeds == pooled_embeds
+    assert restored.prompt_embeds_mask == prompt_embeds_mask
+    assert restored.prompt_seq_lens == prompt_seq_lens
+    assert restored.negative_prompt_embeds == []
+    assert restored.negative_prompt_embeds_mask is None
+    assert restored.negative_prompt_seq_lens is None
