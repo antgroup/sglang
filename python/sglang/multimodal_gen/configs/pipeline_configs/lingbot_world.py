@@ -274,7 +274,7 @@ def _prepare_lingbot_world_condition(
     if len(action_history) == 0:
         return None
 
-    batch_extra = batch.extra or {}
+    batch_extra = getattr(batch, "extra", None) or {}
     c2ws_plucker_emb = _build_camera_condition(
         action_history=action_history,
         width=int(batch.width),

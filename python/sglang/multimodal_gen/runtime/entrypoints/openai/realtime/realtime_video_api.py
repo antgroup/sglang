@@ -182,6 +182,8 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                 server_args,
                 chunk,
             )
+            if not hasattr(batch, "extra"):
+                batch.extra = {}
             camera_actions = (batch.condition_inputs or {}).get("camera_actions")
             if camera_actions is not None:
                 batch.extra["actions"] = camera_actions
@@ -305,10 +307,11 @@ async def _send_output_and_log(
     request_prepare_ms: float,
     scheduler_forward_ms: float,
     chunk_started: float,
-    save_file_paths: list[str],
+    save_file_paths: list[str] | None = None,
 ) -> RealtimeFrameSendStats:
     if session.adapter is None:
         raise ValueError("realtime adapter is not initialized")
+    save_file_paths = list(save_file_paths or [])
     pace_wait_ms = await _wait_for_realtime_output_slot(session, batch, result)
     if session.legacy_protocol:
         if not save_file_paths and result.output is not None:

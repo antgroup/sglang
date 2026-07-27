@@ -143,6 +143,8 @@ class RealtimeCameraControlState:
             return self._sample_camera_script(chunk_size)
         # State mode is the WebUI path: held controls persist across chunks until
         # a new transition changes the current state.
+        if not self.camera_state_queue.has_state():
+            return None
         action_list = self.camera_state_queue.sample_chunk(chunk_size)
         if action_list is None:
             return None
