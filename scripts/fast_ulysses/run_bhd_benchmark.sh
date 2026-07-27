@@ -18,8 +18,8 @@ for value_name in DEGREE GLOBAL_SEQ HEADS HEAD_DIM; do
     exit 2
   fi
 done
-if ((DEGREE < 2 || DEGREE > 8)); then
-  echo "ulysses_degree must be in [2, 8]" >&2
+if [[ "${DEGREE}" != "2" && "${DEGREE}" != "4" && "${DEGREE}" != "6" && "${DEGREE}" != "8" ]]; then
+  echo "ulysses_degree must be one of 2, 4, 6, or 8 for event_test3 sgl_p2p" >&2
   exit 2
 fi
 if ((GLOBAL_SEQ % DEGREE != 0)); then
