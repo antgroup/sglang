@@ -410,14 +410,6 @@ class ControlStateQueue:
         for transition in transitions:
             self.push(transition)
 
-    def has_state(self) -> bool:
-        """Return whether a pending or active non-default state exists."""
-        return (
-            bool(self._pending)
-            or self._current_seq_id is not None
-            or self._current_item != self.default_item
-        )
-
     def sample_chunk(self, chunk_size: int) -> list[Any] | None:
         if chunk_size <= 0:
             return None
