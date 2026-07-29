@@ -13,6 +13,9 @@ from typing import (
 
 import torch
 
+from sglang.srt.debug_utils.mamba_slot_copy_validator import (
+    mamba_slot_copy_validator,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -936,6 +939,7 @@ class SchedulerBatchResultProcessor:
     ):
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
+        mamba_slot_copy_validator.record_result(req, batch, i)
         self._mamba_prefix_cache_update(req, batch, result, i)
 
         if (

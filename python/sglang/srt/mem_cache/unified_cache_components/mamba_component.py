@@ -5,6 +5,9 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.debug_utils.mamba_slot_copy_validator import (
+    mamba_slot_copy_validator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -496,6 +499,13 @@ class MambaComponent(TreeComponent):
                 insert_params.mamba_value = self._commit_int8_checkpoint(active_value)
             else:
                 insert_params.mamba_value = active_value
+                if self.cache.enable_mamba_extra_buffer:
+                    mamba_slot_copy_validator.record_selection(
+                        req=req,
+                        cache_len=cache_len,
+                        selected_logical_slot=keep_idx,
+                        selected_slot_tensor=active_value,
+                    )
             return cache_len
         else:
             if cache_len is None:
