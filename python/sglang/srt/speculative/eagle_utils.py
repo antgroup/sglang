@@ -874,16 +874,9 @@ def eagle_sample(
     return predict, num_correct_drafts + 1, accept_index
 
 
-def eagle_prepare_for_decode(batch: ScheduleBatch):
-    batch.maybe_evict_swa()
-
+def eagle_reserve_for_decode(batch: ScheduleBatch):
+    """Reserve speculative KV slots without advancing decode bookkeeping."""
     bs = batch.batch_size()
-
-    # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if batch.sampling_info.penalizer_orchestrator.is_required:
-        batch.cumulate_penalty_output_tokens()
-
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
 
@@ -907,7 +900,6 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur
-        r.decode_batch_idx += 1
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
@@ -918,7 +910,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
     from sglang.srt.runtime_context import get_server_args
 
-    if page_size > 1 and (get_server_args().speculative_eagle_topk or 1) > 1:
+    if bs > 0 and page_size > 1 and (get_server_args().speculative_eagle_topk or 1) > 1:
         max_alloc_len = int(nxt_kv_lens_cpu.max())
         row_width = batch.req_to_token_pool.req_to_token.shape[1]
         assert max_alloc_len <= row_width, (
@@ -949,3 +941,18 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         num_needed_tokens=num_needed_tokens,
         batch=batch,
     )
+
+
+def eagle_prepare_for_decode(batch: ScheduleBatch, *, advance_bookkeeping: bool = True):
+    batch.maybe_evict_swa()
+
+    if advance_bookkeeping:
+        # Accumulate penalty
+        # This is a relaxed version of penalties for speculative decoding.
+        if batch.sampling_info.penalizer_orchestrator.is_required:
+            batch.cumulate_penalty_output_tokens()
+
+        for r in batch.reqs:
+            r.decode_batch_idx += 1
+
+    eagle_reserve_for_decode(batch)

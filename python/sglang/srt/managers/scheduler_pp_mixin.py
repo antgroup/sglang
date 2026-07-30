@@ -1153,8 +1153,12 @@ class SchedulerPPMixin:
             batch.spec_info = EaglePPVerifyInputRaw.from_pp_outputs(pp_outputs)
         elif not self.spec_algorithm.is_none() and batch.forward_mode.is_extend():
             if batch.contains_last_prefill_chunk:
-                # The last PP rank produces no draft tokens for prefill batches;
-                # build a dummy draft for the first decode step.
+                if not self.enable_dp_attention:
+                    raise RuntimeError(
+                        "Final PP speculative prefill output is missing its draft tree"
+                    )
+                # DP attention still uses a synchronized dummy bootstrap because
+                # all peers must agree on the final prefill chunk.
                 batch.spec_info = EaglePPVerifyInputRaw.build_dummy_for_decode(
                     batch, self.server_args.speculative_num_draft_tokens
                 )

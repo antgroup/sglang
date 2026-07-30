@@ -72,6 +72,7 @@ from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
     default_tree_mask_mode,
+    eagle_prepare_for_decode,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
@@ -1185,6 +1186,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 )
 
+    def _build_pp_verify_input_raw(
+        self,
+        batch: ScheduleBatch,
+        draft_tokens: torch.Tensor,
+        parent_list: torch.Tensor,
+        top_scores_index: torch.Tensor,
+        accept_lens: List[int],
+        accept_index: Optional[List] = None,
+    ) -> EaglePPVerifyInputRaw:
+        return EaglePPVerifyInputRaw(
+            draft_tokens=draft_tokens.reshape(
+                batch.batch_size(), self.speculative_num_draft_tokens
+            ).tolist(),
+            bonus_tokens=batch.spec_info.bonus_tokens.to(torch.int64).tolist(),
+            top_scores_index=top_scores_index.tolist(),
+            parent_list=parent_list.tolist(),
+            accept_lens=accept_lens,
+            accept_index=accept_index,
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -1251,6 +1272,49 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
+
+                # Build the first real draft tree on the final PP rank so the
+                # next iteration can enter target verification directly.
+                if (
+                    self._pp_enabled
+                    and not self.server_args.enable_dp_attention
+                    and batch.contains_last_prefill_chunk
+                ):
+                    if not batch.forward_mode.is_idle():
+                        eagle_prepare_for_decode(batch, advance_bookkeeping=False)
+                    batch.forward_mode = (
+                        ForwardMode.IDLE
+                        if batch.forward_mode.is_idle()
+                        else ForwardMode.DECODE
+                    )
+
+                    # This inline draft bypasses the scheduler pass that normally
+                    # converts prefill metadata to decode metadata.
+                    if batch.global_num_tokens is not None:
+                        decode_batch_size = batch.batch_size()
+                        batch.global_num_tokens = [decode_batch_size]
+                        batch.global_num_tokens_for_logprob = [decode_batch_size]
+                    batch.is_extend_in_batch = False
+                    batch.tbo_split_seq_index = None
+                    if batch.global_forward_mode is not None:
+                        batch.global_forward_mode = batch.forward_mode
+                    batch.can_run_dp_cuda_graph = not check_cuda_graph_backend(
+                        Phase.DECODE, Backend.DISABLED
+                    )
+                    batch.can_run_dp_breakable_cuda_graph = False
+
+                    batch.spec_info = batch_output.next_draft_input
+                    batch.seq_lens = batch_output.new_seq_lens
+                    pp_draft_tokens, pp_parent_list, pp_top_scores_index = (
+                        self.draft_worker.draft(batch)
+                    )
+                    batch_output.pp_verify_input_raw = self._build_pp_verify_input_raw(
+                        batch,
+                        pp_draft_tokens,
+                        pp_parent_list,
+                        pp_top_scores_index,
+                        accept_lens=[1] * batch.batch_size(),
+                    )
             return batch_output
 
         # Decode
@@ -1346,15 +1410,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # PP last rank: serialize the draft tree for PP relay.
         if self._pp_enabled and self._pp_is_last_rank:
-            batch_output.pp_verify_input_raw = EaglePPVerifyInputRaw(
-                draft_tokens=pp_draft_tokens.reshape(
-                    batch.batch_size(), self.speculative_num_draft_tokens
-                ).tolist(),
-                bonus_tokens=batch_output.next_draft_input.bonus_tokens.to(
-                    torch.int64
-                ).tolist(),
-                top_scores_index=pp_top_scores_index.tolist(),
-                parent_list=pp_parent_list.tolist(),
+            batch_output.pp_verify_input_raw = self._build_pp_verify_input_raw(
+                batch,
+                pp_draft_tokens,
+                pp_parent_list,
+                pp_top_scores_index,
                 accept_lens=batch_output.accept_lens.tolist(),
                 accept_index=(
                     batch_output.accept_index.tolist() if self.topk > 1 else None
