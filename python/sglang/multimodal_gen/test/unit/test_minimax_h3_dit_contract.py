@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Mixed-precision weight and TP/Ulysses numerical contracts for H3 DiT."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -25,10 +26,12 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_BUFFER_NAMES,
     MINIMAX_H3_FP32_PARAM_NAMES,
+    MiniMaxH3Attention,
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
     _reorder_grouped_qkv_to_qkv,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
@@ -203,6 +206,57 @@ def test_sdpa_varlen_fallback_matches_naive_packed_reference():
             torch.softmax(seg_q @ seg_k.transpose(-1, -2) * scale, dim=-1) @ seg_v
         ).transpose(0, 1)
         torch.testing.assert_close(out[start:stop], expected, atol=1e-6, rtol=1e-6)
+
+
+def test_sol_attn_backend_config_is_forwarded_to_h3_attention_impl():
+    assert (
+        AttentionBackendEnum.SOL_ATTN
+        in MiniMaxH3DiTArchConfig()._supported_attention_backends
+    )
+    captured = {}
+
+    class CapturingImpl:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    class SolBackend:
+        @staticmethod
+        def get_enum():
+            return AttentionBackendEnum.SOL_ATTN
+
+        @staticmethod
+        def get_impl_cls():
+            return CapturingImpl
+
+    attention = SimpleNamespace(
+        num_heads=7,
+        head_dim=128,
+        softmax_scale=128**-0.5,
+        prefix="blocks.3.attn",
+        _attention_backend=None,
+        _attention_impl=None,
+    )
+    server_args = SimpleNamespace(
+        attention_backend_config={
+            "tau": 1.75,
+            "thresh_type": "exact",
+            "kv_splits": 2,
+            "strict": True,
+        }
+    )
+    with patch(
+        "sglang.multimodal_gen.runtime.server_args.get_global_server_args",
+        return_value=server_args,
+    ):
+        MiniMaxH3Attention._set_attention_backend(attention, SolBackend)
+
+    assert attention._attention_backend == AttentionBackendEnum.SOL_ATTN
+    assert captured["num_heads"] == 7
+    assert captured["prefix"] == "blocks.3.attn.impl"
+    assert captured["tau"] == 1.75
+    assert captured["thresh_type"] == "exact"
+    assert captured["kv_splits"] == 2
+    assert captured["strict"] is True
 
 
 @patch(

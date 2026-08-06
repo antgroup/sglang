@@ -124,6 +124,13 @@ class _SageSparseLinearAttentionBackendResolver(_DirectCudaAttentionBackendResol
     backend_cls_str = "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SageSparseLinearAttentionBackend"
 
 
+class _SolAttentionBackendResolver(_DirectCudaAttentionBackendResolver):
+    """Resolve the integration without importing the optional kernel package."""
+
+    backend = AttentionBackendEnum.SOL_ATTN
+    backend_cls_str = "sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn.SolAttentionBackend"
+
+
 class _SlidingTileAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.SLIDING_TILE_ATTN
 
@@ -288,6 +295,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _DynamicCudnnSDPAAttentionBackendResolver,
         _SparseLinearAttentionBackendResolver,
         _SageSparseLinearAttentionBackendResolver,
+        _SolAttentionBackendResolver,
         _SlidingTileAttentionBackendResolver,
         _SageAttentionBackendResolver,
         _SageAttention3BackendResolver,

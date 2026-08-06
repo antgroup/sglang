@@ -528,7 +528,9 @@ class MiniMaxH3Attention(nn.Module):
         self.local_inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
         self._supported_attention_backends = arch._supported_attention_backends
+        self._attention_backend: AttentionBackendEnum | None = None
         self._attention_impl = None
+        self.prefix = prefix
         # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
         # matrix must be sharded independently; a plain ColumnParallelLinear
         # would instead slice across the concatenated tensor and is incorrect
@@ -569,14 +571,34 @@ class MiniMaxH3Attention(nn.Module):
         )
 
     def _set_attention_backend(self, backend) -> None:
+        backend_enum = backend.get_enum()
         impl_cls = backend.get_impl_cls()
+        extra_impl_args = {}
+        if backend_enum == AttentionBackendEnum.SOL_ATTN:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn import (
+                SolAttentionConfig,
+            )
+            from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+            sol_config = SolAttentionConfig.from_mapping(
+                get_global_server_args().attention_backend_config
+            )
+            extra_impl_args.update(
+                tau=sol_config.tau,
+                thresh_type=sol_config.thresh_type,
+                kv_splits=sol_config.kv_splits,
+                strict=sol_config.strict,
+            )
         self._attention_impl = impl_cls(
             num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=self.softmax_scale,
             num_kv_heads=self.num_heads,
+            prefix=f"{self.prefix}.impl",
+            **extra_impl_args,
         )
+        self._attention_backend = backend_enum
 
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
         weight = self.qkv_proj.weight
