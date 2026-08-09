@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c128_state_indices,
@@ -26,6 +27,7 @@ from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -99,6 +101,35 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestMooncakeHiSparseMTPIndices(CustomTestCase):
+    def test_draft_buffers_use_logical_device_indices(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            mla_compression_ratios=None,
+            prefill_start_layer=10,
+            prefill_end_layer=12,
+            kv_data_ptrs=[1, 2, 3],
+            kv_item_lens=[4, 4, 4],
+            kv_layer_ids=[],
+        )
+        manager._send_kvcache_generic = MagicMock(return_value=0)
+        device_indices = np.array([7, 8], dtype=np.int32)
+
+        status = manager.send_kvcache(
+            mooncake_session_id="session",
+            prefill_kv_indices=np.array([1, 2], dtype=np.int32),
+            dst_kv_ptrs=[101, 102, 201],
+            dst_kv_indices=np.array([11, 12], dtype=np.int32),
+            executor=MagicMock(),
+            dst_device_kv_indices=device_indices,
+        )
+
+        self.assertEqual(status, 0)
+        kwargs = manager._send_kvcache_generic.call_args.kwargs
+        self.assertEqual(kwargs["dst_device_data_ptrs"], {201})
+        np.testing.assert_array_equal(kwargs["dst_device_data_indices"], device_indices)
 
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):

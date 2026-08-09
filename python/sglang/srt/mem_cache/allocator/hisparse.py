@@ -168,7 +168,12 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
         # disable free group mechanism for device buffer free
         self.hisparse_attn_allocator.is_not_in_free_group = True
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        # The paged allocator reserves the entire physical page 0 for padded
+        # writes.  Returning any slot from that page would add page 0 to the
+        # free list even though the allocator never handed it out.
+        self.hisparse_attn_allocator.free(
+            buffer_indices[buffer_indices >= self.page_size]
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
@@ -475,7 +480,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
         self.hisparse_attn_allocator.is_not_in_free_group = True
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        self.hisparse_attn_allocator.free(
+            buffer_indices[buffer_indices >= self.page_size]
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return (last_locs - 3) // self.compress_ratio

@@ -79,6 +79,8 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     device_buffer_size = extra_config.pop("device_buffer_size", 2 * top_k)
     host_to_device_ratio = extra_config.pop("host_to_device_ratio", 2)
     swap_in_block_size = extra_config.pop("swap_in_block_size", 960)
+    # Accepted for compatibility; speculative decoding selects MTP automatically.
+    extra_config.pop("swap_policy", None)
 
     if device_buffer_size < top_k:
         raise ValueError(
@@ -92,7 +94,6 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         raise ValueError(
             f"swap_in_block_size ({swap_in_block_size}) must be in the range [1, 1024]"
         )
-
     algorithm = extra_config.pop("algorithm", None)
     backend = extra_config.pop("backend", None)
     min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", None)

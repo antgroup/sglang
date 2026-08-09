@@ -525,6 +525,8 @@ def eagle_prepare_for_verify(
             draft_token_num=verify_input.draft_token_num,
             device=device,
         )
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.prepare_spec_verify(batch)
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
@@ -950,3 +952,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         num_needed_tokens=num_needed_tokens,
         batch=batch,
     )
+    if batch.hisparse_coordinator is not None and num_needed_tokens > 0:
+        batch.hisparse_coordinator.release_spec_decode_reserve(
+            batch=batch,
+            current_kv_lens_cpu=cur_kv_lens_cpu,
+            next_kv_lens_cpu=nxt_kv_lens_cpu,
+        )

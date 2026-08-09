@@ -784,14 +784,31 @@ class MooncakeKVManager(CommonKVManager):
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
             compression_ratios = self.kv_args.mla_compression_ratios
-            assert compression_ratios is not None
-            if len(dst_kv_ptrs) == len(self.kv_args.kv_data_ptrs):
+            if compression_ratios is not None:
+                if len(dst_kv_ptrs) == len(self.kv_args.kv_data_ptrs):
+                    start = self.kv_args.prefill_start_layer
+                    end = self.kv_args.prefill_end_layer
+                    assert end is not None
+                    compression_ratios = compression_ratios[start:end]
+                host_backed_kv_count = sum(ratio == 4 for ratio in compression_ratios)
+            else:
+                # HiSparse target KV occupies the host-backed prefix while MTP
+                # draft KV is appended as a device-only suffix. The draft cache
+                # shares logical page IDs with the target indexer and must never
+                # use the target's sparse physical page IDs.
                 start = self.kv_args.prefill_start_layer
                 end = self.kv_args.prefill_end_layer
-                assert end is not None
-                compression_ratios = compression_ratios[start:end]
-            c4_layer_num = sum(ratio == 4 for ratio in compression_ratios)
-            dst_device_kv_ptrs = set(dst_kv_ptrs[c4_layer_num:])
+                if end is None:
+                    raise ValueError(
+                        "HiSparse MTP PD transfer requires prefill_end_layer"
+                    )
+                host_backed_kv_count = end - start
+                if not 0 <= host_backed_kv_count < len(dst_kv_ptrs):
+                    raise ValueError(
+                        "HiSparse MTP PD transfer requires an appended device-only "
+                        "draft KV buffer"
+                    )
+            dst_device_kv_ptrs = set(dst_kv_ptrs[host_backed_kv_count:])
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,

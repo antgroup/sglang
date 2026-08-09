@@ -343,7 +343,9 @@ class ModelRunner:
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = server_args.enable_hisparse
+        # HiSparse owns the target KV cache. The draft runner has an independent
+        # short-lived KV pool and must not construct a second coordinator.
+        self.enable_hisparse = server_args.enable_hisparse and not is_draft_worker
 
         self.init_startup_observability()
 
@@ -873,6 +875,11 @@ class ModelRunner:
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
+            num_draft_tokens=(
+                0
+                if self.spec_algorithm.is_none()
+                else self.server_args.speculative_num_draft_tokens or 0
+            ),
         )
 
     def post_capture_resize_kv_pool(self):
