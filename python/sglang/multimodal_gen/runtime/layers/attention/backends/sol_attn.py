@@ -29,6 +29,7 @@ logger = init_logger(__name__)
 _SOL_ATTN_HEAD_SIZE = 128
 _SOL_ATTN_SOFTMAX_SCALE = _SOL_ATTN_HEAD_SIZE**-0.5
 _SOL_ATTN_KV_SPLITS = {1, 2, 4}
+_SOL_ATTN_CONFIG_KEYS = ("tau", "thresh_type", "kv_splits", "strict")
 _FATAL_CUDA_ERROR_MARKERS = (
     "out of memory",
     "cublas_status_alloc_failed",
@@ -53,12 +54,17 @@ def _is_fatal_cuda_error(exc: Exception) -> bool:
 
 @dataclass(frozen=True)
 class SolAttentionConfig:
-    """Static Sol-Attn options accepted through attention_backend_config."""
+    """Static Sol-Attn options accepted through attention_backend_config.
+
+    Strict execution is the default because selecting Sol-Attn should not
+    silently run a different backend. Set ``strict=false`` to opt into the
+    dense fallback.
+    """
 
     tau: float = 1.0
     thresh_type: str = "diag"
     kv_splits: int | str = "auto"
-    strict: bool = False
+    strict: bool = True
 
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any] | None) -> SolAttentionConfig:
@@ -174,7 +180,7 @@ class SolAttentionBackend(AttentionBackend):
 
 
 class SolAttentionImpl(AttentionImpl):
-    """Packed THD Sol-Attn with a dense implementation as a safe fallback."""
+    """Packed THD Sol-Attn with an explicitly enabled dense fallback."""
 
     def __init__(
         self,
@@ -193,23 +199,24 @@ class SolAttentionImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
         self.dropout_p = float(extra_impl_args.pop("dropout_p", 0.0))
         self.prefix = prefix
-        self.config = SolAttentionConfig.from_mapping(
-            {
-                "tau": extra_impl_args.pop("tau", SolAttentionConfig.tau),
-                "thresh_type": extra_impl_args.pop(
-                    "thresh_type", SolAttentionConfig.thresh_type
-                ),
-                "kv_splits": extra_impl_args.pop(
-                    "kv_splits", SolAttentionConfig.kv_splits
-                ),
-                "strict": extra_impl_args.pop("strict", SolAttentionConfig.strict),
-            }
-        )
+        config_overrides = {
+            key: extra_impl_args.pop(key)
+            for key in _SOL_ATTN_CONFIG_KEYS
+            if key in extra_impl_args
+        }
+        if config_overrides:
+            config = config_overrides
+        else:
+            from sglang.multimodal_gen.runtime.server_args import (
+                get_global_server_args,
+            )
+
+            config = get_global_server_args().attention_backend_config
+        self.config = SolAttentionConfig.from_mapping(config)
         self._dense = extra_impl_args.pop("dense_impl", None)
         self._dense_was_injected = self._dense is not None
         self._dense_key: tuple[str, torch.dtype] | None = None
         self._sol_unavailable_reason: str | None = None
-        self._failed_sol_signatures: set[tuple[Any, ...]] = set()
 
     def _get_dense_impl(self, query: torch.Tensor) -> AttentionImpl:
         if self._dense_was_injected:
@@ -315,27 +322,6 @@ class SolAttentionImpl(AttentionImpl):
                     f"N64 route group; got seqlen={seqlen}, kv_splits={kv_splits}."
                 )
         return kv_splits
-
-    @staticmethod
-    def _execution_signature(
-        query: torch.Tensor,
-        *,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-        cu_seqlens_host: tuple[int, ...] | None,
-    ) -> tuple[Any, ...]:
-        bounds = (
-            tuple(int(item) for item in cu_seqlens_host)
-            if cu_seqlens_host is not None
-            else ("segments", int(cu_seqlens.numel()))
-        )
-        return (
-            str(query.device),
-            query.dtype,
-            tuple(query.shape),
-            int(max_seqlen),
-            bounds,
-        )
 
     @staticmethod
     def _validate_output(output: Any, query: torch.Tensor) -> torch.Tensor:
@@ -449,6 +435,11 @@ class SolAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        if self.config.strict:
+            raise NotImplementedError(
+                "Sol-Attn only supports packed varlen attention; set strict=false "
+                "to allow the dense fallback."
+            )
         return self._get_dense_impl(query).forward(query, key, value, attn_metadata)
 
     @torch.compiler.disable
@@ -463,6 +454,12 @@ class SolAttentionImpl(AttentionImpl):
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         if not self._eligible(query, key, value):
+            if self.config.strict:
+                raise ValueError(
+                    "Sol-Attn received unsupported inputs; it requires non-causal "
+                    "BF16 CUDA MHA with head_size=128, dropout_p=0, and the default "
+                    "softmax scale. Set strict=false to allow the dense fallback."
+                )
             return self._dense_forward_varlen(
                 query,
                 key,
@@ -472,16 +469,7 @@ class SolAttentionImpl(AttentionImpl):
                 cu_seqlens_host=cu_seqlens_host,
             )
 
-        signature = self._execution_signature(
-            query,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            cu_seqlens_host=cu_seqlens_host,
-        )
-        if (
-            self._sol_unavailable_reason is not None
-            or signature in self._failed_sol_signatures
-        ):
+        if self._sol_unavailable_reason is not None:
             return self._dense_forward_varlen(
                 query,
                 key,
@@ -538,11 +526,10 @@ class SolAttentionImpl(AttentionImpl):
         except Exception as exc:
             if self.config.strict or _is_fatal_cuda_error(exc):
                 raise
-            self._failed_sol_signatures.add(signature)
+            self._sol_unavailable_reason = f"{type(exc).__name__}: {exc}"
             logger.warning_once(
-                "Sol-Attn failed for this execution signature, which is now "
-                "disabled and will use dense packed attention: "
-                f"{type(exc).__name__}: {exc}"
+                "Sol-Attn failed and is now disabled for this layer; using dense "
+                f"packed attention: {self._sol_unavailable_reason}"
             )
         return self._dense_forward_varlen(
             query,

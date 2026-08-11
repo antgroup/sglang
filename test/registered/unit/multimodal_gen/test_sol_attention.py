@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
+    MiniMaxH3DiTArchConfig,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn import (
     SolAttentionConfig,
     SolAttentionImpl,
@@ -54,6 +58,7 @@ def _make_impl(*, dense=None, strict=False, kv_splits="auto"):
 class TestSolAttentionConfig(CustomTestCase):
     def test_defaults_and_string_values(self):
         self.assertEqual(SolAttentionConfig.from_mapping(None), SolAttentionConfig())
+        self.assertTrue(SolAttentionConfig().strict)
         self.assertEqual(SolAttentionConfig.from_mapping({"tau": 0}).tau, 0.0)
         self.assertEqual(
             SolAttentionConfig.from_mapping(
@@ -91,6 +96,10 @@ class TestSolAttentionSelection(CustomTestCase):
     def test_enum_name_and_sparse_classification(self):
         self.assertEqual(str(AttentionBackendEnum.SOL_ATTN), "sol_attn")
         self.assertTrue(AttentionBackendEnum.SOL_ATTN.is_sparse)
+        self.assertIn(
+            AttentionBackendEnum.SOL_ATTN,
+            MiniMaxH3DiTArchConfig()._supported_attention_backends,
+        )
 
     def test_cuda_resolver_does_not_import_optional_package(self):
         with patch("importlib.import_module") as import_module:
@@ -122,6 +131,37 @@ class TestSolAttentionImpl(CustomTestCase):
             cu_seqlens_host=self.bounds,
             max_seqlen=max_seqlen,
         )
+
+    def test_backend_owns_global_config_parsing(self):
+        server_args = SimpleNamespace(
+            attention_backend_config={
+                "tau": 1.75,
+                "thresh_type": "exact",
+                "kv_splits": 2,
+                "strict": False,
+            }
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.server_args.get_global_server_args",
+            return_value=server_args,
+        ):
+            impl = SolAttentionImpl(
+                num_heads=2,
+                head_size=128,
+                causal=False,
+                softmax_scale=128**-0.5,
+                num_kv_heads=2,
+                dense_impl=_FakeDenseImpl(),
+            )
+
+        self.assertEqual(impl.config.tau, 1.75)
+        self.assertEqual(impl.config.thresh_type, "exact")
+        self.assertEqual(impl.config.kv_splits, 2)
+        self.assertFalse(impl.config.strict)
+
+    def test_strict_mode_rejects_ineligible_inputs(self):
+        with self.assertRaisesRegex(ValueError, "unsupported inputs"):
+            self._forward(_make_impl(strict=True))
 
     def test_ineligible_input_uses_dense_without_loading_sol_attn(self):
         dense = _FakeDenseImpl(fill=3.0)
@@ -219,7 +259,7 @@ class TestSolAttentionImpl(CustomTestCase):
         self.assertEqual(len(dense.varlen_calls), 2)
         load_kernels.assert_called_once()
 
-    def test_recoverable_runtime_failure_is_cached_per_signature(self):
+    def test_recoverable_runtime_failure_disables_sol_for_impl(self):
         kernel = Mock(side_effect=RuntimeError("kernel failed"))
         kernels = _SolAttentionKernels(
             varlen=kernel,
@@ -245,9 +285,12 @@ class TestSolAttentionImpl(CustomTestCase):
         torch.testing.assert_close(
             output_other_signature, torch.full_like(self.query, 9.0)
         )
-        self.assertEqual(kernel.call_count, 2)
-        self.assertEqual(load_kernels.call_count, 2)
+        self.assertEqual(kernel.call_count, 1)
+        load_kernels.assert_called_once()
         self.assertEqual(len(non_strict._dense.varlen_calls), 3)
+        self.assertEqual(
+            non_strict._sol_unavailable_reason, "RuntimeError: kernel failed"
+        )
 
     def test_runtime_failure_obeys_strict(self):
         kernel = Mock(side_effect=RuntimeError("kernel failed"))
