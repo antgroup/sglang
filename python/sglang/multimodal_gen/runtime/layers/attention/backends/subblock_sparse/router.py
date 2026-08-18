@@ -54,12 +54,14 @@ estimators the way 40 denoise steps through 50 layers do. Nothing short of an en
 render has predicted this correctly yet -- neither block mass recall nor single-step output
 L2.
 
-Worth trying, not yet exposed
------------------------------
-A per-head budget beats any estimator upgrade measured here: at a fixed mean sparsity,
-spending more blocks on diffuse heads and fewer on peaked ones lifts 5th-percentile mass
-recall from .52 to .90. It needs a rule for setting the per-head split, which nothing in
-the pipeline currently produces.
+SM90 variable-budget oracle
+---------------------------
+The SM90 backend allocates the same total budget as uniform top-k across all heads and
+query blocks, while allowing each row from one block up to twice the uniform top-k.  It
+softmax-normalises each score row, binary-searches one global threshold, and resolves the
+discrete remainder by the next boundary weight.  This maximises retained *router-score*
+mass under those constraints; it is an oracle for the estimator, not proof that the proxy
+score perfectly orders end-to-end video quality.  SM100 remains on uniform top-k.
 
 Usage
 -----
@@ -154,13 +156,104 @@ def _snap_up_to_8(topk: int, num_blocks: int) -> int:
 class RoutingPlan(msgspec.Struct, frozen=True):
     """What the kernel needs, plus the budget that produced it."""
 
-    index: torch.Tensor  # [B, H, Gq, topk] int32
-    topk: int  # key blocks kept per query block
+    index: torch.Tensor  # [B, H, Gq, topk or cap] int32
+    topk: int  # mean key-block budget per query block
     num_blocks: int  # key blocks available
+    # Optional per-row valid-prefix lengths.  None is the original uniform
+    # plan; SM90 consumes this tensor through mask_block_cnt.
+    block_counts: torch.Tensor | None = None  # [B, H, Gq] int32
 
     @property
     def density(self) -> float:
         return self.topk / self.num_blocks
+
+
+def _allocate_variable_budget(
+    scores: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate a uniform total budget unevenly across query-block rows.
+
+    ``scores`` is ``[B, H, Gq, Gk]``.  For each batch item independently, the
+    returned counts satisfy all three constraints exactly:
+
+    * ``sum(counts) == H * Gq * topk``;
+    * ``1 <= counts[row] <= min(2 * topk, Gk)``;
+    * the valid prefix of each index row contains that row's highest softmax
+      weights.
+
+    A global threshold first finds the largest under-budget prefix set.  A
+    discrete boundary pass then fills the remaining slots in descending weight
+    order.  The latter is necessary for exact conservation when many fp32
+    weights tie at the threshold (or the threshold lies between adjacent
+    representable values).
+    """
+    if scores.ndim != 4:
+        raise ValueError(f"scores must have shape [B, H, Gq, Gk], got {scores.shape}")
+
+    b, h, gq, gk = scores.shape
+    if not 1 <= topk <= gk:
+        raise ValueError(f"topk must be in [1, {gk}], got {topk}")
+
+    cap = min(2 * topk, gk)
+    rows = h * gq
+    budget = rows * topk
+
+    # A row's weights sum to one, so values are comparable across heads and
+    # query blocks.  Sorting also makes every feasible selection a row prefix.
+    weights = torch.softmax(scores.float(), dim=-1)
+    sorted_weights, sorted_indices = torch.sort(
+        weights, dim=-1, descending=True, stable=True
+    )
+    candidate_weights = sorted_weights[..., :cap]
+
+    # Invariant: threshold_low is over budget and threshold_high is at or under
+    # budget.  The strict comparison implements the requested ``weight > lo``
+    # rule; clamping applies the per-row floor and cap during the search itself.
+    threshold_low = torch.full(
+        (b, 1, 1, 1), -1.0, dtype=torch.float32, device=scores.device
+    )
+    threshold_high = candidate_weights.amax(dim=(1, 2, 3), keepdim=True)
+    for _ in range(32):
+        midpoint = (threshold_low + threshold_high) * 0.5
+        midpoint_counts = (candidate_weights > midpoint).sum(dim=-1)
+        midpoint_counts.clamp_(min=1, max=cap)
+        midpoint_total = midpoint_counts.sum(dim=(1, 2)).view(b, 1, 1, 1)
+        over_budget = midpoint_total > budget
+        threshold_low = torch.where(over_budget, midpoint, threshold_low)
+        threshold_high = torch.where(over_budget, threshold_high, midpoint)
+
+    counts = (candidate_weights > threshold_high).sum(dim=-1)
+    counts.clamp_(min=1, max=cap)
+    deficit = budget - counts.sum(dim=(1, 2))
+
+    # The binary search deliberately approaches from the under-budget side.
+    # Fill a whole equal-weight boundary level at a time.  This is equivalent
+    # to repeatedly assigning the globally best current boundary block, but it
+    # handles a large tie in one tensor pass and preserves row prefixes.
+    ranks = torch.arange(cap, device=scores.device).view(1, 1, 1, cap)
+    while bool((deficit > 0).any()):
+        remaining = ranks >= counts.unsqueeze(-1)
+        boundary_weight = torch.where(
+            remaining,
+            candidate_weights,
+            torch.full_like(candidate_weights, -float("inf")),
+        ).amax(dim=(1, 2, 3), keepdim=True)
+        at_boundary = remaining & (candidate_weights == boundary_weight)
+
+        flat_boundary = at_boundary.reshape(b, -1)
+        boundary_ordinal = flat_boundary.cumsum(dim=-1)
+        take = flat_boundary & (boundary_ordinal <= deficit.view(b, 1))
+        increments = take.view(b, h, gq, cap).sum(dim=-1)
+        stalled = (deficit > 0) & (increments.sum(dim=(1, 2)) == 0)
+        if bool(stalled.any()):
+            raise RuntimeError(
+                "variable-budget allocation could not make progress; scores "
+                "likely contain non-finite values"
+            )
+        counts = counts + increments
+        deficit = budget - counts.sum(dim=(1, 2))
+
+    return sorted_indices[..., :cap].to(torch.int32), counts.to(torch.int32)
 
 
 class SubBlockRouter:
@@ -235,14 +328,36 @@ class SubBlockRouter:
 
     @torch.no_grad()
     def route(
-        self, q: torch.Tensor, k: torch.Tensor, sparsity: float, softmax_scale: float
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        sparsity: float,
+        softmax_scale: float,
+        *,
+        variable_budget: bool = False,
     ) -> RoutingPlan:
-        """Select the top ``(1 - sparsity)`` fraction of key blocks per query block."""
+        """Select the top ``(1 - sparsity)`` fraction of key blocks.
+
+        The default preserves the original uniform per-row budget.  With
+        ``variable_budget=True`` the total is unchanged, but rows receive
+        between one and twice the uniform budget according to globally ranked
+        per-row softmax weights.  SM90 consumes the resulting valid-prefix
+        lengths directly; the SM100 path remains uniform for now.
+        """
         b, s, h, d = q.shape
         gk = -(-k.shape[1] // BLOCK)
         scores = self.scores(q, k, softmax_scale)  # [B, H, Gq, Gk]
         gq = scores.shape[2]
         topk = _snap_up_to_8(math.ceil((1.0 - sparsity) * gk), gk)
+        if variable_budget:
+            index, block_counts = _allocate_variable_budget(scores, topk)
+            return RoutingPlan(
+                index=index,
+                topk=topk,
+                num_blocks=gk,
+                block_counts=block_counts,
+            )
+
         # One pass over the score matrix instead of torch.topk's several; the kernel
         # accepts the blocks in any order, so nothing sorts them.
         index = fused_topk(scores.reshape(-1, gk), topk).view(b, h, gq, topk)

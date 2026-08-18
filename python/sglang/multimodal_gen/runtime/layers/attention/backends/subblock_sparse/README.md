@@ -75,22 +75,31 @@ estimator change in this family that has held up end to end. `router.py` carries
 the recall table behind `n_q = n_k = 4` and the record of what was tried and
 rejected.
 
+On SM90, selection uses a variable per-query-block budget. Each score row is
+softmax-normalised over key blocks, then one global threshold is applied across
+all heads and query blocks. A row keeps between one block and
+`min(2 * topk, num_key_blocks)` blocks, while the exact total remains
+`num_heads * num_query_blocks * topk` — identical to uniform top-k. Any discrete
+remainder after thresholding is assigned by descending boundary weight. This is
+the maximum retained router-score mass under those constraints. SM100 keeps the
+original uniform top-k path.
+
 ## Configuration
 
 | key | default | meaning |
 | --- | ---: | --- |
-| `sparsity` | 0.75 | key blocks dropped per query block, as an upper bound |
+| `sparsity` | 0.75 | mean key-block fraction dropped; uniform on SM100, globally reallocated per row on SM90 |
 | `n_k` | 4 | key sub-blocks per 64-token block (1, 2, 4, 8) |
 | `n_q` | 4 | query sub-blocks per 64-token block (1, 2, 4, 8) |
 | `skip_first_steps` | 10 | leading denoise forwards kept dense |
 | `skip_first_layers` | 0 | leading DiT blocks kept dense |
 | `min_seq_len` | 4096 | shorter sequences run dense |
 
-**`sparsity` is an upper bound, not an exact figure.** The kernel pads each query
-row's block count up to a multiple of 8 with phantom slots it then masks out, so
-148 blocks costs exactly what 152 costs; the router takes the 152. At 590 blocks,
-0.75 requested delivers 0.7424, and the startup log reports what was kept. It is
-the speed lever — see below — and the only knob most users should touch.
+**`sparsity` is an upper bound, not an exact figure.** The base `topk` is rounded
+to the existing uniform kernel budget: 148 blocks therefore becomes 152. At 590
+blocks, 0.75 requested delivers a mean sparsity of 0.7424. SM100 gives every row
+152 blocks; SM90 preserves exactly the same total but lets individual rows range
+from 1 to 304 blocks. The startup log reports the mean budget and row capacity.
 
 **`n_k` and `n_q` buy score accuracy, not speed.** They set how finely a block is
 cut before scoring: `n_k=4` means four 16-token key sub-blocks, and the block's
@@ -120,8 +129,9 @@ reasoning rather than from a measured threshold sweep.
 ## Measured
 
 MiniMax-H3 t2va, 1344x768 / 5 s / 50 steps, 8x B200, Ulysses-8, bf16, at the
-shipped defaults (152 of 590 key blocks per query block). All arms in one session
-on one node, cold sample dropped; spread within an arm is under 0.07 s.
+shipped defaults (uniform 152 of 590 key blocks per query block on SM100). All
+arms in one session on one node, cold sample dropped; spread within an arm is
+under 0.07 s. These B200 numbers do not measure the SM90 variable-budget path.
 
 | | DiT denoise | vs dense |
 | --- | ---: | ---: |

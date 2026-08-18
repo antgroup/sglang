@@ -20,6 +20,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.router import (
+    _allocate_variable_budget,
     _snap_up_to_8,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
@@ -178,6 +179,71 @@ class TestBudgetGranularity(unittest.TestCase):
         self.assertEqual(_snap_up_to_8(3, 5), 5)
 
 
+class TestVariableBudgetAllocation(unittest.TestCase):
+    def test_conserves_budget_and_respects_row_bounds(self):
+        # Two peaked rows, one diffuse row and one four-way row force a
+        # non-uniform optimum while keeping the expected allocation obvious.
+        scores = torch.tensor(
+            [
+                [
+                    [
+                        [12.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [2.0, 2.0, 2.0, 2.0, -10.0, -10.0, -10.0, -10.0],
+                        [12.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    ]
+                ]
+            ]
+        )
+        topk = 2
+        index, counts = _allocate_variable_budget(scores, topk)
+
+        self.assertEqual(index.shape, (1, 1, 4, 4))
+        self.assertEqual(int(counts.sum()), 1 * 4 * topk)
+        self.assertGreaterEqual(int(counts.min()), 1)
+        self.assertLessEqual(int(counts.max()), 2 * topk)
+        self.assertGreater(int(counts.max()), int(counts.min()))
+
+        # Every active prefix must be a score prefix.  Softmax is monotone, so
+        # comparing score values avoids making tie order part of the contract.
+        sorted_scores = scores.sort(dim=-1, descending=True).values
+        selected_scores = scores.gather(-1, index.to(torch.int64))
+        for row_idx, (row, count) in enumerate(
+            zip(selected_scores.reshape(-1, index.shape[-1]), counts.reshape(-1))
+        ):
+            n = int(count)
+            torch.testing.assert_close(
+                row[:n].sort(descending=True).values,
+                sorted_scores.reshape(-1, scores.shape[-1])[row_idx, :n],
+            )
+
+        weights = scores.softmax(dim=-1)
+        selected_weights = weights.gather(-1, index.to(torch.int64))
+        active = torch.arange(index.shape[-1]) < counts.unsqueeze(-1)
+        variable_mass = selected_weights.masked_fill(~active, 0).sum()
+        uniform_mass = weights.sort(dim=-1, descending=True).values[..., :topk].sum()
+        self.assertGreaterEqual(float(variable_mass), float(uniform_mass))
+
+    def test_tied_weights_still_conserve_the_exact_budget(self):
+        scores = torch.zeros(2, 2, 3, 7)
+        topk = 2
+        _, counts = _allocate_variable_budget(scores, topk)
+
+        torch.testing.assert_close(
+            counts.sum(dim=(1, 2)),
+            torch.full((2,), 2 * 3 * topk, dtype=counts.dtype),
+        )
+        self.assertGreaterEqual(int(counts.min()), 1)
+        self.assertLessEqual(int(counts.max()), 2 * topk)
+
+    def test_full_budget_keeps_every_block_in_every_row(self):
+        scores = torch.randn(1, 2, 3, 5)
+        index, counts = _allocate_variable_budget(scores, topk=5)
+
+        self.assertEqual(index.shape[-1], 5)
+        torch.testing.assert_close(counts, torch.full_like(counts, 5))
+
+
 class TestSubBlockSparseBackend(unittest.TestCase):
     def test_the_advertised_builder_can_be_built(self):
         """`AttentionMetadataBuilder.__init__` is abstract; a builder that does
@@ -190,7 +256,7 @@ class TestSubBlockSparseBackend(unittest.TestCase):
         )
         self.assertEqual(metadata.current_timestep, 7)
 
-    def test_sm90_adapter_sorts_indices_and_uses_64x64_blocks(self):
+    def test_sm90_adapter_sorts_only_the_variable_length_prefix(self):
         captured = {}
 
         class _FakeBlockSparseTensors:
@@ -202,18 +268,20 @@ class TestSubBlockSparseBackend(unittest.TestCase):
             captured.update(kwargs)
             return q, None
 
-        index = torch.tensor([[[[5, 1, 7, 3]]]], dtype=torch.int32)
+        index = torch.tensor([[[[5, 1, 7, 3, 0, 2]]]], dtype=torch.int32)
+        counts = torch.tensor([[[4]]], dtype=torch.int32)
         q = torch.empty(1, 64, 1, HEAD_DIM, dtype=torch.bfloat16)
+        kv = torch.empty(1, 512, 1, HEAD_DIM, dtype=torch.bfloat16)
         with patch(
             "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn._load_sm90_block_sparse_attention",
             return_value=(_FakeBlockSparseTensors, fake_flash_attn_func),
         ):
-            out = _sm90_sparse_attention(q, q, q, index, 4, HEAD_DIM**-0.5)
+            out = _sm90_sparse_attention(q, kv, kv, index, 4, HEAD_DIM**-0.5, counts)
 
         self.assertIs(out, q)
         torch.testing.assert_close(
             captured["mask_block_idx"],
-            torch.tensor([[[[1, 3, 5, 7]]]], dtype=torch.int32),
+            torch.tensor([[[[1, 3, 5, 7, 8, 8]]]], dtype=torch.int32),
         )
         self.assertEqual(captured["mask_block_cnt"].item(), 4)
         self.assertIsNone(captured["full_block_cnt"])
@@ -229,8 +297,11 @@ class TestSubBlockGating(unittest.TestCase):
     """The schedule must decide sparsity from the layer and the step alone."""
 
     def _impl(self, prefix: str, **config) -> SubBlockSparseAttentionImpl:
-        with _patch_schedule(config), patch.object(
-            SubBlockSparseAttentionImpl, "_build_dense_impl", return_value=None
+        with (
+            _patch_schedule(config),
+            patch.object(
+                SubBlockSparseAttentionImpl, "_build_dense_impl", return_value=None
+            ),
         ):
             return SubBlockSparseAttentionImpl(
                 num_heads=NUM_HEADS,
@@ -254,8 +325,11 @@ class TestSubBlockGating(unittest.TestCase):
         self.assertFalse(self._impl("token_refiner.blocks.0.attn").layer_enabled)
 
     def test_head_dim_other_than_128_is_dense(self):
-        with _patch_schedule({}), patch.object(
-            SubBlockSparseAttentionImpl, "_build_dense_impl", return_value=None
+        with (
+            _patch_schedule({}),
+            patch.object(
+                SubBlockSparseAttentionImpl, "_build_dense_impl", return_value=None
+            ),
         ):
             impl = SubBlockSparseAttentionImpl(
                 num_heads=NUM_HEADS,

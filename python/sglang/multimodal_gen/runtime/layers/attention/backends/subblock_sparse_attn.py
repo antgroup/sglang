@@ -137,6 +137,7 @@ def _sm90_sparse_attention(
     q2k_block_index: torch.Tensor,
     topk: int,
     softmax_scale: float,
+    block_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run a SubBlock routing plan through the existing SM90 CuTe kernel."""
     BlockSparseTensorsTorch, flash_attn_func = _load_sm90_block_sparse_attention()
@@ -146,12 +147,31 @@ def _sm90_sparse_attention(
     # sequence-tail masking to the first block. Sort explicitly so the largest
     # block id -- the possible ragged tail -- occupies the highest slot without
     # depending on the fused top-k kernel's current ascending output order.
-    ordered_index = q2k_block_index.sort(dim=-1).values
-    block_counts = torch.full(
-        ordered_index.shape[:-1],
-        topk,
-        dtype=torch.int32,
-        device=ordered_index.device,
+    if block_counts is None:
+        block_counts = torch.full(
+            q2k_block_index.shape[:-1],
+            topk,
+            dtype=torch.int32,
+            device=q2k_block_index.device,
+        )
+
+    # Variable-budget rows only own a valid *prefix*.  Sorting the whole index
+    # row directly could pull an inactive low block id into that prefix.  Replace
+    # the suffix with an out-of-range sentinel first; sorting then packs exactly
+    # the active ids at the front, while the kernel ignores the sentinel suffix.
+    slots = torch.arange(q2k_block_index.shape[-1], device=q2k_block_index.device).view(
+        1, 1, 1, -1
+    )
+    active = slots < block_counts.unsqueeze(-1)
+    num_key_blocks = -(-k.shape[1] // SUBBLOCK_SPARSE_BLOCK_SIZE)
+    ordered_index = (
+        torch.where(
+            active,
+            q2k_block_index,
+            torch.full_like(q2k_block_index, num_key_blocks),
+        )
+        .sort(dim=-1)
+        .values
     )
     sparse_tensors = BlockSparseTensorsTorch(
         mask_block_cnt=block_counts,
@@ -183,8 +203,11 @@ def _sm100_sparse_attention(
     q2k_block_index: torch.Tensor,
     topk: int,
     softmax_scale: float,
+    block_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run a SubBlock routing plan through FlashInfer's SM100 kernel."""
+    if block_counts is not None:
+        raise ValueError("variable SubBlock budgets are only enabled on SM90")
     out = load_bsa_attn_blk64_fwd()(
         q,
         k,
@@ -219,6 +242,7 @@ def _run_subblock_sparse_attention(
     q2k_block_index: torch.Tensor,
     topk: int,
     softmax_scale: float,
+    block_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dispatch the same 64x64 routing plan to Hopper or Blackwell."""
     runner = _get_subblock_sparse_attention_runner(q.device)
@@ -229,6 +253,7 @@ def _run_subblock_sparse_attention(
         q2k_block_index,
         topk,
         softmax_scale,
+        block_counts,
     )
 
 
@@ -404,14 +429,20 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
         """q, k, v: ``[1, S, H, 128]`` bf16 -> same shape."""
+        variable_budget = torch.cuda.get_device_capability(q.device) == (9, 0)
         plan = self.router.route(
-            q, k, sparsity=self.schedule.sparsity, softmax_scale=self.softmax_scale
+            q,
+            k,
+            sparsity=self.schedule.sparsity,
+            softmax_scale=self.softmax_scale,
+            variable_budget=variable_budget,
         )
         # Proof that the sparse path actually ran, with the shape it ran on --
         # the construction-time log above only says the layer was eligible.
         logger.info_once(
             f"SubBlock sparse attention active: S={k.shape[1]} heads={q.shape[2]} "
-            f"keeping {plan.topk}/{plan.num_blocks} key blocks per query block "
+            f"keeping {plan.topk}/{plan.num_blocks} key blocks per query block on average "
+            f"(row capacity {plan.index.shape[-1]}) "
             f"(sparsity {1 - plan.density:.4f})"
         )
         return _run_subblock_sparse_attention(
@@ -421,6 +452,7 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             plan.index,
             plan.topk,
             self.softmax_scale,
+            plan.block_counts,
         )
 
     def forward(
