@@ -560,19 +560,22 @@ done
 
 ### Choose the quality level
 
-`quality` is a request-scoped sampling parameter with two validated levels:
+`quality` is a request-scoped sampling parameter with two levels:
 
 - `"lossless"` (default): the exact reference path. Output is bit-exact
   against the reference implementation and the CI ground truth.
-- `"high"`: the audited accelerated path. Quality is guaranteed (the audited
-  Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
-  `lossless`), but output is no longer bit-identical to the reference.
+- `"high"`: the accelerated Cache-DiT path. On CUDA SM90 and SM100 with
+  `ring_degree=1` and graph compilation disabled, it also enables SubBlock
+  sparse attention while keeping attention dense for the first ten logical
+  denoising steps. Other CUDA architectures keep dense attention and still use
+  Cache-DiT. Output is not bit-identical to the reference.
 
 One resident server serves both levels; a `quality: "high"` request mounts
-its audited Cache-DiT policy at the batch boundary, and a later
-`quality: "lossless"` request removes the hooks before denoising.
+its Cache-DiT policy and eligible SubBlock backend at the batch boundary. A
+later `quality: "lossless"` request restores the server's dense attention
+backend and removes the Cache-DiT hooks before denoising.
 
-Start the validated server once:
+Start a server once. This example is the measured 4×H200 profile:
 
 ```bash Command
 sglang serve \
@@ -608,8 +611,8 @@ omitting the field is equivalent.
 
 <Tab title="high">
 
-The audited accelerated path. Use it when you can trade bit-exactness for
-latency while keeping output closest to the same-seed lossless trajectory.
+The accelerated path. Use it when you can trade bit-exactness for latency while
+keeping output close to the same-seed lossless trajectory.
 
 ```json Request field
 {
@@ -621,7 +624,8 @@ latency while keeping output closest to the same-seed lossless trajectory.
 
 </Tabs>
 
-The measured trade-off is:
+The published Cache-DiT-only trade-off, measured before the SubBlock path was
+added to `quality: "high"`, is:
 
 | `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />lossless | PSNR vs <br />lossless | Expected <br />trade-off |
 | --- | ---: | ---: | ---: | ---: | --- |
@@ -634,16 +638,24 @@ video flow shift 12, audio flow shift 3, and three fixed prompt/seed pairs on
 and a moving close-up portrait. `inference_time_s` is averaged across the three
 prompts; the quiet-scene point is itself the mean of two repeats.
 
+The combined Cache-DiT + SubBlock path requires a new same-workload quality and
+latency measurement. Do not use the Cache-DiT-only row above as evidence for
+the combined path.
+
 SSIM and PSNR compare decoded, frame-aligned output with the `lossless`
 result for the same prompt and seed. They measure trajectory deviation, not
 absolute perceptual quality: the `high` path can produce a different but
 still plausible realization. It also changes the joint audio-video denoise
 trajectory, while these two metrics cover video only.
 
-`quality: "high"` currently accepts only the exact workload and 4×H200
-deployment above; other hardware, task modes, request shapes, step counts, or
-flow shifts fail before denoising. Offline generation uses the same level
-name, for example `sglang generate --quality high`.
+`quality: "high"` currently accepts only the exact workload above: T2VA at
+1344×768, 124 frames, 24 fps, 50 steps, video flow shift 12, and audio flow
+shift 3. CUDA GPU product names and parallel topology are not allowlisted.
+Cache-DiT support is validated independently, while SubBlock is enabled only
+on SM90 or SM100 when its execution-mode requirements are met. The measurements
+above cover 4×H200 Cache-DiT only; qualify other deployments and the combined
+path separately. Offline generation uses the same level name, for example
+`sglang generate --quality high`.
 
 <Note>
 `quality` selects a model sampling level and can change generated content.
@@ -673,11 +685,14 @@ sglang serve \
 
 <Warning>
 Cache-DiT skips selected block computation and is approximate. It cannot be
-combined with FSDP inference or DiT layerwise offload. Breakable CUDA graph
-execution takes precedence and leaves Cache-DiT disabled. Tune the cache
-thresholds only after comparing both video and audio quality on the target
-task profile. A real B200 request has completed, but the `quality: "high"`
-path above remains fail-closed to the audited 4×H200 workload.
+combined with FSDP inference, DiT layerwise offload, or breakable CUDA graphs.
+Those combinations reject a `quality: "high"` request unless the request sets
+`enable_cache_dit: false`. MiniMax-H3 Cache-DiT is not enabled on MPS. SubBlock
+falls back to the server's dense attention backend on unsupported SM versions,
+Ring Attention, `torch.compile`, or breakable CUDA graphs. Tune the cache
+thresholds only after comparing both video and audio quality on the target task
+profile. A real B200 Cache-DiT request has completed, but only the 4×H200
+Cache-DiT-only profile above has published quality and latency measurements.
 </Warning>
 
 ## 7. Runtime feature recipes
@@ -822,8 +837,8 @@ sglang serve \
 flag is required: SGLang reads the checkpoint's `quantization_config` and
 fails closed if the native encoder does not support that format. The language
 linear layers use FP8 while embeddings, normalization, and the vision tower
-remain BF16. This is an approximate serve-time choice and is incompatible with
-the strict `quality="high"` deployment contract.
+remain BF16. This is an approximate serve-time choice. It can be combined with
+`quality="high"`, but that combination is outside the measured 4×H200 profile.
 
 </Tab>
 

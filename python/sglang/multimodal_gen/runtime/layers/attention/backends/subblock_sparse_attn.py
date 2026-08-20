@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import functools
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -285,10 +286,10 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
     min_seq_len: int
 
     @classmethod
-    def from_server_args(cls) -> SubBlockSparseSchedule:
-        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-
-        config = get_global_server_args().attention_backend_config or {}
+    def from_config(
+        cls, config: Mapping[str, Any] | None = None
+    ) -> SubBlockSparseSchedule:
+        config = config or {}
         schedule = SubBlockSparseSchedule(
             sparsity=float(config.get("sparsity", DEFAULT_SPARSITY)),
             skip_first_steps=int(
@@ -312,6 +313,12 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
             raise ValueError("subblock skip_first_* must be non-negative")
         return schedule
 
+    @classmethod
+    def from_server_args(cls) -> SubBlockSparseSchedule:
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+        return cls.from_config(get_global_server_args().attention_backend_config)
+
 
 class SubBlockSparseAttentionImpl(AttentionImpl):
     """Block-sparse attention with a dense fallback for the excluded region.
@@ -329,6 +336,7 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         softmax_scale: float | None = None,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        schedule: SubBlockSparseSchedule | None = None,
         **extra_impl_args,
     ) -> None:
         self.prefix = prefix
@@ -340,7 +348,7 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         )
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
 
-        self.schedule = SubBlockSparseSchedule.from_server_args()
+        self.schedule = schedule or SubBlockSparseSchedule.from_server_args()
         self.layer_idx = _dit_layer_index(prefix)
         # A layer outside the DiT stack (token refiner, cross attention) never
         # runs sparse: its sequences are short and its budget meaningless.

@@ -96,94 +96,30 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         return getattr(value, "value", value)
 
     def validate_quality_deployment(self, server_args) -> None:
-        """Fail closed unless the resident server matches the deployment
-        audited for quality="high"."""
+        """Validate only runtime requirements, not GPU product models."""
 
-        attention_backend = self._server_arg_value(server_args.attention_backend)
-        attention_backend = (
-            str(attention_backend).strip().lower()
-            if attention_backend is not None
-            else None
-        )
-        capability = current_platform.get_device_capability()
-        capability_int = capability.to_int() if capability is not None else None
-        device_name = (
-            current_platform.get_device_name()
-            if current_platform.is_cuda()
-            else type(current_platform).__name__
-        )
-        model_variant = str(server_args.model_variant or "fl2va").lower()
-        resolved_quant_config = self.text_encoder_configs[0].quant_config
-        text_encoder_quantization = (
-            resolved_quant_config.get_name()
-            if resolved_quant_config is not None
-            else None
-        )
-        actual = {
-            "attention_backend": attention_backend,
-            "backend": self._server_arg_value(server_args.backend),
-            "component_attention_backends": {},
-            "enable_breakable_cuda_graph": server_args.enable_breakable_cuda_graph,
-            "enable_torch_compile": server_args.enable_torch_compile,
-            "is_dit_layerwise_offload_selected": (
-                server_args.is_dit_layerwise_offload_selected
-            ),
-            "model_variant": model_variant,
-            "num_gpus": server_args.num_gpus,
-            "performance_mode": server_args.performance_mode,
-            "quantization": server_args.quantization,
-            "text_encoder_quantization": text_encoder_quantization,
-            "regional_compile": server_args.regional_compile,
-            "ring_degree": server_args.ring_degree,
-            "sp_degree": server_args.sp_degree,
-            "tp_size": server_args.tp_size,
-            "ulysses_degree": server_args.ulysses_degree,
-            "use_fsdp_inference": server_args.use_fsdp_inference,
-        }
-        actual["component_attention_backends"] = dict(
-            server_args.component_attention_backends or {}
-        )
-        expected = {
-            "attention_backend": {None, "fa"},
-            "backend": {"auto", "sglang"},
-            "component_attention_backends": {},
-            "enable_breakable_cuda_graph": False,
-            "enable_torch_compile": False,
-            "is_dit_layerwise_offload_selected": False,
-            "model_variant": "fl2va",
-            "num_gpus": 4,
-            "performance_mode": "speed",
-            "quantization": None,
-            "text_encoder_quantization": None,
-            "regional_compile": False,
-            "ring_degree": 1,
-            "sp_degree": 4,
-            "tp_size": 1,
-            "ulysses_degree": 4,
-            "use_fsdp_inference": False,
-        }
-        mismatches = {
-            name: {"expected": wanted, "actual": actual[name]}
-            for name, wanted in expected.items()
-            if (
-                actual[name] not in wanted
-                if isinstance(wanted, set)
-                else actual[name] != wanted
-            )
-        }
-        if (
-            not current_platform.is_cuda()
-            or "H200" not in device_name.upper()
-            or capability_int != 90
-        ):
-            mismatches["device"] = {
-                "expected": "NVIDIA H200 (compute capability 9.0)",
-                "actual": f"{device_name} (compute capability {capability_int})",
-            }
-        if mismatches:
+        if not current_platform.is_cuda():
             raise ValueError(
-                'MiniMax-H3 quality="high" is validated only for '
-                f"the strict 4xH200 fl2va deployment; mismatches: {mismatches}"
+                "MiniMax-H3 Cache-DiT requires a CUDA deployment; set "
+                "enable_cache_dit=false for this request on other platforms."
+            )
+        if server_args.enable_breakable_cuda_graph:
+            raise ValueError(
+                "MiniMax-H3 Cache-DiT cannot run with breakable CUDA graphs; set "
+                "enable_cache_dit=false for this request or restart without "
+                "--enable-breakable-cuda-graph."
+            )
+        if server_args.use_fsdp_inference:
+            raise ValueError(
+                "MiniMax-H3 Cache-DiT cannot wrap an FSDP-managed transformer; set "
+                "enable_cache_dit=false for this request or restart without "
+                "--use-fsdp-inference."
+            )
+        if server_args.is_dit_layerwise_offload_selected:
+            raise ValueError(
+                "MiniMax-H3 Cache-DiT cannot reuse blocks managed by DiT "
+                "layerwise offload; set enable_cache_dit=false for this request "
+                "or disable DiT layerwise offload."
             )
 
     def validate_server_args(self, server_args) -> None:

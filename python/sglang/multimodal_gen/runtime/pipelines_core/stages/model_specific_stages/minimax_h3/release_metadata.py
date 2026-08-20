@@ -159,7 +159,8 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
             )
         high_quality = quality == "high"
         if high_quality and not batch.is_warmup:
-            server_args.pipeline_config.validate_quality_deployment(server_args)
+            if batch.sampling_params.enable_cache_dit is not False:
+                server_args.pipeline_config.validate_quality_deployment(server_args)
             plan = minimax_h3_plan_from_batch(batch)
             if plan is None:
                 raise ValueError(
@@ -213,4 +214,7 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
         return batch
 
 
-__all__ = ["MiniMaxH3PartitionAdmissionStage", "MiniMaxH3ReleaseMetadata"]
+__all__ = [
+    "MiniMaxH3PartitionAdmissionStage",
+    "MiniMaxH3ReleaseMetadata",
+]

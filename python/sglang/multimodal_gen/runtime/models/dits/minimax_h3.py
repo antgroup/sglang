@@ -615,9 +615,6 @@ class MiniMaxH3Attention(nn.Module):
             num_kv_heads=self.num_heads,
             prefix=self.prefix,
         )
-        # Ring only supports FA (see _minimax_h3_attention_core_impl); keep
-        # the resolved enum alongside the impl instance instead of a second
-        # get_attn_backend() call at the ring gate.
         self._attention_backend_enum = backend.get_enum()
 
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
@@ -1752,7 +1749,16 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             if self._adaln_precomputed
             else None
         )
+        self._subblock_attention_modules = tuple(
+            module
+            for module in self.modules()
+            if isinstance(module, MiniMaxH3Attention)
+            and module.prefix.startswith("blocks.")
+        )
+        self._subblock_default_states = None
+        self._subblock_impls = None
         self._resolved_attention_backend: AttentionBackendEnum | None = None
+        self._high_quality_subblock_enabled = False
         self._mark_missing_params_required()
 
     def set_cache_dit_input_preservation(self, enabled: bool) -> None:
@@ -1783,6 +1789,60 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             if isinstance(module, MiniMaxH3Attention):
                 module._set_attention_backend(backend)
         self._resolved_attention_backend = backend.get_enum()
+
+    def set_high_quality_subblock(
+        self,
+        enabled: bool,
+        *,
+        schedule: Any | None = None,
+    ) -> None:
+        self._resolve_attention_backend_once()
+        if enabled == self._high_quality_subblock_enabled:
+            return
+        if enabled and self._subblock_impls is None:
+            if schedule is None:
+                raise ValueError("MiniMax-H3 high-quality SubBlock needs a schedule")
+            backend = get_attn_backend(
+                self.arch.attention_head_dim,
+                _BF16_DTYPE,
+                selected_attention_backend=AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+                attention_requirements=AttentionRequirements(packed_varlen=True),
+            )
+            impl_cls = backend.get_impl_cls()
+            defaults = []
+            candidates = []
+            for attention in self._subblock_attention_modules:
+                defaults.append(
+                    (attention._attention_impl, attention._attention_backend_enum)
+                )
+                candidates.append(
+                    impl_cls(
+                        num_heads=attention.num_heads,
+                        head_size=attention.head_dim,
+                        causal=False,
+                        softmax_scale=attention.softmax_scale,
+                        num_kv_heads=attention.num_heads,
+                        prefix=attention.prefix,
+                        schedule=schedule,
+                    )
+                )
+            self._subblock_default_states = tuple(defaults)
+            self._subblock_impls = tuple(candidates)
+        if enabled:
+            for attention, impl in zip(
+                self._subblock_attention_modules, self._subblock_impls
+            ):
+                attention._attention_impl = impl
+                attention._attention_backend_enum = (
+                    AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+                )
+        else:
+            for attention, (impl, backend_enum) in zip(
+                self._subblock_attention_modules, self._subblock_default_states
+            ):
+                attention._attention_impl = impl
+                attention._attention_backend_enum = backend_enum
+        self._high_quality_subblock_enabled = enabled
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():

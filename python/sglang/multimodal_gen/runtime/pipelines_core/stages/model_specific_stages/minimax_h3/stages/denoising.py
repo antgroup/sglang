@@ -43,6 +43,16 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
 logger = init_logger(__name__)
 
+_HIGH_QUALITY_SUBBLOCK_CAPABILITIES = frozenset({(9, 0), (10, 0)})
+_HIGH_QUALITY_SUBBLOCK_CONFIG = {
+    "sparsity": 0.75,
+    "skip_first_steps": 10,
+    "skip_first_layers": 0,
+    "n_k": 4,
+    "n_q": 4,
+    "min_seq_len": 4096,
+}
+
 _REF2VA_VIDEO_CHAINS = {
     "video.reference_preserve",
     "video_audio.reference_preserve",
@@ -390,6 +400,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         )
         self._minimax_h3_quality = "lossless"
         self._minimax_h3_cache_mode: str | None = None
+        self._minimax_h3_subblock_enabled = False
 
     def _owns_compile_warmup_lifecycle(self) -> bool:
         return True
@@ -398,6 +409,65 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         return (
             getattr(self, "_minimax_h3_quality", "lossless") == "high"
             or super()._cache_dit_requested()
+        )
+
+    def _supports_high_quality_subblock(self) -> bool:
+        if (
+            not current_platform.is_cuda()
+            or (self.server_args.ring_degree or 1) > 1
+            or self.server_args.enable_torch_compile
+            or self.server_args.enable_breakable_cuda_graph
+        ):
+            return False
+        capability = current_platform.get_device_capability()
+        return (
+            capability is not None
+            and (
+                capability.major,
+                capability.minor,
+            )
+            in _HIGH_QUALITY_SUBBLOCK_CAPABILITIES
+        )
+
+    def _resolve_h3_model_method(self, name: str):
+        model = self.transformer
+        for _ in range(6):
+            method = getattr(model, name, None)
+            if callable(method):
+                return method
+            inner = (
+                getattr(model, "_orig_mod", None)
+                or getattr(model, "module", None)
+                or getattr(model, "model", None)
+            )
+            if inner is None:
+                break
+            model = inner
+        raise TypeError(
+            f"MiniMax-H3 transformer {type(self.transformer).__name__} does not "
+            f"expose {name}()"
+        )
+
+    def _maybe_override_attention_backend(self, batch: Req) -> None:
+        super()._maybe_override_attention_backend(batch)
+        quality = getattr(batch.sampling_params, "quality", "lossless")
+        want_subblock = quality == "high" and self._supports_high_quality_subblock()
+        if want_subblock == self._minimax_h3_subblock_enabled:
+            return
+        schedule = None
+        if want_subblock:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
+                SubBlockSparseSchedule,
+            )
+
+            schedule = SubBlockSparseSchedule.from_config(_HIGH_QUALITY_SUBBLOCK_CONFIG)
+        setter = self._resolve_h3_model_method("set_high_quality_subblock")
+        setter(want_subblock, schedule=schedule)
+        self._minimax_h3_subblock_enabled = want_subblock
+        logger.info(
+            "MiniMax-H3 SubBlock attention %s for quality=%s",
+            "enabled" if want_subblock else "disabled",
+            quality,
         )
 
     def _maybe_enable_cache_dit(

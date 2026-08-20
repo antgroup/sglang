@@ -43,7 +43,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.server_args.server_args import Backend
 
 TARGET = {
     "short_edge": 768,
@@ -237,58 +236,125 @@ def test_video_adapter_rejects_invalid_quality(bad_quality):
         )
 
 
-class _HopperCapability:
-    def to_int(self) -> int:
-        return 90
+class _Capability:
+    def __init__(self, major, minor):
+        self.major = major
+        self.minor = minor
+
+    def as_version_str(self):
+        return f"{self.major}.{self.minor}"
 
 
-def _quality_server_args():
-    return SimpleNamespace(
-        attention_backend=None,
-        model_variant="fl2va",
-        num_gpus=4,
-        backend=Backend.AUTO,
-        component_attention_backends={},
-        enable_breakable_cuda_graph=False,
-        enable_torch_compile=False,
-        is_dit_layerwise_offload_selected=False,
-        performance_mode="speed",
-        quantization=None,
-        regional_compile=False,
-        ring_degree=1,
-        sp_degree=4,
-        tp_size=1,
-        ulysses_degree=4,
-        use_fsdp_inference=False,
-    )
+def _quality_server_args(**overrides):
+    values = {
+        "enable_breakable_cuda_graph": False,
+        "enable_torch_compile": False,
+        "use_fsdp_inference": False,
+        "is_dit_layerwise_offload_selected": False,
+        "ring_degree": 1,
+        "pipeline_config": MiniMaxH3PipelineConfig(),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
-def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
+def _high_quality_cache_dit_stage():
     stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
-    stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)
+    stage.server_args = _quality_server_args()
     stage._cache_dit_enabled = False
-    batch = SimpleNamespace(
+    stage._minimax_h3_quality = "lossless"
+    stage._minimax_h3_subblock_enabled = False
+    return stage
+
+
+def _high_quality_cache_dit_batch(enable_cache_dit=None, quality="high"):
+    return SimpleNamespace(
         sampling_params=SimpleNamespace(
-            quality="high",
+            quality=quality,
             _explicit_fields={"quality"},
-            enable_cache_dit=None,
+            enable_cache_dit=enable_cache_dit,
             cache_dit_params=None,
+            attention_backend_override=None,
         )
     )
 
-    with patch(
-        "sglang.multimodal_gen.runtime.pipelines_core.stages.denoising."
-        "logger.warning_once"
-    ) as warning_once:
-        stage._maybe_enable_cache_dit(50, batch)
 
-    warning_once.assert_called_once_with(
-        "Cache-DiT was requested but is disabled because breakable CUDA graphs "
-        "are enabled."
+@pytest.mark.parametrize(
+    ("server_flag", "message"),
+    [
+        ("enable_breakable_cuda_graph", "breakable CUDA graphs"),
+        ("use_fsdp_inference", "FSDP-managed transformer"),
+        ("is_dit_layerwise_offload_selected", "DiT layerwise offload"),
+    ],
+)
+def test_high_quality_rejects_incompatible_cache_dit_modes(server_flag, message):
+    server_args = _quality_server_args(**{server_flag: True})
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        pytest.raises(ValueError, match=message),
+    ):
+        server_args.pipeline_config.validate_quality_deployment(server_args)
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [
+        ((9, 0), True),
+        ((10, 0), True),
+        ((8, 0), False),
+        ((10, 3), False),
+        ((12, 0), False),
+    ],
+)
+def test_high_quality_subblock_support_is_capability_based(capability, expected):
+    stage = _high_quality_cache_dit_stage()
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_Capability(*capability),
+        ),
+    ):
+        supported = stage._supports_high_quality_subblock()
+
+    assert supported is expected
+
+
+def test_high_quality_subblock_switches_at_batch_boundaries():
+    calls = []
+    transformer = SimpleNamespace(
+        set_high_quality_subblock=lambda enabled, schedule=None: calls.append(
+            (enabled, schedule)
+        )
     )
+    stage = _high_quality_cache_dit_stage()
+    stage.transformer = transformer
+    stage._attention_backend_active_override = None
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_Capability(9, 0),
+        ),
+    ):
+        stage._maybe_override_attention_backend(_high_quality_cache_dit_batch())
+        stage._maybe_override_attention_backend(
+            _high_quality_cache_dit_batch(quality="lossless")
+        )
+
+    assert calls[0][0] is True
+    assert calls[0][1].sparsity == 0.75
+    assert calls[0][1].n_k == calls[0][1].n_q == 4
+    assert calls[0][1].skip_first_steps == 10
+    assert calls[1] == (False, None)
 
 
-def test_quality_admission_fails_closed_outside_validated_request():
+def test_quality_admission_keeps_support_checks_without_gpu_model_allowlist():
     metadata = MiniMaxH3ReleaseMetadata.from_model_index(
         {
             "_minimax_h3": {
@@ -309,23 +375,43 @@ def test_quality_admission_fails_closed_outside_validated_request():
     )
     plan = minimax_h3_resolve_plan(canonical)
     batch = SimpleNamespace(
-        sampling_params=SimpleNamespace(task="t2va", quality="high"),
+        sampling_params=SimpleNamespace(
+            task="t2va", quality="high", enable_cache_dit=None
+        ),
         num_inference_steps=50,
         is_warmup=False,
     )
     stage = MiniMaxH3PartitionAdmissionStage(metadata)
-    config = MiniMaxH3PipelineConfig()
     server_args = _quality_server_args()
-    server_args.pipeline_config = config
 
+    server_args.enable_breakable_cuda_graph = True
     with (
         patch.object(current_platform, "is_cuda", return_value=True),
-        patch.object(current_platform, "get_device_name", return_value="NVIDIA H200"),
-        patch.object(
-            current_platform,
-            "get_device_capability",
-            return_value=_HopperCapability(),
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+            "minimax_h3.release_metadata.minimax_h3_plan_from_batch"
+        ) as plan_from_batch,
+        pytest.raises(ValueError, match="breakable CUDA graphs"),
+    ):
+        stage.forward(batch, server_args)
+    plan_from_batch.assert_not_called()
+
+    server_args.enable_breakable_cuda_graph = False
+    batch.sampling_params.enable_cache_dit = False
+    with (
+        patch.object(current_platform, "is_cuda", return_value=False),
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+            "minimax_h3.release_metadata.minimax_h3_plan_from_batch",
+            return_value=plan,
         ),
+    ):
+        assert stage.forward(batch, server_args) is batch
+
+    batch.sampling_params.enable_cache_dit = None
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name") as get_device_name,
         patch(
             "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
             "minimax_h3.release_metadata.minimax_h3_plan_from_batch",
@@ -336,14 +422,13 @@ def test_quality_admission_fails_closed_outside_validated_request():
         batch.num_inference_steps = 40
         with pytest.raises(ValueError, match="validated only"):
             stage.forward(batch, server_args)
+    get_device_name.assert_not_called()
 
     batch.sampling_params.quality = "lossless"
     batch.num_inference_steps = 50
-    server_args.attention_backend = "sage_attn"
     assert stage.forward(batch, server_args) is batch
 
     batch.sampling_params.quality = "ultra"
-    server_args.attention_backend = None
     with pytest.raises(ValueError, match="quality must be one of"):
         stage.forward(batch, server_args)
 
