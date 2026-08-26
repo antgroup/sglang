@@ -1,7 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
@@ -820,6 +820,7 @@ def _ring_attention_varlen(
     attn_impl: "AttentionImpl",
     real_seq_len: int,
     ring_ws: int,
+    ring_kv_chunk_kwargs: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     """Ring-rotated varlen attention over one rank's local packed chunk.
 
@@ -890,6 +891,7 @@ def _ring_attention_varlen(
                 q,
                 kv_bufs[cur][0, :remote_used],
                 kv_bufs[cur][1, :remote_used],
+                **(ring_kv_chunk_kwargs or {}),
             )
             out_acc, lse_acc = _ring_merge_attention(
                 out_acc, lse_acc, step_out, step_lse

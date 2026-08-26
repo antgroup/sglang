@@ -593,10 +593,25 @@ def _minimax_h3_attention_core_impl(
 
     if ring_active:
         ring_ws, _ = get_ring_ctx()
-        if attention._attention_backend_enum is not AttentionBackendEnum.FA:
+        ring_kv_chunk_kwargs = None
+        if (
+            attention._attention_backend_enum
+            is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+        ):
+            impl = attention._attention_impl
+            sparse_will_run = impl._sparse_ready(q, k)
+            if sparse_will_run and subblock_sparse_query_block_mask is None:
+                raise ValueError(
+                    "MiniMax H3 requires subblock_sparse_query_block_mask "
+                    "when SubBlock sparse attention is active"
+                )
+            ring_kv_chunk_kwargs = {
+                "sparse_query_block_mask": subblock_sparse_query_block_mask
+            }
+        elif attention._attention_backend_enum is not AttentionBackendEnum.FA:
             raise NotImplementedError(
-                "MiniMax H3 ring parallelism requires the FlashAttention "
-                "backend (matches --ring-degree's general restriction)."
+                "MiniMax H3 ring parallelism requires FlashAttention or "
+                "SubBlock sparse attention"
             )
         # max_seqlen is cu_seqlens[1] (`used`) by construction -- the real,
         # non-padding row count ring needs, already a host int here.
@@ -607,6 +622,7 @@ def _minimax_h3_attention_core_impl(
             attn_impl=attention._attention_impl,
             real_seq_len=max_seqlen,
             ring_ws=ring_ws,
+            ring_kv_chunk_kwargs=ring_kv_chunk_kwargs,
         )
     else:
         if (

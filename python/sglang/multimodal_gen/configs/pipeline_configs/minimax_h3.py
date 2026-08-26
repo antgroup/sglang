@@ -250,14 +250,27 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "pass --enable-torch-compile false"
                 )
         selected_backend = self.resolve_transformer_attention_backend(server_args)
-        if (
-            int(server_args.ring_degree or 1) > 1
-            and selected_backend is not AttentionBackendEnum.FA
-        ):
-            raise ValueError(
-                "MiniMax-H3 ring parallelism requires the FlashAttention "
-                "backend for the transformer"
-            )
+        if int(server_args.ring_degree or 1) > 1:
+            if selected_backend not in {
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            }:
+                raise ValueError(
+                    "MiniMax-H3 ring parallelism requires FlashAttention or "
+                    "SubBlock sparse attention for the transformer"
+                )
+            if selected_backend is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN:
+                capability = current_platform.get_device_capability()
+                capability_tuple = (
+                    (capability.major, capability.minor)
+                    if capability is not None
+                    else None
+                )
+                if capability_tuple != (9, 0):
+                    raise ValueError(
+                        "MiniMax-H3 SubBlock ring parallelism currently "
+                        "supports SM90 only"
+                    )
         if selected_backend is None:
             return
         get_attn_backend(

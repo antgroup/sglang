@@ -461,6 +461,53 @@ def test_validate_server_args_accepts_transformer_backend_override():
     )
 
 
+def test_validate_server_args_accepts_subblock_ring_on_sm90():
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(
+        component_attention_backends={"transformer": "subblock_sparse_attn"},
+        attention_backend="fa",
+        ring_degree=2,
+        resolve_component_attention_backend=lambda *_names: (
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            "transformer",
+        ),
+    )
+    capability = SimpleNamespace(major=9, minor=0)
+
+    with (
+        patch.object(
+            current_platform, "get_device_capability", return_value=capability
+        ),
+        patch(
+            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+            "get_attn_backend"
+        ) as get_attn_backend,
+    ):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+    get_attn_backend.assert_called_once()
+
+
+def test_validate_server_args_rejects_subblock_ring_off_sm90():
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(
+        component_attention_backends={"transformer": "subblock_sparse_attn"},
+        attention_backend="fa",
+        ring_degree=2,
+        resolve_component_attention_backend=lambda *_names: (
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            "transformer",
+        ),
+    )
+    capability = SimpleNamespace(major=10, minor=0)
+
+    with patch.object(
+        current_platform, "get_device_capability", return_value=capability
+    ):
+        with pytest.raises(ValueError, match="SM90 only"):
+            MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+
 def test_resolve_transformer_attention_backend_uses_selector_precedence():
     config = MiniMaxH3PipelineConfig()
     subblock = AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN

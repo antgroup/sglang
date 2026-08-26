@@ -10,6 +10,36 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 
 
 class TestMiniMaxH3PackedSequence(unittest.TestCase):
+    def test_ring_subblock_alignment_keeps_64_row_chunk_boundaries(self):
+        common = dict(
+            text_len=5,
+            latent_t=2,
+            latent_h=4,
+            latent_w=4,
+            audio_t=5,
+            sequence_alignment=128,
+        )
+        layouts = (
+            minimax_h3_packed_sequence(
+                **common,
+                include_keyframe_cond=False,
+            ),
+            minimax_h3_packed_sequence_ref2va_blocks(
+                **common,
+                ref_blocks=[{"kind": "image", "latent_h": 4, "latent_w": 4}],
+            ),
+        )
+
+        for built in layouts:
+            with self.subTest(keys=tuple(built)):
+                self.assertEqual(int(built["seq_len"]) % 128, 0)
+                self.assertEqual(int(built["cu_seqlens"][-1]), built["seq_len"])
+                self.assertEqual(built["img_position_ids"].shape[0], built["seq_len"])
+                self.assertEqual(built["token_tags"].shape[0], built["seq_len"])
+                self.assertTrue(
+                    (built["token_tags"][int(built["cu_seqlens"][1]) :] == -1).all()
+                )
+
     def test_t2va_structure(self):
         built = minimax_h3_packed_sequence(
             text_len=97,

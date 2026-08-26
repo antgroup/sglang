@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MiniMaxH3DenoiseBranch,
     _build_local_embedding_layout,
+    _minimax_h3_subblock_sparse_query_block_mask,
     _minimax_h3_update_target_rows_,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
@@ -196,6 +197,29 @@ def test_rank_local_token_tags_match_reference_slice():
                 torch.testing.assert_close(
                     branch.static_kwargs["block_token_tags"], expected, rtol=0, atol=0
                 )
+
+
+def test_subblock_ring_mask_uses_rank_local_query_blocks():
+    # The Ring boundary is intentionally not aligned to the global 64-row
+    # blocks. Local BSA blocks cover [32, 96) and [96, 128).
+    video_rows = torch.arange(32, 96)
+    mask = _minimax_h3_subblock_sparse_query_block_mask(
+        video_rows,
+        used_len=128,
+        query_start=32,
+        query_len=96,
+    )
+    torch.testing.assert_close(mask, torch.tensor([True, False]))
+
+
+def test_subblock_ring_mask_keeps_padding_only_blocks_dense():
+    mask = _minimax_h3_subblock_sparse_query_block_mask(
+        torch.arange(64, 80),
+        used_len=80,
+        query_start=64,
+        query_len=128,
+    )
+    torch.testing.assert_close(mask, torch.tensor([True, False]))
 
 
 def test_grouped_outputs_share_prompt_refinement():

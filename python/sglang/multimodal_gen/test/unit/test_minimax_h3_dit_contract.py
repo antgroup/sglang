@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
     _diffusers_h3_checkpoint,
+    _minimax_h3_attention_core_impl,
     _modulate_gate,
     _reorder_grouped_qkv_to_qkv,
 )
@@ -319,6 +320,72 @@ def test_lazy_attention_resolution_preserves_backend_precedence(
         attention_requirements=AttentionRequirements(packed_varlen=True),
     )
     assert model._resolved_attention_backend is expected_backend
+
+
+def test_ring_subblock_passes_the_local_query_mask_to_every_kv_chunk():
+    impl = SimpleNamespace(_sparse_ready=Mock(return_value=True))
+    attention = SimpleNamespace(
+        _attention_impl=impl,
+        _attention_backend_enum=AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+    )
+    q = torch.randn(128, 2, 8)
+    mask = torch.tensor([True, False])
+    ring_out = torch.randn_like(q)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_ring_ctx",
+            return_value=(2, 0),
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
+            "_ring_attention_varlen",
+            return_value=ring_out,
+        ) as ring_attention,
+    ):
+        out = _minimax_h3_attention_core_impl(
+            attention,
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 200, 256], dtype=torch.int32),
+            cu_seqlens_host=(0, 200, 256),
+            max_seqlen=200,
+            ulysses_active=False,
+            subblock_sparse_query_block_mask=mask,
+            ring_active=True,
+        )
+
+    self_kwargs = ring_attention.call_args.kwargs
+    assert self_kwargs["ring_kv_chunk_kwargs"] == {"sparse_query_block_mask": mask}
+    assert self_kwargs["real_seq_len"] == 200
+    assert self_kwargs["ring_ws"] == 2
+    assert out is ring_out
+
+
+def test_ring_subblock_requires_modality_mask_only_when_sparse_runs():
+    impl = SimpleNamespace(_sparse_ready=Mock(return_value=True))
+    attention = SimpleNamespace(
+        _attention_impl=impl,
+        _attention_backend_enum=AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+    )
+    q = torch.randn(64, 1, 8)
+    with patch(
+        "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_ring_ctx",
+        return_value=(2, 0),
+    ):
+        with pytest.raises(ValueError, match="subblock_sparse_query_block_mask"):
+            _minimax_h3_attention_core_impl(
+                attention,
+                q,
+                q,
+                q,
+                cu_seqlens=torch.tensor([0, 100, 128], dtype=torch.int32),
+                cu_seqlens_host=(0, 100, 128),
+                max_seqlen=100,
+                ulysses_active=False,
+                ring_active=True,
+            )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

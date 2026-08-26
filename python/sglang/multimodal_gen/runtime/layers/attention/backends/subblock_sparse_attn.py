@@ -50,7 +50,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse imp
     load_bsa_attn_blk64_fwd,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -138,7 +141,9 @@ def _sm90_sparse_attention(
     topk: int,
     softmax_scale: float,
     block_counts: torch.Tensor | None = None,
-) -> torch.Tensor:
+    *,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run a SubBlock routing plan through the existing SM90 CuTe kernel."""
     BlockSparseTensorsTorch, flash_attn_func = _load_sm90_block_sparse_attention()
 
@@ -163,7 +168,7 @@ def _sm90_sparse_attention(
         full_block_idx=None,
         block_size=(SUBBLOCK_SPARSE_BLOCK_SIZE, SUBBLOCK_SPARSE_BLOCK_SIZE),
     )
-    out, _ = flash_attn_func(
+    out, lse = flash_attn_func(
         q,
         k,
         v,
@@ -171,7 +176,15 @@ def _sm90_sparse_attention(
         causal=False,
         num_splits=1,
         block_sparse_tensors=sparse_tensors,
+        return_lse=return_lse,
     )
+    if return_lse:
+        if lse is None:
+            raise RuntimeError(
+                "SM90 SubBlock attention did not return the LSE required by "
+                "ring attention"
+            )
+        return out, lse
     return out
 
 
@@ -220,7 +233,9 @@ def _run_subblock_sparse_attention(
     topk: int,
     softmax_scale: float,
     block_counts: torch.Tensor | None = None,
-) -> torch.Tensor:
+    *,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Dispatch a prepared 64x64 routing plan to Hopper or Blackwell.
 
     SM90 requires every active index prefix to be sorted in ascending order;
@@ -228,6 +243,19 @@ def _run_subblock_sparse_attention(
     compact sparse prefixes before expanding them to full-width dense rows.
     """
     runner = _get_subblock_sparse_attention_runner(q.device)
+    if return_lse:
+        if runner is not _sm90_sparse_attention:
+            raise RuntimeError("SubBlock ring attention currently supports SM90 only")
+        return runner(
+            q,
+            k,
+            v,
+            q2k_block_index,
+            topk,
+            softmax_scale,
+            block_counts,
+            return_lse=True,
+        )
     return runner(
         q,
         k,
@@ -240,6 +268,17 @@ def _run_subblock_sparse_attention(
 
 
 class SubBlockSparseAttentionBackend(AttentionBackend):
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        # The SM90 CuTe kernel exposes the per-query LSE needed to merge
+        # independently normalized Ring KV chunks. Keep SM100 fail-closed until
+        # its LSE contract has equivalent coverage.
+        capability = current_platform.get_device_capability()
+        return capability is not None and (capability.major, capability.minor) == (
+            9,
+            0,
+        )
+
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [SUBBLOCK_SPARSE_HEAD_DIM]
@@ -414,7 +453,8 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         v: torch.Tensor,
         *,
         sparse_query_block_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Q ``[1, Sq, H, 128]`` against K/V ``[1, Sk, H, 128]``."""
         plan = self.router.route(
             q,
@@ -492,6 +532,7 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             kernel_topk,
             self.softmax_scale,
             block_counts,
+            return_lse=return_lse,
         )
 
     def forward(
@@ -583,6 +624,40 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
                 seg_out = self._dense_segment(q_seg, k_seg, v_seg)
             out[start:stop] = seg_out[0]
         return out
+
+    def forward_ring_kv_chunk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        sparse_query_block_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend local queries to one Ring KV chunk and return its LSE.
+
+        Routing is performed independently inside each rotated KV chunk. This
+        keeps the configured density across the complete sequence without an
+        all-gather: sparse query blocks retain the same fraction from every
+        chunk, while unselected query blocks remain dense in every chunk.
+        """
+        if not self._sparse_ready(query, key):
+            return self.dense_impl.forward_ring_kv_chunk(query, key, value)
+        result = self._sparse_attention(
+            query.unsqueeze(0),
+            key.unsqueeze(0),
+            value.unsqueeze(0),
+            sparse_query_block_mask=sparse_query_block_mask,
+            return_lse=True,
+        )
+        if not isinstance(result, tuple):
+            raise RuntimeError("SM90 SubBlock ring attention did not return LSE")
+        output, lse = result
+        if lse.ndim != 3 or lse.shape[0] != 1:
+            raise RuntimeError(
+                "SM90 SubBlock ring attention returned an unexpected LSE shape: "
+                f"{tuple(lse.shape)}"
+            )
+        return output[0], lse[0]
 
     def _dense_segment(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor

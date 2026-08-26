@@ -56,10 +56,18 @@ def _minimax_h3_subblock_sparse_query_block_mask(
     video_query_indices: torch.Tensor,
     *,
     used_len: int,
+    query_start: int = 0,
+    query_len: int | None = None,
 ) -> torch.Tensor:
-    """Return True for pure-video 64-row Q blocks and False otherwise."""
+    """Return True for pure-video 64-row blocks in a query-row window."""
     if used_len < 0:
         raise ValueError(f"used_len must be non-negative, got {used_len}")
+    if query_start < 0:
+        raise ValueError(f"query_start must be non-negative, got {query_start}")
+    if query_len is None:
+        query_len = used_len
+    if query_len < 0:
+        raise ValueError(f"query_len must be non-negative, got {query_len}")
     if video_query_indices.ndim != 1:
         raise ValueError(
             f"video_query_indices must be rank 1, got {list(video_query_indices.shape)}"
@@ -76,21 +84,32 @@ def _minimax_h3_subblock_sparse_query_block_mask(
         if torch.unique(video_query_indices).numel() != video_query_indices.numel():
             raise ValueError("video_query_indices must not contain duplicates")
     block_size = _MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE
-    num_query_blocks = -(-used_len // block_size)
+    num_query_blocks = -(-query_len // block_size)
+    query_stop = query_start + query_len
+    local_video_query_indices = (
+        video_query_indices[
+            (video_query_indices >= query_start) & (video_query_indices < query_stop)
+        ]
+        - query_start
+    )
     video_rows_per_block = torch.bincount(
-        torch.div(video_query_indices, block_size, rounding_mode="floor"),
+        torch.div(local_video_query_indices, block_size, rounding_mode="floor"),
         minlength=num_query_blocks,
     )
     block_ids = torch.arange(
         num_query_blocks, device=video_query_indices.device, dtype=torch.long
     )
-    real_rows_per_block = (used_len - block_ids * block_size).clamp(
+    query_rows_per_block = (query_len - block_ids * block_size).clamp(
         min=0, max=block_size
+    )
+    real_rows_per_block = torch.minimum(
+        query_rows_per_block,
+        (used_len - query_start - block_ids * block_size).clamp(min=0, max=block_size),
     )
     # BSA is block-granular. Only blocks whose real rows are all video may use
     # the sparse budget; mixed boundary blocks stay dense so their non-video
     # rows retain exact attention in the single heterogeneous BSA call.
-    return video_rows_per_block == real_rows_per_block
+    return (real_rows_per_block > 0) & (video_rows_per_block == real_rows_per_block)
 
 
 @torch.inference_mode()
@@ -249,14 +268,20 @@ class MiniMaxH3DenoiseBranch:
         sp_world_size = ulysses_world_size * ring_world_size
         sp_rank = ring_rank * ulysses_world_size + ulysses_rank
         token_tags_host = token_tags.view(-1).to(dtype=torch.long)
-        subblock_sparse_query_block_mask = (
-            _minimax_h3_subblock_sparse_query_block_mask(
-                video_query_indices.view(-1).to(dtype=torch.long),
-                used_len=int(cu[1]),
-            ).to(device)
-            if video_query_indices is not None
-            else None
-        )
+        if video_query_indices is None:
+            subblock_sparse_query_block_mask = None
+        else:
+            ring_query_len = seq_len // ring_world_size
+            subblock_sparse_query_block_mask = (
+                _minimax_h3_subblock_sparse_query_block_mask(
+                    video_query_indices.view(-1).to(dtype=torch.long),
+                    used_len=int(cu[1]),
+                    query_start=(
+                        ring_rank * ring_query_len if ring_world_size > 1 else 0
+                    ),
+                    query_len=(ring_query_len if ring_world_size > 1 else None),
+                ).to(device)
+            )
         local_seq_len = seq_len // sp_world_size
         local_row_start = sp_rank * local_seq_len
         local_row_stop = local_row_start + local_seq_len

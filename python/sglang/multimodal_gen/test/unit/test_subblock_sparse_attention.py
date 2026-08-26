@@ -190,6 +190,16 @@ class TestSubBlockSparseBackend(unittest.TestCase):
         )
         self.assertEqual(metadata.current_timestep, 7)
 
+    def test_ring_capability_is_sm90_only(self):
+        module = (
+            "sglang.multimodal_gen.runtime.layers.attention.backends."
+            "subblock_sparse_attn.current_platform.get_device_capability"
+        )
+        with patch(module, return_value=Mock(major=9, minor=0)):
+            self.assertTrue(SubBlockSparseAttentionBackend.supports_ring_rotation())
+        with patch(module, return_value=Mock(major=10, minor=0)):
+            self.assertFalse(SubBlockSparseAttentionBackend.supports_ring_rotation())
+
     def test_sm90_adapter_uses_presorted_indices_and_64x64_blocks(self):
         captured = {}
 
@@ -222,6 +232,62 @@ class TestSubBlockSparseBackend(unittest.TestCase):
         self.assertIs(
             captured["block_sparse_tensors"].mask_block_idx,
             captured["mask_block_idx"],
+        )
+        self.assertFalse(captured["return_lse"])
+
+    def test_sm90_adapter_returns_lse_for_ring_merge(self):
+        expected_lse = torch.randn(1, 1, 64)
+
+        class _FakeBlockSparseTensors:
+            def __init__(self, **kwargs):
+                pass
+
+        def fake_flash_attn_func(q, k, v, **kwargs):
+            assert kwargs["return_lse"]
+            return q, expected_lse
+
+        q = torch.empty(1, 64, 1, HEAD_DIM, dtype=torch.bfloat16)
+        index = torch.zeros(1, 1, 1, 1, dtype=torch.int32)
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn._load_sm90_block_sparse_attention",
+            return_value=(_FakeBlockSparseTensors, fake_flash_attn_func),
+        ):
+            out, lse = _sm90_sparse_attention(
+                q,
+                q,
+                q,
+                index,
+                1,
+                HEAD_DIM**-0.5,
+                return_lse=True,
+            )
+
+        self.assertIs(out, q)
+        self.assertIs(lse, expected_lse)
+
+    def test_ring_chunk_forwards_sparse_mask_and_normalizes_lse(self):
+        impl = SubBlockSparseAttentionImpl.__new__(SubBlockSparseAttentionImpl)
+        impl._sparse_ready = Mock(return_value=True)
+        query = torch.empty(64, 2, HEAD_DIM, dtype=torch.bfloat16)
+        expected_lse = torch.randn(1, 2, 64)
+        impl._sparse_attention = Mock(return_value=(query.unsqueeze(0), expected_lse))
+        mask = torch.tensor([True])
+
+        out, lse = impl.forward_ring_kv_chunk(
+            query,
+            query,
+            query,
+            sparse_query_block_mask=mask,
+        )
+
+        self.assertIs(out, query)
+        self.assertIs(lse, expected_lse[0])
+        impl._sparse_attention.assert_called_once_with(
+            query.unsqueeze(0),
+            query.unsqueeze(0),
+            query.unsqueeze(0),
+            sparse_query_block_mask=mask,
+            return_lse=True,
         )
 
 

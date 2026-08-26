@@ -12,6 +12,9 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
+    MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT,
+)
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
@@ -636,10 +639,15 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         subblock_enabled = server_args.pipeline_config.uses_subblock_attention(
             server_args
         )
+        ring_degree = int(server_args.ring_degree or 1)
+        sequence_alignment = MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT * (
+            ring_degree if subblock_enabled and ring_degree > 1 else 1
+        )
         packed = _build_packed_layout(
             ctx,
             emb,
             include_video_pos=subblock_enabled,
+            sequence_alignment=sequence_alignment,
         )
         tags = packed["token_tags"]
         tags[packed["text_pos"].view(-1)] = (
@@ -906,6 +914,7 @@ def _build_packed_layout(
     emb: Mapping[str, Any],
     *,
     include_video_pos: bool = False,
+    sequence_alignment: int = MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT,
 ) -> dict[str, torch.Tensor]:
     """Build the per-task packed layout for the positive branch."""
 
@@ -927,6 +936,7 @@ def _build_packed_layout(
             keyframe_frame_indices=ctx.keyframe_frame_indices,
             frame_count=ctx.keyframe_frame_count,
             include_video_pos=include_video_pos,
+            sequence_alignment=sequence_alignment,
         )
     else:
         packed = minimax_h3_packed_sequence(
@@ -941,6 +951,7 @@ def _build_packed_layout(
             ),
             frame_count=ctx.keyframe_frame_count,
             include_video_pos=include_video_pos,
+            sequence_alignment=sequence_alignment,
         )
     return packed
 

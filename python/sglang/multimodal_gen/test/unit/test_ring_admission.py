@@ -13,6 +13,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     FlashAttentionBackend,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
+from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
+    SubBlockSparseAttentionBackend,
+)
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
 from sglang.multimodal_gen.runtime.server_args.server_args import (
     RING_CAPABLE_ATTENTION_BACKENDS,
@@ -32,6 +35,10 @@ class TestRingAdmission(unittest.TestCase):
         # every platform; keep it consistent with the classes it mirrors
         self.assertIn(
             FlashAttentionBackend.get_enum().name.lower(),
+            RING_CAPABLE_ATTENTION_BACKENDS,
+        )
+        self.assertIn(
+            SubBlockSparseAttentionBackend.get_enum().name.lower(),
             RING_CAPABLE_ATTENTION_BACKENDS,
         )
         self.assertNotIn(
