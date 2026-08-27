@@ -305,6 +305,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
     "megamoe",
+    "intel_xpu",
 ]
 add_moe_runner_backend_choices = MOE_RUNNER_BACKEND_CHOICES.extend
 
@@ -10828,7 +10829,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     # Check for config file and merge arguments if present
     if "--config" in argv:
         # Import here to avoid circular imports
-        from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+        from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 
         # Extract boolean actions from the parser to handle them correctly
         config_merger = ConfigArgumentMerger(parser)
