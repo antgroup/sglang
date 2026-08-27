@@ -31,6 +31,7 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_bf16_,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
     MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT,
@@ -1823,6 +1824,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             self.adaln_cache is None
             and get_tp_world_size() > 1
             and not torch.compiler.is_compiling()
+            and not envs.SGLANG_CACHE_DIT_ENABLED
+            and not hasattr(self, "_sglang_cache_dit_adapter")
             and not is_layerwise_offloaded_module(self)
             and all(type(block) is MiniMaxH3DiTBlock for block in blocks)
         )

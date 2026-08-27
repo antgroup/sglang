@@ -303,7 +303,7 @@ def test_cache_dit_adaln_discovers_original_block_stack():
     assert model._cache_dit_block_stack() is original_blocks
 
 
-def test_cache_dit_adaln_keeps_tp_batch_projection_enabled():
+def test_cache_dit_adaln_keeps_resident_projection_lazy():
     model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
     torch.nn.Module.__init__(model)
     model.adaln_cache = None
@@ -324,7 +324,7 @@ def test_cache_dit_adaln_keeps_tp_batch_projection_enabled():
             return_value=False,
         ),
     ):
-        assert model._can_batch_block_adaln(original_blocks)
+        assert not model._can_batch_block_adaln(original_blocks)
 
 
 def test_cache_dit_adaln_selects_params_by_stable_block_index():
