@@ -279,6 +279,99 @@ def test_cache_dit_input_preservation_toggles_every_block():
     assert not any(block.preserve_input_for_cache_dit for block in model.blocks)
 
 
+def _empty_h3_block(block_index: int) -> MiniMaxH3DiTBlock:
+    block = MiniMaxH3DiTBlock.__new__(MiniMaxH3DiTBlock)
+    torch.nn.Module.__init__(block)
+    block.block_index = block_index
+    return block
+
+
+class _CacheDitLikeBlockWrapper(torch.nn.Module):
+    def __init__(self, blocks: torch.nn.ModuleList):
+        super().__init__()
+        self.transformer_blocks = blocks
+
+
+def test_cache_dit_adaln_discovers_original_block_stack():
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    original_blocks = torch.nn.ModuleList(
+        [_empty_h3_block(index) for index in range(3)]
+    )
+    model.blocks = torch.nn.ModuleList([_CacheDitLikeBlockWrapper(original_blocks)])
+
+    assert model._cache_dit_block_stack() is original_blocks
+
+
+def test_cache_dit_adaln_keeps_tp_batch_projection_enabled():
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model.adaln_cache = None
+    model._sglang_cache_dit_adapter = object()
+    original_blocks = torch.nn.ModuleList(
+        [_empty_h3_block(index) for index in range(3)]
+    )
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_tp_world_size",
+            return_value=8,
+        ),
+        patch.object(torch.compiler, "is_compiling", return_value=False),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
+            "is_layerwise_offloaded_module",
+            return_value=False,
+        ),
+    ):
+        assert model._can_batch_block_adaln(original_blocks)
+
+
+def test_cache_dit_adaln_selects_params_by_stable_block_index():
+    block = _empty_h3_block(1)
+    block.norm1 = torch.nn.Identity()
+    block.norm2 = torch.nn.Identity()
+    block.attn = _KwargIdentity()
+    block.mlp = torch.nn.Identity()
+    block.adaln_proj = None
+    block.preserve_input_for_cache_dit = False
+    observed_shifts = []
+    params_by_block = tuple(
+        tuple(
+            torch.full((1, 4), block_index * 10 + param_index)
+            for param_index in range(6)
+        )
+        for block_index in range(3)
+    )
+
+    def fake_scale_shift(value, shift, _scale, _indices, *, dtype):
+        observed_shifts.append(shift.clone())
+        return value.to(dtype)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_scale_shift",
+            side_effect=fake_scale_shift,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_gate",
+            side_effect=lambda residual, *_args, **_kwargs: residual,
+        ),
+    ):
+        block(
+            torch.zeros(2, 4),
+            adaln_input=torch.zeros(1, 4),
+            combined_indices=torch.zeros(2, dtype=torch.long),
+            rope_cache=None,
+            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            max_seqlen=2,
+            adaln_params_by_block=params_by_block,
+        )
+
+    torch.testing.assert_close(observed_shifts[0], params_by_block[1][0])
+    torch.testing.assert_close(observed_shifts[1], params_by_block[1][3])
+
+
 @pytest.mark.parametrize(
     ("global_backend", "expected_backend"),
     [
