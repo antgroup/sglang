@@ -4,10 +4,81 @@
 
 import re
 from types import MappingProxyType
-from typing import Iterable, List, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Iterable, List, Mapping, Optional
 
 from compressed_tensors import CompressionFormat
 from torch.nn import Module
+
+if TYPE_CHECKING:
+    from sglang.srt.models.utils import WeightsMapper
+
+
+def _map_anchored_regex_prefix(target: str, mapper: "WeightsMapper") -> Optional[str]:
+    r"""Map a literal path prefix at the start of a CT regex target.
+
+    ``WeightsMapper`` operates on concrete weight paths, while compressed-
+    tensors also accepts regex targets.  Rewriting an arbitrary regex as a
+    string is unsafe, so only handle the unambiguous form emitted for an
+    anchored, escaped module path, for example::
+
+        re:^model\.language_model\.layers\..*$
+
+    Substring/suffix rules, unanchored patterns, empty-prefix rules, and
+    alternate regex spellings are deliberately left unchanged.
+    """
+    if not target.startswith("re:^"):
+        return target
+
+    pattern = target[len("re:^") :]
+    for prefix, new_prefix in sorted(
+        mapper.orig_to_new_prefix.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        # An empty concrete-path prefix is ambiguous for regex targets: the
+        # regex may describe a module class rather than a module path.
+        if not prefix:
+            continue
+
+        escaped_prefix = re.escape(prefix)
+        if pattern.startswith(escaped_prefix):
+            if new_prefix is None:
+                return None
+            return "re:^" + re.escape(new_prefix) + pattern[len(escaped_prefix) :]
+
+    return target
+
+
+def apply_compressed_tensors_mapper_to_list(
+    targets: list[str], mapper: "WeightsMapper"
+) -> list[str]:
+    """Map CT layer paths without corrupting regex or module-class targets."""
+    mapped_targets = []
+    for target in targets:
+        if target.startswith("re:"):
+            mapped_target = _map_anchored_regex_prefix(target, mapper)
+        elif "." not in target:
+            # Targets such as ``Linear`` and ``FusedMoE`` are module classes,
+            # not checkpoint paths.  A broad mapper like ``"" -> "model."``
+            # must not rename them.
+            mapped_target = target
+        else:
+            mapped = mapper.apply_list([target])
+            mapped_target = mapped[0] if mapped else None
+
+        if mapped_target is not None:
+            mapped_targets.append(mapped_target)
+    return mapped_targets
+
+
+def apply_compressed_tensors_mapper_to_dict(
+    targets: dict[str, Any], mapper: "WeightsMapper"
+) -> dict[str, Any]:
+    """Map dictionary keys using compressed-tensors target semantics."""
+    mapped_targets = {}
+    for target, value in targets.items():
+        mapped_names = apply_compressed_tensors_mapper_to_list([target], mapper)
+        if mapped_names:
+            mapped_targets[mapped_names[0]] = value
+    return mapped_targets
 
 
 def is_activation_quantization_format(format: str) -> bool:

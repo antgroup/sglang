@@ -58,6 +58,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW8A8Int8DynamicMoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    apply_compressed_tensors_mapper_to_dict,
+    apply_compressed_tensors_mapper_to_list,
     check_equal_or_regex_match,
     find_matched_target,
     is_activation_quantization_format,
@@ -161,13 +163,17 @@ class CompressedTensorsConfig(QuantizationConfig):
         return []
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
-        self.target_scheme_map = hf_to_sglang_mapper.apply_dict(self.target_scheme_map)
-        self.ignore = hf_to_sglang_mapper.apply_list(self.ignore)
-        self.sparsity_scheme_map = hf_to_sglang_mapper.apply_dict(
-            self.sparsity_scheme_map
+        self.target_scheme_map = apply_compressed_tensors_mapper_to_dict(
+            self.target_scheme_map, hf_to_sglang_mapper
         )
-        self.sparsity_ignore_list = hf_to_sglang_mapper.apply_list(
-            self.sparsity_ignore_list
+        self.ignore = apply_compressed_tensors_mapper_to_list(
+            self.ignore, hf_to_sglang_mapper
+        )
+        self.sparsity_scheme_map = apply_compressed_tensors_mapper_to_dict(
+            self.sparsity_scheme_map, hf_to_sglang_mapper
+        )
+        self.sparsity_ignore_list = apply_compressed_tensors_mapper_to_list(
+            self.sparsity_ignore_list, hf_to_sglang_mapper
         )
         # kv_cache_scheme is deliberately not remapped: it holds schema fields
         # (type/num_bits/strategy), never module names, and apply_dict drops
