@@ -888,6 +888,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
+            if poll not in (
+                KVPoll.Bootstrapping,
+                KVPoll.WaitingForInput,
+                KVPoll.Failed,
+            ):
+                # A protocol violation from the transfer backend fails only
+                # this request instead of crashing the whole scheduler.
+                logger.error(
+                    f"Unexpected poll state {poll} for req {decode_req.req.rid} "
+                    "during the decode handshake; treating it as a handshake "
+                    "failure for this request."
+                )
+                poll = KVPoll.Failed
+
             if poll == KVPoll.Bootstrapping:
                 pass
             elif poll == KVPoll.WaitingForInput:
@@ -913,8 +927,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-            else:
-                raise ValueError(f"Unexpected poll case: {poll}")
 
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
@@ -2267,6 +2279,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 continue
 
             hicache_restore_status = decode_req.hicache_restore_status
+            if poll not in (
+                KVPoll.Bootstrapping,
+                KVPoll.WaitingForInput,
+                KVPoll.Transferring,
+                KVPoll.Success,
+                KVPoll.Failed,
+            ):
+                # A protocol violation from the transfer backend fails only
+                # this request instead of crashing the whole scheduler.
+                logger.error(
+                    f"Unexpected poll state {poll} for req {decode_req.req.rid} "
+                    "in the decode transfer queue; treating it as a transfer "
+                    "failure for this request."
+                )
+                poll = KVPoll.Failed
             if (
                 poll == KVPoll.Failed
                 or hicache_restore_status == HiCacheRestoreResult.FAILED
@@ -2349,8 +2376,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 KVPoll.Transferring,
             ]:
                 pass
-            else:
-                raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
             if i in deferred_indices:

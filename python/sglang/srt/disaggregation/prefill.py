@@ -883,7 +883,9 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.handle_pending_bootstrap(req, poll):
                     self.send_kv_chunk(req, last_chunk=True)
                     undone_reqs.append(req)
-                elif poll != KVPoll.Failed:
+                elif not isinstance(req.finished_reason, FINISH_ABORT):
+                    # Keep waiting unless handle_pending_bootstrap concluded
+                    # the request as a bootstrap failure.
                     undone_reqs.append(req)
                 continue
 
@@ -902,9 +904,14 @@ class SchedulerDisaggregationPrefillMixin:
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
             else:
-                raise RuntimeError(
-                    f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
+                # A protocol violation from the transfer backend fails only
+                # this request instead of crashing the whole scheduler.
+                logger.error(
+                    f"Unexpected poll state {poll} for req {req.rid} in inflight "
+                    "queue; treating it as a transfer failure for this request."
                 )
+                self.handle_inflight_transfer_failure(req)
+                done_reqs.append(req)
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
@@ -1030,9 +1037,15 @@ class SchedulerDisaggregationPrefillMixin:
             assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
             return True
         else:
-            raise RuntimeError(
-                f"Unexpected poll state {poll} for req {req.rid} in handle_pending_bootstrap"
+            # A protocol violation from the transfer backend fails only this
+            # request instead of crashing the whole scheduler.
+            logger.error(
+                f"Unexpected poll state {poll} for req {req.rid} in "
+                "handle_pending_bootstrap; treating it as a bootstrap failure "
+                "for this request."
             )
+            self.handle_bootstrap_failure(req)
+            return False
 
     def check_bootstrap(self: Scheduler, req: Req) -> bool:
         """Check bootstrap status for an optimistic prefilled request.
