@@ -392,7 +392,8 @@ class Envs:
     SGLANG_TEST_STUCK_SCHEDULER_INIT = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
-    # Scheduler: raise once from the first run_batch to exercise event-loop recovery
+    # Scheduler: raise from run_batch for rid-marked requests (see
+    # TEST_RECOVERY_CRASH_RID_MARKER) to exercise event-loop recovery
     SGLANG_TEST_SCHEDULER_RECOVERY_CRASH = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)

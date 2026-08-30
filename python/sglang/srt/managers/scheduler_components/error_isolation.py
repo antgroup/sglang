@@ -45,6 +45,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# With SGLANG_TEST_SCHEDULER_RECOVERY_CRASH enabled, Scheduler.run_batch
+# raises for any batch containing a request whose rid carries this marker;
+# the e2e recovery test poisons exactly the requests it chooses with it.
+TEST_RECOVERY_CRASH_RID_MARKER = "sglang-test-recovery-crash"
+
 # Message substrings that indicate the CUDA/HIP context or the communication
 # layer is likely poisoned. Recovering in-place after one of these would risk
 # hangs or silent corruption, so they keep the crash behavior.
@@ -121,9 +126,7 @@ def _abort_output_for_req(req: Req, message: str) -> AbortReq:
 # =============================================================================
 
 
-def guard_request_admission(
-    scheduler: Scheduler, handler: Callable, recv_req
-) -> None:
+def guard_request_admission(scheduler: Scheduler, handler: Callable, recv_req) -> None:
     """Run one tokenized request through ``handler``; on an unexpected
     exception, abort only this request instead of crashing the scheduler."""
     try:
@@ -244,8 +247,7 @@ def try_recover_from_loop_crash(scheduler: Scheduler, exc: Exception) -> bool:
     """Attempt in-place recovery. Returns True when the scheduler is safe to
     keep serving; False re-raises the original exception (process crash)."""
     logger.error(
-        "Scheduler event loop hit an exception; attempting in-place "
-        "recovery: %s",
+        "Scheduler event loop hit an exception; attempting in-place recovery: %s",
         get_exception_traceback(),
     )
     if not is_recoverable_exception(exc):

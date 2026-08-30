@@ -215,6 +215,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.error_isolation import (
+    TEST_RECOVERY_CRASH_RID_MARKER,
     filter_failed_materialization,
     guard_request_admission,
     run_event_loop_with_recovery,
@@ -1176,8 +1177,9 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
-        # Test hook: crash the first forward once to exercise event-loop recovery.
-        self._pending_test_loop_crash = envs.SGLANG_TEST_SCHEDULER_RECOVERY_CRASH.get()
+        # Test hook: crash the forward of rid-marked requests to exercise
+        # event-loop recovery e2e.
+        self._test_loop_crash_enabled = envs.SGLANG_TEST_SCHEDULER_RECOVERY_CRASH.get()
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
@@ -3806,8 +3808,9 @@ class Scheduler(
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
-        if self._pending_test_loop_crash:
-            self._pending_test_loop_crash = False
+        if self._test_loop_crash_enabled and any(
+            TEST_RECOVERY_CRASH_RID_MARKER in req.rid for req in batch.reqs
+        ):
             raise RuntimeError(
                 "Injected scheduler crash (SGLANG_TEST_SCHEDULER_RECOVERY_CRASH)"
             )
