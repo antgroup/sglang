@@ -911,6 +911,11 @@ class ServerArgs:
         ),
         NS("schedule"),
     ] = False
+    enable_scheduler_recovery: A[
+        bool,
+        "When the scheduler hits an unexpected exception, abort all in-flight requests with an internal error response, reset the KV cache and scheduling state, and keep serving instead of crashing the whole server. Errors that indicate a corrupted process (e.g. CUDA context poison, communicator failures) still crash the server. Not supported with disaggregation, pipeline parallelism, or PD multiplexing.",
+        NS("schedule"),
+    ] = False
     num_continuous_decode_steps: A[
         int,
         "Run multiple continuous decoding steps to reduce scheduling overhead. This can potentially increase throughput but may also increase time-to-first-token latency. The default value is 1, meaning only run one decoding step at a time.",

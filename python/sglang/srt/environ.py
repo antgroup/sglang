@@ -392,6 +392,8 @@ class Envs:
     SGLANG_TEST_STUCK_SCHEDULER_INIT = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
+    # Scheduler: raise once from the first run_batch to exercise event-loop recovery
+    SGLANG_TEST_SCHEDULER_RECOVERY_CRASH = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
     SGLANG_TEST_RETRACT = EnvBool(False)
@@ -567,6 +569,9 @@ class Envs:
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
+    # With --enable-scheduler-recovery: per-step budget (seconds) for the
+    # cross-rank recovery consensus barrier and the in-flight work drain.
+    SGLANG_SCHEDULER_RECOVERY_TIMEOUT = EnvFloat(10.0)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     # For non-streaming requests, the scheduler still flushes intermediate

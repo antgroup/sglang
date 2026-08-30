@@ -214,6 +214,11 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.error_isolation import (
+    filter_failed_materialization,
+    guard_request_admission,
+    run_event_loop_with_recovery,
+)
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
@@ -1171,6 +1176,8 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        # Test hook: crash the first forward once to exercise event-loop recovery.
+        self._pending_test_loop_crash = envs.SGLANG_TEST_SCHEDULER_RECOVERY_CRASH.get()
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
@@ -1570,8 +1577,8 @@ class Scheduler(
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
-                (TokenizedGenerateReqInput, self.handle_generate_request),
-                (TokenizedEmbeddingReqInput, self.handle_embedding_request),
+                (TokenizedGenerateReqInput, self.handle_generate_request_guarded),
+                (TokenizedEmbeddingReqInput, self.handle_embedding_request_guarded),
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
@@ -1722,7 +1729,7 @@ class Scheduler(
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
             # not PyTorch MPS streams.
-            dispatch_event_loop(self)
+            run_event_loop_with_recovery(self, lambda: dispatch_event_loop(self))
             return
 
         self.schedule_stream = self.device_module.Stream(priority=0)
@@ -1744,7 +1751,7 @@ class Scheduler(
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         with self.device_module.StreamContext(self.schedule_stream):
-            dispatch_event_loop(self)
+            run_event_loop_with_recovery(self, lambda: dispatch_event_loop(self))
 
     def _apply_war_barrier(self):
         # WAR: keep later schedule_stream writes behind this forward's shared reads.
@@ -1922,8 +1929,10 @@ class Scheduler(
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         if get_mm().mm_feature_transport == "cuda_vmm":
-            for recv_req in recv_reqs:
-                self._materialize_cuda_vmm_inputs(recv_req)
+            # A malformed multimodal payload aborts only its own request.
+            recv_reqs = filter_failed_materialization(
+                self, recv_reqs, self._materialize_cuda_vmm_inputs
+            )
 
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
@@ -2438,6 +2447,20 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def handle_generate_request_guarded(
+        self,
+        recv_req: TokenizedGenerateReqInput,
+    ):
+        # An unexpected admission error aborts only this request (per-request
+        # error isolation) instead of crashing the whole scheduler.
+        guard_request_admission(self, self.handle_generate_request, recv_req)
+
+    def handle_embedding_request_guarded(
+        self,
+        recv_req: TokenizedEmbeddingReqInput,
+    ):
+        guard_request_admission(self, self.handle_embedding_request, recv_req)
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -2766,9 +2789,9 @@ class Scheduler(
         """Handle optimized batch generate request."""
         logger.debug(f"Processing batch generate request with {len(recv_req)} requests")
 
-        # Process each request in the batch
+        # Process each request in the batch with per-request error isolation.
         for tokenized_req in recv_req:
-            self.handle_generate_request(tokenized_req)
+            self.handle_generate_request_guarded(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
@@ -3019,9 +3042,9 @@ class Scheduler(
             f"Processing batch embedding request with {len(recv_req)} requests"
         )
 
-        # Process each request in the batch
+        # Process each request in the batch with per-request error isolation.
         for tokenized_req in recv_req:
-            self.handle_embedding_request(tokenized_req)
+            self.handle_embedding_request_guarded(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
@@ -3782,6 +3805,12 @@ class Scheduler(
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
+
+        if self._pending_test_loop_crash:
+            self._pending_test_loop_crash = False
+            raise RuntimeError(
+                "Injected scheduler crash (SGLANG_TEST_SCHEDULER_RECOVERY_CRASH)"
+            )
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
