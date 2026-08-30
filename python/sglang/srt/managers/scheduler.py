@@ -364,6 +364,10 @@ TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
+# Test hook: crash the forward of rid-marked requests (see
+# TEST_RECOVERY_CRASH_RID_MARKER) to exercise event-loop recovery e2e.
+TEST_RECOVERY_CRASH = envs.SGLANG_TEST_SCHEDULER_RECOVERY_CRASH.get()
+
 
 STEP_MAX_US = 2_000_000
 
@@ -1177,9 +1181,6 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
-        # Test hook: crash the forward of rid-marked requests to exercise
-        # event-loop recovery e2e.
-        self._test_loop_crash_enabled = envs.SGLANG_TEST_SCHEDULER_RECOVERY_CRASH.get()
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
@@ -3808,7 +3809,7 @@ class Scheduler(
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
-        if self._test_loop_crash_enabled and any(
+        if TEST_RECOVERY_CRASH and any(
             TEST_RECOVERY_CRASH_RID_MARKER in req.rid for req in batch.reqs
         ):
             raise RuntimeError(
