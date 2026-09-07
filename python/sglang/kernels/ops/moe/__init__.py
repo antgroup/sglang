@@ -214,3 +214,17 @@ register_kernel(
         description="Row gather of quantized values plus their scales, one launch.",
     )
 )
+
+# Gluon MegaMoE owns its symmetric context and fused dispatch/FC1/FC2 path.
+# Register the callable without importing Triton or allocating GPU state.
+register_kernel(
+    KernelSpec(
+        op="moe.mega_moe_gluon",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.mega_moe_gluon:run_sm90_fused_dispatch_1d2d_compact_symmetric",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+        description="SM90 FP8 Gluon MegaMoE with fused dispatch, FC1, FC2, and combine.",
+    )
+)
