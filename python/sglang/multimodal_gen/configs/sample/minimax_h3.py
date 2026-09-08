@@ -34,6 +34,16 @@ def _optional_positive_finite_float(value: Any, field_name: str) -> float | None
     return out
 
 
+def minimax_h3_output_scale(options: Any) -> int:
+    """Delivery scaling is independent of the canonical generation canvas."""
+    if not getattr(options, "enable_upscaling", False):
+        return 1
+    scale = getattr(options, "upscaling_scale", None)
+    if isinstance(scale, bool) or not isinstance(scale, int) or scale <= 0:
+        raise ValueError("MiniMax H3 upscaling_scale must be a positive integer")
+    return scale
+
+
 @dataclass
 class MiniMaxH3SamplingParams(SamplingParams):
     height: int = 512
@@ -204,11 +214,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "MiniMax H3 does not support enable_frame_interpolation: the "
                 "accepted delivery contract is the canonical 24 fps output"
             )
-        if self.enable_upscaling:
-            raise ValueError(
-                "MiniMax H3 does not support enable_upscaling: the accepted "
-                "delivery contract is the resolved target canvas"
-            )
+        minimax_h3_output_scale(self)
         if self.enable_teacache:
             raise ValueError(
                 "MiniMax H3 does not support enable_teacache: its packed "

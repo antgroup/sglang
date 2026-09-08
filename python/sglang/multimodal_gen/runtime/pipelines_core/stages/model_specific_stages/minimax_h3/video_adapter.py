@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
+from sglang.multimodal_gen.configs.sample.minimax_h3 import minimax_h3_output_scale
 from sglang.multimodal_gen.configs.sample.sampling_params import QUALITY_LEVELS
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
@@ -214,11 +215,7 @@ class MiniMaxH3VideoModelAdapter:
                 "MiniMax H3 does not support enable_frame_interpolation: the "
                 "accepted delivery contract is the canonical 24 fps output"
             )
-        if request.enable_upscaling:
-            raise ValueError(
-                "MiniMax H3 does not support enable_upscaling: the accepted "
-                "delivery contract is the resolved target canvas"
-            )
+        minimax_h3_output_scale(request)
 
     def validate_sampling_params(self, sampling_params: SamplingParams) -> None:
         """Apply the HTTP task/delivery gate to offline requests as well."""
@@ -231,11 +228,7 @@ class MiniMaxH3VideoModelAdapter:
                 "MiniMax H3 does not support enable_frame_interpolation: the "
                 "accepted delivery contract is the canonical 24 fps output"
             )
-        if getattr(sampling_params, "enable_upscaling", False):
-            raise ValueError(
-                "MiniMax H3 does not support enable_upscaling: the accepted "
-                "delivery contract is the resolved target canvas"
-            )
+        minimax_h3_output_scale(sampling_params)
         if not bool(getattr(sampling_params, "save_output", False)) or not getattr(
             sampling_params, "output_path", None
         ):
@@ -296,7 +289,10 @@ class MiniMaxH3VideoModelAdapter:
             return {}
         fields: dict[str, str] = {}
         if shape.get("width") is not None and shape.get("height") is not None:
-            fields["size"] = f"{int(shape['width'])}x{int(shape['height'])}"
+            scale = minimax_h3_output_scale(batch.sampling_params)
+            fields["size"] = (
+                f"{int(shape['width']) * scale}x{int(shape['height']) * scale}"
+            )
         queued_frame_count = shape.get("frame_count")
         if queued_frame_count is not None:
             fields["seconds"] = _format_video_seconds(
@@ -327,7 +323,11 @@ class MiniMaxH3VideoModelAdapter:
             if shape.get("frame_count") is not None:
                 expected_frame_count = int(shape["frame_count"])
             if shape.get("width") is not None and shape.get("height") is not None:
-                expected_size = (int(shape["width"]), int(shape["height"]))
+                scale = minimax_h3_output_scale(batch.sampling_params)
+                expected_size = (
+                    int(shape["width"]) * scale,
+                    int(shape["height"]) * scale,
+                )
 
         def probe_output(output_path: str) -> dict[str, str]:
             return _probe_minimax_h3_output_fields(
