@@ -324,7 +324,7 @@ def _ffprobe_media(path: str) -> dict[str, Any]:
                     "-protocol_whitelist",
                     "file",
                     "-format_whitelist",
-                    "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,wav,mp3,flac,ogg",
+                    "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,wav,mp3,flac,ogg,aac",
                     "-show_entries",
                     entries,
                     "-of",
@@ -415,6 +415,7 @@ def _validate_localized_media(
         "mp3",
         "flac",
         "ogg",
+        "aac",
     }
     if not format_names or not format_names.issubset(allowed_formats):
         raise ValueError("MiniMax H3 media container format is not allowed")
