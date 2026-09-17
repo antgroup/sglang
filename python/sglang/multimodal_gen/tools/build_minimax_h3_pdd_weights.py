@@ -6,8 +6,7 @@
 
 Produces two things:
 
-* a complete transformer checkpoint with the 2D LoRA deltas merged in (sglang and
-  VideoX-Fun both load it as an ordinary checkpoint);
+* `transformer/`: a complete checkpoint with the 2D LoRA deltas merged in;
 * `pdd_heads.safetensors`: the 32 position-level output heads, plus a
   `pdd_config.json` recording num_steps / block_size. Those cannot be merged --
   they are what PDD *is*. See below.
@@ -32,10 +31,10 @@ over the per-step sigma deltas, because the h in
 
     x_{n+L} = x_n + sum_j dsigma_{n+j} * W_{n+j} h
 
-is shared and the sum can be moved onto the weights. This script does NOT do that
-fusion: the caller applies the 4 heads one at a time through 4 scheduler steps,
-which is bit-equivalent to the fused form without us having to re-derive the sigma
-grid and the weighting. The arithmetic saved is negligible (a 96x5376 GEMM).
+is shared and the sum can be moved onto the weights. Run
+`fuse_minimax_h3_pdd_heads <out dir>` next to produce the fused head bank.
+The merged shards live in <out dir>/transformer/; PDD sidecars live in <out dir>/
+so the ordinary transformer loader never reads them as checkpoint shards.
 """
 
 from __future__ import annotations
@@ -141,6 +140,10 @@ def main() -> int:
                 qkv.setdefault(target[: -len(f".attn.{role}")], {})[role[-1]] = delta
                 break
         else:
+            if module.endswith(".ff.net.0.proj"):
+                # Diffusers packs [value, gate]; native H3 consumes [gate, value].
+                value, gate = delta.chunk(2, dim=0)
+                delta = torch.cat((gate, value), dim=0)
             deltas[target + ".weight"] = delta
 
     for prefix, parts in qkv.items():
@@ -152,34 +155,51 @@ def main() -> int:
     print(f"2D deltas to merge: {len(deltas)} ({len(qkv)} of them qkv)")
 
     out = Path(args.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    applied, shards = 0, []
-    for shard in sorted(glob.glob(os.path.join(args.base_dir, "*.safetensors"))):
+    if out.resolve() == Path(args.base_dir).resolve():
+        raise SystemExit("Output directory must differ from the base checkpoint")
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit(
+            "Output directory must be empty to avoid stale checkpoint shards"
+        )
+    if (
+        pdd["num_steps"] <= 0
+        or pdd["block_size"] <= 0
+        or pdd["num_steps"] % pdd["block_size"]
+    ):
+        raise SystemExit("PDD num_steps must be positive and divisible by block_size")
+    shards = sorted(glob.glob(os.path.join(args.base_dir, "*.safetensors")))
+    if not shards:
+        raise SystemExit("Base transformer directory contains no safetensors shards")
+    transformer_out = out / "transformer"
+    transformer_out.mkdir(parents=True, exist_ok=True)
+    applied = set()
+    for shard in shards:
         with safe_open(shard, "pt") as f:
             tensors = {k: f.get_tensor(k) for k in f.keys()}
         for key in list(tensors):
             if key in deltas:
                 base = tensors[key]
+                if base.shape != deltas[key].shape:
+                    raise SystemExit(
+                        f"LoRA delta shape mismatch for {key}: {deltas[key].shape} vs {base.shape}"
+                    )
                 merged = base.float() + deltas[key].to(base.device)
                 if args.verify:
                     rel = ((merged - base.float()).norm() / base.float().norm()).item()
                     print(f"  {key}: relative change {rel:.4f}")
                 tensors[key] = merged.to(base.dtype)
-                applied += 1
+                applied.add(key)
         name = os.path.basename(shard)
-        save_file(tensors, str(out / name), metadata={"format": "pt"})
-        shards.append(name)
-    print(f"merged {applied}/{len(deltas)} tensors")
-    if applied != len(deltas):
-        missing = sorted(set(deltas) - set())
-        raise SystemExit(
-            f"{len(deltas) - applied} deltas found no target; do not use this output"
-        )
+        save_file(tensors, str(transformer_out / name), metadata={"format": "pt"})
+    print(f"merged {len(applied)}/{len(deltas)} tensors")
+    if len(applied) != len(deltas):
+        missing = sorted(set(deltas) - applied)
+        raise SystemExit(f"Deltas found no target: {missing}; do not use this output")
 
     for extra in ("config.json", "diffusion_pytorch_model.safetensors.index.json"):
         src = os.path.join(args.base_dir, extra)
         if os.path.exists(src):
-            shutil.copy(src, out / extra)
+            shutil.copy(src, transformer_out / extra)
 
     heads = {
         k: lora[k]

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -39,13 +40,31 @@ from safetensors.torch import save_file
 
 
 def sigma_grid(num_points: int, shift: float) -> torch.Tensor:
+    if num_points < 2 or not math.isfinite(shift) or shift <= 0:
+        raise ValueError(
+            "PDD grid requires at least two points and a positive finite shift"
+        )
     base = torch.linspace(1.0, 0.0, num_points, dtype=torch.float64)
     return shift * base / (1 + (shift - 1) * base)
 
 
 def fuse(heads: torch.Tensor, sigmas: torch.Tensor, block: int) -> torch.Tensor:
     """heads: (N, ...) -> (N//block, ...), averaged within a block weighted by dsigma."""
+    if (
+        heads.ndim < 1
+        or not heads.is_floating_point()
+        or not torch.isfinite(heads).all()
+    ):
+        raise ValueError("PDD heads must be finite floating-point tensors")
     steps = heads.shape[0]
+    if block <= 0 or steps == 0 or steps % block:
+        raise ValueError("PDD head count must be positive and divisible by block size")
+    if (
+        sigmas.ndim != 1
+        or not torch.isfinite(sigmas).all()
+        or not torch.all(sigmas[:-1] > sigmas[1:])
+    ):
+        raise ValueError("PDD sigma grid must be finite and strictly decreasing")
     if sigmas.numel() != steps + 1:
         raise SystemExit(
             f"sigma grid has {sigmas.numel()} points but there are {steps} heads"
@@ -56,10 +75,10 @@ def fuse(heads: torch.Tensor, sigmas: torch.Tensor, block: int) -> torch.Tensor:
         w = dsigma[b * block : (b + 1) * block]
         if float(w.sum()) <= 0:
             raise SystemExit(f"block {b} has an all-zero dsigma")
-        w = (w / w.sum()).to(heads.dtype)
+        w = (w / w.sum()).float()
         chunk = heads[b * block : (b + 1) * block].float()
         out.append((chunk * w.float().view(-1, *([1] * (chunk.dim() - 1)))).sum(0))
-    return torch.stack(out).to(heads.dtype)
+    return torch.stack(out)
 
 
 def main() -> int:
@@ -79,13 +98,30 @@ def main() -> int:
 
     sv = sigma_grid(n + 1, args.video_shift)
     sa = sigma_grid(n + 1, args.audio_shift)
+    for name in ("proj_out", "audio_proj_out"):
+        weight, bias = heads[f"{name}.weight"], heads[f"{name}.bias"]
+        if (
+            weight.ndim != 3
+            or bias.ndim != 2
+            or weight.shape[0] != n
+            or weight.shape[:2] != bias.shape
+        ):
+            raise ValueError(f"Invalid PDD {name} weight/bias shapes")
     fused = {
         "video_out.weight": fuse(heads["proj_out.weight"], sv, block),
         "video_out.bias": fuse(heads["proj_out.bias"], sv, block),
         "audio_out.weight": fuse(heads["audio_proj_out.weight"], sa, block),
         "audio_out.bias": fuse(heads["audio_proj_out.bias"], sa, block),
     }
-    save_file(fused, str(d / "pdd_fused_heads.safetensors"), metadata={"format": "pt"})
+    save_file(
+        fused,
+        str(d / "pdd_fused_heads.safetensors"),
+        metadata={
+            "format": "pt",
+            "video_sigmas": json.dumps(sv[::block].tolist()),
+            "audio_sigmas": json.dumps(sa[::block].tolist()),
+        },
+    )
     cfg["fused_steps"] = n // block
     cfg["num_inference_steps"] = n // block + 1  # H3 counts steps as sigma grid points
     cfg["video_shift"], cfg["audio_shift"] = args.video_shift, args.audio_shift

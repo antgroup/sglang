@@ -1531,6 +1531,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         # Parallel Decoding Distillation heads, one per denoise step, loaded by
         # `load_pdd_fused_heads`. None on every ordinary run.
         self._pdd_heads: dict[str, torch.Tensor] | None = None
+        self._pdd_metadata: dict[str, str] = {}
 
     def load_pdd_fused_heads(self, path: str) -> None:
         """Swap the two output heads for a per-step stack (PDD).
@@ -1544,24 +1545,39 @@ class MiniMaxH3FinalLayer(nn.Module):
         """
         from safetensors import safe_open
 
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.pdd import (
+            shard_pdd_heads,
+        )
+
         with safe_open(path, "pt") as f:
-            self._pdd_heads = {k: f.get_tensor(k) for k in f.keys()}
+            heads = {k: f.get_tensor(k) for k in f.keys()}
+            self._pdd_metadata = f.metadata() or {}
+        self._pdd_heads = shard_pdd_heads(
+            heads,
+            video_width=self.video_out.output_size_per_partition,
+            audio_width=self.audio_out.output_size_per_partition,
+            hidden_size=self.video_out.input_size,
+            tp_size=self.video_out.tp_size,
+            tp_rank=self.video_out.tp_rank,
+        )
+        if (
+            "video_sigmas" not in self._pdd_metadata
+            or "audio_sigmas" not in self._pdd_metadata
+        ):
+            logger.warning(
+                "PDD heads lack sigma metadata; regenerate with fuse_minimax_h3_pdd_heads to enable schedule validation"
+            )
         steps = self._pdd_heads["video_out.weight"].shape[0]
         logger.info("MiniMax-H3 PDD: %d fused output heads loaded from %s", steps, path)
 
     def _pdd_project(self, h: torch.Tensor, name: str) -> torch.Tensor:
-        heads = self._pdd_heads
-        step = int(get_forward_context().current_timestep)
-        stack = heads[f"{name}.weight"]
-        if not 0 <= step < stack.shape[0]:
-            raise ValueError(
-                f"MiniMax-H3 PDD has {stack.shape[0]} fused heads but the loop is at "
-                f"step {step}; run with --num-inference-steps {stack.shape[0] + 1} "
-                "(H3 counts sigma grid points, so that is one more than the steps)."
-            )
-        weight = stack[step].to(device=h.device, dtype=h.dtype)
-        bias = heads[f"{name}.bias"][step].to(device=h.device, dtype=h.dtype)
-        return torch.nn.functional.linear(h, weight, bias)
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.pdd import (
+            project_pdd_head,
+        )
+
+        return project_pdd_head(
+            self._pdd_heads, h, name, int(get_forward_context().current_timestep)
+        )
 
     def forward(
         self,
@@ -1595,8 +1611,12 @@ class MiniMaxH3FinalLayer(nn.Module):
                     inverse_indices[start:stop],
                     dtype=_BF16_DTYPE,
                 ).to(_FP32_DTYPE)
-                video_chunk, _ = self.video_out(h)
-                audio_chunk, _ = self.audio_out(h)
+                if self._pdd_heads is not None:
+                    video_chunk = self._pdd_project(h, "video_out")
+                    audio_chunk = self._pdd_project(h, "audio_out")
+                else:
+                    video_chunk, _ = self.video_out(h)
+                    audio_chunk, _ = self.audio_out(h)
                 if video is None:
                     video = torch.empty(
                         (x.shape[0], video_chunk.shape[-1]),
@@ -2102,6 +2122,20 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             # "ones"); claiming only undeclared params keeps that intact.
             if getattr(param, "missing_param_init", None) is None:
                 param.missing_param_init = "error"
+
+    def validate_pdd_schedule(self, sigmas, *, warmup=False) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.pdd import (
+            validate_pdd_schedule,
+        )
+
+        heads = self.final_layer._pdd_heads
+        if heads is not None:
+            validate_pdd_schedule(
+                heads["video_out.weight"].shape[0],
+                self.final_layer._pdd_metadata,
+                sigmas,
+                warmup=warmup,
+            )
 
     def post_load_weights(self) -> None:
         fp32_param_names = list(_MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER)

@@ -742,6 +742,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device,
                 placement_managed=placement_managed,
             )
+            validate_pdd = getattr(model, "validate_pdd_schedule", None)
+            if callable(validate_pdd):
+                validate_pdd(ctx.sigmas, warmup=batch.is_warmup)
             build_vsa_h3_step_metadata = _maybe_prepare_vsa_h3_step_metadata(
                 model=model,
                 packed=packed,
