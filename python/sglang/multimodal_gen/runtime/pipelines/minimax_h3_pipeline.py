@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import shutil
+from collections.abc import Mapping
 from dataclasses import replace
+from typing import Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
@@ -70,6 +72,86 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     "package before starting SGLang."
                 )
         super().__init__(*args, **kwargs)
+        self._pdd_startup_complete = True
+
+    def _check_pdd_runtime_mutation(self) -> None:
+        if (
+            getattr(self, "_pdd_startup_complete", False)
+            and getattr(self, "_pdd_config", None) is not None
+        ):
+            raise ValueError(
+                "PDD is loaded at startup; restart with the desired --lora-path to change or disable it"
+            )
+
+    def set_lora(self, *args: Any, **kwargs: Any) -> None:
+        self._check_pdd_runtime_mutation()
+        return super().set_lora(*args, **kwargs)
+
+    def deactivate_lora_weights(self, *args: Any, **kwargs: Any) -> None:
+        self._check_pdd_runtime_mutation()
+        return super().deactivate_lora_weights(*args, **kwargs)
+
+    def merge_lora_weights(self, *args: Any, **kwargs: Any) -> None:
+        self._check_pdd_runtime_mutation()
+        return super().merge_lora_weights(*args, **kwargs)
+
+    def unmerge_lora_weights(self, *args: Any, **kwargs: Any) -> None:
+        self._check_pdd_runtime_mutation()
+        return super().unmerge_lora_weights(*args, **kwargs)
+
+    def _prepare_startup_pdd(
+        self, server_args: ServerArgs, scales: Mapping[str, float] | None
+    ) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.pdd import (
+            load_pdd_adapter,
+        )
+
+        self._pdd_config = None
+        path = getattr(server_args, "lora_path", None)
+        if not path:
+            return
+        from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+            maybe_download_lora,
+        )
+
+        path = maybe_download_lora(
+            path, weight_name=getattr(server_args, "lora_weight_name", None)
+        )
+        bank = load_pdd_adapter(
+            path,
+            video_shift=float((scales or {}).get("video", 12.0)),
+            audio_shift=float((scales or {}).get("audio", 3.0)),
+        )
+        if bank is None:
+            return
+        config, heads, alpha = bank
+        if server_args.lora_scale != 1.0 or server_args.lora_target_modules is not None:
+            raise ValueError(
+                "PDD requires the complete backbone adapter at --lora-scale 1"
+            )
+        model = self.get_module("transformer")
+        for _ in range(4):
+            if hasattr(model, "final_layer"):
+                break
+            model = getattr(model, "_orig_mod", None) or getattr(model, "module", None)
+            if model is None:
+                raise ValueError("Cannot find H3 model to install PDD heads")
+        if getattr(model.final_layer, "_pdd_heads", None) is not None:
+            raise ValueError("Do not combine --lora-path PDD with offline PDD heads")
+        model.final_layer.install_pdd_heads(heads, config)
+        model._pdd_adapter_config = config
+        model._pdd_adapter_head_keys = {
+            key
+            for spec in config.modalities.values()
+            for key in (spec.weight_key, spec.bias_key)
+        }
+        if alpha is not None:
+            if server_args.lora_alpha is not None and server_args.lora_alpha != alpha:
+                raise ValueError(
+                    "PDD LoRA alpha override disagrees with the checkpoint"
+                )
+            server_args.lora_alpha = alpha
+        self._pdd_config = config.with_canonical_keys()
 
     @staticmethod
     def model_subfolder_for_variant(variant: str) -> str:
@@ -149,6 +231,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             if release_metadata is not None
             else None
         )
+        self._prepare_startup_pdd(server_args, sigma_shift_scales)
         self.add_stage(InputValidationStage())
         if release_metadata is not None:
             self.add_stage(MiniMaxH3PartitionAdmissionStage(release_metadata))
@@ -175,6 +258,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(
             MiniMaxH3TimestepPreparationStage(
                 sigma_shift_scales=sigma_shift_scales,
+                pdd_config=self._pdd_config,
             )
         )
         self.add_stage(

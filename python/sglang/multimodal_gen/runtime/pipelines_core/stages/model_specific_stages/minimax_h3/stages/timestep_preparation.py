@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -18,17 +19,23 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 from ..constants import MINIMAX_H3_SIGMAS_EXTRA_KEY
 
+if TYPE_CHECKING:
+    from ..pdd import PDDConfig
+
 
 class MiniMaxH3TimestepPreparationStage(PipelineStage):
     deduplicated_tensor_tree_output_fields = ("timesteps", "sigmas")
     deduplicated_extra_tensor_tree_output_keys = (MINIMAX_H3_SIGMAS_EXTRA_KEY,)
 
-    def __init__(self, sigma_shift_scales=None) -> None:
+    def __init__(
+        self, sigma_shift_scales=None, pdd_config: PDDConfig | None = None
+    ) -> None:
         super().__init__()
         # Per-model sigma shift override (model_index.json "_minimax_h3" release
         # block, sigma_shift_scales): the schedule constants are a MODEL
         # serving contract — fl2va and ref2va use video 12 / audio 3 by default.
         self.sigma_shift_scales = sigma_shift_scales
+        self.pdd_config = pdd_config
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
@@ -63,6 +70,9 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             plan.default_flow_shift,
             plan.default_audio_flow_shift,
             self.freeze_for_dedup(self.sigma_shift_scales),
+            self.freeze_for_dedup(
+                self.pdd_config.to_dict() if self.pdd_config else None
+            ),
         )
 
     @staticmethod
@@ -110,6 +120,17 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 "num_inference_steps must be a positive integer, got "
                 f"{requested_num_steps!r}"
             )
+
+        if self.pdd_config is not None:
+            if plan.flow_shift is not None or plan.audio_flow_shift is not None:
+                raise ValueError(
+                    "PDD uses its configured sigma grid; request flow_shift overrides are not supported"
+                )
+            batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = self.pdd_config.request_sigmas(
+                requested_num_steps,
+                warmup=batch.is_warmup,
+            )
+            return
 
         model_scales = self.sigma_shift_scales
         if model_scales is not None and not isinstance(model_scales, Mapping):

@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from safetensors import safe_open
 from safetensors.torch import load_file
 from torch.distributed.tensor import DTensor
 
@@ -883,7 +884,19 @@ class LoRAPipeline(ComposedPipelineBase):
         if rank != 0:
             lora_local_path = maybe_download_lora(lora_path, weight_name=weight_name)
 
+        validate_metadata = getattr(
+            self.modules["transformer"], "validate_lora_metadata", None
+        )
+        if callable(validate_metadata):
+            with safe_open(lora_local_path, "pt", device="cpu") as checkpoint:
+                validate_metadata(checkpoint.metadata() or {})
+
         raw_state_dict = load_file(lora_local_path)
+        prepare_state = getattr(
+            self.modules["transformer"], "prepare_lora_state_dict", None
+        )
+        if callable(prepare_state):
+            raw_state_dict = prepare_state(raw_state_dict)
         adapter_config = load_peft_config(lora_local_path)
         lora_state_dict = normalize_lora_state_dict(
             raw_state_dict,

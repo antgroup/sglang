@@ -10,8 +10,8 @@ from __future__ import annotations
 import math
 import os
 from collections import defaultdict
-from collections.abc import Iterable, Iterator
-from typing import Any, Callable
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 import torch.nn as nn
@@ -97,6 +97,12 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.pdd import (
+        PDDConfig,
+    )
+
 
 logger = init_logger(__name__)
 
@@ -372,9 +378,9 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def _accepts_mxfp8_input(linear: nn.Module) -> bool:
-    return linear.quant_method is not None and linear.quant_method.accepts_mxfp8_input(
-        linear
-    )
+    # LoRA wrappers consume ordinary activations, not the prequantized tuple.
+    quant_method = getattr(linear, "quant_method", None)
+    return quant_method is not None and quant_method.accepts_mxfp8_input(linear)
 
 
 def _modulate_scale_shift(
@@ -1570,6 +1576,30 @@ class MiniMaxH3FinalLayer(nn.Module):
         steps = self._pdd_heads["video_out.weight"].shape[0]
         logger.info("MiniMax-H3 PDD: %d fused output heads loaded from %s", steps, path)
 
+    def install_pdd_heads(
+        self, heads: dict[str, torch.Tensor], config: PDDConfig
+    ) -> None:
+        import json
+
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.pdd import (
+            PDD_CONFIG_METADATA_KEY,
+            shard_pdd_heads,
+        )
+
+        video = getattr(self.video_out, "base_layer", self.video_out)
+        audio = getattr(self.audio_out, "base_layer", self.audio_out)
+        self._pdd_heads = shard_pdd_heads(
+            heads,
+            video_width=video.output_size_per_partition,
+            audio_width=audio.output_size_per_partition,
+            hidden_size=video.input_size,
+            tp_size=video.tp_size,
+            tp_rank=video.tp_rank,
+        )
+        self._pdd_metadata = {
+            PDD_CONFIG_METADATA_KEY: json.dumps(config.with_canonical_keys().to_dict())
+        }
+
     def _pdd_project(self, h: torch.Tensor, name: str) -> torch.Tensor:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.pdd import (
             project_pdd_head,
@@ -1680,6 +1710,38 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+
+    def validate_lora_metadata(self, metadata: dict[str, str]) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.pdd import (
+            pdd_config_from_metadata,
+        )
+
+        config = pdd_config_from_metadata(metadata)
+        if config is None:
+            return
+        installed = getattr(self, "_pdd_adapter_config", None)
+        if installed is None or self.final_layer._pdd_heads is None:
+            raise ValueError(
+                "PDD adapters must be selected at server startup with --lora-path"
+            )
+        if config != installed:
+            raise ValueError("PDD adapter metadata differs from the installed heads")
+
+    def prepare_lora_state_dict(
+        self, adapter: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        # Heads are installed by the H3 pipeline, never interpreted as LoRA deltas.
+        head_keys = getattr(self, "_pdd_adapter_head_keys", set())
+        legacy_keys = {
+            f"{prefix}.{kind}"
+            for prefix in ("proj_out", "audio_proj_out")
+            for kind in ("weight", "bias")
+        }
+        if not head_keys and set(adapter) & legacy_keys:
+            raise ValueError(
+                "PDD adapters must be selected at server startup with --lora-path"
+            )
+        return {key: tensor for key, tensor in adapter.items() if key not in head_keys}
 
     def prepare_lora_adapter(
         self, adapter: dict[str, torch.Tensor]
@@ -2123,7 +2185,12 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             if getattr(param, "missing_param_init", None) is None:
                 param.missing_param_init = "error"
 
-    def validate_pdd_schedule(self, sigmas, *, warmup=False) -> None:
+    def validate_pdd_schedule(
+        self,
+        sigmas: Mapping[str, Sequence[float] | torch.Tensor],
+        *,
+        warmup: bool = False,
+    ) -> None:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.pdd import (
             validate_pdd_schedule,
         )
