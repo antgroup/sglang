@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
 )
 from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    CausalChunkWindowReq,
     GetDisaggStatsReq,
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -178,6 +179,7 @@ class Scheduler(
         self._running = True
 
         self.request_handlers = {
+            CausalChunkWindowReq: self._handle_causal_window,
             SetLoraReq: self._handle_set_lora,
             MergeLoraWeightsReq: self._handle_merge_lora,
             UnmergeLoraWeightsReq: self._handle_unmerge_lora,
@@ -286,6 +288,9 @@ class Scheduler(
     def _handle_release_realtime_session(self, reqs: List[Any]) -> OutputBatch:
         req = reqs[0]
         return self.worker.release_realtime_session(req.session_id)
+
+    def _handle_causal_window(self, reqs: List[Any]) -> OutputBatch:
+        return self.worker.execute_causal_window(reqs[0].chunks)
 
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
         """Handle update_weights_from_disk request for RL workflows."""
@@ -1362,7 +1367,14 @@ class Scheduler(
         if recv_reqs is not None:
             recv_reqs = materialize_cuda_refs(recv_reqs)
 
-        if self.server_args.comfyui_mode and self._is_multi_rank():
+        if self.server_args.causal_pipeline_mode != "off":
+            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                get_world_group,
+            )
+
+            group = get_world_group()
+            recv_reqs = broadcast_pyobj(recv_reqs, group.rank, group.cpu_group, src=0)
+        elif self.server_args.comfyui_mode and self._is_multi_rank():
             recv_reqs = self._broadcast_recv_reqs(recv_reqs)
         else:
             # TODO: fix this condition

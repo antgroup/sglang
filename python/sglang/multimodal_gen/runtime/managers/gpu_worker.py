@@ -449,6 +449,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             dp_size=self.server_args.dp_size,
             distributed_init_method=rendezvous_addr.to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
+            pipeline_parallel_degree=(
+                self.server_args.num_gpus
+                if self.server_args.causal_pipeline_mode != "off"
+                else 1
+            ),
+            separate_decode_ranks=self.server_args.causal_pipeline_mode != "off",
         )
 
         from sglang.srt.runtime_context import get_context, publish
@@ -584,6 +590,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         IPC_A2A.check_timeout()
         IPC_A2A_MULTI.check_timeout()
         if len(batch) > 1:
+            if self.server_args.causal_pipeline_mode != "off":
+                raise ValueError("Use a causal chunk window instead of grouped outputs")
             if return_req:
                 raise ValueError(
                     "Grouped execute_forward does not support return_req=True"
@@ -606,6 +614,43 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             error_context=f"request {req.request_id}",
             defer_finalize=defer_finalize,
         )
+
+    def execute_causal_window(self, batches: list[Req]) -> OutputBatch:
+        from sglang.multimodal_gen.runtime.realtime.lingbot_causal_pipeline import (
+            validate_chunk_window,
+        )
+
+        if self.server_args.causal_pipeline_mode == "off":
+            raise ValueError("Causal chunk windows require --causal-pipeline-mode")
+        validate_chunk_window(batches, self.server_args.causal_pipeline_window)
+        if self.is_sleeping():
+            raise RuntimeError("Resume the worker before submitting a causal window")
+        for req in batches:
+            self._realtime_sessions.attach(req)
+            if req.metrics is not None:
+                req.metrics.window_chunks = len(batches)
+
+        def forward():
+            outputs = self.pipeline.forward_causal_window(batches, self.server_args)
+            return OutputBatch(
+                chunk_outputs=outputs,
+                metrics=outputs[0].metrics,
+                metrics_list=[output.metrics for output in outputs],
+            )
+
+        try:
+            return self._execute_forward_common(
+                batches[0],
+                forward_fn=forward,
+                log_reqs=batches,
+                return_req=False,
+                save_output_paths=lambda output: None,
+                error_context="causal chunk window",
+                propagate_forward_errors=True,
+            )
+        except Exception:
+            self._realtime_sessions.release(batches[0].realtime_session_id)
+            raise
 
     def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
         """Yield grouped results after each request finishes its terminal stage."""
@@ -787,6 +832,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     output_metrics=output_metrics,
                     done_event=done_event,
                 )
+            elif output_batch.chunk_outputs is not None:
+                for chunk_req, chunk in zip(
+                    log_reqs, output_batch.chunk_outputs, strict=True
+                ):
+                    self._finalize_output_batch(
+                        output_batch=chunk,
+                        req=chunk_req,
+                        save_output_paths=save_output_paths,
+                        output_metrics=self._iter_output_metrics(chunk),
+                        deferred=False,
+                    )
             else:
                 self._finalize_output_batch(
                     output_batch=output_batch,

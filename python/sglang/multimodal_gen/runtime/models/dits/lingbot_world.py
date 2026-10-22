@@ -1694,6 +1694,8 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         self,
         c2ws_plucker_emb: torch.Tensor | None,
         forward_batch,
+        block_start: int = 0,
+        block_end: int | None = None,
     ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
         if c2ws_plucker_emb is None:
             return None
@@ -1725,7 +1727,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
 
         entries = cache["entries"]
         scale_shifts = []
-        for block in self.blocks:
+        for block in self.blocks[block_start:block_end]:
             entry_key = id(block.cam_conditioner)
             scale_shift = entries.get(entry_key)
             if scale_shift is None:
@@ -1749,7 +1751,16 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         start_frame: int = 0,
         c2ws_plucker_emb: torch.Tensor | None = None,
         skip_final_projection: bool = False,
+        block_range: tuple[int, int] | None = None,
+        block_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        block_start, block_end = block_range or (0, len(self.blocks))
+        if not 0 <= block_start < block_end <= len(self.blocks):
+            raise ValueError("Invalid LingBot transformer block range")
+        if (block_start > 0) != (block_hidden_states is not None):
+            raise ValueError(
+                "A noninitial block range requires intermediate hidden states"
+            )
         forward_batch = get_forward_context().forward_batch
         sequence_shard_enabled = (
             forward_batch is not None
@@ -1757,6 +1768,10 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             and self.sp_size > 1
         )
         if sequence_shard_enabled:
+            if block_range is not None:
+                raise ValueError(
+                    "LingBot block pipeline does not compose with sequence sharding"
+                )
             if get_ring_parallel_world_size() > 1:
                 raise NotImplementedError(
                     "LingBot causal sequence sharding currently supports ulysses_degree > 1 with ring_degree = 1 only."
@@ -1797,7 +1812,15 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 device=hidden_states.device,
             )
 
-        hidden_states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
+        hidden_states = (
+            self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
+            if block_hidden_states is None
+            else block_hidden_states
+        )
+        if block_range is not None:
+            # Transport packs intermediates into token-major contiguous tensors.
+            # Use the same layout for an unsplit noisy-history reference forward.
+            hidden_states = hidden_states.contiguous()
         c2ws_plucker_emb = self._prepare_c2ws_plucker_emb(
             hidden_states, c2ws_plucker_emb, forward_batch
         )
@@ -1832,7 +1855,11 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
             encoder_hidden_states_image=encoder_hidden_states_image,
-            crossattn_cache=crossattn_cache,
+            crossattn_cache=(
+                crossattn_cache[block_start:block_end]
+                if crossattn_cache is not None
+                else None
+            ),
         )
         timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
             dim=0, sizes=timestep.shape
@@ -1847,10 +1874,11 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             else encoder_hidden_states
         )
         cam_conditioner_scale_shifts = self._prepare_cam_conditioner_scale_shifts(
-            c2ws_plucker_emb, forward_batch
+            c2ws_plucker_emb, forward_batch, block_start, block_end
         )
 
-        for block_index, block in enumerate(self.blocks):
+        for block_index in range(block_start, block_end):
+            block = self.blocks[block_index]
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
@@ -1865,13 +1893,13 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 cam_conditioner_scale_shift=(
                     None
                     if cam_conditioner_scale_shifts is None
-                    else cam_conditioner_scale_shifts[block_index]
+                    else cam_conditioner_scale_shifts[block_index - block_start]
                 ),
                 update_cache_only=skip_final_projection
                 and block_index == len(self.blocks) - 1,
             )
 
-        if skip_final_projection:
+        if skip_final_projection or block_end < len(self.blocks):
             return hidden_states
 
         temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)

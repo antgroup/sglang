@@ -357,6 +357,9 @@ def _materialize_local_cuda_refs(endpoint: str, output_batch: Any) -> None:
 def _materialize_output_batch_file_refs(output_batch: Any) -> None:
     if not isinstance(output_batch, OutputBatch):
         return
+    if output_batch.chunk_outputs is not None:
+        for chunk in output_batch.chunk_outputs:
+            _materialize_output_batch_file_refs(chunk)
 
     start_time = time.perf_counter()
     output_batch.output = materialize_file_refs(output_batch.output)

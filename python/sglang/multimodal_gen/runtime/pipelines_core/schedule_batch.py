@@ -463,6 +463,7 @@ class OutputBatch:
 
     # tensors or numpy frames
     output: Sequence[Any] | None = None
+    chunk_outputs: list[OutputBatch] | None = None
     raw_frame_batches: list[list[bytes]] | None = None
     raw_frame_content_type: str = "application/x-raw-rgb"
     raw_frame_metadata: dict[str, Any] | None = None
@@ -499,6 +500,7 @@ class OutputBatch:
 
     def drop_payload_for_warmup(self) -> None:
         self.output = None
+        self.chunk_outputs = None
         self.audio = None
         self.trajectory_timesteps = None
         self.trajectory_latents = None

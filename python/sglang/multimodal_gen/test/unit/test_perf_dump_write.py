@@ -11,17 +11,56 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     RequestMetrics,
 )
+from sglang.multimodal_gen.test.test_utils import read_perf_logs
 
 
-def _metrics(request_id: str) -> SimpleNamespace:
-    return SimpleNamespace(
-        request_id=request_id,
-        stages={"DenoisingStage": 1.0},
-        denoising_stages={"DenoisingStage"},
-        steps=[1.0],
-        memory_snapshots={},
-        total_duration_ms=1.0,
+def _metrics(request_id: str) -> RequestMetrics:
+    metrics = RequestMetrics(request_id)
+    metrics.stages = {"DenoisingStage": 1.0}
+    metrics.denoising_stages = {"DenoisingStage"}
+    metrics.steps = [1.0]
+    metrics.total_duration_ms = 1.0
+    return metrics
+
+
+def test_performance_log_roundtrip_preserves_window_scope_and_old_records(
+    tmp_path, monkeypatch
+):
+    """Window metadata must survive the existing reader without breaking old logs."""
+    monkeypatch.setattr(
+        perf_logger_module, "get_diffusion_perf_log_dir", lambda: str(tmp_path)
     )
+    monkeypatch.setattr(perf_logger_module, "get_is_main_process", lambda: True)
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+    path = tmp_path / "performance.log"
+    legacy = {
+        "request_id": "legacy",
+        "timestamp": "2026-01-01T00:00:00+00:00",
+        "commit_hash": "test",
+        "tag": "pipeline_stage_metrics",
+        "stages": [],
+        "steps": [],
+        "total_duration_ms": 12.0,
+        "memory_snapshots": {},
+    }
+    path.write_text(json.dumps(legacy) + "\n")
+    window = _metrics("window")
+    window.total_duration_ms = 55.0
+    window.window_chunks = 3
+    PerformanceLogger.log_request_summary(window)
+    PerformanceLogger.log_request_summary(_metrics("ordinary"))
+
+    records = read_perf_logs(path)
+    assert [record.request_id for record in records] == ["legacy", "window", "ordinary"]
+    assert [record.total_duration_ms for record in records] == [12.0, 55.0, 1.0]
+    assert [record.total_duration_scope for record in records] == [
+        "request",
+        "window",
+        "request",
+    ]
+    assert [record.window_chunks for record in records] == [None, 3, None]
+    ordinary = json.loads(path.read_text().splitlines()[-1])
+    assert ordinary.keys() == legacy.keys()
 
 
 def test_reader_during_a_dump_sees_the_previous_complete_report(tmp_path, monkeypatch):

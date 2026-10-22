@@ -61,6 +61,7 @@ class RequestMetrics:
         self.denoising_stages: set[str] = set()
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
+        self.window_chunks: int | None = None
         self.suppress_stage_breakdown: bool = False
         # Set on the first request after a failed request-based warmup: its
         # timing includes first-use cost the warmup was meant to absorb.
@@ -71,6 +72,12 @@ class RequestMetrics:
     @property
     def total_duration_s(self) -> float:
         return self.total_duration_ms / 1000.0
+
+    @property
+    def duration_metadata(self) -> dict:
+        if self.window_chunks is None:
+            return {}
+        return {"total_duration_scope": "window", "window_chunks": self.window_chunks}
 
     def record_stage(self, stage_name: str, duration_s: float):
         """Records the duration of a pipeline stage"""
@@ -97,6 +104,7 @@ class RequestMetrics:
             "denoising_stages": sorted(self.denoising_stages),
             "steps": self.steps,
             "total_duration_ms": self.total_duration_ms,
+            **self.duration_metadata,
             "warmup_failed": self.warmup_failed,
             "memory_snapshots": {
                 name: snapshot.to_dict()
@@ -237,6 +245,8 @@ class RequestPerfRecord:
     steps: list[float]
     total_duration_ms: float
     memory_snapshots: dict[str, dict] = dataclasses.field(default_factory=dict)
+    total_duration_scope: str = "request"
+    window_chunks: int | None = None
 
     def __init__(
         self,
@@ -248,6 +258,8 @@ class RequestPerfRecord:
         total_duration_ms,
         memory_snapshots=None,
         timestamp=None,
+        total_duration_scope="request",
+        window_chunks=None,
     ):
         self.request_id = request_id
         if timestamp is not None:
@@ -261,6 +273,8 @@ class RequestPerfRecord:
         self.steps = steps
         self.total_duration_ms = total_duration_ms
         self.memory_snapshots = memory_snapshots or {}
+        self.total_duration_scope = total_duration_scope
+        self.window_chunks = window_chunks
 
 
 class StageProfiler:
@@ -418,6 +432,7 @@ class PerformanceLogger:
             "commit_hash": get_git_commit_hash(),
             "tag": tag,
             "total_duration_ms": metrics.total_duration_ms,
+            **metrics.duration_metadata,
             "steps": formatted_steps,
             "denoise_steps_ms": denoise_steps_ms,
             "memory_checkpoints": memory_checkpoints,
@@ -469,6 +484,7 @@ class PerformanceLogger:
             steps=metrics.steps,
             total_duration_ms=metrics.total_duration_ms,
             memory_snapshots=memory_checkpoints,
+            **metrics.duration_metadata,
         )
 
         try:
@@ -479,8 +495,12 @@ class PerformanceLogger:
 
                 log_file = os.path.join(log_dir, "performance.log")
 
+                record_dict = dataclasses.asdict(record)
+                if record.window_chunks is None:
+                    record_dict.pop("total_duration_scope")
+                    record_dict.pop("window_chunks")
                 with open(log_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(dataclasses.asdict(record)) + "\n")
+                    f.write(json.dumps(record_dict) + "\n")
 
         except (OSError, PermissionError) as e:
             print(f"WARNING: Failed to log performance record: {e}", file=sys.stderr)

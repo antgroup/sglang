@@ -371,6 +371,13 @@ class ServerArgs(DisaggServerArgsMixin):
     # data parallelism
     # number of data parallelism groups
     dp_size: int = 1
+    # Experimental LingBot same-step noisy-KV execution. The decoder is not
+    # counted in the denoising degree when it has a dedicated rank.
+    causal_pipeline_mode: str = "off"
+    causal_pipeline_parallel_size: int = 1
+    causal_pipeline_window: int = 4
+    causal_vae_placement: str = "shared"
+    causal_vae_rank: int | None = None
     # number of gpu in a dp group
     # cfg parallel (None = auto-decide based on num_gpus)
     enable_cfg_parallel: Optional[bool] = None
@@ -712,6 +719,11 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
         self.pipeline_config.validate_server_args(self)
+        from sglang.multimodal_gen.runtime.realtime.causal_pipeline_config import (
+            validate_causal_pipeline_args,
+        )
+
+        validate_causal_pipeline_args(self)
 
     def _validate_minimax_h3_adaln(self) -> None:
         # Warn, not raise: config-file and from_kwargs construction mark every
@@ -1585,6 +1597,12 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _adjust_parallelism(self):
+        if self.causal_pipeline_mode != "off":
+            from sglang.multimodal_gen.runtime.realtime.causal_pipeline_config import (
+                configure_causal_pipeline_parallelism,
+            )
+
+            configure_causal_pipeline_parallelism(self)
         sp_unspecified = self.sp_degree is None
         ulysses_unspecified = self.ulysses_degree is None
         ring_unspecified = self.ring_degree is None
@@ -2420,6 +2438,36 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=None,
             help="The tensor parallelism size. Defaults to 1 if not specified.",
+        )
+        parser.add_argument(
+            "--causal-pipeline-mode",
+            choices=["off", "timestep", "block"],
+            default=ServerArgs.causal_pipeline_mode,
+            help="Experimental LingBot same-step noisy-KV pipeline; changes clean-history semantics.",
+        )
+        parser.add_argument(
+            "--causal-pipeline-parallel-size",
+            type=int,
+            default=1,
+            help="Number of denoising ranks, excluding a dedicated VAE rank.",
+        )
+        parser.add_argument(
+            "--causal-pipeline-window",
+            type=int,
+            default=4,
+            help="Maximum consecutive realtime chunks submitted in one pipeline window.",
+        )
+        parser.add_argument(
+            "--causal-vae-placement",
+            choices=["shared", "dedicated"],
+            default="shared",
+            help="Decode on a denoising rank or on one extra rank.",
+        )
+        parser.add_argument(
+            "--causal-vae-rank",
+            type=int,
+            default=None,
+            help="Logical VAE rank; defaults to the last denoising rank, or the extra dedicated rank.",
         )
         parser.add_argument(
             "--sp-degree",

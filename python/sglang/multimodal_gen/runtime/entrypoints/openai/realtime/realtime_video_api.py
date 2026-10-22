@@ -121,6 +121,14 @@ async def _send_realtime_chunk_stats(
                 "event_id": getattr(batch, "realtime_event_id", None),
                 "request_prepare_ms": _transport_ms(request_prepare_ms),
                 "scheduler_forward_ms": _transport_ms(scheduler_forward_ms),
+                **(
+                    {
+                        "scheduler_forward_scope": "window",
+                        "window_chunks": batch.extra["causal_pipeline_window_size"],
+                    }
+                    if "causal_pipeline_window_size" in batch.extra
+                    else {}
+                ),
                 "pace_wait_ms": _transport_ms(send_stats["pace_wait_ms"]),
                 "header_write_ms": _transport_ms(send_stats["header_write_ms"]),
                 "raw_payload_build_ms": _transport_ms(
@@ -143,6 +151,25 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
     adapter = session.adapter
     if adapter is None:
         raise ValueError("realtime adapter is not initialized")
+
+    server_args = get_global_server_args()
+    if server_args.causal_pipeline_mode != "off":
+        from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.causal_window import (
+            generate_causal_windows,
+        )
+
+        try:
+            await generate_causal_windows(
+                ws, session, server_args, async_scheduler_client, _send_output_and_log
+            )
+        except WebSocketDisconnect:
+            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Causal pipeline generation failed")
+            await write_error_msg(str(exc).splitlines()[0], ws)
+        return
 
     pending_send_task = None
     while not session.reached_max_chunks():

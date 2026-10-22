@@ -44,6 +44,12 @@ class ReleaseRealtimeSessionReq(msgspec.Struct):
     session_id: str
 
 
+class CausalChunkWindowReq(msgspec.Struct):
+    """Ordered generation work, not a replica-wide mutation/control operation."""
+
+    chunks: list
+
+
 class GetDisaggStatsReq(msgspec.Struct):
     """Request to get disagg pipeline metrics from the scheduler."""
 
