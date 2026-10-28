@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import pickle
 import threading
 import unittest
@@ -8,6 +9,9 @@ from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import torch
+from fastapi import FastAPI
+from fastapi.routing import APIRoute
+from fastapi.testclient import TestClient
 
 import sglang.srt.disaggregation.encoder.server as encoder_server
 from sglang.srt.disaggregation.encoder import http_server
@@ -17,6 +21,7 @@ from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
 from sglang.srt.disaggregation.encoder.runtime import (
     _DP_RELEASE_AFTER_ENCODE,
     DPDispatcher,
+    EncoderScheduler,
     _retire_abandoned_encode,
 )
 from sglang.srt.disaggregation.encoder.server import (
@@ -28,9 +33,11 @@ from sglang.srt.disaggregation.encoder.server import (
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import unwrap_from_pickle
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
+from sglang.srt.runtime_context import get_context, get_flags
 from sglang.srt.utils.common import safe_pickle_loads
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -38,7 +45,141 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
+class TestEncoderRouteSelection(CustomTestCase):
+    def test_preprocess_meta_route_requires_epd_in_the_http_process(self):
+        """Importing HTTP used to expose metadata preprocessing even when off.
+        Exercise startup as well: DP children cannot initialize the HTTP parent.
+        """
+        for dp_size in (1, 2):
+            for enabled, disabled, expected in (
+                (False, "", 404),
+                (True, "", 200),
+                (True, "epd", 404),
+            ):
+                with self.subTest(dp_size=dp_size, enabled=enabled, disabled=disabled):
+                    # Preserve the actual import-time routes, including a leaked
+                    # decorator on pre-fix code; isolate each launch's app state.
+                    app = FastAPI()
+                    app.router.routes.extend(
+                        route
+                        for route in http_server.app.router.routes
+                        if isinstance(route, APIRoute)
+                    )
+                    content = {"req_id": "meta-route", "items": []}
+                    backend = SimpleNamespace(
+                        preprocess_meta=AsyncMock(return_value=content)
+                    )
+                    runtime = SimpleNamespace(
+                        encoder=backend, scheduler=None, send_sockets=[]
+                    )
+                    dispatcher = SimpleNamespace(
+                        dispatch=AsyncMock(return_value={"content": content})
+                    )
+                    model_config = SimpleNamespace(
+                        hf_config=SimpleNamespace(model_type="deepseek_v41")
+                    )
+                    with (
+                        get_context().override_server_args(
+                            encoder_only=True,
+                            dp_size=dp_size,
+                            enable_metrics=False,
+                            encoder_register_urls=[],
+                            _model_config=model_config,
+                        ) as server_args,
+                        get_flags().dsv41_sm90.override(
+                            subsystems=frozenset(), lossy=frozenset(), role=""
+                        ),
+                        envs.SGLANG_OPT_DSV41_SM90.override(enabled),
+                        envs.SGLANG_OPT_DSV41_SM90_DISABLE.override(disabled),
+                        envs.SGLANG_OPT_DSV41_SM90_LOSSY.override(""),
+                        patch(
+                            "sglang.srt.layers.dsv41_sm90.is_sm90_supported",
+                            return_value=True,
+                        ),
+                        patch.multiple(
+                            http_server,
+                            app=app,
+                            encoder=None,
+                            encoder_scheduler=None,
+                            local_runtime=None,
+                            send_sockets=[],
+                            dp_dispatcher=None,
+                        ),
+                        patch.object(http_server, "configure_logger"),
+                        patch.object(
+                            http_server, "launch_local_runtime", return_value=runtime
+                        ),
+                        patch.object(
+                            http_server, "launch_dp_runtime", return_value=dispatcher
+                        ),
+                        patch.object(http_server.uvicorn, "run"),
+                    ):
+                        http_server.launch_server(server_args)
+                        with TestClient(app) as client:
+                            response = client.post("/preprocess_meta", json=content)
+                            self.assertEqual(response.status_code, expected)
+                            if expected == 200:
+                                self.assertEqual(response.json(), content)
+                            # OpenAPI is also a client-visible surface.
+                            paths = client.get("/openapi.json").json()["paths"]
+                            self.assertEqual(
+                                "/preprocess_meta" in paths, expected == 200
+                            )
+                        if expected == 200:
+                            # Rebuilding in the same process must remove both
+                            # the route and its cached OpenAPI entry.
+                            with envs.SGLANG_OPT_DSV41_SM90.override(False):
+                                http_server.launch_server(server_args)
+                                with TestClient(app) as client:
+                                    self.assertEqual(
+                                        client.post(
+                                            "/preprocess_meta", json=content
+                                        ).status_code,
+                                        404,
+                                    )
+                                    self.assertNotIn(
+                                        "/preprocess_meta",
+                                        client.get("/openapi.json").json()["paths"],
+                                    )
+
+
 class TestEncoderDPErrorHandling(CustomTestCase):
+    def test_encode_control_field_cannot_enable_metadata_preprocessing(self):
+        """The /encode dict can carry _dp_type; that must not bypass EPD opt-out."""
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                enc = SimpleNamespace(
+                    dsv41_epd=enabled,
+                    preprocess_meta=AsyncMock(return_value={"metadata": True}),
+                )
+                send = AsyncMock()
+
+                async def run():
+                    with (
+                        patch.object(encoder_runtime, "async_sock_send", send),
+                        patch.object(
+                            encoder_runtime,
+                            "execute_encode_pipeline",
+                            AsyncMock(return_value={"embedding": True}),
+                        ),
+                    ):
+                        await encoder_runtime._dp_worker_handle_request(
+                            enc,
+                            None,
+                            object(),
+                            asyncio.Lock(),
+                            0,
+                            {"req_id": "injected", "_dp_type": "preprocess_meta"},
+                            "preprocess_meta",
+                        )
+
+                asyncio.run(run())
+                envelope = unwrap_from_pickle(send.await_args.args[1])
+                self.assertEqual(
+                    envelope["content"],
+                    {"metadata": True} if enabled else {"embedding": True},
+                )
+
     @staticmethod
     async def _run_registration_error(error):
         encoder = SimpleNamespace(
@@ -470,6 +611,39 @@ class TestEncoderDPAbandonedRequest(CustomTestCase):
 
         asyncio.run(run())
 
+    def test_timed_out_preprocess_meta_sends_no_release(self):
+        """/preprocess_meta leaves no encode state on the worker; a release for
+        its req_id would sit in the worker's abandoned set forever."""
+
+        async def run():
+            dispatcher = self._make_dispatcher()
+            sent = []
+
+            async def send(_socket, payload):
+                sent.append(unwrap_from_pickle(payload))
+
+            request = {"req_id": "meta-timeout", "_dp_type": "preprocess_meta"}
+            with (
+                get_flags().dsv41_sm90.override(subsystems=frozenset({"epd"})),
+                patch(
+                    "sglang.srt.disaggregation.encoder.runtime.async_sock_send",
+                    side_effect=send,
+                ),
+                patch(
+                    "sglang.srt.disaggregation.encoder.runtime.server_module.ENCODER_REQ_TIMEOUT",
+                    0.01,
+                ),
+            ):
+                result = await dispatcher.dispatch(request)
+                await asyncio.sleep(0.05)
+
+            self.assertEqual(result["_error_type"], "TimeoutError")
+            self.assertEqual(result["_dp_type"], "preprocess_meta")
+            self.assertEqual(sent, [request])
+            self.assertEqual(dispatcher.pending_counts, [0])
+
+        asyncio.run(run())
+
     def test_dispatch_cancellation_notifies_worker_to_release(self):
         async def run():
             dispatcher = self._make_dispatcher()
@@ -563,6 +737,238 @@ class TestEncoderDPAbandonedRequest(CustomTestCase):
             await asyncio.gather(encode_task, return_exceptions=True)
 
         asyncio.run(run())
+
+
+class _StagedEncoder:
+    """batch_encode that preprocesses, then runs a gated forward under compute_lock."""
+
+    def __init__(self, *, dsv41_epd: bool):
+        self.dsv41_epd = dsv41_epd
+        self.encode_dispatch_lock = asyncio.Lock()
+        self.events = []
+        self.forward_started = asyncio.Event()
+        self.finish_forward = asyncio.Event()
+
+    async def batch_encode(self, requests, _modality, compute_lock=None):
+        req_id = requests[0]["req_id"]
+        self.events.append(("preprocess", req_id))
+        await asyncio.sleep(0)
+        async with compute_lock or contextlib.nullcontext():
+            self.events.append(("forward", req_id))
+            self.forward_started.set()
+            await self.finish_forward.wait()
+            self.events.append(("forward_done", req_id))
+        return [(1, 2, 3, None, None)]
+
+
+def _image_request(req_id):
+    return {
+        "req_id": req_id,
+        "modality": "image",
+        "mm_items": [object()],
+        "num_parts": 1,
+        "part_idx": 0,
+    }
+
+
+class TestEncoderSchedulerPipelining(CustomTestCase):
+    """With the V4.1 switch and no TP followers, the next batch preprocesses
+    while the previous one runs the forward (1E c16 3.70 -> 5.80 img/s on H20)."""
+
+    async def _run_two(self, scheduler, encoder):
+        scheduler.start()
+        try:
+            first = asyncio.create_task(scheduler.submit(_image_request("a")))
+            await asyncio.wait_for(encoder.forward_started.wait(), timeout=1)
+            second = asyncio.create_task(scheduler.submit(_image_request("b")))
+            for _ in range(10):
+                await asyncio.sleep(0)
+            overlapped = ("preprocess", "b") in encoder.events
+            forward_overlapped = ("forward", "b") in encoder.events
+            encoder.finish_forward.set()
+            await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+        finally:
+            await scheduler.stop()
+        return overlapped, forward_overlapped
+
+    def test_completion_time_advances_only_after_successful_staging(self):
+        """Failed embedding publication must not refresh the health fast path."""
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder.dsv41_epd, encoder.rank = True, 0
+        ctx = SimpleNamespace(
+            req_id="request",
+            items_per_req=[1],
+            preprocess_result=SimpleNamespace(token_counts=[2], grid_thw=[[1, 1, 2]]),
+            aux_data={},
+            modality=Modality.IMAGE,
+        )
+        requests = [{"req_id": "request", "num_parts": 1, "part_idx": 0}]
+        embedding = torch.zeros(2, 4)
+        with (
+            patch.object(encoder, "_stage_embedding_batch") as stage,
+            patch.object(
+                encoder_server, "time", SimpleNamespace(monotonic=lambda: 100.0)
+            ),
+        ):
+            self.assertIsNone(encoder.last_embedding_completed_at)
+            result = encoder._stage_embeddings(
+                ctx, requests, embedding, keep_on_gpu=False
+            )
+            self.assertEqual(result, [(32, 2, 4, None, None)])
+            self.assertEqual(encoder.last_embedding_completed_at, 100.0)
+            stage.side_effect = RuntimeError("stage failed")
+            encoder.last_embedding_completed_at = 50.0
+            with self.assertRaisesRegex(RuntimeError, "stage failed"):
+                encoder._stage_embeddings(ctx, requests, embedding, keep_on_gpu=False)
+            self.assertEqual(encoder.last_embedding_completed_at, 50.0)
+
+    def test_next_batch_preprocesses_while_previous_forward_runs(self):
+        async def run():
+            encoder = _StagedEncoder(dsv41_epd=True)
+            scheduler = EncoderScheduler(
+                encoder=encoder, send_sockets=[], max_batch_size=1
+            )
+            overlapped, forward_overlapped = await self._run_two(scheduler, encoder)
+            self.assertTrue(overlapped)
+            self.assertFalse(forward_overlapped)
+            forwards = [e for e in encoder.events if e[0] != "preprocess"]
+            self.assertEqual(
+                forwards,
+                [
+                    ("forward", "a"),
+                    ("forward_done", "a"),
+                    ("forward", "b"),
+                    ("forward_done", "b"),
+                ],
+            )
+
+        asyncio.run(run())
+
+    def test_whole_batches_stay_serial_with_tp_followers_or_switch_off(self):
+        """TP followers replay the broadcast order; switch off is upstream."""
+
+        async def run(dsv41_epd, send_sockets):
+            encoder = _StagedEncoder(dsv41_epd=dsv41_epd)
+            scheduler = EncoderScheduler(
+                encoder=encoder, send_sockets=send_sockets, max_batch_size=1
+            )
+            with patch("sglang.srt.disaggregation.encoder.runtime.sock_send"):
+                overlapped, _ = await self._run_two(scheduler, encoder)
+            self.assertFalse(scheduler.pipelined)
+            self.assertFalse(overlapped)
+
+        for dsv41_epd, send_sockets in ((True, [object()]), (False, [])):
+            with self.subTest(dsv41_epd=dsv41_epd, followers=len(send_sockets)):
+                asyncio.run(run(dsv41_epd, send_sockets))
+
+    def test_busy_encoder_answers_health_without_waiting_for_dispatch_lock(self):
+        """A pipelined encoder holds the dispatch lock for whole forwards; the
+        bootstrap probe times out after 2 s and evicts it if /health waits."""
+
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.dsv41_epd = True
+            encoder.last_embedding_completed_at = http_server.time.monotonic()
+            encoder.encode_dispatch_lock = asyncio.Lock()
+            encoder.req_states = {"real-request": object()}
+            encoder.supports_modality = lambda modality: modality == Modality.IMAGE
+            await encoder.encode_dispatch_lock.acquire()
+            with (
+                patch.object(http_server, "encoder", encoder),
+                patch.object(http_server, "dp_dispatcher", None),
+            ):
+                response = await asyncio.wait_for(
+                    http_server.health_generate(), timeout=1
+                )
+            self.assertEqual(response.status_code, 200)
+
+        asyncio.run(run())
+
+    def test_pending_without_recent_completion_waits_for_upstream_health_check(self):
+        """A wedged forward with pending work must not get the fast health 200."""
+
+        async def run(last_completed):
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.dsv41_epd = True
+            encoder.last_embedding_completed_at = last_completed
+            encoder.encode_dispatch_lock = asyncio.Lock()
+            encoder.req_states = {"real-request": object()}
+            encoder.supports_modality = lambda modality: modality == Modality.IMAGE
+            await encoder.encode_dispatch_lock.acquire()
+            with (
+                patch.object(http_server, "encoder", encoder),
+                patch.object(http_server, "dp_dispatcher", None),
+                patch.object(
+                    http_server, "time", SimpleNamespace(monotonic=lambda: 1000.0)
+                ),
+            ):
+                task = asyncio.create_task(http_server.health_generate())
+                try:
+                    await asyncio.sleep(0)
+                    self.assertFalse(task.done())
+                finally:
+                    encoder.encode_dispatch_lock.release()
+                    await asyncio.wait_for(task, timeout=1)
+
+        for last_completed in (None, 1000.0 - http_server.HEALTH_CHECK_TIMEOUT):
+            with self.subTest(last_completed=last_completed):
+                asyncio.run(run(last_completed))
+
+
+class _StopRefresh(Exception):
+    pass
+
+
+class TestEncoderRegistrationRefresh(CustomTestCase):
+    def test_encoder_registers_again_with_a_restarted_bootstrap(self):
+        """Registration lives in the bootstrap's memory: a prefill that
+        restarted listed no encoder until this encoder came back."""
+        posts = []
+        listed = []
+
+        def post(url, json, timeout):
+            posts.append(url)
+            return SimpleNamespace(status_code=200, text="")
+
+        def get(url, timeout):
+            if url.endswith("/list_encoder_urls"):
+                listed.append(url)
+                return SimpleNamespace(
+                    status_code=200, json=lambda: {"encoder_urls": []}
+                )
+            return SimpleNamespace(status_code=200)  # the encoder's /health
+
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) > 1:
+                raise _StopRefresh
+
+        def run_inline(target, daemon, name):
+            return SimpleNamespace(start=target)
+
+        with (
+            get_context().override_server_args(
+                host="10.0.0.1",
+                port=8288,
+                encoder_register_urls=["http://boot:8997"],
+            ),
+            get_flags().dsv41_sm90.override(subsystems=frozenset({"epd"})),
+            patch.object(http_server.http_requests, "post", side_effect=post),
+            patch.object(http_server.http_requests, "get", side_effect=get),
+            patch.object(http_server.time, "sleep", side_effect=sleep),
+            patch.object(http_server.threading, "Thread", side_effect=run_inline),
+        ):
+            with self.assertRaises(_StopRefresh):
+                http_server._register_encoder_url_with_bootstrap()
+
+        # The startup registration, then one refresh after the bootstrap
+        # lost it; the refresh runs on a fixed interval.
+        register = "http://boot:8997/register_encoder_url"
+        self.assertEqual(posts, [register, register])
+        self.assertEqual(listed, ["http://boot:8997/list_encoder_urls"])
+        self.assertEqual(sleeps, [http_server._REGISTER_REFRESH_INTERVAL_S] * 2)
 
 
 class TestMooncakeRegistration(CustomTestCase):

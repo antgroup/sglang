@@ -143,7 +143,7 @@ def test_epd_rejection_reads_the_resolved_transfer_backend():
 def test_epd_scheduler_contains_invalid_embedding_part_metadata():
     waiting = WaitingZmqRequest.__new__(WaitingZmqRequest)
     waiting.rid = "request"
-    waiting.recv_req = SimpleNamespace(rid="request")
+    waiting.recv_req = SimpleNamespace(rid="request", encoder_req_id=None)
     waiting.status = WaitingMMRequestStatus.PENDING
     waiting.recv_embedding_data = None
     waiting.model_type = None

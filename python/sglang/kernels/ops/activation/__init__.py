@@ -174,6 +174,15 @@ for _fn in ("swiglu_oai_mxfp8", "swiglu_oai_mxfp8_deepgemm"):
         )
     )
 del _fn
+# DeepSeek-V4.1 ViT SwiGLU, bitwise the eager silu-then-multiply.
+register_kernel(
+    KernelSpec(
+        op="activation.vision_swiglu",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.vision_swiglu:vision_swiglu",
+        capabilities=CUDA_ONLY,
+    )
+)
 # Clamped SwiGLU fused with Humming's per-row FP8 quant of the MoE down input.
 register_kernel(
     KernelSpec(

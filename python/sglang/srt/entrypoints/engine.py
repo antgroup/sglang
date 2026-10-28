@@ -1214,11 +1214,17 @@ class Engine(EngineScoreMixin, EngineBase):
             restore_context(context_before_publish)
             raise
 
-        if envs.SGLANG_OPT_DSV41_SM90.get():
-            # This process asks the switch too: the replay below, the HTTP warmups.
-            initialize_dsv41_sm90(model_config=model_config_of(server_args))
-            if dsv41_sm90_on("startup"):
-                jit_manifest.start_replay()
+        # Resolve before tokenizer/bootstrap construction, including opt-out
+        # rebuilds after a previous Engine enabled the process-local flags.
+        initialize_dsv41_sm90(
+            model_config=(
+                model_config_of(server_args)
+                if envs.SGLANG_OPT_DSV41_SM90.get()
+                else None
+            )
+        )
+        if dsv41_sm90_on("startup"):
+            jit_manifest.start_replay()
 
         # Launch scheduler processes
         # Passed only when there is one: this hook is an override point, and a
@@ -1440,6 +1446,13 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         publish(server_args, role="tokenizer")
         self = cls.__new__(cls)
+        initialize_dsv41_sm90(
+            model_config=(
+                model_config_of(server_args)
+                if envs.SGLANG_OPT_DSV41_SM90.get()
+                else None
+            )
+        )
         self._attached = True
         self.server_args = server_args
         self.port_args = port_args

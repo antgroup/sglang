@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.encoder.server import (
     launch_encoder,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -141,6 +142,12 @@ MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACX
 MINIMUM_WAV_SILENCE_BASE64 = "UklGRmQBAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YUABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
 
 
+def _fail_pending(group: List["PendingRequest"], error: BaseException) -> None:
+    for p in group:
+        if not p.future.done():
+            p.future.set_exception(error)
+
+
 class EncoderScheduler:
     """Aggregate concurrent /encode requests into bounded image/audio batches."""
 
@@ -159,6 +166,14 @@ class EncoderScheduler:
         self.request_timeout = max(1.0, float(request_timeout))
         self.pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task] = None
+        # With the V4.1 switch on and no TP followers (no collective fixes the
+        # dispatch order), a batch preprocesses while the previous one runs the
+        # forward: one group in the forward, one preprocessing behind it.
+        self.pipelined = not send_sockets and encoder.dsv41_epd
+        self._group_slots = asyncio.Semaphore(2) if encoder.dsv41_epd else None
+        self._group_tasks: Optional[Set[asyncio.Task]] = (
+            set() if encoder.dsv41_epd else None
+        )
 
     def start(self) -> None:
         if self._worker_task is None:
@@ -175,6 +190,10 @@ class EncoderScheduler:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._worker_task
             self._worker_task = None
+        if self._group_tasks is not None:
+            for task in list(self._group_tasks):
+                task.cancel()
+            await asyncio.gather(*self._group_tasks, return_exceptions=True)
         # Reject any requests still queued so their HTTP handlers don't hang.
         while True:
             try:
@@ -232,7 +251,10 @@ class EncoderScheduler:
                         Modality.from_str(p.request.get("modality", "image"))
                     ].append(p)
                 for modality, group in groups.items():
-                    await self._dispatch_group(group, modality)
+                    if self.pipelined:
+                        await self._start_group(group, modality)
+                    else:
+                        await self._dispatch_group(group, modality)
             except asyncio.CancelledError:
                 for p in batch:
                     if not p.future.done():
@@ -245,6 +267,25 @@ class EncoderScheduler:
                 for p in batch:
                     if not p.future.done():
                         p.future.set_exception(e)
+
+    async def _start_group(self, group: List[PendingRequest], modality: Modality):
+        """Hand a group to its own task once a pipeline slot is free."""
+        await self._group_slots.acquire()
+        task = asyncio.create_task(self._run_group(group, modality))
+        self._group_tasks.add(task)
+        task.add_done_callback(self._group_tasks.discard)
+
+    async def _run_group(self, group: List[PendingRequest], modality: Modality):
+        try:
+            await self._dispatch_group(group, modality)
+        except asyncio.CancelledError:
+            _fail_pending(group, RuntimeError("EncoderScheduler stopped"))
+            raise
+        except Exception as e:
+            logger.error(f"EncoderScheduler group failed: {e}", exc_info=True)
+            _fail_pending(group, e)
+        finally:
+            self._group_slots.release()
 
     async def _dispatch_group(
         self,
@@ -289,28 +330,19 @@ class EncoderScheduler:
                     max(0.0, start - p.submit_time), modality=modality_str
                 )
         try:
-            # The scheduler is the sole owner of batched dispatch order. Keep
-            # the collective broadcast and rank-0 execution under the same
-            # lock, while allowing concurrent HTTP handlers to enqueue before
-            # waiting on their individual futures.
-            async with self.encoder.encode_dispatch_lock:
-                for sock in self.send_sockets:
-                    sock_send(
-                        sock,
-                        wrap_as_pickle(
-                            {
-                                "type": "batch_encode",
-                                "modality": modality.name,
-                                "requests": requests,
-                                "enter_time": start,
-                            }
-                        ),
-                    )
-
+            if self.pipelined:
                 logger.info(
                     f"Dispatching batch of {len(group)} {modality.name} requests"
                 )
-                results = await self.encoder.batch_encode(requests, modality)
+                # The lock covers the forward only: health probes and the
+                # previous batch still exclude it, preprocessing does not.
+                results = await self.encoder.batch_encode(
+                    requests,
+                    modality,
+                    compute_lock=self.encoder.encode_dispatch_lock,
+                )
+            else:
+                results = await self._dispatch_under_lock(requests, modality, start)
             if len(group) > 1:
                 logger.info(
                     f"Batch of {len(group)} {modality.name} requests completed in "
@@ -357,6 +389,32 @@ class EncoderScheduler:
             if not p.future.done():
                 p.future.set_result(result)
 
+    async def _dispatch_under_lock(
+        self, requests: List[dict], modality: Modality, start: float
+    ) -> List[Tuple]:
+        # The scheduler is the sole owner of batched dispatch order. Keep the
+        # collective broadcast and rank-0 execution under the same lock, while
+        # allowing concurrent HTTP handlers to enqueue before waiting on their
+        # individual futures.
+        async with self.encoder.encode_dispatch_lock:
+            for sock in self.send_sockets:
+                sock_send(
+                    sock,
+                    wrap_as_pickle(
+                        {
+                            "type": "batch_encode",
+                            "modality": modality.name,
+                            "requests": requests,
+                            "enter_time": start,
+                        }
+                    ),
+                )
+
+            logger.info(
+                f"Dispatching batch of {len(requests)} {modality.name} requests"
+            )
+            return await self.encoder.batch_encode(requests, modality)
+
     async def _dispatch_per_request(
         self,
         group: List[PendingRequest],
@@ -384,6 +442,9 @@ class EncoderScheduler:
                     num_parts=req["num_parts"],
                     part_idx=req["part_idx"],
                     hashes=req.get("hashes"),
+                    compute_lock=(
+                        self.encoder.encode_dispatch_lock if self.pipelined else None
+                    ),
                 )
                 if not p.future.done():
                     p.future.set_result(result)
@@ -613,6 +674,12 @@ class DPDispatcher:
         rank = candidates[self._rr_counter % len(candidates)]
         self._rr_counter += 1
         req_id = request["req_id"]
+        dp_type = (
+            request.get("_dp_type", "encode") if dsv41_sm90_on("epd") else "encode"
+        )
+        # Only an encode leaves state on the worker; releasing anything else
+        # (preprocess_meta) would park its req_id in the abandoned set for good.
+        releases_on_abandon = dp_type == "encode"
         future = asyncio.get_running_loop().create_future()
         self.pending_futures[rank][req_id] = future
         self._update_pending_gauge()
@@ -646,16 +713,16 @@ class DPDispatcher:
                 future, timeout=server_module.ENCODER_REQ_TIMEOUT
             )
         except asyncio.TimeoutError:
-            if dispatched:
+            if dispatched and releases_on_abandon:
                 self._release_abandoned_encode(rank, req_id)
             self._drop_pending_and_mapping(rank, req_id)
             return self._timeout_envelope(
                 req_id,
-                "encode",
+                dp_type,
                 f"Encoder DP rank={rank} timed out after {server_module.ENCODER_REQ_TIMEOUT}s",
             )
         except BaseException:
-            if dispatched:
+            if dispatched and releases_on_abandon:
                 self._release_abandoned_encode(rank, req_id)
             self._drop_pending_and_mapping(rank, req_id)
             raise
@@ -1455,6 +1522,8 @@ async def _dp_worker_handle_request(
             content = await _dp_worker_handle_profile(enc, dp_rank, dp_type, request)
         elif dp_type == "health_encode":
             content = await _dp_worker_health_encode(enc)
+        elif dp_type == "preprocess_meta" and enc.dsv41_epd:
+            content = await enc.preprocess_meta(request)
         elif dp_type == "register_destinations":
             await enc.register_embedding_destinations(
                 request["req_id"],

@@ -40,6 +40,7 @@ import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.environ import envs
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -49,6 +50,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    EncoderRegistryUpdateReq,
     FreezeGCReq,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
@@ -67,7 +69,7 @@ from sglang.srt.managers.load_snapshot import (
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.trace import process_tracing_init
-from sglang.srt.runtime_context import get_disagg, get_observability
+from sglang.srt.runtime_context import get_disagg, get_observability, get_serving
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -626,6 +628,11 @@ class MultiTokenizerRouter:
             context, zmq.PULL, port_args.tokenizer_worker_ipc_name, True
         )
         self._loop = asyncio.new_event_loop()
+        # Set before the routing coroutines or a registry callback can run; all
+        # worker sends happen on self._loop.
+        self.all_worker_ipcs: set[str] = set()
+        self.socket_mapping = SocketMapping()
+        self._init_encoder_registry()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self._task = asyncio.run_coroutine_threadsafe(
@@ -649,10 +656,37 @@ class MultiTokenizerRouter:
 
         self.disaggregation_bootstrap_server = start_disagg_service()
 
-        # Worker IPC names for pause/continue broadcasting
-        self.all_worker_ipcs: set[str] = set()
-        # Shared socket mapping (both coroutines run on self._loop, so safe)
-        self.socket_mapping = SocketMapping()
+    def _init_encoder_registry(self) -> None:
+        # The workers cannot each bind the encoder bootstrap port: the router
+        # owns the registry and pushes versioned snapshots to every worker.
+        self.encoder_bootstrap_server = None
+        if get_disagg().language_only and dsv41_sm90_on("epd"):
+            from sglang.srt.disaggregation.encoder.receiver import (
+                EncoderBootstrapServer,
+            )
+
+            self.encoder_bootstrap_server = EncoderBootstrapServer(
+                host=get_serving().host,
+                port=get_disagg().encoder_bootstrap_port,
+                urls=list(get_disagg().encoder_urls),
+                on_change=self._on_encoder_registry_change,
+            )
+
+    def _on_encoder_registry_change(self, version: int, urls: List[str]) -> None:
+        # Runs on the bootstrap server's thread; the sockets belong to self._loop.
+        self._loop.call_soon_threadsafe(self._broadcast_encoder_registry, version, urls)
+
+    def _broadcast_encoder_registry(self, version: int, urls: List[str]) -> None:
+        update = EncoderRegistryUpdateReq(version=version, urls=urls)
+        for ipc_name in self.all_worker_ipcs:
+            self.socket_mapping.send_output(ipc_name, update)
+
+    def _send_encoder_registry(self, ipc_name: str) -> None:
+        if self.encoder_bootstrap_server is not None:
+            version, urls = self.encoder_bootstrap_server.snapshot()
+            self.socket_mapping.send_output(
+                ipc_name, EncoderRegistryUpdateReq(version=version, urls=urls)
+            )
 
     def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
         self.startup_time = startup_time
@@ -686,6 +720,9 @@ class MultiTokenizerRouter:
                         f"Router registered worker IPC: {recv_obj.worker_ipc_name} "
                         f"(total: {len(self.all_worker_ipcs)})"
                     )
+                # A worker that joins after a registration, or restarts, gets
+                # the current snapshot, even an empty one.
+                self._send_encoder_registry(recv_obj.worker_ipc_name)
                 continue
 
             if isinstance(
@@ -868,13 +905,36 @@ class TokenizerWorker(TokenizerManager):
 
         # Future for awaiting pause/continue broadcast confirmation
         self._pause_continue_future: Optional[asyncio.Future] = None
+        self._encoder_registry_version = -1
 
         # Register PauseContinueBroadcastReq in the result dispatcher so
         # handle_loop routes it to _handle_pause_continue_broadcast
         from sglang.utils import TypeBasedDispatcher
 
         self._result_dispatcher += TypeBasedDispatcher(
-            [(PauseContinueBroadcastReq, self._handle_pause_continue_broadcast)]
+            [
+                (PauseContinueBroadcastReq, self._handle_pause_continue_broadcast),
+                (EncoderRegistryUpdateReq, self._handle_encoder_registry_update),
+            ]
+        )
+
+        # Encoder discovery is a subscription: an idle worker applies the
+        # router's snapshots before its first request, which a lazily started
+        # receive loop would deliver only after that request's dispatch.
+        if self.encoder_registry_ready is not None:
+            self.auto_create_handle_loop()
+
+    def _handle_encoder_registry_update(self, obj: EncoderRegistryUpdateReq):
+        if obj.version <= self._encoder_registry_version:
+            return
+        self._encoder_registry_version = obj.version
+        # In place: the MM receiver holds this same list.
+        self.encoder_urls[:] = obj.urls
+        self.encoder_registry_ready.set()
+        logger.info(
+            "Encoder registry synchronized: version=%s, encoders=%s",
+            obj.version,
+            obj.urls,
         )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):

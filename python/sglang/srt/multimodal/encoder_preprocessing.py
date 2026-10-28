@@ -70,7 +70,8 @@ class EncoderPreprocessOutput(dict):
 
     The mapping remains compatible with existing encoder metadata helpers;
     ``mm_items`` is an out-of-band, per-item representation used only by the
-    encoder forward/cache paths.
+    encoder forward/cache paths. ``token_counts`` gives each item's embedding
+    rows when the model's layout is not the generic ``prod(grid) / merge**2``.
     """
 
     def __init__(
@@ -82,6 +83,7 @@ class EncoderPreprocessOutput(dict):
         materialize_local_items: (
             Callable[[list[MultimodalDataItem]], Sequence[torch.Tensor]] | None
         ) = None,
+        token_counts: Sequence[int] | None = None,
     ) -> None:
         super().__init__(values or {})
         self.mm_items = list(mm_items)
@@ -91,6 +93,11 @@ class EncoderPreprocessOutput(dict):
         if self.item_sizes is not None and len(self.item_sizes) != len(self.mm_items):
             raise ValueError("Encoder preprocess item_sizes must match mm_items")
         self.materialize_local_items = materialize_local_items
+        self.token_counts = list(token_counts) if token_counts is not None else None
+        if self.token_counts is not None and len(self.token_counts) != len(
+            self.mm_items
+        ):
+            raise ValueError("Encoder preprocess token_counts must match mm_items")
 
     def local_item_indices(self, rank: int, world_size: int) -> list[int]:
         """Return the same size-balanced owner assignment used by vision DP."""
@@ -136,6 +143,14 @@ def get_encoder_preprocessed_items(
 ) -> list[MultimodalDataItem] | None:
     if isinstance(processor_output, EncoderPreprocessOutput):
         return processor_output.mm_items
+    return None
+
+
+def get_encoder_preprocessed_token_counts(
+    processor_output: Mapping[str, Any],
+) -> list[int] | None:
+    if isinstance(processor_output, EncoderPreprocessOutput):
+        return processor_output.token_counts
     return None
 
 

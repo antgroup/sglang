@@ -352,6 +352,28 @@ class ServerArgs:
 
         add_cli_args_from_dataclass(parser, ServerArgs)
 
+        # CLI parsing precedes model/device resolution. Expose the EPD choice
+        # only when requested; the store factory also checks the resolved gate.
+        if (
+            envs.SGLANG_OPT_DSV41_SM90.get()
+            and "epd" not in envs.SGLANG_OPT_DSV41_SM90_DISABLE.get()
+        ):
+            cache_backend = next(
+                action
+                for action in parser._actions
+                if action.dest == "mm_global_cache_backend"
+            )
+            cache_backend.choices = ["mooncake", "shm"]
+            cache_backend.help = (
+                "Storage backend for the multimodal global embedding cache. "
+                "Used when --enable-mm-global-cache is set. 'mooncake' shares entries "
+                "across hosts through a Mooncake store. 'shm' shares them among the "
+                "encoder processes of one host through files in "
+                "/dev/shm/sglang_emb_cache, evicted LRU once they exceed half of that "
+                "filesystem or a quarter of the memory limit (cgroup or physical RAM), "
+                "whichever is smaller; tmpfs pages count against the memory limit."
+            )
+
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
         sampling_backend_choices = set(SAMPLING_BACKEND_CHOICES)
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():

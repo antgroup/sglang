@@ -2,11 +2,9 @@
 
 import asyncio
 import logging
-from functools import partial
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -16,16 +14,16 @@ from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
     GPU_PLAN_KEY,
     image_token_types,
-    patchify_image,
-    patchify_image_rust,
     prepare_image_gpu,
+)
+from sglang.srt.multimodal.deepseek_v41_mm_inputs import (
+    build_epd_mm_output,
+    resolve_image_backend,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.runtime_context import get_mm
-from sglang.srt.rust_extensions import load_rust_extension
 
 logger = logging.getLogger(__name__)
 
@@ -37,30 +35,8 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
     gpu_image_decode = False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        self.preprocess_backend = "cpu"
-        self.cpu_patchify = patchify_image
-        backend = get_mm().image_processor_backend
-        if backend == "pil" or get_mm().disable_fast_image_processor:
-            self.preprocess_backend = "cpu"
-        elif envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get():
-            self.preprocess_backend = "gpu"
-        elif backend == "auto":
-            # Resolved before super().__init__(), which fingerprints the backend;
-            # a load failure falls back to PIL, later image errors do not.
-            try:
-                extension = load_rust_extension(
-                    "sglang.srt.rust_extensions._multimodal"
-                )
-                resize_patchify = extension.dsv41.resize_patchify
-            except (ImportError, OSError, RuntimeError, AttributeError) as error:
-                logger.warning(
-                    "V4.1 Rust image processor unavailable; using PIL: %s", error
-                )
-            else:
-                self.preprocess_backend = "rust"
-                self.cpu_patchify = partial(
-                    patchify_image_rust, resize_patchify=resize_patchify
-                )
+        # Resolved before super().__init__(), which fingerprints the backend.
+        self.preprocess_backend, self.cpu_patchify = resolve_image_backend()
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.image_token_id = hf_config.image_token_id
         self.mm_tokens = MultimodalSpecialTokens(
@@ -124,4 +100,14 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
             input_ids=tokens,
             mm_items=self._prepare_mm_items_for_transport(items),
             im_token_id=self.image_token_id,
+        )
+
+    def get_mm_data(self, prompt, embeddings, *, img_grid_thw=None, **kwargs):
+        """Rebuild an EPD prompt from the encoder's grids; see build_epd_mm_output."""
+        return build_epd_mm_output(
+            prompt if isinstance(prompt, list) else self._processor.encode(prompt),
+            embeddings=embeddings,
+            img_grid_thw=img_grid_thw,
+            image_token_id=self.image_token_id,
+            downsample_ratio=self.hf_config.vision_downsample_ratio,
         )

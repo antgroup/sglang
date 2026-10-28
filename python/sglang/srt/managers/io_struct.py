@@ -370,6 +370,8 @@ class GenerateReqInput:
 
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
+    # The encode dispatch's wire identity, independent of the reusable rid.
+    encoder_req_id: Optional[str] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
     # Snapshot of encoder URLs at the time tokenizer-side computed
     # ``num_items_assigned``.
@@ -1220,6 +1222,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # The encode dispatch's wire identity, independent of the reusable rid.
+    encoder_req_id: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -2010,6 +2014,13 @@ class PauseContinueBroadcastReq(BaseReq, kw_only=True):
     is_pause: bool
 
 
+class EncoderRegistryUpdateReq(BaseReq, kw_only=True):
+    """Versioned encoder discovery snapshot from the router to tokenizer workers."""
+
+    version: int
+    urls: List[str]
+
+
 class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     # The model path with the new weights
     model_path: str
@@ -2344,6 +2355,7 @@ class EncoderDispatchErrorReq(BaseReq, kw_only=True):
 
     error_msg: str
     error_code: int
+    encoder_req_id: Optional[str] = None
 
 
 class ActiveRanksOutput(BaseReq, kw_only=True):

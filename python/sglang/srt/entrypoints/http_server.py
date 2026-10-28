@@ -70,6 +70,7 @@ from fastapi.routing import APIRoute
 from uvicorn.supervisors import multiprocess as uvicorn_multiprocess
 from uvicorn.supervisors.multiprocess import Multiprocess
 
+from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
@@ -260,6 +261,10 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args: PortArgs
 
     publish(server_args, role="tokenizer")
+    if envs.SGLANG_OPT_DSV41_SM90.get():
+        # The launcher resolved it for its own process only; the tokenizer
+        # manager built below reads it.
+        initialize_dsv41_sm90(model_config=model_config_of(server_args))
 
     # API key authentication is not supported in multi-tokenizer mode
     assert get_serving().api_key is None, (
@@ -312,8 +317,6 @@ async def lifespan(fast_api_app: FastAPI):
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
-        # The launcher resolved it for its own process only.
-        initialize_dsv41_sm90(model_config=_global_state.tokenizer_manager.model_config)
         worker_id = _global_state.tokenizer_manager.worker_id
         warmup_thread_kwargs = _multi_tokenizer_warmup_kwargs(server_args, worker_id)
         thread_label = f"MultiTokenizer-{worker_id}"

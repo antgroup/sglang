@@ -3298,6 +3298,34 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         self.assertNotIn("token_oracle", disabled_action.choices)
 
 
+class TestDsv41EmbeddingCacheArgs(CustomTestCase):
+    def test_shm_choice_and_help_require_epd_opt_in(self):
+        """The port must not advertise or accept an extra cache backend when off."""
+        for enabled, disabled, available in (
+            (False, "", False),
+            (True, "", True),
+            (True, "epd", False),
+        ):
+            with (
+                self.subTest(enabled=enabled, disabled=disabled),
+                envs.SGLANG_OPT_DSV41_SM90.override(enabled),
+                envs.SGLANG_OPT_DSV41_SM90_DISABLE.override(disabled),
+            ):
+                parser = argparse.ArgumentParser()
+                ServerArgs.add_cli_args(parser)
+                self.assertEqual(
+                    "/dev/shm/sglang_emb_cache" in parser.format_help(), available
+                )
+                argv = ["--model-path", "dummy", "--mm-global-cache-backend", "shm"]
+                if available:
+                    self.assertEqual(
+                        parser.parse_args(argv).mm_global_cache_backend, "shm"
+                    )
+                else:
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args(argv)
+
+
 class TestDeepEPv2Args(CustomTestCase):
     """DeepEP v2 server-argument resolution and validation."""
 

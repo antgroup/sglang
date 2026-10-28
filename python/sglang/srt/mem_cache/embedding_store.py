@@ -2,11 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to SGLang project
 
 import abc
+import hashlib
 import importlib
+import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping, Optional
 
 import torch
+
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +59,34 @@ class EmbeddingStore(abc.ABC):
     def register_buffer(self, tensor: torch.Tensor) -> None:
         pass
 
+    def bind_model(self, fingerprint: bytes) -> None:
+        """Scope entries to the model that produces them; see model_fingerprint.
+
+        A no-op by default: backends that keep the plain key do not scope entries.
+        """
+
     def get_key(self, mm_hash: str) -> str:
         return f"emb_{mm_hash}"
+
+
+def model_fingerprint(
+    *,
+    model_path: str,
+    revision: Optional[str],
+    dtype: torch.dtype,
+    dims_by_modality: Mapping[Any, int],
+) -> bytes:
+    """16-byte identity of what an embedding of a given content hash means:
+    the content hash covers the preprocessed input, not the encoder weights,
+    dtype or per-modality width that turned it into the stored bytes."""
+    payload = {
+        "model_path": model_path,
+        "revision": revision,
+        "dtype": str(dtype),
+        "dims": {str(k): int(v) for k, v in sorted(dims_by_modality.items(), key=str)},
+    }
+    encoded = json.dumps(payload, sort_keys=True).encode()
+    return hashlib.blake2b(encoded, digest_size=16).digest()
 
 
 class EmbeddingStoreFactory:
@@ -104,6 +134,16 @@ class EmbeddingStoreFactory:
 
     @classmethod
     def create_backend(cls, backend_name: str, **kwargs) -> EmbeddingStore:
+        if (
+            backend_name == "shm"
+            and backend_name not in cls._registry
+            and dsv41_sm90_on("epd")
+        ):
+            cls.register_backend(
+                "shm",
+                "sglang.srt.mem_cache.storage.shm.shm_embedding_store",
+                "ShmEmbeddingStore",
+            )
         if backend_name not in cls._registry:
             available = list(cls._registry.keys())
             raise ValueError(

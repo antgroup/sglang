@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import contextlib
 import ctypes
 import hashlib
 import logging
@@ -22,16 +23,20 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.encoder.mm_meta import (
+    MMMetaCache,
+    batch_leaves,
+    batch_meta_entries,
+    compute_mm_meta,
+)
 from sglang.srt.disaggregation.encoder.preprocessor import (
     EncoderPreprocessor,
     EncoderPreprocessResult,
+    _build_mm_aux_data,
     _convert,
     _mm_grid_attrs,
 )
-from sglang.srt.disaggregation.encoder.receiver import (
-    EmbeddingData,
-    video_meta_attrs_for,
-)
+from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
 from sglang.srt.distributed.parallel_state import (
     get_default_distributed_backend,
     get_mooncake_transfer_engine,
@@ -43,6 +48,7 @@ from sglang.srt.layers.dp_attention import (
     init_dp_gathered_buffer,
     initialize_dp_attention_flags,
 )
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on, initialize_dsv41_sm90
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -495,44 +501,35 @@ def _get_mm_feature(mm_inputs, modality):
     )
 
 
-def _normalize_aux_value(val):
-    """Normalize aux values to pickle types compatible with safe_pickle_loads.
+# Media items whose preprocess metadata /encode keeps for decode's
+# /preprocess_meta. Arbitrary; entries are a few hundred bytes.
+_MM_META_CACHE_ENTRIES = 4096
 
-    HF multimodal processors (e.g. Qwen3-VL/Omni) emit numpy arrays for
-    fields like ``video_timestamps`` / ``second_per_grid_ts``. ``numpy.*`` is
-    not in SafeUnpickler's allowlist, so the receiver would refuse to load
-    those payloads. Convert numpy values to torch tensors (numeric) or plain
-    Python lists (object dtype) before pickling.
-    """
-    if val is None:
-        return None
-    if isinstance(val, np.ndarray):
-        if val.dtype == object:
-            return val.tolist()
-        return torch.from_numpy(np.ascontiguousarray(val))
-    if isinstance(val, np.generic):
-        return val.item()
-    if isinstance(val, (list, tuple)):
-        return type(val)(_normalize_aux_value(v) for v in val)
-    if isinstance(val, dict):
-        return {k: _normalize_aux_value(v) for k, v in val.items()}
-    return val
+# Pinned relay for Mooncake sends of shm-cache hits; 4 GiB holds dozens of
+# full-size image spans. Arbitrary.
+_GC_SEND_STAGING_BYTES = 4096 * 1024 * 1024
 
 
-def _build_mm_aux_data(mm_inputs, model_type=None):
-    # Video aux metadata, scoped to model_type's video-meta attrs.
-    aux = {
-        attr: _normalize_aux_value(mm_inputs.get(attr))
-        for attr in video_meta_attrs_for(model_type)
-    }
-    if model_type == "kimi_k3":
-        aux["original_image_sizes"] = _normalize_aux_value(
-            mm_inputs.get("original_image_sizes")
-        )
-    return aux
+# Bound on a payload-free ZMQ ack; arbitrary, well above a live receiver's latency.
+_ENCODER_ACK_SEND_TIMEOUT_S = 10.0
+
+# torch intra-op threads per encoder process; with one per core (~190 on H20),
+# each encoder spun 46-49 cores and encoders sharing a container hit its CFS quota.
+# An explicit OMP_NUM_THREADS wins.
+_ENCODER_TORCH_NUM_THREADS = 8
+
+
+def configure_encoder_cpu_threads() -> None:
+    """Cap torch's intra-op threads for this encoder process."""
+    if "OMP_NUM_THREADS" not in os.environ:
+        torch.set_num_threads(_ENCODER_TORCH_NUM_THREADS)
 
 
 class MMEncoder:
+    # Class-level default for instances built without running __init__.
+    dsv41_epd = False
+    last_embedding_completed_at: Optional[float] = None
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -615,6 +612,13 @@ class MMEncoder:
         initialize_model_parallel()
         initialize_dp_attention_flags(server_args)
         init_dp_gathered_buffer(self.model_config)
+        # No scheduler runs here; the encoder resolves the switch for its own role.
+        initialize_dsv41_sm90(model_config=self.model_config)
+        # Decode workers' /preprocess_meta and its cache, filled by /encode; the
+        # ViT forward off the event loop, and EncoderScheduler pipelining.
+        self.dsv41_epd = dsv41_sm90_on("epd")
+        if self.dsv41_epd:
+            configure_encoder_cpu_threads()
 
         self.model = load_model(
             model_config=self.model_config,
@@ -631,6 +635,11 @@ class MMEncoder:
             server_args=server_args,
             model_config=self.model_config,
             model_preprocessor=getattr(self.model, "preprocess_mm_for_encoder", None),
+            model_meta_preprocessor=(
+                getattr(self.model, "preprocess_mm_meta_for_encoder", None)
+                if self.dsv41_epd
+                else None
+            ),
             encoder_media_processor_config=encoder_media_processor_config,
         )
 
@@ -659,16 +668,31 @@ class MMEncoder:
             [], dtype=self._embedding_dtype
         ).element_size()
         self._embedding_dims = self._infer_embedding_dims()
+        self.mm_meta_cache = (
+            MMMetaCache(_MM_META_CACHE_ENTRIES) if self.dsv41_epd else None
+        )
 
         if get_mm().enable_mm_global_cache:
             from sglang.srt.mem_cache.embedding_cache_controller import (
                 EmbeddingCacheController,
             )
-            from sglang.srt.mem_cache.embedding_store import EmbeddingStoreFactory
+            from sglang.srt.mem_cache.embedding_store import (
+                EmbeddingStoreFactory,
+                model_fingerprint,
+            )
 
             embedding_store = EmbeddingStoreFactory.create_backend(
                 get_mm().mm_global_cache_backend,
             )
+            if self.dsv41_epd and get_mm().mm_global_cache_backend == "shm":
+                embedding_store.bind_model(
+                    model_fingerprint(
+                        model_path=get_model().model_path,
+                        revision=get_model().revision,
+                        dtype=self._embedding_dtype,
+                        dims_by_modality=self._embedding_dims,
+                    )
+                )
             self.mm_global_cache = EmbeddingCacheController(
                 embedding_store=embedding_store,
                 hidden_dims=self._embedding_dims,
@@ -709,6 +733,23 @@ class MMEncoder:
             self.encode_dispatch_lock = asyncio.Lock()
 
             if get_disagg().encoder_transfer_backend == "mooncake":
+                # Sends from the shm cache come from unregistered host memory, and
+                # a per-send registration does not take on this transfer engine
+                # (register returns 0, transferSync then fails): relay them
+                # through one buffer registered here.
+                self._gc_send_staging = None
+                self._gc_send_lock = asyncio.Lock()
+                if (
+                    self.mm_global_cache is not None
+                    and get_mm().mm_global_cache_backend == "shm"
+                ):
+                    self._gc_send_staging = torch.empty(
+                        _GC_SEND_STAGING_BYTES, dtype=torch.uint8, pin_memory=True
+                    )
+                    self.engine.register(
+                        self._gc_send_staging.data_ptr(),
+                        self._gc_send_staging.nbytes,
+                    )
                 self.delivery = MooncakeDelivery(self)
                 # Embeddings live here, so registry cleanup uses the common release.
                 meta_registry.on_release = self.release_request
@@ -1029,16 +1070,40 @@ class MMEncoder:
         )
 
         forward_start = time.perf_counter()
-        with torch.inference_mode():
-            new_embeddings = get_feature_fn(mm_items)
-            if new_embeddings.ndim != 2:
-                new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
+        new_embeddings = self._run_feature_forward(
+            get_feature_fn, mm_items, keep_on_gpu=True, reshape_2d=True
+        )
         if encoder_metrics_collector is not None:
             encoder_metrics_collector.observe_model_forward(
                 time.perf_counter() - forward_start, modality=modality.name.lower()
             )
 
         return self.slice_embedding(new_embeddings, (token_counts[i] for i in indices))
+
+    @staticmethod
+    def _run_feature_forward(
+        get_feature_fn, mm_items, keep_on_gpu: bool, *, reshape_2d: bool = False
+    ):
+        with torch.inference_mode():
+            embedding = get_feature_fn(mm_items)
+            if not keep_on_gpu:
+                embedding = embedding.cpu()
+            if reshape_2d and embedding.ndim != 2:
+                embedding = embedding.reshape(-1, embedding.shape[-1])
+        return embedding
+
+    def _on_encoder_device(self, fn, *args):
+        # The current device is per-thread: pin this encoder's GPU first.
+        torch.get_device_module(self.device).set_device(self.gpu_id)
+        return fn(*args)
+
+    async def _feature_forward_off_loop(self, fn, *args):
+        """Run a blocking ViT step on a worker thread when the V4.1 switch is
+        on: a forward takes hundreds of ms per image, and the loop must keep
+        answering /health and the language side's metadata pulls."""
+        if self.dsv41_epd:
+            return await asyncio.to_thread(self._on_encoder_device, fn, *args)
+        return fn(*args)
 
     def _build_model_mm_items(
         self,
@@ -1637,7 +1702,8 @@ class MMEncoder:
 
         new_slices = []
         if missing_indices:
-            new_slices = self._encode_missing(
+            new_slices = await self._feature_forward_off_loop(
+                self._encode_missing,
                 ctx.mm_feature,
                 ctx.preprocess_result,
                 missing_indices,
@@ -1665,7 +1731,8 @@ class MMEncoder:
                 f"Req {ctx.req_id}: All ranks running ViT fallback "
                 f"for {len(fallback_indices)} items."
             )
-            fallback_slices = self._encode_missing(
+            fallback_slices = await self._feature_forward_off_loop(
+                self._encode_missing,
                 ctx.mm_feature,
                 ctx.preprocess_result,
                 fallback_indices,
@@ -1759,10 +1826,12 @@ class MMEncoder:
 
             if mm_embedding is None:
                 forward_start = time.perf_counter()
-                with torch.inference_mode():
-                    mm_embedding: torch.Tensor = ctx.get_feature_fn(mm_items)
-                    if not keep_on_gpu:
-                        mm_embedding = mm_embedding.cpu()
+                mm_embedding: torch.Tensor = await self._feature_forward_off_loop(
+                    self._run_feature_forward,
+                    ctx.get_feature_fn,
+                    mm_items,
+                    keep_on_gpu,
+                )
                 if len(mm_embedding.shape) != 2:
                     mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
                 if encoder_metrics_collector is not None and not ctx.is_health_check:
@@ -1932,14 +2001,31 @@ class MMEncoder:
 
             # Fall back to a per-send registration only if the shared one failed.
             mr_already_registered = mm_data._mr_ptr == embedding.data_ptr()
-            if not mr_already_registered:
+            staging = self._gc_send_staging
+            use_staging = (
+                not mr_already_registered
+                and staging is not None
+                and embedding.nbytes <= staging.nbytes
+            )
+            per_send_mr = not mr_already_registered and not use_staging
+            if use_staging:
+                await self._gc_send_lock.acquire()
+            elif per_send_mr:
                 self.engine.register(embedding.data_ptr(), embedding.nbytes)
             transfer_error = None
             try:
+                if use_staging:
+                    src = embedding.reshape(-1).contiguous().view(torch.uint8)
+                    staging[: embedding.nbytes].copy_(src)
+                    if embedding.is_cuda:
+                        torch.cuda.current_stream(embedding.device).synchronize()
+                    send_ptr = staging.data_ptr()
+                else:
+                    send_ptr = embedding.data_ptr()
                 _t_xfer_start = time.monotonic()
                 xfer_ret = await self._run_mooncake_transfer(
                     session_id,
-                    embedding.data_ptr(),
+                    send_ptr,
                     buffer_address,
                     embedding.nbytes,
                 )
@@ -1947,7 +2033,9 @@ class MMEncoder:
                 transfer_error = error
                 raise
             finally:
-                if not mr_already_registered:
+                if use_staging:
+                    self._gc_send_lock.release()
+                if per_send_mr:
                     try:
                         self.engine.deregister(embedding.data_ptr())
                     except Exception:
@@ -2055,11 +2143,19 @@ class MMEncoder:
 
         # Per-request sockets remain for zmq_to_tokenizer and legacy direct
         # scheduler sends. Scheduler URL sends use persistent sockets above.
+        # A gone receiver would hold a payload-free ack's thread for the whole
+        # send timeout.
+        send_timeout = (
+            self.send_timeout
+            if buffer is not None or not self.dsv41_epd
+            else min(self.send_timeout, _ENCODER_ACK_SEND_TIMEOUT_S)
+        )
+
         def send_with_socket():
             sock = self.sync_context.socket(zmq.PUSH)
             config_socket(sock, zmq.PUSH)
             sock.setsockopt(zmq.IMMEDIATE, 1)
-            sock.setsockopt(zmq.SNDTIMEO, int(self.send_timeout * 1000))
+            sock.setsockopt(zmq.SNDTIMEO, int(send_timeout * 1000))
             try:
                 sock.connect(endpoint)
                 if buffer is not None:
@@ -2070,7 +2166,7 @@ class MMEncoder:
                     tracker = sock.send_multipart(
                         [serialized_data], copy=False, track=True
                     )
-                tracker.wait(timeout=self.send_timeout)
+                tracker.wait(timeout=send_timeout)
             finally:
                 sock.close(linger=5000)
 
@@ -2196,6 +2292,8 @@ class MMEncoder:
             if keep_on_gpu and mm_embedding.is_cuda:
                 torch.cuda.current_stream(mm_embedding.device).synchronize()
             self._stage_embedding_batch(staged_embeddings)
+            if self.dsv41_epd:
+                self.last_embedding_completed_at = time.monotonic()
             return results
         except BaseException:
             for mm_data in staged_embeddings:
@@ -2227,12 +2325,19 @@ class MMEncoder:
         return [(0, 0, 0, msg, code)] * len(requests)
 
     async def batch_encode(
-        self, requests: List[dict], modality: Modality
+        self,
+        requests: List[dict],
+        modality: Modality,
+        *,
+        compute_lock: Optional[asyncio.Lock] = None,
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
         """Encode requests through one fused pipeline; encode() is the N=1 case.
 
         Fuse-or-not is EncoderScheduler policy, not an API fork. Health probes
         bypass caches and stage on CPU so completion confirms a model forward.
+        ``compute_lock`` is held only around the forward and staging, so another
+        batch can preprocess meanwhile; callers with TP followers hold their own
+        lock around the whole call instead.
         """
         states = [self._acquire_encode_ref(req["req_id"]) for req in requests]
         is_health_check = all(
@@ -2250,23 +2355,93 @@ class MMEncoder:
                 use_global_cache=use_global_cache,
                 is_health_check=is_health_check,
             )
-            mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
+            self._cache_preprocess_meta(ctx, requests)
+            async with (
+                compute_lock if compute_lock is not None else contextlib.nullcontext()
+            ):
+                mm_embedding = await self._compute_embedding(
+                    ctx, keep_on_gpu=keep_on_gpu
+                )
 
-            if self.profiler is not None:
-                for _ in requests:
-                    self.profiler.step()
+                if self.profiler is not None:
+                    for _ in requests:
+                        self.profiler.step()
 
-            return self._stage_embeddings(
-                ctx, requests, mm_embedding, keep_on_gpu=keep_on_gpu
-            )
+                return self._stage_embeddings(
+                    ctx, requests, mm_embedding, keep_on_gpu=keep_on_gpu
+                )
         except Exception as e:
             return self._stage_errors(requests, modality, e)
         finally:
             for state in states:
                 await self._release_encode_ref(state)
 
+    def _cache_preprocess_meta(self, ctx: EncodeContext, requests: List[dict]) -> None:
+        if (
+            self.rank != 0
+            or ctx.is_health_check
+            or self.mm_meta_cache is None
+            or self.mm_meta_cache.capacity == 0
+        ):
+            return
+        # Leaves are read now: the pipeline drops a request's mm_items after encode.
+        leaves = batch_leaves(self.preprocessor, requests)
+        self._create_background_task(self._store_preprocess_meta(ctx, leaves))
+
+    async def _store_preprocess_meta(self, ctx: EncodeContext, leaves: List) -> None:
+        """Key and slice the batch off the event loop, then fill the cache on it."""
+        try:
+            entries = await asyncio.to_thread(
+                batch_meta_entries,
+                preprocessor=self.preprocessor,
+                model_type=self.model_type,
+                modality=ctx.modality,
+                leaves=leaves,
+                result=ctx.preprocess_result,
+                aux=ctx.aux_data,
+            )
+        except Exception:
+            logger.warning("Failed to cache preprocess meta", exc_info=True)
+            return
+        for key, meta in entries:
+            self.mm_meta_cache.put(key, meta)
+
+    async def preprocess_meta(self, request: dict) -> dict:
+        """Preprocess-only metadata for decode workers; no forward, no collective."""
+        modality = Modality.from_str(request["modality"])
+        if (
+            modality == Modality.VIDEO
+            and self.server_args.mm_enable_dp_encoder
+            and get_parallel().attn_tp_size > 1
+        ):
+            # Only this rank serves the request, so TP peers never join the
+            # sharded video decode's collective.
+            raise MMError(
+                "preprocess_meta does not support TP-sharded video decode",
+                code=HTTPStatus.NOT_IMPLEMENTED,
+            )
+        try:
+            return await compute_mm_meta(
+                preprocessor=self.preprocessor,
+                cache=self.mm_meta_cache,
+                model_type=self.model_type,
+                embedding_dim=self._embedding_dims[modality],
+                request=request,
+            )
+        except (OSError, TypeError, ValueError) as e:
+            # Match /encode's client-error semantics for unreadable media and
+            # invalid preprocess inputs (including HTTP download failures).
+            raise BadRequestError(f"Failed to preprocess mm metadata: {e}") from e
+
     async def encode(
-        self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
+        self,
+        mm_items,
+        modality: Modality,
+        req_id,
+        num_parts,
+        part_idx,
+        hashes=None,
+        compute_lock: Optional[asyncio.Lock] = None,
     ):
         """Encode one request: the batch-of-1 case of batch_encode."""
         results = await self.batch_encode(
@@ -2280,6 +2455,7 @@ class MMEncoder:
                 }
             ],
             modality,
+            compute_lock=compute_lock,
         )
         return results[0]
 

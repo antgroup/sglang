@@ -37,6 +37,7 @@ from sglang.kernels.ops.attention.dsv4.wo_a import (
     fused_rope_wo_a_bf16,
 )
 from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
+from sglang.kernels.ops.embeddings.vision_span import pack_vision_span
 from sglang.kernels.ops.gemm.dsv4_wo_a import (
     wo_a_bf16_gemv,
     wo_a_bf16_small_batch,
@@ -75,10 +76,12 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
+    cp_shard_hidden_states,
     is_cp_active,
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
@@ -124,7 +127,11 @@ from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    MM_PAD_SHIFT_VALUE,
+    Modality,
+    MultimodalInputs,
+)
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -215,10 +222,22 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     image_token_types,
     materialize_image_gpu,
 )
+from sglang.srt.multimodal.deepseek_v41_mm_inputs import (
+    VISION_WEIGHT_PREFIXES,
+    encoder_image_meta,
+    image_preprocess_pool,
+    iter_vision_weights,
+    prepare_encoder_images,
+    remap_vision_weight_name,
+    resolve_image_backend,
+    vision_weight_allow_patterns,
+)
+from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_forward,
+    get_model,
     get_parallel,
     get_platform,
 )
@@ -4005,6 +4024,8 @@ class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
     # Class-level default for instances built without running __init__.
     decoder_replay_tail: Optional[DecoderReplayTail] = None
+    # Set when prompts carry image tokens (DeepseekV4ForCausalLM.takes_image_inputs).
+    cp_image_token_id: Optional[int] = None
 
     def __init__(
         self,
@@ -4244,6 +4265,27 @@ class DeepseekV4Model(nn.Module):
                 "decoder SWA bounded replay tail misses prompt-logprob rows"
             )
 
+    def _late_layer_ids_global(
+        self, *, tail, tail_input_ids, input_ids_global, cp_extend: bool
+    ):
+        """Token ids of the late layers' MoE rows, for the routers that read them."""
+        if cp_extend and self.late_layer_vl_routing and get_moe_a2a_backend().is_none():
+            # The TP MoE gathers each CP rank's tail rows in rank order.
+            return attn_cp_interleave_gather(tail_input_ids)
+        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+            return input_ids_global
+        return tail.rows(input_ids_global)
+
+    def cp_vocab_ids(
+        self, ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """Prefill CP hands the body the scheduler's ids, whose image tokens are
+        pad hashes (prepare_language_model_inputs remaps them on the other
+        paths); Engram and the visual MoE routing read image_token_id."""
+        if self.cp_image_token_id is None or not is_cp_active(forward_batch):
+            return ids
+        return ids.masked_fill(ids >= MM_PAD_SHIFT_VALUE, self.cp_image_token_id)
+
     def _forward_layers_hc_pre_from_prev(
         self,
         positions: torch.Tensor,
@@ -4264,7 +4306,8 @@ class DeepseekV4Model(nn.Module):
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
                 hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
+                    self.cp_vocab_ids(forward_batch.input_ids[:total], forward_batch),
+                    forward_batch,
                 )
                 parallel = get_parallel()
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
@@ -4445,10 +4488,12 @@ class DeepseekV4Model(nn.Module):
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
                 input_ids = tail.rows(input_ids)
-                if not (
-                    get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
-                ):
-                    input_ids_global = tail.rows(input_ids_global)
+                input_ids_global = self._late_layer_ids_global(
+                    tail=tail,
+                    tail_input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    cp_extend=cp_extend,
+                )
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
@@ -4807,6 +4852,8 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
+        input_ids = self.cp_vocab_ids(input_ids, forward_batch)
+        input_ids_global = self.cp_vocab_ids(input_ids_global, forward_batch)
 
         capture_dspark = self.dspark_layers_to_capture is not None
         dspark_aux_hidden_states = (
@@ -5009,6 +5056,10 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
 
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
+    # EPD roles and image input, also read by subclasses that build no tower.
+    encoder_only = False
+    language_only = False
+    takes_image_inputs = False
 
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> Optional[WeightsMapper]:
@@ -5048,16 +5099,30 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
+        # ModelConfig sets the EPD roles; a bare checkpoint config has neither.
+        self.encoder_only = getattr(config, "encoder_only", False)
+        self.language_only = getattr(config, "language_only", False)
+        if (self.encoder_only or self.language_only) and not dsv41_sm90_on("epd"):
+            raise ValueError(
+                "DeepSeek-V4.1 encoder disaggregation needs SGLANG_OPT_DSV41_SM90 "
+                "on an SM90 GPU"
+            )
+        if self.encoder_only:
+            self._init_encoder_only(config)
+            return
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.wo_a_fp8_block32 = dsv41_attn_proj.wo_a_fp8_block32_enabled(quant_config)
         # The weight loader reads this after the build.
         self.num_fused_shared_experts = get_num_fused_shared_experts()
-        self.vision = None
-        if (
+        # Image tokens reach the language model from its own tower, or as the
+        # encoder's spans on a language-only (EPD) server, which builds no tower.
+        self.takes_image_inputs = (
             config.model_type == "deepseek_v41"
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
-        ):
+        )
+        self.vision = None
+        if self.takes_image_inputs and not self.language_only:
             if (
                 get_parallel().attn_cp_size != 1
                 or get_parallel().pp_group.world_size != 1
@@ -5071,15 +5136,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                     "MoE A2A requires CUDA MegaMoE"
                 )
 
-            args = SimpleNamespace(**vars(config), dim=config.hidden_size)
-            self.vision = ViT(args)
-            self.aligner = Aligner(args)
-            self.image_start = nn.Parameter(torch.empty(config.hidden_size))
-            self.image_end = nn.Parameter(torch.empty(config.hidden_size))
-            self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
+            self._init_vision(config)
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
+        if self.takes_image_inputs:
+            self.model.cp_image_token_id = config.image_token_id
         self.pp_group = get_parallel().pp_group
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
@@ -5125,6 +5187,40 @@ class DeepseekV4ForCausalLM(nn.Module):
         # its barrier must only run on the first (startup) load.
         self._mhc_prewarmed_at_load = False
         self._share_mhc_prewarm = dsv41_sm90_on("startup")
+
+    def _init_vision(self, config) -> None:
+        args = SimpleNamespace(**vars(config), dim=config.hidden_size)
+        self.vision = ViT(args)
+        self.aligner = Aligner(args)
+        self.image_start = nn.Parameter(torch.empty(config.hidden_size))
+        self.image_end = nn.Parameter(torch.empty(config.hidden_size))
+        self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
+
+    def _init_encoder_only(self, config) -> None:
+        """EPD encode server: the vision tower alone, no language model."""
+        if not (config.model_type == "deepseek_v41" and config.vision_n_layers > 0):
+            raise ValueError(
+                "--encoder-only needs a DeepSeek-V4.1 checkpoint with a vision tower"
+            )
+        self._init_vision(config)
+        self.encoder_image_backend, self.encoder_cpu_patchify = resolve_image_backend()
+        # The encode server runs this model's preprocessing off its event loop,
+        # the images of a batch concurrently on a pool of single-threaded workers.
+        self.encoder_media_processor_config = EncoderMediaProcessorConfig(
+            preprocess_off_event_loop=True
+        )
+        self.encoder_image_pool = image_preprocess_pool(
+            envs.SGLANG_ENCODER_PREPROC_WORKERS.get()
+        )
+        # DefaultModelLoader reads only the shards these patterns match.
+        self.allow_patterns_overrides = vision_weight_allow_patterns(
+            get_model().model_path
+        )
+        log_info_on_rank0(
+            logger,
+            f"DeepSeek-V4.1 encoder-only: image backend {self.encoder_image_backend}, "
+            f"weight shards {self.allow_patterns_overrides or 'all'}",
+        )
 
     @torch.inference_mode()
     def wants_prefill_autotune(self) -> bool:
@@ -5207,7 +5303,21 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
             features = self.aligner(self.vision(patches, h, w), h, w)
             r = self.config.vision_downsample_ratio
-            types = image_token_types((h + r - 1) // r, (w + r - 1) // r).to(device)
+            n_llm_h, n_llm_w = (h + r - 1) // r, (w + r - 1) // r
+            if self.vision.fused:
+                # One launch, bitwise the boolean-mask scatters below.
+                spans.append(
+                    pack_vision_span(
+                        features.to(dtype),
+                        self.image_start,
+                        self.image_newline,
+                        self.image_end,
+                        n_llm_h,
+                        n_llm_w,
+                    )
+                )
+                continue
+            types = image_token_types(n_llm_h, n_llm_w).to(device)
             span = torch.empty(
                 (len(types), self.config.hidden_size), device=device, dtype=dtype
             )
@@ -5216,7 +5326,27 @@ class DeepseekV4ForCausalLM(nn.Module):
             span[types == 2] = self.image_newline
             span[types == 3] = self.image_end
             spans.append(span)
-        return spans
+        # The encode server slices one [rows, hidden] tensor by its token counts.
+        return torch.cat(spans) if self.encoder_only else spans
+
+    def preprocess_mm_for_encoder(self, mm_data, modality, config):
+        """Encode-server preprocessing into the local V4.1 processor's items."""
+        if modality != Modality.IMAGE:
+            raise ValueError("DeepSeek-V4.1 encoder mode supports image input only")
+        return prepare_encoder_images(
+            mm_data,
+            hf_config=self.config,
+            backend=self.encoder_image_backend,
+            cpu_patchify=self.encoder_cpu_patchify,
+            executor=self.encoder_image_pool,
+        )
+
+    def preprocess_mm_meta_for_encoder(self, mm_data, modality, config):
+        """/preprocess_meta: preprocess_mm_for_encoder's grids and token counts
+        from the image headers (raw bytes), without decoding."""
+        if modality != Modality.IMAGE:
+            raise ValueError("DeepSeek-V4.1 encoder mode supports image input only")
+        return encoder_image_meta(mm_data, hf_config=self.config)
 
     def _prepare_mm_embeddings(self, input_ids, forward_batch):
         # Keep scheduler hash IDs intact: the shared embedder clamps its input in place.
@@ -5286,9 +5416,23 @@ class DeepseekV4ForCausalLM(nn.Module):
     ) -> Optional[torch.Tensor]:
         """This CP rank's shard of the chunk's input embedding, built without
         embedding the whole chunk; None: embed the chunk and shard it."""
+        if self._embeds_prompt_images(forward_batch):
+            # Only a language-only (EPD) prefill runs images under CP; the
+            # encoder's spans land on the whole chunk before it is sharded.
+            input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
+            return cp_shard_hidden_states(input_embeds, forward_batch)
         if not self.cp_embed_scatter:
             return None
         return cp_shard_input_embeds(self.model.embed_tokens, input_ids, forward_batch)
+
+    def _embeds_prompt_images(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            self.takes_image_inputs
+            and not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_target_verify()
+            and forward_batch.mm_inputs is not None
+            and any(x is not None for x in forward_batch.mm_inputs)
+        )
 
     def prepare_language_model_inputs(
         self,
@@ -5301,17 +5445,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         Scheduler hash IDs stay intact for multimodal cache keys; the language
         model uses image_token_id for Engram masking and visual MoE routing.
         """
-        if (
-            getattr(self, "vision", None) is not None
-            and not forward_batch.forward_mode.is_decode()
-            and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.mm_inputs is not None
-            and any(x is not None for x in forward_batch.mm_inputs)
-        ):
+        if self._embeds_prompt_images(forward_batch):
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if getattr(self, "vision", None) is not None and not (
+        if self.takes_image_inputs and not (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
         ):
@@ -5561,18 +5699,29 @@ class DeepseekV4ForCausalLM(nn.Module):
                     build_mega_moe_shared_weights(module.shared_experts)
                 )
 
+    @torch.no_grad()
+    def _prewarm_vision_kernels(self) -> None:
+        """Compile the fused ViT and span kernels before the first image arrives."""
+        self.vision.prewarm_fused_kernels()
+        # The span kernel specializes on the hidden size and dtype only.
+        features = torch.zeros(
+            (4, self.config.hidden_size),
+            device=self.image_start.device,
+            dtype=self.image_start.dtype,
+        )
+        pack_vision_span(
+            features, self.image_start, self.image_newline, self.image_end, 2, 2
+        )
+        torch.cuda.synchronize(self.image_start.device)
+
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
         name: str,
         is_nextn: bool = False,
         num_hidden_layers: Optional[int] = None,
     ) -> str:
-        if name.startswith("vision."):
-            return name.replace(".attn.wqkv.", ".attn.qkv_proj.").replace(
-                ".attn.wo.", ".attn.proj."
-            )
-        if name.startswith(("aligner.", "image_")):
-            return name
+        if name.startswith(VISION_WEIGHT_PREFIXES):
+            return remap_vision_weight_name(name)
         if name.startswith("embed."):
             return "model.embed_tokens." + name.removeprefix("embed.")
         if name.startswith("head."):
@@ -5745,6 +5894,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        if self.encoder_only:
+            self._load_encoder_only_weights(weights)
+            return
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -5855,10 +6007,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                     if not is_dsv41:
                         pass
                     elif self.vision is None and name.startswith(
-                        ("vision.", "aligner.", "image_")
+                        VISION_WEIGHT_PREFIXES
                     ):
                         skip_group = "vision"
-                    elif self.vision is None and name.endswith(
+                    elif not self.takes_image_inputs and name.endswith(
                         ".gate.e_score_correction_bias_vl"
                     ):
                         skip_group = "gate.bias_vl"
@@ -6152,6 +6304,22 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")
             self._prewarm_mhc_kernels()
+
+    def _load_encoder_only_weights(self, weights) -> None:
+        params_dict = dict(self.named_parameters())
+        loaded: Set[str] = set()
+        for name, loaded_weight in iter_vision_weights(weights):
+            if name not in params_dict:
+                raise ValueError(f"Unexpected vision checkpoint tensor {name}")
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded.add(name)
+        missing = sorted(params_dict.keys() - loaded)
+        if missing:
+            raise ValueError(f"Checkpoint lacks vision weights: {missing}")
+        if self.vision.fused:
+            self._prewarm_vision_kernels()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

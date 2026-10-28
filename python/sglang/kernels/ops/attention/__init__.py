@@ -393,6 +393,14 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="attention.vision_qk_rope_half",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.vision_rope_half:vision_qk_rope_half",
+        capabilities=CUDA_ONLY,
+    )
+)
 
 register_kernel(
     KernelSpec(

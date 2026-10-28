@@ -62,13 +62,18 @@ from sglang.srt.beam_search.output import (
 )
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
+from sglang.srt.disaggregation.encoder.receiver import (
+    create_mm_receiver,
+    epd_decode_uses_meta_only,
+    epd_meta_covers_request,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
     parse_decision_layout,
@@ -810,6 +815,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Encoder Disaggregation
         self.encoder_bootstrap_server = None
+        # Set only on a multi-tokenizer worker, whose registry the router owns.
+        self.encoder_registry_ready: Optional[asyncio.Event] = None
+        self.epd_decode_meta_only = False
         if get_disagg().language_only:
             from sglang.srt.disaggregation.encoder.receiver import (
                 EncoderBootstrapServer,
@@ -820,16 +828,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # list.  Pre-populated with static --encoder-urls so the legacy
             # CLI flag still works (alongside dynamic registrations).
             self.encoder_urls: List[str] = list(get_disagg().encoder_urls)
-            self.encoder_bootstrap_server = EncoderBootstrapServer(
-                host=get_serving().host,
-                port=get_disagg().encoder_bootstrap_port,
-                urls=self.encoder_urls,
-            )
+            if start_pd_bootstrap_service or not dsv41_sm90_on("epd"):
+                self.encoder_bootstrap_server = EncoderBootstrapServer(
+                    host=get_serving().host,
+                    port=get_disagg().encoder_bootstrap_port,
+                    urls=self.encoder_urls,
+                )
+            else:
+                # MultiTokenizerRouter binds the registration port and sends
+                # versioned snapshots over the result IPC.
+                self.encoder_registry_ready = asyncio.Event()
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
                 hf_config=self.model_config.hf_config,
                 encode_urls=self.encoder_urls,
+            )
+            self.epd_decode_meta_only = epd_decode_uses_meta_only(
+                get_disagg(), self.mm_receiver
             )
 
     def init_metric_collector_watchdog(self):
@@ -930,6 +946,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         try:
             if get_disagg().language_only:
+                await self._wait_for_encoder_registry(obj)
                 self._handle_epd_disaggregation_encode_request(obj)
 
             # Log the request
@@ -1212,15 +1229,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 in ["zmq_to_scheduler", "mooncake"]
                 and not obj.need_wait_for_mm_inputs
             ):
-                # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
-                # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs = await self.mm_processor.process_mm_data_async(
-                    image_data=obj.image_data,
-                    audio_data=obj.audio_data,
-                    input_text=mm_processor_input,
-                    request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
-                )
+                if self._epd_fetches_meta(obj) and self._epd_should_dispatch(obj):
+                    mm_inputs = await self._fetch_epd_decode_mm_inputs(
+                        obj, mm_processor_input
+                    )
+                if mm_inputs is None and not obj.need_wait_for_mm_inputs:
+                    # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
+                    # to encoder (e.g., only one image), process locally like non-language_only mode
+                    mm_inputs = await self.mm_processor.process_mm_data_async(
+                        image_data=obj.image_data,
+                        audio_data=obj.audio_data,
+                        input_text=mm_processor_input,
+                        request_obj=obj,
+                        max_req_input_len=self.max_req_input_len,
+                    )
 
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids
@@ -1620,6 +1642,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
+                encoder_req_id=obj.encoder_req_id,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
@@ -2447,10 +2470,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
-            rids = [obj.rid] if obj.is_single else obj.rid
-            for rid in rids:
-                if rid in self.rid_to_state:
-                    self.abort_request(rid)
+            owners = [obj] if obj.is_single else [obj[i] for i in range(len(obj.rid))]
+            for owner in owners:
+                state = self.rid_to_state.get(owner.rid)
+                # A finished stream's delayed cleanup can run after the client
+                # reused its rid: cancel only this handler's own request.
+                if state is not None and state.obj is owner:
+                    self.abort_request(owner.rid)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
@@ -3893,7 +3919,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 dispatch_ready.set()
 
     def _forward_encoder_dispatch_error(self, error: EncoderDispatchErrorReq) -> None:
-        if error.rid in self.rid_to_state:
+        state = self.rid_to_state.get(error.rid)
+        # A reused rid's new request must not take its predecessor's error.
+        if state is not None and (
+            error.encoder_req_id is None
+            or error.encoder_req_id == state.obj.encoder_req_id
+        ):
             self._dispatch_to_scheduler(error)
 
     def _schedule_encoder_dispatch_error(self, error: EncoderDispatchErrorReq) -> None:
@@ -3926,37 +3957,94 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         return total_mm_items >= envs.SGLANG_ENCODER_DISPATCH_MIN_ITEMS.get()
 
+    def _epd_should_dispatch(self, obj: GenerateReqInput) -> bool:
+        if get_disagg().enable_adaptive_dispatch_to_encoder:
+            return self._should_dispatch_to_encoder(obj)
+        return True
+
+    def _epd_fetches_meta(self, obj: GenerateReqInput) -> bool:
+        return self.epd_decode_meta_only and epd_meta_covers_request(obj)
+
+    async def _fetch_epd_decode_mm_inputs(self, obj: GenerateReqInput, prompt):
+        """Rebuild decode mm_inputs from encoder metadata; when that fails,
+        dispatch the encode so the layout still comes from the encoder that
+        prefill used, never from tokenizer-local preprocessing."""
+        mm_inputs = await self.mm_receiver.fetch_mm_meta_inputs(
+            request_obj=obj,
+            mm_processor=self.mm_processor,
+            prompt=prompt,
+        )
+        if mm_inputs is None:
+            logger.warning(
+                "Encoder preprocess meta not available for %s, "
+                "dispatching the encode instead",
+                obj.rid,
+            )
+            self._dispatch_epd_encode(obj)
+        return mm_inputs
+
+    def _dispatch_epd_encode(self, obj: GenerateReqInput) -> None:
+        obj.need_wait_for_mm_inputs = True
+        if get_disagg().encoder_transfer_backend not in [
+            "zmq_to_scheduler",
+            "mooncake",
+        ]:
+            return
+        time_stats_json = None
+        if self.enable_trace:
+            state = self.rid_to_state.get(obj.rid)
+            if state is not None:
+                time_stats_json = state.time_stats.encode_json()
+
+        dispatch_ready = self.mm_receiver.send_encode_request(
+            obj,
+            time_stats_json=time_stats_json,
+            on_dispatch_error=self._schedule_encoder_dispatch_error,
+        )
+        if dispatch_ready is not None:
+            self.encoder_dispatch_ready[obj.rid] = dispatch_ready
+        elif self.mm_receiver.dsv41_epd:
+            # No encoder is registered (none yet, or all evicted). A V4.1
+            # language-only server builds no vision tower: processing the
+            # images locally failed the scheduler and took the server down.
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail="No encoder is available for this multimodal request.",
+            )
+
+    async def _wait_for_encoder_registry(self, obj) -> None:
+        """A worker's first multimodal request waits for the router's first
+        encoder snapshot instead of reading an empty registry."""
+        if (
+            self.encoder_registry_ready is not None
+            and not self.encoder_registry_ready.is_set()
+            and isinstance(obj, GenerateReqInput)
+            and obj.contains_mm_input()
+            and self._epd_should_dispatch(obj)
+        ):
+            try:
+                await asyncio.wait_for(self.encoder_registry_ready.wait(), timeout=10)
+            except asyncio.TimeoutError as exc:
+                raise fastapi.HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail="The encoder registry has not reached this tokenizer worker.",
+                ) from exc
+
     def _handle_epd_disaggregation_encode_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ):
         """Handle EPD-disaggregation mode encoding request."""
         if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
-            # dispatch to encoder by default
-            should_dispatch = True
-            if get_disagg().enable_adaptive_dispatch_to_encoder:
-                should_dispatch = self._should_dispatch_to_encoder(obj)
+            should_dispatch = self._epd_should_dispatch(obj)
 
             # Set need_wait_for_mm_inputs flag based on whether we dispatch to encoder
             # This flag will be used in _tokenize_one_request to determine processing path
-            if should_dispatch:
-                obj.need_wait_for_mm_inputs = True
-                if get_disagg().encoder_transfer_backend in [
-                    "zmq_to_scheduler",
-                    "mooncake",
-                ]:
-                    time_stats_json = None
-                    if self.enable_trace:
-                        state = self.rid_to_state.get(obj.rid)
-                        if state is not None:
-                            time_stats_json = state.time_stats.encode_json()
-
-                    dispatch_ready = self.mm_receiver.send_encode_request(
-                        obj,
-                        time_stats_json=time_stats_json,
-                        on_dispatch_error=self._schedule_encoder_dispatch_error,
-                    )
-                    if dispatch_ready is not None:
-                        self.encoder_dispatch_ready[obj.rid] = dispatch_ready
+            if should_dispatch and self._epd_fetches_meta(obj):
+                # Decode fetches preprocess metadata in _tokenize_one_request
+                # and dispatches the encode there only if that fails.
+                obj.need_wait_for_mm_inputs = False
+            elif should_dispatch:
+                self._dispatch_epd_encode(obj)
             else:
                 obj.need_wait_for_mm_inputs = False
 

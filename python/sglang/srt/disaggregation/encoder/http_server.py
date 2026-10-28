@@ -22,8 +22,10 @@ import uvicorn
 import zmq
 from fastapi import Body, FastAPI
 from fastapi.responses import ORJSONResponse, Response
+from fastapi.routing import APIRoute
 
 import sglang.srt.disaggregation.encoder.server as server_module
+from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.runtime import (
     DPDispatcher,
@@ -40,6 +42,8 @@ from sglang.srt.disaggregation.encoder.server import (
     MMEncoder,
     MMError,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on, initialize_dsv41_sm90
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -65,6 +69,16 @@ from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 logger = logging.getLogger(__name__)
 
 HEALTH_CHECK_TIMEOUT = 30
+
+# Registration lives in each bootstrap's memory; a prefill/decode restart,
+# or a bootstrap opened after the startup retries, needs encoder re-registration.
+# The refresh interval is arbitrary.
+_REGISTER_REFRESH_INTERVAL_S = 30.0
+
+# Above aiohttp's 15 s client keep-alive, so clients always drop an idle
+# connection first: a server-side close racing a client's reuse resets the
+# request, and a starved event loop makes uvicorn's 5 s default fire early.
+HTTP_KEEP_ALIVE_S = 75
 
 # Minimal 32x32 black PNG for health check dummy encode
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
@@ -150,6 +164,40 @@ def _register_encoder_url_with_bootstrap():
             logger.debug(f"Register attempt to {bootstrap_url} failed: {e}")
         return False
 
+    def _listed_by(bootstrap_url: str) -> Optional[bool]:
+        # None: the bootstrap did not answer (down, restarting, not open yet).
+        try:
+            resp = http_requests.get(
+                f"{bootstrap_url}/list_encoder_urls", timeout=request_timeout
+            )
+            if resp.status_code == 200:
+                return encoder_url in resp.json().get("encoder_urls", [])
+        except Exception as e:
+            logger.debug(f"List encoders at {bootstrap_url} failed: {e}")
+        return None
+
+    def _healthy() -> bool:
+        # The bootstrap health check's probe: an encoder it evicted as
+        # unhealthy is not pushed back in by its own refresh.
+        try:
+            resp = http_requests.get(f"{encoder_url}/health", timeout=request_timeout)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def _refresh_once() -> None:
+        missing = [url for url in bootstrap_urls if _listed_by(url) is False]
+        if not missing or not _healthy():
+            return
+        for bootstrap_url in missing:
+            if _try_register_once(bootstrap_url):
+                logger.info(
+                    f"Re-registered encoder URL '{encoder_url}' with {bootstrap_url}, "
+                    "which did not list it (restarted or started after this encoder)."
+                )
+
+    refresh_registration = dsv41_sm90_on("epd")
+
     def _worker():
         pending = list(bootstrap_urls)
         retry_count = {url: 0 for url in pending}
@@ -160,16 +208,29 @@ def _register_encoder_url_with_bootstrap():
                     continue
                 retry_count[bootstrap_url] += 1
                 if retry_count[bootstrap_url] >= max_retries:
-                    logger.error(
-                        f"Giving up on bootstrap {bootstrap_url} after "
-                        f"{max_retries} attempts. Encoder discovery via this "
-                        f"bootstrap will be incomplete."
-                    )
+                    if refresh_registration:
+                        logger.error(
+                            f"Giving up on bootstrap {bootstrap_url} after "
+                            f"{max_retries} attempts; retrying every "
+                            f"{_REGISTER_REFRESH_INTERVAL_S:.0f} s."
+                        )
+                    else:
+                        logger.error(
+                            f"Giving up on bootstrap {bootstrap_url} after "
+                            f"{max_retries} attempts. Encoder discovery via this "
+                            f"bootstrap will be incomplete."
+                        )
                     continue
                 still_pending.append(bootstrap_url)
             pending = still_pending
             if pending:
                 time.sleep(retry_interval)
+        while refresh_registration:
+            time.sleep(_REGISTER_REFRESH_INTERVAL_S)
+            try:
+                _refresh_once()
+            except Exception as e:
+                logger.warning(f"Encoder registration refresh failed: {e}")
 
     threading.Thread(
         target=_worker, daemon=True, name="encoder-bootstrap-register"
@@ -210,6 +271,24 @@ def launch_server(server_args: ServerArgs):
 
     configure_logger(server_args, prefix=" encode_server")
     publish(server_args, role="encoder")
+    # DP workers initialize their own flags, not this HTTP process's. Resolve
+    # here too; an opt-out restart clears old flags without reading the model.
+    initialize_dsv41_sm90(
+        model_config=(
+            model_config_of(server_args) if envs.SGLANG_OPT_DSV41_SM90.get() else None
+        )
+    )
+    app.router.routes[:] = [
+        route
+        for route in app.router.routes
+        if not (
+            isinstance(route, APIRoute)
+            and route.endpoint is handle_preprocess_meta_request
+        )
+    ]
+    app.openapi_schema = None
+    if dsv41_sm90_on("epd"):
+        app.post("/preprocess_meta")(handle_preprocess_meta_request)
     if get_parallel().num_dp_ranks > 1:
         dp_dispatcher = launch_dp_runtime(server_args)
         # runtime initializes multiprocess metrics before spawning;
@@ -233,7 +312,15 @@ def launch_server(server_args: ServerArgs):
         _register_encoder_url_with_bootstrap()
         atexit.register(_unregister_encoder_url_from_bootstrap)
 
-    uvicorn.run(app, host=get_serving().host, port=get_serving().port)
+    http_options = (
+        {"timeout_keep_alive": HTTP_KEEP_ALIVE_S} if dsv41_sm90_on("epd") else {}
+    )
+    uvicorn.run(
+        app,
+        host=get_serving().host,
+        port=get_serving().port,
+        **http_options,
+    )
 
 
 def _summarise_dp_broadcast(results: List[dict]) -> Response:
@@ -377,6 +464,45 @@ async def handle_encode_request(request: dict):
                 "req_id": req_id,
             },
         )
+
+
+def _error_response(status_code, message: str, req_id: str) -> ORJSONResponse:
+    return ORJSONResponse(
+        status_code=int(status_code),
+        content={"status": "error", "message": message, "req_id": req_id},
+    )
+
+
+async def handle_preprocess_meta_request(request: dict):
+    """Preprocess-only metadata (grids, token counts, hashes, aux) for EPD
+    decode workers, which never consume the embedding itself."""
+    req_id = request["req_id"]
+    if dp_dispatcher is not None:
+        try:
+            result = await dp_dispatcher.dispatch(
+                {**request, "_dp_type": "preprocess_meta"}
+            )
+        except MMError as e:
+            return _error_response(e.code, str(e), req_id)
+        if result.get("_error"):
+            status_code = result.get("_error_code") or (
+                HTTPStatus.BAD_REQUEST
+                if result.get("_error_type") == "ValueError"
+                else HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+            return _error_response(status_code, result["_error"], req_id)
+        return ORJSONResponse(content=result.get("content"))
+    if encoder is None:
+        return _error_response(
+            HTTPStatus.SERVICE_UNAVAILABLE, "encoder not ready", req_id
+        )
+    try:
+        return ORJSONResponse(content=await encoder.preprocess_meta(request))
+    except MMError as e:
+        return _error_response(e.code, str(e), req_id)
+    except Exception as e:
+        logger.error(f"Unexpected error in preprocess_meta for {req_id}: {e}")
+        return _error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), req_id)
 
 
 @app.post("/send")
@@ -579,6 +705,16 @@ async def health_generate():
         modality = Modality.AUDIO
     else:
         # No processor available, fall back to liveness check only
+        return Response(status_code=200)
+
+    # The dispatch lock spans V4.1 forwards; only recent completion can bypass it.
+    if (
+        encoder.dsv41_epd
+        and encoder.has_pending_embeddings()
+        and encoder.last_embedding_completed_at is not None
+        and time.monotonic() - encoder.last_embedding_completed_at
+        < HEALTH_CHECK_TIMEOUT
+    ):
         return Response(status_code=200)
 
     # uuid keeps rids unique across workers; a bare time.time() can collide.

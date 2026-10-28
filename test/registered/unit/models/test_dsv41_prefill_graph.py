@@ -135,6 +135,7 @@ def _model(log, late, runner):
     m.decoder_replay_tail = None
     m.engram_hasher = lambda ids, fb: torch.stack([ids * 3 + 1, ids * 5 + 2], dim=-1)
     m.prefill_graph = runner
+    m.late_layer_vl_routing = False
     return m
 
 

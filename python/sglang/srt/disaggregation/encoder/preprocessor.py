@@ -7,6 +7,7 @@ GPU tensor operations remain in :mod:`server.MMEncoder`.
 """
 
 import asyncio
+import base64
 import concurrent.futures
 import functools
 import logging
@@ -19,12 +20,16 @@ import torch
 from transformers import AutoProcessor
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.encoder.receiver import video_meta_attrs_for
+from sglang.srt.disaggregation.encoder.request_image_cache import RequestImageCache
 from sglang.srt.environ import envs
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderMediaProcessorConfig,
     EncoderPreprocessOutput,
+    get_encoder_preprocessed_token_counts,
     invoke_encoder_preprocessor,
 )
 from sglang.srt.multimodal.processors.glm4v import (
@@ -94,6 +99,59 @@ def _get_original_image_size(image):
     raise TypeError(f"Cannot determine original image size from {type(image)}")
 
 
+def _normalize_aux_value(val):
+    """Normalize aux values to pickle types compatible with safe_pickle_loads.
+
+    HF multimodal processors (e.g. Qwen3-VL/Omni) emit numpy arrays for
+    fields like ``video_timestamps`` / ``second_per_grid_ts``. ``numpy.*`` is
+    not in SafeUnpickler's allowlist, so the receiver would refuse to load
+    those payloads. Convert numpy values to torch tensors (numeric) or plain
+    Python lists (object dtype) before pickling.
+    """
+    if val is None:
+        return None
+    if isinstance(val, np.ndarray):
+        if val.dtype == object:
+            return val.tolist()
+        return torch.from_numpy(np.ascontiguousarray(val))
+    if isinstance(val, np.generic):
+        return val.item()
+    if isinstance(val, (list, tuple)):
+        return type(val)(_normalize_aux_value(v) for v in val)
+    if isinstance(val, dict):
+        return {k: _normalize_aux_value(v) for k, v in val.items()}
+    return val
+
+
+def _build_mm_aux_data(mm_inputs, model_type=None):
+    # Video aux metadata, scoped to model_type's video-meta attrs.
+    aux = {
+        attr: _normalize_aux_value(mm_inputs.get(attr))
+        for attr in video_meta_attrs_for(model_type)
+    }
+    if model_type == "kimi_k3":
+        aux["original_image_sizes"] = _normalize_aux_value(
+            mm_inputs.get("original_image_sizes")
+        )
+    return aux
+
+
+def _inline_image_bytes(item) -> Optional[bytes]:
+    """Raw bytes of an inline image item (data URL or snapshot bytes), else None."""
+    url = item.get("url") if isinstance(item, dict) else item
+    if isinstance(url, (bytes, bytearray)):
+        return bytes(url)
+    if isinstance(url, str) and url.startswith("data:"):
+        header, _, payload = url.partition(",")
+        return base64.b64decode(payload) if ";base64" in header else None
+    return None
+
+
+# P's /encode and D's /preprocess_meta share URL images of one PD bootstrap attempt;
+# the 60 s retention is arbitrary.
+_REQUEST_IMAGE_CACHE_BYTES = 256 * 1024 * 1024
+
+
 @dataclass
 class EncoderPreprocessResult:
     mm_inputs: dict
@@ -120,16 +178,24 @@ class EncoderPreprocessor:
         modality.
     """
 
+    # Class defaults for instances built without __init__ (tests); see __init__.
+    _model_meta_preprocessor: Optional[Callable] = None
+    request_image_cache: Optional[RequestImageCache] = None
+
     def __init__(
         self,
         server_args: ServerArgs,
         model_config: ModelConfig,
         encoder_media_processor_config: EncoderMediaProcessorConfig,
         model_preprocessor: Optional[Callable] = None,
+        model_meta_preprocessor: Optional[Callable] = None,
     ):
         self.server_args = server_args
         self.model_config = model_config
         self._model_preprocessor = model_preprocessor
+        # Header-only image metadata for /preprocess_meta (model hook
+        # ``preprocess_mm_meta_for_encoder``); None runs the full preprocessing.
+        self._model_meta_preprocessor = model_meta_preprocessor
         self.encoder_media_processor_config = encoder_media_processor_config
         self.model_type = getattr(
             model_config.hf_config, "model_type", "unknown"
@@ -159,6 +225,11 @@ class EncoderPreprocessor:
 
         self.preproc_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=envs.SGLANG_ENCODER_PREPROC_WORKERS.get()
+        )
+        self.request_image_cache = (
+            RequestImageCache(_REQUEST_IMAGE_CACHE_BYTES)
+            if dsv41_sm90_on("epd")
+            else None
         )
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=envs.SGLANG_ENCODER_MM_LOAD_WORKERS.get()
@@ -302,6 +373,12 @@ class EncoderPreprocessor:
     # Media I/O
     # ------------------------------------------------------------------
 
+    def snapshot_request_image(self, data, scope=None):
+        """I/O-thread entry shared by encode and metadata-only preprocessing."""
+        if self.request_image_cache is None:
+            return snapshot_media(data)
+        return self.request_image_cache.get(scope, data, snapshot_media)
+
     def _load_single_item(
         self,
         data,
@@ -313,17 +390,26 @@ class EncoderPreprocessor:
 
         media_metadata = {}
         content_hash = None
+        request_scope = None
         if isinstance(data, dict):
             if "url" not in data:
                 return data
             media_metadata = {key: value for key, value in data.items() if key != "url"}
+            if self.request_image_cache is not None:
+                request_scope = media_metadata.pop("_request_image_scope", None)
             content_hash = parse_content_hash(data.get("content_hash"))
             data = data["url"]
         try:
             if modality == Modality.IMAGE:
-                if content_hash is not None:
-                    snapshot = snapshot_media(data)
-                    if snapshot.content_digest != content_hash:
+                if content_hash is not None or (
+                    self.request_image_cache is not None
+                    and RequestImageCache.eligible(request_scope, data)
+                ):
+                    snapshot = self.snapshot_request_image(data, request_scope)
+                    if (
+                        content_hash is not None
+                        and snapshot.content_digest != content_hash
+                    ):
                         raise BadRequestError(
                             "Encoder media content hash mismatch: "
                             f"expected {content_hash}, got {snapshot.content_digest}"
@@ -663,11 +749,42 @@ class EncoderPreprocessor:
         else:
             raise ValueError(f"Unsupported modality: {modality}")
         grid_thw = self._get_mm_grid_dim(mm_inputs, modality)
-        token_counts = [self.get_num_tokens(grid, modality) for grid in grid_thw]
+        token_counts = get_encoder_preprocessed_token_counts(mm_inputs)
+        if token_counts is None:
+            token_counts = [self.get_num_tokens(grid, modality) for grid in grid_thw]
         return EncoderPreprocessResult(
             mm_inputs=mm_inputs,
             grid_thw=grid_thw,
             token_counts=token_counts,
+        )
+
+    async def process_mm_items_meta(
+        self, mm_items, modality: Modality
+    ) -> EncoderPreprocessResult:
+        """process_mm_items for metadata consumers: the model's header-only hook
+        gives the same grids and token counts without decoding or resizing;
+        items it cannot read inline fall back to the full preprocessing."""
+        payloads = (
+            [_inline_image_bytes(item) for item in mm_items]
+            if modality == Modality.IMAGE and self._model_meta_preprocessor is not None
+            else None
+        )
+        if payloads is None or any(p is None for p in payloads):
+            return await self.process_mm_items(mm_items, modality)
+        mm_inputs = await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(
+                invoke_encoder_preprocessor,
+                self._model_meta_preprocessor,
+                payloads,
+                modality,
+                self.vision_config,
+            ),
+        )
+        return EncoderPreprocessResult(
+            mm_inputs=mm_inputs,
+            grid_thw=self._get_mm_grid_dim(mm_inputs, modality),
+            token_counts=get_encoder_preprocessed_token_counts(mm_inputs),
         )
 
     def supports_modality(self, modality: Modality) -> bool:

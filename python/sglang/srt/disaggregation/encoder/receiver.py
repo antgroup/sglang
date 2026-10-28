@@ -1,6 +1,9 @@
 import asyncio
+import hashlib
 import itertools
+import json
 import logging
+import math
 import random
 import threading
 import time
@@ -12,7 +15,16 @@ from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
 from enum import IntEnum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import aiohttp
 import numpy as np
@@ -21,19 +33,20 @@ import uvicorn
 import zmq
 import zmq.asyncio
 from aiohttp import ClientSession, ClientTimeout
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.managers.io_struct import (
     EncoderDispatchErrorReq,
     GenerateReqInput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.schedule_batch import Modality, Req
+from sglang.srt.managers.schedule_batch import Modality, MultimodalInputs, Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
@@ -119,12 +132,17 @@ class EncoderBootstrapServer:
         health_check_interval: Optional[float] = None,
         health_check_timeout: Optional[float] = None,
         evicted_ttl: Optional[float] = None,
+        on_change: Optional[Callable[[int, List[str]], None]] = None,
     ):
 
         self.host = host
         self.port = port
         self._urls: List[str] = urls if urls is not None else []
         self._lock = threading.Lock()
+        # Bumped on every change of the URL set; on_change receives (version,
+        # urls) outside the lock, so subscribers drop out-of-order snapshots.
+        self._version = 0
+        self._on_change = on_change
         self._server: Optional[uvicorn.Server] = None  # set in _run_server
         self._health_check_interval = (
             health_check_interval
@@ -212,10 +230,13 @@ class EncoderBootstrapServer:
             self._evicted_urls.pop(url, None)
             if url not in self._urls:
                 self._urls.append(url)
-                logger.info(f"Registered encoder URL: {url}")
-                return True
-            logger.debug(f"Encoder URL already registered: {url}")
-            return False
+                snapshot = self._changed_snapshot_locked()
+            else:
+                logger.debug(f"Encoder URL already registered: {url}")
+                return False
+        self._notify_change(snapshot)
+        logger.info(f"Registered encoder URL: {url}")
+        return True
 
     def unregister(self, url: str) -> bool:
         """Remove *url* if present.  Returns True if removed.
@@ -229,9 +250,26 @@ class EncoderBootstrapServer:
                 self._urls.remove(url)
             self._evicted_urls.pop(url, None)
             self._health_fail_counts.pop(url, None)
-            if removed:
-                logger.info(f"Unregistered encoder URL: {url}")
-            return removed
+            snapshot = self._changed_snapshot_locked() if removed else None
+        if removed:
+            self._notify_change(snapshot)
+            logger.info(f"Unregistered encoder URL: {url}")
+        return removed
+
+    def snapshot(self) -> Tuple[int, List[str]]:
+        """Version and URLs read together, for a subscriber that joins late."""
+        with self._lock:
+            return self._version, list(self._urls)
+
+    def _changed_snapshot_locked(self) -> Optional[Tuple[int, List[str]]]:
+        if self._on_change is None:
+            return None
+        self._version += 1
+        return self._version, list(self._urls)
+
+    def _notify_change(self, snapshot: Optional[Tuple[int, List[str]]]) -> None:
+        if snapshot is not None and self._on_change is not None:
+            self._on_change(*snapshot)
 
     def list_urls(self) -> List[str]:
         """Return a snapshot of all registered encoder URLs."""
@@ -294,6 +332,10 @@ class EncoderBootstrapServer:
                 evicted, revived = [], []
                 with self._lock:
                     for url, ok in zip(candidates, results):
+                        # An unregister during the probe must not let its
+                        # result put the URL back.
+                        if url not in self._urls and url not in self._evicted_urls:
+                            continue
                         if ok is True:
                             self._health_fail_counts.pop(url, None)
                             if url in self._evicted_urls:
@@ -312,6 +354,11 @@ class EncoderBootstrapServer:
                                 self._evicted_urls[url] = now
                                 self._health_fail_counts.pop(url, None)
                                 evicted.append(url)
+                    snapshot = (
+                        self._changed_snapshot_locked() if evicted or revived else None
+                    )
+                if snapshot is not None:
+                    self._notify_change(snapshot)
                 if revived:
                     logger.info(
                         f"Health check revived {len(revived)} encoder(s): {revived}"
@@ -778,6 +825,81 @@ def _aggregate_embedding_part(current, recv_obj, model_type):
     return current
 
 
+def epd_decode_uses_meta_only(disagg, mm_receiver: "MMReceiverBase") -> bool:
+    """A language-only decode worker never embeds multimodal tokens, so it
+    asks the encoder for preprocess metadata instead of the embedding."""
+    return (
+        mm_receiver.dsv41_epd
+        and mm_receiver.serves_preprocess_meta
+        and disagg.language_only
+        and disagg.disaggregation_mode == "decode"
+        and disagg.encoder_transfer_backend in ("zmq_to_scheduler", "mooncake")
+    )
+
+
+def epd_meta_covers_request(request_obj) -> bool:
+    """Whether preprocess metadata alone can rebuild this request's layout.
+
+    Video is excluded: Qwen3-VL/3.5 split one grid into per-frame-group items
+    that a per-grid hash cannot cover, MiMo derives audio from the video file,
+    and a TP-sharded GLM decode cannot run on one encoder rank.
+    """
+    return not request_obj.video_data
+
+
+def _meta_part_to_embedding_data(meta: dict, req_id: str) -> EmbeddingData:
+    """One /preprocess_meta response as the metadata-only twin of an encode part."""
+    aux = {}
+    for key, value in (meta.get("aux") or {}).items():
+        aux[key] = torch.tensor(value) if key in _VIDEO_META_TENSOR_ATTRS else value
+    return EmbeddingData(
+        req_id,
+        meta["num_parts"],
+        meta["part_idx"],
+        torch.tensor(meta["grid_thw"]),
+        Modality.from_str(meta["modality"]),
+        embedding_shape=[sum(meta["token_counts"]), meta["embedding_dim"]],
+        **aux,
+    )
+
+
+def _assign_item_hashes(
+    mm_items, hashes_by_modality: Dict[Modality, List[int]]
+) -> bool:
+    """Bind encoder-side per-grid hashes to items in prompt order so pad values
+    exist without an embedding to hash. False when the counts disagree."""
+    remaining = {
+        modality: list(hashes) for modality, hashes in hashes_by_modality.items()
+    }
+    for item in mm_items:
+        hashes = remaining.get(item.modality)
+        if not hashes:
+            logger.warning(
+                "Encoder preprocess meta has no hash for %s item", item.modality.name
+            )
+            return False
+        item.set_hash(hashes.pop(0))
+    return True
+
+
+def build_mm_inputs_from_meta(
+    metas: List[dict], req_id: str, mm_processor, prompt, model_type
+):
+    """Rebuild mm_inputs from preprocess metadata alone (no embedding)."""
+    aggregate = None
+    hashes_by_modality: Dict[Modality, List[int]] = defaultdict(list)
+    for meta in sorted(metas, key=lambda m: m["part_idx"]):
+        part = _meta_part_to_embedding_data(meta, req_id)
+        aggregate = _aggregate_embedding_part(aggregate, part, model_type)
+        hashes_by_modality[part.modality].extend(int(h) for h in meta["hashes"])
+    if aggregate is None or not aggregate.ready:
+        return None
+    output = mm_processor.get_mm_data(prompt, None, **aggregate.get_mm_extra_meta())
+    if output is None or not _assign_item_hashes(output.mm_items, hashes_by_modality):
+        return None
+    return output
+
+
 class WaitingMMRequestStatus(IntEnum):
     FAIL = -1
     PENDING = 0
@@ -793,6 +915,12 @@ def _select_mm_processor_prompt(recv_req, mm_processor):
     if mm_processor.prefer_tokenized_input and input_ids is not None:
         return input_ids
     return recv_req.input_text or input_ids
+
+
+def _encoder_request_id(request) -> str:
+    """The encode dispatch's wire identity: it survives scheduler IPC but never
+    aliases a reused client rid, nor P's and D's encodes of one request."""
+    return request.encoder_req_id or request.rid
 
 
 def create_part_req_id(original_req_id: str, part_idx: int) -> str:
@@ -840,6 +968,45 @@ def _embedding_part_matches_request(
     return (
         _resolve_embedding_part_request_id(embedding_data, expected_req_id) is not None
     )
+
+
+def _request_image_scope(request_obj):
+    """Shared P/D attempt identity; transport/abort IDs remain independent.
+
+    Do not use rid or URL alone: clients may reuse them. Without a PD
+    bootstrap tuple, keep the uncached-reference behavior.
+    """
+    host = request_obj.bootstrap_host
+    port = request_obj.bootstrap_port
+    room = request_obj.bootstrap_room
+    if (
+        not isinstance(host, str)
+        or not host
+        or type(port) is not int
+        or not 0 < port < 65536
+        or type(room) is not int
+    ):
+        return None
+    identity = [host, port, room, request_obj.cache_salt]
+    return hashlib.sha256(
+        json.dumps(identity, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def dispatch_parts(num_items_assigned):
+    """(modality, part_idx, encoder_idx, item_start, item_end) of every part,
+    in the order the /encode dispatch numbers them."""
+    parts = []
+    part_idx = 0
+    for modality, assigned_nums in num_items_assigned.items():
+        cum = 0
+        for encoder_idx, assigned in enumerate(assigned_nums):
+            if assigned == 0:
+                continue
+            parts.append((modality, part_idx, encoder_idx, cum, cum + assigned))
+            cum += assigned
+            part_idx += 1
+    return parts
 
 
 def _encoder_media_item(mm_item: dict):
@@ -1025,7 +1192,9 @@ class WaitingMMRequestBase(ABC):
 
     def _is_valid_embedding_part(self, recv_obj) -> bool:
         """Check for and drop stale or out-of-sync payloads; normalize the part req_id to the original rid."""
-        return _embedding_part_matches_request(recv_obj, self.recv_req.rid)
+        return _embedding_part_matches_request(
+            recv_obj, _encoder_request_id(self.recv_req)
+        )
 
     @abstractmethod
     def _extract_embedding_from_buffer(self, recv_obj, parts) -> None:
@@ -1077,9 +1246,15 @@ class WaitingMMRequestBase(ABC):
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
+        input_ids = mm_inputs.input_ids
+        if self._pool_slot_id is not None and self.embedding_pool is not None:
+            # Bind the slot to the scheduler's final owner: bound to this
+            # temporary processor output, its finalizer freed the slot under
+            # the live tensor views once the scheduler replaced the output.
+            mm_inputs = MultimodalInputs.from_processor_output(mm_inputs)
         self._bind_pool_slot_to_mm_inputs(mm_inputs)
         self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = array("q", mm_inputs.input_ids)
+        self.recv_req.input_ids = array("q", input_ids)
         self.status = WaitingMMRequestStatus.SUCCESS
 
     def _fail_assemble(self, e: Exception) -> None:
@@ -1124,6 +1299,33 @@ class WaitingMMRequestBase(ABC):
             finalizer()  # at-most-once; a later GC call becomes a no-op
 
 
+# A failed connect sent nothing, so re-posting cannot deliver a request twice.
+_CONNECT_ATTEMPTS = 3
+# Arbitrary; in-cluster connects finish in milliseconds.
+_CONNECT_BACKOFF_S = 0.2
+
+
+async def _post_retrying_connect(session, url, **kwargs) -> aiohttp.ClientResponse:
+    attempts = _CONNECT_ATTEMPTS if dsv41_sm90_on("epd") else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return await session.post(url, **kwargs)
+        except aiohttp.ClientConnectorError as e:
+            if attempt == attempts:
+                raise
+            logger.warning(
+                f"Connect to {url} failed ({e.os_error!r}); "
+                f"retry {attempt}/{attempts - 1}"
+            )
+            await asyncio.sleep(_CONNECT_BACKOFF_S * attempt)
+
+
+async def _post_receive_url(session, url, payload) -> str:
+    async with await _post_retrying_connect(session, url, json=payload) as response:
+        response.raise_for_status()
+        return await response.text()
+
+
 # For zmq_to_scheduler: embedding parts arrive as ZMQ payload frames and
 # are optionally staged into the GPU EmbeddingPool.
 class WaitingZmqRequest(WaitingMMRequestBase):
@@ -1160,9 +1362,7 @@ class WaitingZmqRequest(WaitingMMRequestBase):
     def send_encode_request(self):
         async def _send_single_request(session, url, payload):
             try:
-                async with session.post(url, json=payload) as response:
-                    response.raise_for_status()
-                    return await response.text()
+                return await _post_receive_url(session, url, payload)
             except Exception as e:
                 logger.error(f"Failed to send request to {url}: {e}")
                 raise
@@ -1237,7 +1437,7 @@ class WaitingZmqRequest(WaitingMMRequestBase):
 
         self._start_registration(
             send_embedding_port(
-                self.recv_req.rid,
+                _encoder_request_id(self.recv_req),
                 self.receive_count,
                 self.host_name,
                 self.embedding_port,
@@ -1341,7 +1541,7 @@ class WaitingZmqRequestGrpc(WaitingZmqRequest):
 
         self._start_registration(
             send_embedding_port(
-                self.recv_req.rid,
+                _encoder_request_id(self.recv_req),
                 self.receive_count,
                 self.host_name,
                 self.embedding_port,
@@ -1389,6 +1589,8 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         self._receive_running = False
         self._receive_error = None
         self._receive_error_lock = threading.Lock()
+        # Set while the metadata pull may be cancelled; guarded by _buffer_lock.
+        self._cancel_meta_pull: Optional[Callable[[], None]] = None
 
     def send_encode_request(self):
         # Base-class hook. The tokenizer owns /encode, so this rank only pulls
@@ -1399,6 +1601,10 @@ class WaitingRDMARequest(WaitingMMRequestBase):
     def _run_receive_in_thread(self):
         try:
             asyncio.run(self._pull_meta_and_receive_embedding())
+        except asyncio.CancelledError:
+            logger.info(
+                "Stopped the encoder metadata pull of terminal rid=%s", self.rid
+            )
         except Exception as e:
             logger.error(f"RDMA receive failed for rid={self.rid}: {e}")
             self._record_receive_error(str(e))
@@ -1407,6 +1613,42 @@ class WaitingRDMARequest(WaitingMMRequestBase):
                 self._receive_running = False
                 if self._terminal:
                     self._release_buffer_locked()
+
+    async def _pull_meta_until_terminal(self, session, encode_requests):
+        """The metadata pull, which the encoder holds until the part publishes
+        (up to its request timeout), is the one receive step a terminal request
+        cancels: no landing slot is held yet and no RDMA write can target it."""
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        pulling = [True]
+
+        def cancel_if_pulling():
+            if pulling[0]:
+                task.cancel()
+
+        with self._buffer_lock:
+            if self._terminal:
+                raise asyncio.CancelledError
+            self._cancel_meta_pull = lambda: loop.call_soon_threadsafe(
+                cancel_if_pulling
+            )
+        try:
+            return await asyncio.gather(
+                *(
+                    _post_retrying_connect(
+                        session,
+                        f"{self.encoder_urls[r['encoder_idx']]}"
+                        "/scheduler_receive_meta_data",
+                        json={"req_id": r["req_id"], "part_idx": r["part_idx"]},
+                    )
+                    for r in encode_requests
+                ),
+                return_exceptions=True,
+            )
+        finally:
+            pulling[0] = False
+            with self._buffer_lock:
+                self._cancel_meta_pull = None
 
     def _record_receive_error(self, error_msg, error_code=None) -> None:
         """Pass a worker-thread failure to the scheduler thread."""
@@ -1454,24 +1696,25 @@ class WaitingRDMARequest(WaitingMMRequestBase):
                     {
                         "encoder_idx": idx,
                         "part_idx": part_idx,
-                        "req_id": create_part_req_id(self.recv_req.rid, part_idx),
+                        "req_id": create_part_req_id(
+                            _encoder_request_id(self.recv_req), part_idx
+                        ),
                     }
                 )
                 cum_idx += 1
             part_idx_offset += modality_num_parts[modality]
 
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
-        ) as session:
+        session_kwargs = {
+            "timeout": aiohttp.ClientTimeout(
+                total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
+            )
+        }
+        if dsv41_sm90_on("epd"):
+            # A pool wait can outlive the encoder's idle connection timeout.
+            session_kwargs["connector"] = aiohttp.TCPConnector(force_close=True)
+        async with aiohttp.ClientSession(**session_kwargs) as session:
             # Phase 1: pull per-part sizes, blocking until the encode publishes.
-            tasks = [
-                session.post(
-                    f"{self.encoder_urls[r['encoder_idx']]}/scheduler_receive_meta_data",
-                    json={"req_id": r["req_id"], "part_idx": r["part_idx"]},
-                )
-                for r in encode_requests
-            ]
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            responses = await self._pull_meta_until_terminal(session, encode_requests)
             if not await self._check_encoder_responses(
                 responses, "/scheduler_receive_meta_data"
             ):
@@ -1555,7 +1798,8 @@ class WaitingRDMARequest(WaitingMMRequestBase):
                     }
                 )
                 send_tasks.append(
-                    session.post(
+                    _post_retrying_connect(
+                        session,
                         f"{self.encoder_urls[encoder_idx_by_part[idx]]}/send",
                         json=rj,
                     )
@@ -1590,6 +1834,9 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         is deferred to its exit hook instead of blocking here. Idempotent."""
         with self._buffer_lock:
             self._terminal = True
+            if self._cancel_meta_pull is not None:
+                self._cancel_meta_pull()
+                self._cancel_meta_pull = None
             if not self._receive_running:
                 self._release_buffer_locked()
 
@@ -1717,11 +1964,18 @@ class EmbeddingPool:
         if alloc_result is None:
             return None
         slot_view, _, slot_id = alloc_result
-        offset = 0
-        for part in parts:
-            nbytes = part.nbytes
-            slot_view[offset : offset + nbytes].copy_(part.flatten().view(torch.uint8))
-            offset += nbytes
+        try:
+            offset = 0
+            for part in parts:
+                nbytes = part.nbytes
+                slot_view[offset : offset + nbytes].copy_(
+                    part.flatten().view(torch.uint8)
+                )
+                offset += nbytes
+        except Exception:
+            # The caller cannot clean up a slot it has not received yet.
+            self.release(slot_id)
+            raise
         return slot_view, slot_id
 
     def release_on_gc(self, obj, slot_id: int) -> weakref.finalize:
@@ -1867,7 +2121,48 @@ def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
     }
 
 
+class WaitingListSync:
+    """Collectives over the scheduler ranks that share one waiting list: the
+    TP group without DP attention, one DP shard (attn-TP x attn-CP) with it.
+    No single group spans both shard factors, so each collective runs along
+    every factor in turn; ranks of other DP shards hold other requests."""
+
+    def __init__(self, groups: Sequence[Any] = ()):
+        self._groups = [group for group in groups if group.world_size > 1]
+        self.size = math.prod(group.world_size for group in self._groups)
+
+    @classmethod
+    def for_scheduler(cls, parallel) -> "WaitingListSync":
+        # The ranks that receive the same work requests (SchedulerRequestReceiver).
+        if parallel.attn_dp_enabled:
+            return cls((parallel.attn_tp_group, parallel.attn_cp_group))
+        return cls((parallel.tp_group,))
+
+    def all_reduce_min_(self, tensor: torch.Tensor) -> None:
+        for group in self._groups:
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+            )
+
+    def all_gather_object(self, obj: Any) -> List[Any]:
+        values = [obj]
+        for group in self._groups:
+            values = [
+                value for part in group.all_gather_object(values) for value in part
+            ]
+        return values
+
+
+# Decode's /preprocess_meta wait before it dispatches the encode instead; the
+# meta call runs CPU preprocessing only. Arbitrary.
+_META_TIMEOUT_S = 30.0
+_CLIENT_ERROR_STATUSES = (HTTPStatus.BAD_REQUEST, HTTPStatus.UNPROCESSABLE_ENTITY)
+
+
 class MMReceiverBase(ABC):
+    # Whether this transport implements the encoder's /preprocess_meta.
+    serves_preprocess_meta: bool = False
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -1891,14 +2186,20 @@ class MMReceiverBase(ABC):
             encode_urls if encode_urls is not None else list(get_disagg().encoder_urls)
         )
         self.recv_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
+        # PD attempts share URL image downloads on the encoder, and decode
+        # rebuilds its inputs from encoder metadata (EpdMetaInputs).
+        self.dsv41_epd = dsv41_sm90_on("epd")
         self.host = get_local_ip_auto(get_serving().host)
         # A scheduler-side receiver works across its TP group; the tokenizer
         # side has no placement.
         parallel = get_parallel()
         self.pp_rank = parallel.pp_rank if scheduler is not None else None
         self.tp_rank = parallel.tp_rank if scheduler is not None else None
-        self.tp_size = parallel.tp_size
-        self.tp_group = parallel.tp_group if scheduler is not None else None
+        self.waiting_list_sync = (
+            WaitingListSync.for_scheduler(parallel)
+            if scheduler is not None
+            else WaitingListSync()
+        )
         self.nnodes = get_parallel().nnodes
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
@@ -2222,12 +2523,16 @@ class MMReceiverBase(ABC):
             # Freeze the encoder URL snapshot onto obj so the scheduler
             # subprocess uses the same list when indexing encoder_idx.
             obj.encoder_urls = encode_urls
+            # P and D may both encode one client request (decode's metadata
+            # fallback), and an aborted rid can come back before the encoder
+            # retires its old embedding and registered memory.
+            obj.encoder_req_id = uuid.uuid4().hex
             scheduler_dispatch_ready = threading.Event()
 
             encode_thread = threading.Thread(
                 target=self._run_encode_in_thread,
                 args=(
-                    obj.rid,
+                    obj.encoder_req_id,
                     mm_data,
                     "encode",
                     num_items_assigned,
@@ -2235,6 +2540,7 @@ class MMReceiverBase(ABC):
                     time_stats_json,
                     scheduler_dispatch_ready,
                     on_dispatch_error,
+                    obj.rid,
                 ),
                 daemon=True,
             )
@@ -2253,6 +2559,53 @@ class MMReceiverBase(ABC):
             obj.need_wait_for_mm_inputs = False
             return None
 
+    async def fetch_mm_meta_inputs(self, *, request_obj, mm_processor, prompt):
+        """Decode-side EPD: rebuild mm_inputs from encoder preprocess metadata
+        without ever receiving the embedding. None means try a remote encode."""
+        mm_data = self._extract_url_data(request_obj)
+        encode_urls = list(self.encode_urls)
+        if not mm_data or not encode_urls:
+            return None
+        req_id = uuid.uuid4().hex
+        parts = dispatch_parts(
+            self._assign_items_by_modality(mm_data, len(encode_urls))
+        )
+        start_time = time.monotonic()
+        try:
+            metas = await asyncio.wait_for(
+                self.preprocess_meta(req_id, mm_data, parts, encode_urls),
+                timeout=_META_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[{req_id}] Encoder preprocess meta timed out after {_META_TIMEOUT_S}s"
+            )
+            return None
+        except HTTPException:
+            # Definitively invalid media cannot be repaired by another encode.
+            raise
+        except Exception as e:
+            logger.warning(f"[{req_id}] Encoder preprocess meta failed: {e}")
+            return None
+        if metas is None:
+            return None
+        try:
+            output = build_mm_inputs_from_meta(
+                metas, req_id, mm_processor, prompt, self.model_type
+            )
+        except Exception as e:
+            # Processors whose get_mm_data needs an embedding fall back too.
+            logger.warning(f"[{req_id}] Rebuilding mm_inputs from meta failed: {e}")
+            return None
+        logger.info(
+            f"[{req_id}] Rebuilt mm_inputs from encoder preprocess meta in "
+            f"{time.monotonic() - start_time:.3f}s"
+        )
+        return output
+
+    async def preprocess_meta(self, req_id, mm_data, parts, encode_urls):
+        raise NotImplementedError
+
     def _sync_fail_info_across_tp(self, waiting_req: WaitingMMRequestBase) -> None:
         """Share encoder error fields across TP ranks before abort.
 
@@ -2262,10 +2615,10 @@ class MMReceiverBase(ABC):
         ``error_msg`` / ``error_code``. attn_tp_rank 0 streams the abort to the
         client, so merge the best-known payload from all ranks first.
         """
-        if self.tp_size <= 1 or self.tp_group is None:
+        if self.waiting_list_sync.size <= 1:
             return
 
-        gathered = self.tp_group.all_gather_object(
+        gathered = self.waiting_list_sync.all_gather_object(
             (waiting_req.error_msg, waiting_req.error_code)
         )
         best_msg = waiting_req.error_msg
@@ -2316,7 +2669,7 @@ class MMReceiverBase(ABC):
         abort_reqs = []
         for recv_req in recv_reqs:
             if isinstance(recv_req, EncoderDispatchErrorReq):
-                waiting_req = self.waiting_by_rid.get(recv_req.rid)
+                waiting_req = self.waiting_by_rid.get(_encoder_request_id(recv_req))
                 if waiting_req is None:
                     logger.debug(
                         "Ignoring encoder dispatch error for inactive request %s",
@@ -2349,7 +2702,8 @@ class MMReceiverBase(ABC):
                         encoder_urls=encode_urls,
                         model_type=self.model_type,
                         host_name=self.hostname,
-                        receive_count=self.tp_size,
+                        # Only this waiting list's ranks pull or register.
+                        receive_count=self.waiting_list_sync.size,
                         zmq_context=(
                             None
                             if self.scheduler_recv_socket is not None
@@ -2358,7 +2712,9 @@ class MMReceiverBase(ABC):
                         embedding_port=self.scheduler_embedding_port,
                         **extra_kwargs,
                     )
-                    self.waiting_by_rid[waiting_req.rid] = waiting_req
+                    self.waiting_by_rid[_encoder_request_id(waiting_req.recv_req)] = (
+                        waiting_req
+                    )
                     waiting_req.send_encode_request()
                 except Exception as error:
                     local_error = f"{type(error).__name__}: {error}"
@@ -2366,12 +2722,13 @@ class MMReceiverBase(ABC):
                         "Failed to start multimodal receive for rid=%s", recv_req.rid
                     )
 
-                # The status all-reduce below requires every TP rank to append
-                # exactly the same requests. Agree on startup before appending.
+                # The status all-reduce below requires every rank of this
+                # waiting list to append exactly the same requests. Agree on
+                # startup before appending.
                 rank_errors = (
                     [local_error]
-                    if self.tp_size <= 1
-                    else self.tp_group.all_gather_object(local_error)
+                    if self.waiting_list_sync.size <= 1
+                    else self.waiting_list_sync.all_gather_object(local_error)
                 )
                 failed_ranks = [
                     rank for rank, error in enumerate(rank_errors) if error is not None
@@ -2398,7 +2755,9 @@ class MMReceiverBase(ABC):
                                 "Failed to close multimodal receive socket for rid=%s",
                                 waiting_req.rid,
                             )
-                        self.waiting_by_rid.pop(waiting_req.rid, None)
+                        self.waiting_by_rid.pop(
+                            _encoder_request_id(waiting_req.recv_req), None
+                        )
                     abort_reqs.append(
                         (
                             self.create_req(recv_req),
@@ -2430,11 +2789,7 @@ class MMReceiverBase(ABC):
 
         local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
 
-        torch.distributed.all_reduce(
-            local_status,
-            op=torch.distributed.ReduceOp.MIN,
-            group=self.tp_group.cpu_group,
-        )
+        self.waiting_list_sync.all_reduce_min_(local_status)
 
         new_waiting = []
         for i, waiting_req in enumerate(self.waiting_list):
@@ -2465,14 +2820,15 @@ class MMReceiverBase(ABC):
                     (
                         self.create_req(waiting_req.recv_req),
                         f"Timeout waiting for image embedding after {self.wait_timeout}s",
-                        HTTPStatus.REQUEST_TIMEOUT,
+                        # The client did not time out; its upstream (the encoder) did.
+                        HTTPStatus.GATEWAY_TIMEOUT,
                     )
                 )
             else:  # status_value == WaitingMMRequestStatus.PENDING
                 new_waiting.append(waiting_req)
                 continue
             waiting_req.close_recv_socket()
-            self.waiting_by_rid.pop(waiting_req.rid, None)
+            self.waiting_by_rid.pop(_encoder_request_id(waiting_req.recv_req), None)
 
         self.waiting_list = new_waiting
         return new_recv_reqs, abort_reqs
@@ -2487,6 +2843,7 @@ class MMReceiverBase(ABC):
         time_stats_json=None,
         scheduler_dispatch_ready=None,
         on_dispatch_error=None,
+        logical_req_id: Optional[str] = None,
     ):
         # ``embedding_port`` is always None on this path: zmq_to_scheduler /
         # mooncake ranks register their receive ports with the encoder later
@@ -2512,6 +2869,9 @@ class MMReceiverBase(ABC):
             )
 
         if dispatch_error is not None and on_dispatch_error is not None:
+            if logical_req_id is not None:
+                dispatch_error.rid = logical_req_id
+                dispatch_error.encoder_req_id = req_id
             scheduler_dispatch_ready.wait()
             on_dispatch_error(dispatch_error)
 
@@ -2624,6 +2984,7 @@ class MMReceiverBase(ABC):
         mm_data = []
         image_hashes = request_obj.mm_content_hashes
         image_index = 0
+        request_scope = _request_image_scope(request_obj) if self.dsv41_epd else None
         for mm_items, modality in [
             (request_obj.image_data, Modality.IMAGE),
             (request_obj.video_data, Modality.VIDEO),
@@ -2661,6 +3022,12 @@ class MMReceiverBase(ABC):
                             else None
                         )
                         entry["content_hash"] = explicit_hash or inline_hash
+                        if (
+                            request_scope is not None
+                            and isinstance(raw_url, str)
+                            and raw_url.startswith(("http://", "https://"))
+                        ):
+                            entry["_request_image_scope"] = request_scope
                         image_index += 1
                     mm_data.append(entry)
         if image_hashes is not None and image_index != len(image_hashes):
@@ -2672,6 +3039,8 @@ class MMReceiverBase(ABC):
 
 
 class MMReceiverHTTP(MMReceiverBase):
+    serves_preprocess_meta = True
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -2802,6 +3171,105 @@ class MMReceiverHTTP(MMReceiverBase):
                 error_msg=error[0],
                 error_code=error[1],
             )
+
+    async def preprocess_meta(self, req_id, mm_data, parts, encode_urls):
+        """POST each part to /preprocess_meta; reject bad inputs, otherwise
+        return None on failure so a decode can still dispatch the encode."""
+        mm_data_by_modality = {}
+        for mm_item in mm_data:
+            mm_data_by_modality.setdefault(mm_item.get("modality"), []).append(mm_item)
+        meta_requests = [
+            {
+                "encoder_url": encode_urls[encoder_idx],
+                "mm_items": [
+                    _encoder_media_item(mm_item)
+                    for mm_item in mm_data_by_modality[modality][item_start:item_end]
+                ],
+                "num_parts": len(parts),
+                "part_idx": part_idx,
+                "req_id": create_part_req_id(req_id, part_idx),
+                "modality": modality.name,
+            }
+            for modality, part_idx, encoder_idx, item_start, item_end in parts
+        ]
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=_META_TIMEOUT_S)
+        ) as session:
+            results = await asyncio.gather(
+                *(
+                    self._post_meta_part(session, request["encoder_url"], request)
+                    for request in meta_requests
+                )
+            )
+            metas = []
+            for request, (meta, error) in zip(meta_requests, results):
+                if error is not None:
+                    meta, error = await self._retry_meta_part(
+                        session, request, error, encode_urls, req_id
+                    )
+                if error is not None:
+                    message, status = error
+                    if status in _CLIENT_ERROR_STATUSES:
+                        raise HTTPException(status_code=status, detail=message)
+                    return None
+                metas.append(meta)
+            return metas
+
+    async def _post_meta_part(self, session, url, request):
+        """(meta, None) or (None, (message, status)) for one /preprocess_meta part."""
+        try:
+            # Reading the body releases the connection.
+            resp = await session.post(f"{url}/preprocess_meta", json=request)
+            if resp.status == 200:
+                return await resp.json(), None
+            try:
+                message = (await resp.json()).get("message", "Unknown error")
+            except Exception:
+                message = await resp.text()
+            return None, (message, int(resp.status))
+        except asyncio.TimeoutError:
+            return None, ("preprocess_meta timeout", int(HTTPStatus.GATEWAY_TIMEOUT))
+        except Exception as e:
+            return None, (str(e), int(HTTPStatus.BAD_GATEWAY))
+
+    async def _retry_meta_part(self, session, request, error, encode_urls, req_id):
+        """Metadata comes from the part's own media, so any encoder can answer
+        it: retry a failed part once on each other encoder before the caller's
+        whole-request remote-encode fallback. Client errors are not retried."""
+        failed = request["encoder_url"]
+        logger.warning(
+            "[%s] preprocess_meta part %d failed on %s (%s %s)",
+            req_id,
+            request["part_idx"],
+            failed,
+            error[1],
+            error[0],
+        )
+        if error[1] in _CLIENT_ERROR_STATUSES:
+            return None, error
+        for url in encode_urls:
+            if url == failed:
+                continue
+            meta, retry_error = await self._post_meta_part(session, url, request)
+            if retry_error is None:
+                logger.info(
+                    "[%s] preprocess_meta part %d served by %s after retry",
+                    req_id,
+                    request["part_idx"],
+                    url,
+                )
+                return meta, None
+            error = retry_error
+            if error[1] in _CLIENT_ERROR_STATUSES:
+                break
+        logger.error(
+            "[%s] preprocess_meta part %d failed on every encoder: %s %s",
+            req_id,
+            request["part_idx"],
+            error[1],
+            error[0],
+        )
+        return None, error
 
 
 class MMReceiverGrpc(MMReceiverBase):

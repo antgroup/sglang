@@ -836,3 +836,68 @@ class TestPrefillCpDSparkTailLogits(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCpTailVisionRoutingIds(CustomTestCase):
+    """Under prefill CP the late layers' TP MoE routes every CP rank's tail rows in
+    rank order; vision routing must read those rows' token ids, not a slice of the
+    full-prompt ids (a language-only EPD prefill crashed in its first prefill)."""
+
+    def setUp(self):
+        override = get_context().override_server_args(tp_size=2)
+        override.install()
+        self.addCleanup(override.restore)
+
+    def test_vision_routing_reads_the_gathered_tail_ids(self):
+        cp_size = 2
+        model = object.__new__(DeepseekV4Model)
+        torch.nn.Module.__init__(model)
+        tail = SimpleNamespace(rows=lambda x: x[:3])
+        prompt_ids = torch.arange(100, 110)
+        local_tail_ids = torch.tensor([7, 8, 9])
+
+        def gather(local):
+            # Rank 1 contributes its own tail rows after rank 0's.
+            return torch.cat([local, local + 1000])
+
+        for vl_routing, expected in (
+            (True, torch.tensor([7, 8, 9, 1007, 1008, 1009])),
+            # Without vision routing no late layer reads token ids.
+            (False, prompt_ids[:3]),
+        ):
+            model.late_layer_vl_routing = vl_routing
+            with (
+                self.subTest(vl_routing=vl_routing),
+                # The whole topology: an earlier test in the process may have
+                # built real (world size 1) groups.
+                get_parallel().override(
+                    tp_size=cp_size,
+                    tp_rank=0,
+                    attn_tp_size=1,
+                    attn_tp_rank=0,
+                    attn_cp_size=cp_size,
+                    attn_cp_rank=0,
+                    attn_dp_size=1,
+                    attn_dp_rank=0,
+                    moe_tp_size=cp_size,
+                    moe_ep_size=1,
+                    moe_dp_size=1,
+                    pp_size=1,
+                    tp_group=SimpleNamespace(world_size=cp_size),
+                    attn_tp_group=SimpleNamespace(world_size=1),
+                    attn_cp_group=SimpleNamespace(world_size=cp_size),
+                    moe_ep_group=SimpleNamespace(world_size=1),
+                    pp_group=SimpleNamespace(world_size=1),
+                ),
+                patch(
+                    "sglang.srt.models.deepseek_v4.attn_cp_interleave_gather",
+                    side_effect=gather,
+                ),
+            ):
+                ids = model._late_layer_ids_global(
+                    tail=tail,
+                    tail_input_ids=local_tail_ids,
+                    input_ids_global=prompt_ids,
+                    cp_extend=True,
+                )
+            self.assertTrue(torch.equal(ids, expected))

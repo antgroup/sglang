@@ -295,6 +295,16 @@ def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
         )
 
 
+def _dsv41_epd_requested(hf_config) -> bool:
+    """DeepSeek-V4.1 EPD is part of the SM90 optimization set; the model
+    rejects it again when the set stays off (another GPU)."""
+    return (
+        hf_config.model_type == "deepseek_v41"
+        and envs.SGLANG_OPT_DSV41_SM90.get()
+        and "epd" not in envs.SGLANG_OPT_DSV41_SM90_DISABLE.get()
+    )
+
+
 def handle_encoder_disaggregation(server_args: Any):
     from sglang.srt.arg_groups.model_hook import handle_language_model_only
     from sglang.srt.arg_groups.validation_hook import validate_ib_devices
@@ -349,7 +359,7 @@ def handle_encoder_disaggregation(server_args: Any):
                 model_arch,
                 cfg.tp_size,
             )
-    if (cfg.encoder_only or cfg.language_only) and model_arch not in [
+    epd_architectures = [
         "Qwen2VLForConditionalGeneration",
         "Qwen3VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",
@@ -368,11 +378,20 @@ def handle_encoder_disaggregation(server_args: Any):
         "Glm5NextForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
         "MuseSparkForConditionalGeneration",
-    ]:
+    ]
+    dsv41_epd = _dsv41_epd_requested(hf_config)
+    if dsv41_epd:
+        epd_architectures.append("DeepseekV4ForCausalLM")
+    if (cfg.encoder_only or cfg.language_only) and model_arch not in epd_architectures:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
             f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, MiniMax-M3, MuseSpark."
+        )
+    if dsv41_epd and cfg.language_only and cfg.enable_adaptive_dispatch_to_encoder:
+        raise ValueError(
+            "DeepSeek-V4.1 language-only servers build no vision tower; "
+            "--enable-adaptive-dispatch-to-encoder is not supported."
         )
 
     if (
