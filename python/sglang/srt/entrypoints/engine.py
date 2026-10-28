@@ -51,6 +51,7 @@ import torch
 import uvloop
 import zmq
 
+from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     resolved_view,
@@ -63,6 +64,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.environ import envs
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on, initialize_dsv41_sm90
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
@@ -137,6 +139,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_mnnvl_fabric_device,
+    jit_manifest,
     kill_process_tree,
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
@@ -1210,6 +1213,12 @@ class Engine(EngineScoreMixin, EngineBase):
         except BaseException:
             restore_context(context_before_publish)
             raise
+
+        if envs.SGLANG_OPT_DSV41_SM90.get():
+            # This process asks the switch too: the replay below, the HTTP warmups.
+            initialize_dsv41_sm90(model_config=model_config_of(server_args))
+            if dsv41_sm90_on("startup"):
+                jit_manifest.start_replay()
 
         # Launch scheduler processes
         # Passed only when there is one: this hook is an override point, and a

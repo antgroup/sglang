@@ -125,9 +125,15 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
-from sglang.srt.entrypoints.warmup import execute_warmups
+from sglang.srt.entrypoints.warmup import (
+    execute_warmups,
+    execute_warmups_once,
+    startup_warmup_names,
+    warmup_launch_key,
+)
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on, initialize_dsv41_sm90
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
@@ -306,6 +312,8 @@ async def lifespan(fast_api_app: FastAPI):
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
+        # The launcher resolved it for its own process only.
+        initialize_dsv41_sm90(model_config=_global_state.tokenizer_manager.model_config)
         worker_id = _global_state.tokenizer_manager.worker_id
         warmup_thread_kwargs = _multi_tokenizer_warmup_kwargs(server_args, worker_id)
         thread_label = f"MultiTokenizer-{worker_id}"
@@ -416,7 +424,26 @@ async def lifespan(fast_api_app: FastAPI):
         )
 
     # Execute custom warmups
-    if get_serving().warmups is not None:
+    if dsv41_sm90_on("startup"):
+        # The role's serving shapes compile before readiness, once per launch.
+        warmup_names = startup_warmup_names(
+            explicit=get_serving().warmups,
+            disaggregation_mode=get_disagg().disaggregation_mode,
+        )
+        if warmup_names:
+            await execute_warmups_once(
+                get_disagg().disaggregation_mode,
+                warmup_names,
+                _global_state.tokenizer_manager,
+                explicit=get_serving().warmups is not None,
+                launch_key=(
+                    None
+                    if getattr(fast_api_app, "is_single_tokenizer_mode", False)
+                    else warmup_launch_key(get_main_process_id())
+                ),
+            )
+            logger.info("Warmup ended")
+    elif get_serving().warmups is not None:
         await execute_warmups(
             get_disagg().disaggregation_mode,
             get_serving().warmups.split(","),

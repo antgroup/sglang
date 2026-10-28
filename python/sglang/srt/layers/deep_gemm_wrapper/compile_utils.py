@@ -22,6 +22,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
     get_device,
@@ -60,6 +61,19 @@ def update_deep_gemm_config(gpu_id: int):
     global _BUILTIN_M_LIST
     global _DO_COMPILE_ALL
     global _IS_FIRST_RANK_ON_NODE
+    global _ENABLE_JIT_DEEPGEMM_PRECOMPILE
+    global _FAST_WARMUP
+
+    _ENABLE_JIT_DEEPGEMM_PRECOMPILE = envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.get()
+    _FAST_WARMUP = envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.get()
+    if dsv41_sm90_on("startup"):
+        # The all-M precompile was ~23 of the 41 min of a cold V4.1 start (H20
+        # TP8 mix); the startup serving warmups compile the shapes served
+        # instead. An explicit env still wins.
+        if not envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.is_set():
+            _ENABLE_JIT_DEEPGEMM_PRECOMPILE = False
+        if not envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.is_set():
+            _FAST_WARMUP = True
 
     _BUILTIN_M_LIST = []
 

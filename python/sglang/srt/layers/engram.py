@@ -51,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
@@ -686,9 +687,22 @@ class _HostTable:
 
     Lives for the whole process: the mapping, the memfd and the cudaHostRegister
     pin are never released because the table is read by every forward.
+
+    keep_checkpoint_cache (DeepSeek-V4.1 SM90 fast startup) leaves the checkpoint
+    page cache and the THP backing alone: dropping it makes every later reader of
+    the checkpoint (the speculative draft, the next restart) read it from disk,
+    while on H20 hosts (x86, 2 MiB THP) the shards fault in 100% huge without it.
     """
 
-    def __init__(self, layout: str, nbytes: int, name: str, group):
+    def __init__(
+        self,
+        layout: str,
+        nbytes: int,
+        name: str,
+        group,
+        *,
+        keep_checkpoint_cache: bool = False,
+    ):
         if layout not in ("shared", "per_rank"):
             raise ValueError(
                 f"Invalid SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT={layout!r}; expected "
@@ -698,6 +712,7 @@ class _HostTable:
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
+        self.keep_checkpoint_cache = keep_checkpoint_cache
         if layout == "shared":
             self.fd = self._open_shared_fd(nbytes, name)
             self.mm = mmap.mmap(
@@ -720,7 +735,8 @@ class _HostTable:
         if layout == "per_rank":
             # Cached checkpoint pages, left by a previous server or by the loader,
             # make the 512 MiB huge-page faults fall back, so empty them first.
-            _drop_page_cache_once("before pre-faulting the per-rank shard")
+            if not keep_checkpoint_cache:
+                _drop_page_cache_once("before pre-faulting the per-rank shard")
             np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
         if layout == "shared":
             # Every rank holds the fd before rank 0 continues; the /proc path only
@@ -777,7 +793,11 @@ class _HostTable:
         if self.layout == "shared":
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
-        if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
+        if (
+            self.layout == "per_rank"
+            and not self.keep_checkpoint_cache
+            and huge_kb < mapped_kb * 0.98
+        ):
             # The loader's own reads refilled the page cache; empty it again so the
             # collapse can find contiguous memory.
             drop_checkpoint_page_cache()
@@ -1038,8 +1058,17 @@ class EngramEmbedding(nn.Module):
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
 
+    def _apply(self, fn, recurse=True):
+        # Host-table parameters alias the registered mapping that the gather
+        # kernels read through _host_table_ptrs: a parent .to()/.half() must
+        # neither copy them to the device nor convert their FP8 formats.
+        if self.host_table is not None:
+            return self
+        return super()._apply(fn, recurse=recurse)
+
     def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int):
         layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
+        fast_startup = dsv41_sm90_on("startup")
         n = num_embeddings if layout == "shared" else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
@@ -1048,6 +1077,7 @@ class EngramEmbedding(nn.Module):
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
             f"sglang_engram_{layer_id}",
             get_parallel().tp_group,
+            keep_checkpoint_cache=fast_startup,
         )
         raw = self.host_table.bytes[: w_bytes + s_bytes]
         weight = raw[:w_bytes].view(torch.float8_e4m3fn).view(n, dim)

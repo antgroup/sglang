@@ -1,11 +1,14 @@
 """CPU checks for DeepGEMM warmup buffers and scale conversion workspace."""
 
+import os
 import unittest
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -155,6 +158,53 @@ class TestWarmupMemory(CustomTestCase):
                         self.assertGreaterEqual(budget_gib * (1 << 30), peak_bytes)
                         # Upper bounds include the last row's TMA padding.
                         self.assertLess(budget_gib * (1 << 30) - peak_bytes, 64)
+
+
+class TestPrecompileDefaults(CustomTestCase):
+    def _resolve(self, *, startup: bool, precompile=None, fast_warmup=None):
+        """compile_utils state after update_deep_gemm_config, starting from the
+        import-time values the envs give (None = unset)."""
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ))
+            for env, value in (
+                (envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE, precompile),
+                (envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP, fast_warmup),
+            ):
+                os.environ.pop(env.name, None)
+                if value is not None:
+                    env.set(value)
+            for name, value in (
+                (
+                    "_ENABLE_JIT_DEEPGEMM_PRECOMPILE",
+                    envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.get(),
+                ),
+                ("_FAST_WARMUP", envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.get()),
+                ("_BUILTIN_M_LIST", []),
+                ("_DO_COMPILE_ALL", True),
+                ("_IS_FIRST_RANK_ON_NODE", False),
+                ("dsv41_sm90_on", lambda subsystem: startup),
+                ("get_schedule", lambda: SimpleNamespace(chunked_prefill_size=16384)),
+                ("get_device", lambda: SimpleNamespace(base_gpu_id=0)),
+            ):
+                stack.enter_context(patch.object(compile_utils, name, value))
+            compile_utils.update_deep_gemm_config(0)
+            return (
+                compile_utils._ENABLE_JIT_DEEPGEMM_PRECOMPILE,
+                compile_utils._FAST_WARMUP,
+                len(compile_utils._BUILTIN_M_LIST),
+            )
+
+    def test_startup_switch_changes_only_the_defaults(self):
+        """The V4.1 SM90 startup skips the all-M precompile and samples the Ms if it
+        runs; an explicit env still wins, and off the switch the upstream defaults stay."""
+        # Fast warmup at chunk 16384: Ms 1..1024, then 512 sampled Ms per doubling, then the chunk.
+        self.assertEqual(self._resolve(startup=True), (False, True, 3072))
+        # All Ms up to twice a chunk above 8192.
+        self.assertEqual(
+            self._resolve(startup=True, precompile=True, fast_warmup=False),
+            (True, False, 32768),
+        )
+        self.assertEqual(self._resolve(startup=False), (True, False, 32768))
 
 
 if __name__ == "__main__":

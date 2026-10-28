@@ -45,6 +45,11 @@ _installed: Optional[str] = None
 _install_attempted = False
 
 
+def installed_overlay() -> Optional[str]:
+    """The installed overlay's directory name under OVERLAY_ROOT, None for stock headers."""
+    return _installed
+
+
 def installed_overlay_tables() -> tuple[str, ...]:
     """Overlay names in the tile-table file names for the installed overlay, its own first."""
     if _installed is None:

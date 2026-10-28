@@ -111,6 +111,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -353,6 +354,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_mps,
+    jit_manifest,
     kill_itself_when_parent_died,
     rank_consensus_checker,
     require_mlp_sync,
@@ -539,6 +541,8 @@ class Scheduler(
             dist_port=self.nccl_port,
         )
         bootstrap.init_layer_runtime(model_config=self.model_config)
+        if dsv41_sm90_on("startup"):
+            jit_manifest.maybe_install_recorder()
 
         # Init metrics stats
         self.init_metrics_collector()

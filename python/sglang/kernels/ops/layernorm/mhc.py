@@ -16,6 +16,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip
@@ -186,8 +187,7 @@ class _LazyTilelang:
             compiled = None
             compile_lock = threading.Lock()
 
-            @functools.wraps(fn)
-            def wrapper(*args, **kwargs):
+            def get_jit():
                 nonlocal compiled
                 if compiled is None:
                     with compile_lock:
@@ -195,8 +195,19 @@ class _LazyTilelang:
                             real_tilelang = _load_tilelang()
                             real_kwargs = _resolve_lazy_tilelang_value(jit_kwargs)
                             compiled = real_tilelang.jit(**real_kwargs)(fn)
-                return compiled(*args, **kwargs)
+                return compiled
 
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                if dsv41_sm90_on("startup"):
+                    from sglang.srt.utils import jit_manifest
+
+                    if jit_manifest.is_recording():
+                        jit_manifest.record_tilelang(wrapper, args, kwargs)
+                return get_jit()(*args, **kwargs)
+
+            # The startup JIT manifest compiles recorded calls through this handle.
+            wrapper.get_jit = get_jit
             return wrapper
 
         if callable(func):
@@ -892,6 +903,63 @@ def prewarm_mhc_pre(
                 norm_weight=norm_weight,
                 norm_eps=norm_eps,
             )
+
+
+def prewarm_mhc_pre_sharded(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int,
+    n_splits_pre: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+    bucket_share: Tuple[int, int] = (0, 1),
+) -> int:
+    """Compile the prenorm kernel for every n_splits bucket by replaying the
+    prenorm with the call's real weights. The compiled kernels are written to
+    the TileLang/DeepGEMM on-disk JIT cache, so this cost is paid only on a cold
+    cache; later server runs hit the cache. Driven once per process from load_weights.
+    ``bucket_share=(i, n)`` replays only buckets ``i, i + n, ...``; returns the
+    number of buckets in all shares.
+    """
+    from sglang.srt.runtime_context import get_schedule
+
+    hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
+    schedule = get_schedule()
+    max_num_tokens = schedule.chunked_prefill_size
+    if max_num_tokens is None or max_num_tokens <= 0:
+        # Chunked prefill disabled: bound by the prefill token budget.
+        max_num_tokens = schedule.max_prefill_tokens
+    buckets = get_mhc_pre_token_count_representatives(
+        max_num_tokens, hc_mult * hidden_size
+    )
+    share_index, share_count = bucket_share
+
+    logger.info("DeepSeek V4 MHC prenorm prewarm: %d n_splits buckets", len(buckets))
+    with torch.inference_mode():
+        for num_tokens in buckets[share_index::share_count]:
+            mhc_pre(
+                residual.new_zeros(num_tokens, hc_mult, hidden_size),
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                n_splits_pre,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            )
+    return len(buckets)
 
 
 @tilelang.jit(

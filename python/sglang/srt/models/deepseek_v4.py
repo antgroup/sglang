@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import socket
 import time
 from array import array
 from contextlib import contextmanager, nullcontext
@@ -4827,6 +4828,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # mid-serving (RL refit sends many partial batches); the prewarm and
         # its barrier must only run on the first (startup) load.
         self._mhc_prewarmed_at_load = False
+        self._share_mhc_prewarm = dsv41_sm90_on("startup")
 
     @torch.inference_mode()
     def wants_prefill_autotune(self) -> bool:
@@ -5331,6 +5333,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         Runs before any forward so the compile burst stays off the serving
         path; the barrier keeps ranks from proceeding while a peer is still
         compiling. The early returns below must stay rank-uniform.
+
+        With _share_mhc_prewarm the ranks of a node, which share the on-disk
+        JIT caches, each compile their share of the kernels first and, after a
+        barrier, load the rest.
         """
         if self._mhc_prewarmed_at_load:
             return
@@ -5344,7 +5350,19 @@ class DeepseekV4ForCausalLM(nn.Module):
         if layer is None:
             return
 
-        from sglang.kernels.ops.layernorm.mhc import mhc_post, prewarm_mhc_pre
+        from sglang.kernels.ops.layernorm.mhc import (
+            mhc_post,
+            prewarm_mhc_pre,
+            prewarm_mhc_pre_sharded,
+        )
+
+        tp_group = get_parallel().tp_group
+        share = (0, 1)
+        if self._share_mhc_prewarm:
+            hosts = tp_group.all_gather_object(socket.gethostname())
+            me = tp_group.rank_in_group
+            node_ranks = [r for r, host in enumerate(hosts) if host == hosts[me]]
+            share = (node_ranks.index(me), len(node_ranks))
 
         tic = time.perf_counter()
         residual = torch.zeros(
@@ -5352,7 +5370,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             dtype=torch.bfloat16,
             device=layer.hc_attn_fn.device,
         )
-        prewarm_mhc_pre(
+        pre_kwargs = dict(
             # Template carrying dtype/device; buckets allocate their own sizes.
             residual=residual,
             fn=layer.hc_attn_fn,
@@ -5368,30 +5386,58 @@ class DeepseekV4ForCausalLM(nn.Module):
             norm_weight=layer.input_layernorm.weight.data,
             norm_eps=layer.input_layernorm.variance_epsilon,
         )
-        mhc_post(
-            x=residual.new_zeros((1, layer.hidden_size)),
-            residual=residual,
-            post_layer_mix=torch.zeros(
-                (1, layer.hc_mult, 1),
-                dtype=torch.float32,
-                device=residual.device,
-            ),
-            comb_res_mix=torch.zeros(
-                (1, layer.hc_mult, layer.hc_mult),
-                dtype=torch.float32,
-                device=residual.device,
-            ),
-        )
+
+        def run_mhc_post() -> None:
+            mhc_post(
+                x=residual.new_zeros((1, layer.hidden_size)),
+                residual=residual,
+                post_layer_mix=torch.zeros(
+                    (1, layer.hc_mult, 1),
+                    dtype=torch.float32,
+                    device=residual.device,
+                ),
+                comb_res_mix=torch.zeros(
+                    (1, layer.hc_mult, layer.hc_mult),
+                    dtype=torch.float32,
+                    device=residual.device,
+                ),
+            )
+
+        if self._share_mhc_prewarm:
+            num_buckets = prewarm_mhc_pre_sharded(**pre_kwargs, bucket_share=share)
+            # mhc_post is one more kernel, taken by the next rank in the bucket rotation.
+            if num_buckets % share[1] == share[0]:
+                run_mhc_post()
+        else:
+            prewarm_mhc_pre(**pre_kwargs)
+            run_mhc_post()
         torch.cuda.synchronize()
         compile_secs = time.perf_counter() - tic
+        if self._share_mhc_prewarm:
+            tp_group.barrier()
+            sync_secs = time.perf_counter() - tic - compile_secs
+            prewarm_mhc_pre_sharded(**pre_kwargs)
+            run_mhc_post()
+            torch.cuda.synchronize()
         # Runs before init_memory_pool(); don't let transients skew pool sizing.
         torch.cuda.empty_cache()
-        get_parallel().tp_group.barrier()
-        logger.info(
-            "DeepSeek V4 MHC prewarm at load: compile %.1fs, rank sync +%.1fs",
-            compile_secs,
-            time.perf_counter() - tic - compile_secs,
-        )
+        tp_group.barrier()
+        if self._share_mhc_prewarm:
+            logger.info(
+                "DeepSeek V4 MHC prewarm at load: compile share %d/%d %.1fs, "
+                "rank sync +%.1fs, load all +%.1fs",
+                share[0],
+                share[1],
+                compile_secs,
+                sync_secs,
+                time.perf_counter() - tic - compile_secs - sync_secs,
+            )
+        else:
+            logger.info(
+                "DeepSeek V4 MHC prewarm at load: compile %.1fs, rank sync +%.1fs",
+                compile_secs,
+                time.perf_counter() - tic - compile_secs,
+            )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         params_dict = dict(self.named_parameters())

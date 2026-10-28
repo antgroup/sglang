@@ -80,6 +80,27 @@ def load_jit(
                         given entry points. Otherwise the sources must export
                         from the C++ side themselves.
     """
+    from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
+
+    if dsv41_sm90_on("startup"):
+        from sglang.srt.utils import jit_manifest
+
+        if jit_manifest.is_recording():
+            jit_manifest.record_load_jit(
+                args,
+                dict(
+                    cpp_files=cpp_files,
+                    cuda_files=cuda_files,
+                    cpp_wrappers=cpp_wrappers,
+                    cuda_wrappers=cuda_wrappers,
+                    extra_cflags=extra_cflags,
+                    extra_cuda_cflags=extra_cuda_cflags,
+                    extra_ldflags=extra_ldflags,
+                    extra_include_paths=extra_include_paths,
+                    extra_dependencies=extra_dependencies,
+                    header_only=header_only,
+                ),
+            )
     if is_hip_runtime():
         extra_cuda_cflags = [
             flag
