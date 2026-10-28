@@ -113,6 +113,9 @@ class SparsePrefillKVBuffer:
         current_capacity = self._buffer.shape[0] if self._buffer is not None else 0
         current_dtype = self._buffer.dtype if self._buffer is not None else None
         if num_tokens > current_capacity or dtype != current_dtype:
+            # Release the old buffer before allocating, so growth never holds both;
+            # callers drop their views of it between calls.
+            self._buffer = None
             self._buffer = torch.empty(
                 (num_tokens, 1, WORKSPACE_DIM),
                 dtype=dtype,

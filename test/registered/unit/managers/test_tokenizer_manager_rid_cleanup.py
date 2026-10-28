@@ -12,6 +12,7 @@ Covers:
   - Resubmission succeeds after cleanup
   - Handler failures clean up pending and dispatched requests
   - _handle_batch_output takes non-streaming first_token_time from the scheduler
+  - An abort accepted before dispatch reaches the scheduler after the request
 """
 
 import asyncio
@@ -33,8 +34,10 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
+    BatchTokenizedGenerateReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    TokenizedGenerateReqInput,
     wrap_as_pickle,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
@@ -1278,6 +1281,103 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == rid]
         self.assertTrue(aborts, "disconnect must send an AbortReq to the scheduler")
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestAbortBeforeDispatch(CustomTestCase):
+    """The scheduler drops an abort for a rid it has not received, so an abort
+    accepted while the request is still being prepared must reach the scheduler
+    again after the request does."""
+
+    def _drive(self, *, batch, fail_resend):
+        tm = _make_tokenizer_manager(self)
+        tm.cuda_vmm_feature_transport = Mock()
+        released = []
+        tm.cuda_vmm_feature_transport.cancel_for_dispatch.side_effect = released.append
+        tm.positional_embeds_transport = Mock()
+        tm.positional_embeds_transport.prepare_for_dispatch.return_value = []
+        rids = ["early_abort", "batch_peer"] if batch else ["early_abort"]
+        payloads = []
+        for rid in rids:
+            tm.rid_to_state[rid] = _make_req_state(rid)
+            payload = Mock(spec=TokenizedGenerateReqInput)
+            payload.rid, payload.mm_inputs = rid, None
+            payload.time_stats = APIServerReqTimeStats()
+            payloads.append(payload)
+        sent, failed_sends = [], []
+
+        def dispatch(obj):  # IPC boundary; optionally fails the first resend
+            delivered = any(not isinstance(m, AbortReq) for m in sent)
+            if fail_resend and delivered and isinstance(obj, AbortReq):
+                if not failed_sends:
+                    failed_sends.append(obj)
+                    raise RuntimeError("abort send failed")
+            sent.append(obj)
+
+        tm._dispatch_to_scheduler = dispatch
+
+        async def drive():
+            entered, resume = asyncio.Event(), asyncio.Event()
+
+            async def prepare(_mm_inputs):
+                entered.set()
+                await resume.wait()
+                return ["prepared-feature"]
+
+            tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = prepare
+            task = asyncio.create_task(
+                tm._send_batch_request(payloads)
+                if batch
+                else tm._send_one_request(payloads[0])
+            )
+            await entered.wait()
+            for rid in rids if fail_resend else rids[:1]:
+                tm.abort_request(rid)
+            tm.abort_request(rids[0])  # A repeated cancellation sends nothing more.
+            resume.set()
+            if fail_resend:
+                with self.assertRaisesRegex(RuntimeError, "abort send failed"):
+                    await task
+            else:
+                await task
+
+        with patch(
+            "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+            side_effect=lambda obj: obj,
+        ):
+            asyncio.run(drive())
+        return tm, rids, payloads, sent, released
+
+    def test_early_abort_follows_single_and_batch_payload(self):
+        for batch in (False, True):
+            with self.subTest(batch=batch):
+                tm, rids, payloads, sent, _ = self._drive(
+                    batch=batch, fail_resend=False
+                )
+                self.assertEqual(len(sent), 3)
+                self.assertIsInstance(sent[0], AbortReq)
+                if batch:
+                    self.assertIsInstance(sent[1], BatchTokenizedGenerateReqInput)
+                    self.assertEqual(sent[1].batch, payloads)
+                else:
+                    self.assertIs(sent[1], payloads[0])
+                self.assertIsInstance(sent[2], AbortReq)
+                self.assertEqual(sent[2].rid, rids[0])
+                tm.abort_request(rids[0])
+                self.assertEqual(len(sent), 3, "a later abort is not sent twice")
+
+    def test_failed_resend_leaves_every_delivered_request_abortable(self):
+        """A failed resend must not drop a delivered request locally or cancel
+        its features: handler-failure cleanup must abort every delivered rid."""
+        for batch in (False, True):
+            with self.subTest(batch=batch):
+                tm, rids, _, sent, released = self._drive(batch=batch, fail_resend=True)
+                self.assertEqual(released, [], "the scheduler owns delivered features")
+                delivered_at = len(sent)
+                tm._release_req_states_on_failure(
+                    {rid: tm.rid_to_state[rid] for rid in rids}
+                )
+                self.assertEqual([m.rid for m in sent[delivered_at:]], rids)
+                self.assertTrue(all(rid in tm.rid_to_state for rid in rids))
 
 
 class TestLoRARequestLifecycle(CustomTestCase):

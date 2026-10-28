@@ -21,6 +21,7 @@ def build_dspark_disagg_draft_input(
     spec_info = make_next_draft_input(
         bonus_tokens=last_tokens_tensor,
         new_seq_lens=batch.seq_lens,
+        vocab_size=batch.model_config.vocab_size,
     )
     if batch.enable_overlap:
         spec_info.future_dsa_topk_indices_available = False

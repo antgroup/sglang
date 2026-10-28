@@ -1787,8 +1787,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)
-            self._mark_state_dispatched(tokenized_obj.rid)
             dispatched = True
+            self._mark_states_dispatched([tokenized_obj.rid])
             dispatch_ready = self.encoder_dispatch_ready.pop(tokenized_obj.rid, None)
             if dispatch_ready is not None:
                 dispatch_ready.set()
@@ -1799,15 +1799,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
                 self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
 
-    def _mark_state_dispatched(self, rid: str):
-        """Record that *rid* reached the scheduler.
+    def _mark_state_dispatched(self, rid: str) -> bool:
+        """Record that *rid* reached the scheduler; return whether its abort was
+        already sent, which the scheduler dropped since *rid* had not arrived.
 
         Only dispatched requests are aborted (not discarded) by the
         handler-failure cleanup; see _release_req_states_on_failure.
         """
         state = self.rid_to_state.get(rid)
-        if state is not None:
-            state.dispatched = True
+        if state is None:
+            return False
+        state.dispatched = True
+        return state.abort_sent
+
+    def _mark_states_dispatched(self, rids: List[str]):
+        # Mark every delivered rid before any resend can raise, so the
+        # handler-failure cleanup aborts all of them instead of dropping some.
+        early_aborts = [
+            (rid, self.rid_to_state[rid])
+            for rid in rids
+            if self._mark_state_dispatched(rid)
+        ]
+        # Cleared first so the cleanup retries an abort a failed send left unsent.
+        for _, state in early_aborts:
+            state.abort_sent = False
+        for rid, state in early_aborts:
+            self._dispatch_to_scheduler(AbortReq(rid=rid))
+            state.abort_sent = True
 
     async def _send_batch_request(
         self,
@@ -1840,9 +1858,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
             self._dispatch_to_scheduler(batch_req)
-            for tokenized_obj in tokenized_objs:
-                self._mark_state_dispatched(tokenized_obj.rid)
             dispatched = True
+            self._mark_states_dispatched(
+                [tokenized_obj.rid for tokenized_obj in tokenized_objs]
+            )
             for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
                 tokenized_obj.time_stats = time_stat
             set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")

@@ -75,6 +75,7 @@ from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
     is_cp_active,
@@ -92,7 +93,11 @@ from sglang.srt.layers.layer_boundary import append_stages, get_attn_tp_context
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
-from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sglang.srt.layers.logits_processor import (
+    LogitsMetadata,
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import (
@@ -3541,6 +3546,28 @@ def _scatter_tail_rows(
     return full
 
 
+def _late_layer_tail_logits_metadata(
+    forward_batch: ForwardBatch, tail: LateLayerTail
+) -> LogitsMetadata:
+    logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+    logits_metadata.extend_seq_lens = tail.extend_seq_lens
+    logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+    logits_metadata.extend_logprob_start_lens_cpu = (
+        # A prompt-logprob reader's tail is its whole extend, so its start
+        # stands; every other start is the extend's end.
+        [
+            min(start, t)
+            for start, t in zip(
+                forward_batch.extend_logprob_start_lens_cpu,
+                tail.extend_seq_lens_cpu,
+            )
+        ]
+        if forward_batch.return_logprob
+        else tail.extend_seq_lens_cpu
+    )
+    return logits_metadata
+
+
 class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
     """CUDA execution with declared residual reads and writes."""
 
@@ -4942,13 +4969,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         hidden_states, pre_hc_head = hidden_states
 
         logits_metadata = forward_batch
-        tail = None
-        if (
-            self.capture_aux_hidden_states
-            and self.model.late_layer_start is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+        tail = self._dspark_late_layer_tail(forward_batch)
+        if tail is not None:
             input_ids = tail.rows(input_ids)
             if tail.real_rows_count is not None:
                 # Fixed-capacity tail block from the prefill CUDA graph: drop padding.
@@ -4958,22 +4980,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 pre_hc_head = pre_hc_head[:n]
                 if aux_hidden_states is not None:
                     aux_hidden_states = aux_hidden_states[:n]
-            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
-            logits_metadata.extend_seq_lens = tail.extend_seq_lens
-            logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
-            logits_metadata.extend_logprob_start_lens_cpu = (
-                # A prompt-logprob reader's tail is its whole extend, so its start
-                # stands; every other start is the extend's end.
-                [
-                    min(start, t)
-                    for start, t in zip(
-                        forward_batch.extend_logprob_start_lens_cpu,
-                        tail.extend_seq_lens_cpu,
-                    )
-                ]
-                if forward_batch.return_logprob
-                else tail.extend_seq_lens_cpu
-            )
+            logits_metadata = _late_layer_tail_logits_metadata(forward_batch, tail)
 
         output = self.logits_processor(
             input_ids,
@@ -4991,6 +4998,74 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if tail.real_rows_count is not None
                 else tail.token_indices
             )
+        return output
+
+    def _dspark_late_layer_tail(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[LateLayerTail]:
+        """The late-layer tail when the body returns its rows instead of the extend's:
+        DSpark under decoder SWA bounded replay (see DeepseekV4Model._forward_impl)."""
+        if (
+            self.capture_aux_hidden_states
+            and self.model.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return get_attn_backend().tail_forward_metadata.late_layer_tail
+        return None
+
+    def logits_from_cp_hidden_states(
+        self,
+        hidden_states: Tuple[torch.Tensor, torch.Tensor],
+        aux_hidden_states: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> LogitsProcessorOutput:
+        """Prefill CP: gather the body's rank-local outputs, then run the logits step."""
+        tail = self._dspark_late_layer_tail(forward_batch)
+        extend_cp_metadata = forward_batch.attn_cp_metadata
+        token_indices = None
+        if tail is not None:
+            # Each rank holds its share of the tail rows, padded per tail.cp_metadata.
+            forward_batch.attn_cp_metadata = tail.cp_metadata
+        try:
+            stream = torch.cuda.current_stream()
+            hidden_states, pre_hc_head = cp_gather_after_forward(
+                hidden_states, forward_batch, stream
+            )
+            if aux_hidden_states is not None:
+                aux_hidden_states = cp_gather_after_forward(
+                    aux_hidden_states, forward_batch, stream
+                )
+            if tail is not None:
+                # tail.token_indices index this rank's interleaved shard; DSpark
+                # needs the extend row of every gathered tail row.
+                parallel = get_parallel()
+                token_indices = cp_gather_after_forward(
+                    tail.token_indices * parallel.attn_cp_size + parallel.attn_cp_rank,
+                    forward_batch,
+                    stream,
+                )
+        finally:
+            forward_batch.attn_cp_metadata = extend_cp_metadata
+
+        if tail is None:
+            return self.logits_processor(
+                forward_batch.input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
+                hidden_states_before_norm=(
+                    None if aux_hidden_states is not None else pre_hc_head
+                ),
+            )
+        output = self.logits_processor(
+            forward_batch.input_ids[token_indices],
+            hidden_states,
+            self.lm_head,
+            _late_layer_tail_logits_metadata(forward_batch, tail),
+            aux_hidden_states,
+        )
+        output.hidden_states_token_indices = token_indices
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:

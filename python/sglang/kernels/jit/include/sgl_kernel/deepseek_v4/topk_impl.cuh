@@ -571,9 +571,10 @@ struct TopKRadixBase : TopKConfig {
   /// Re-stages the tie buffer exactly when the threshold bin overflows it: radix
   /// rounds narrow the bin to one bucket, then a final scan emits what lies above
   /// it and stages the bucket for the caller's handle_tie.
+  template <typename SmemT>
   SGL_DEVICE static void refine_ties(  //
       const TopKProblem& problem,
-      Smem* smem,
+      SmemT* smem,
       const float v_lo,
       const float v_hi,
       const uint32_t count_eq) {
@@ -868,10 +869,8 @@ struct TopKStreaming : TopKRadixBase<12> {
 // CUDA only: thread-block clusters and distributed shared memory have no CDNA
 // equivalent.
 //
-// Still truncates an overflowing threshold bin, unlike the register, streaming
-// and ROCm split paths: the candidate set is split across kClusterSize ranks
-// and no single block resolves the row, so refining needs cluster-wide
-// histogram and emit counters rather than the block-local ones refine_ties uses.
+// Rank 0 refines an overflowing global threshold bin after all DSMEM appends.
+// Only that cold path rescans the whole row; the normal cluster path is unchanged.
 // ---------------------------------------------------------------------------
 
 #if SUPPORT_CLUSTER
@@ -894,7 +893,10 @@ struct TopKCluster : TopKRadixBase<10> {
       TieHandleSmem tie_handle;
       int32_t stage_out_idxs[kMaxTopK];
     };
-    TieValue tie_values[kMaxNumTie];
+    union {
+      TieValue tie_values[kMaxNumTie];
+      uint32_t refine_hist[kRefineSize];
+    };
   };
 
   SGL_DEVICE static void barrier_cluster_arrive_relaxed() {
@@ -979,7 +981,8 @@ struct TopKCluster : TopKRadixBase<10> {
       const auto local_count_eq = min(smem->count_eq, kMaxNumTie);
       if (tx == 0) {
         const auto gt = atomicAdd(&smem_0->count_gt, local_count_gt);
-        const auto eq = atomicAdd(&smem_0->count_eq, local_count_eq);
+        // Unclamped, so rank 0 sees the global bin overflow its staging buffer.
+        const auto eq = atomicAdd(&smem_0->count_eq, smem->count_eq);
         smem->local_start_gt = gt;
         smem->local_start_eq = eq;
       }
@@ -1038,6 +1041,11 @@ struct TopKCluster : TopKRadixBase<10> {
 
       cluster.sync();  // bar-3
 
+      // bar-3 completed every DSMEM append, and the other ranks now only emit their
+      // reserved "above" slots, so rank 0 refines into disjoint slots without a barrier.
+      if (smem->count_eq > kMaxNumTie) [[unlikely]] {
+        refine_ties(problem, smem, v_lo, v_hi, smem->count_eq);
+      }
       // Phase 4: Handle ties.
       const auto count_gt = smem->count_gt;
       const auto count_eq = smem->count_eq;

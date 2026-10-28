@@ -1080,6 +1080,7 @@ class SchedulerPPMixin:
             next_draft_input = make_next_draft_input(
                 bonus_tokens=next_token_ids,
                 new_seq_lens=batch.seq_lens,
+                vocab_size=self.model_config.vocab_size,
             )
             batch.spec_info = next_draft_input
 

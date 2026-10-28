@@ -283,8 +283,7 @@ def topk_transform_kpool_v2(
     """GLM k-pool top-k over per-pool scores, fused with pool expansion, the
     ``token_seq_lens % pool_size`` tail and the page-table or offset transform.
 
-    ``metadata`` is :func:`plan_topk_v2` over ``pool_lens``. The kernel reads it
-    before its PDL wait, so plan before launching the kernel that writes ``scores``.
+    ``metadata`` is :func:`plan_topk_v2` over ``pool_lens``.
     """
     _jit_topk_v2_module().topk_transform_kpool(
         scores,

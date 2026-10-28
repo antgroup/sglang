@@ -820,7 +820,14 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
 
     n_sms = torch.cuda.get_device_properties(0).multi_processor_count
 
-    return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
+    n_splits = max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
+    if get_platform().is_sm90:
+        # Workaround for deepseek-ai/DeepGEMM#449: with splits that leave a K-block
+        # remainder, the SM90 tf32_hc_prenorm_gemm reloads the register A operand of
+        # an in-flight WGMMA; drop once sgl-deep-gemm ships the fix.
+        while num_block_k % n_splits:
+            n_splits -= 1
+    return n_splits
 
 
 def get_mhc_pre_token_count_representatives(

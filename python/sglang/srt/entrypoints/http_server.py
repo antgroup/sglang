@@ -22,6 +22,7 @@ import dataclasses
 import errno
 import logging
 import os
+import signal
 import socket
 import ssl
 import tempfile
@@ -66,6 +67,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+from uvicorn.supervisors import multiprocess as uvicorn_multiprocess
 from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.arg_groups.overrides import resolving_view
@@ -2731,6 +2733,24 @@ def _reserve_reuseport_socket(config: uvicorn.Config) -> socket.socket:
         raise SystemExit(1) from error
 
 
+def _run_uvicorn_workers(
+    *, app_path: str, uvicorn_options: Dict[str, Any], reuseport: bool
+) -> None:
+    # A crashed child SIGQUITs this process to tear the engine down; uvicorn's
+    # supervisor (up to 0.54) queues SIGQUIT with no handle_quit, dropping it.
+    uvicorn_multiprocess.SIGNALS.pop(signal.SIGQUIT, None)
+    if reuseport:
+        config = uvicorn.Config(app_path, **uvicorn_options)
+        supervisor = _ReusePortMultiprocess(config)
+        logger.info(
+            f"Uvicorn running on {config.host}:{config.port} "
+            f"with {config.workers} SO_REUSEPORT workers"
+        )
+        supervisor.run()
+    else:
+        uvicorn.run(app_path, **uvicorn_options)
+
+
 def _granian_http1_settings():
     from granian.http import HTTP1Settings
 
@@ -3057,16 +3077,11 @@ def _setup_and_run_http_server(
                     "ssl_ca_certs": get_serving().ssl_ca_certs,
                     "ssl_keyfile_password": get_serving().ssl_keyfile_password,
                 }
-                if get_serving().enable_http_worker_reuseport:
-                    config = uvicorn.Config(app_path, **uvicorn_options)
-                    supervisor = _ReusePortMultiprocess(config)
-                    logger.info(
-                        f"Uvicorn running on {config.host}:{config.port} "
-                        f"with {config.workers} SO_REUSEPORT workers"
-                    )
-                    supervisor.run()
-                else:
-                    uvicorn.run(app_path, **uvicorn_options)
+                _run_uvicorn_workers(
+                    app_path=app_path,
+                    uvicorn_options=uvicorn_options,
+                    reuseport=get_serving().enable_http_worker_reuseport,
+                )
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:

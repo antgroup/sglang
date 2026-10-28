@@ -248,6 +248,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # target pads its embedding (e.g. Inkling true vocab 200058, padded
         # 201024, mask 200064), else the plain vocab size.
         target_model_config = self.target_worker.model_runner.model_config
+        self._vocab_size = int(target_model_config.vocab_size)
         target_embed_rows = (
             getattr(target_model_config.hf_text_config, "padded_vocab_size", None)
             or target_model_config.vocab_size
@@ -886,6 +887,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,
             new_seq_lens=new_seq_lens,
+            vocab_size=self._vocab_size,
         )
         return batch_output
 
@@ -923,6 +925,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         next_draft_input = make_next_draft_input(
             bonus_tokens=torch.empty((0,), device=self.device, dtype=torch.int64),
             new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int64),
+            vocab_size=self._vocab_size,
         )
         if on_publish is not None:
             on_publish(next_draft_input.new_seq_lens)
@@ -1324,6 +1327,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         next_draft_input = make_next_draft_input(
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
+            vocab_size=self._vocab_size,
         )
         if relay is not None:
             relay.published_bonus = next_draft_input.bonus_tokens
@@ -1341,6 +1345,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+            persistent_result_copy_owner=epilogue if graph_accept else None,
         )
 
     def _sampling_graph_eligible(

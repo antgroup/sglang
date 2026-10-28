@@ -220,6 +220,7 @@ class TestDSparkPPOutput(CustomTestCase):
         scheduler = SimpleNamespace(
             _pp_spec_relay=False,
             pp_group=SimpleNamespace(is_first_rank=False),
+            model_config=SimpleNamespace(vocab_size=32),
             future_map=SimpleNamespace(
                 stash=lambda indices, value: payloads.append(value)
             ),
@@ -237,7 +238,9 @@ class TestDSparkPPOutput(CustomTestCase):
             SimpleNamespace(
                 next_token_ids=tokens,
                 next_draft_input=make_next_draft_input(
-                    bonus_tokens=tokens, new_seq_lens=batch.seq_lens
+                    bonus_tokens=tokens,
+                    new_seq_lens=batch.seq_lens,
+                    vocab_size=scheduler.model_config.vocab_size,
                 ),
                 logits_output=None,
             ),

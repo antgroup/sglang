@@ -382,6 +382,81 @@ def test_mhc_refresh_without_deepgemm_prenorm():
     assert "_can_fuse_ffn_mhc" not in layer.__dict__
 
 
+# DeepSeek-V4.1 mHC: hc_mult 4 x hidden 5120, 320 K blocks of 64.
+HC_V41_HIDDEN = 4 * 5120
+
+
+def _with_sm_count(n_sms):
+    from unittest.mock import patch
+
+    props = SimpleNamespace(multi_processor_count=n_sms)
+    return patch.object(torch.cuda, "get_device_properties", return_value=props)
+
+
+def test_mhc_pre_split_divides_k_blocks_on_hopper_only():
+    """deepseek-ai/DeepGEMM#449: an SM90 prenorm split that leaves a K-block
+    remainder corrupts the GEMM, so mhc_pre picks divisors within the SM budget;
+    other archs keep the occupancy-sized split and their partial sums."""
+    from sglang.srt.runtime_context import override_platform
+
+    num_block_k = HC_V41_HIDDEN // 64
+    for n_sms in (78, 132):
+        with override_platform(is_sm90=True), _with_sm_count(n_sms):
+            for num_tokens in range(1, 4097):
+                grid = (num_tokens + 63) // 64
+                budget = max(1, min(n_sms // grid, num_block_k // 4))
+                n = mhc._compute_num_split_for_mhc_pre(num_tokens, HC_V41_HIDDEN)
+                assert num_block_k % n == 0 and 1 <= n <= budget, (n_sms, num_tokens)
+    with override_platform(is_sm90=False), _with_sm_count(148):
+        assert mhc._compute_num_split_for_mhc_pre(128, HC_V41_HIDDEN) == 74
+
+
+def test_hopper_prenorm_gemm_rejects_remainder_splits():
+    """deepseek-ai/DeepGEMM#449: an SM90 prenorm call whose splits leave a K-block
+    remainder must fail loudly instead of returning corrupted sums."""
+    from unittest.mock import patch
+
+    from sglang.srt.layers.deep_gemm_wrapper import entrypoint
+    from sglang.srt.runtime_context import override_platform
+
+    calls = []
+    fake = SimpleNamespace(
+        tf32_hc_prenorm_gemm=lambda *args, num_splits: calls.append(num_splits)
+    )
+    x = torch.empty(64, HC_V41_HIDDEN, dtype=torch.bfloat16)
+    with patch.object(entrypoint, "deep_gemm", fake, create=True):
+        with override_platform(is_sm90=True), pytest.raises(ValueError):
+            entrypoint.tf32_hc_prenorm_gemm(x, None, None, None, num_splits=78)
+        with override_platform(is_sm90=False):
+            entrypoint.tf32_hc_prenorm_gemm(x, None, None, None, num_splits=78)
+    assert calls == [78]
+
+
+def test_hopper_mhc_pre_split_prenorm_sums_are_exact():
+    """deepseek-ai/DeepGEMM#449: every split mhc_pre picks on this device must sum
+    the SM90 prenorm GEMM correctly; remainder splits came out 9-23% wrong."""
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+    from sglang.srt.utils import is_sm90_supported
+
+    if not (is_sm90_supported() and ENABLE_JIT_DEEPGEMM):
+        pytest.skip("SM90 DeepGEMM prenorm GEMM")
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    fn = torch.randn(24, HC_V41_HIDDEN, device="cuda", generator=gen) * 0.02
+    for num_tokens in mhc.get_mhc_pre_token_count_representatives(2048, HC_V41_HIDDEN):
+        n_splits = mhc._compute_num_split_for_mhc_pre(num_tokens, HC_V41_HIDDEN)
+        x = torch.randn(num_tokens, HC_V41_HIDDEN, device="cuda", generator=gen)
+        x = x.bfloat16()
+        out = torch.empty(n_splits, num_tokens, 24, device="cuda")
+        sqrsum = torch.empty(n_splits, num_tokens, device="cuda")
+        tf32_hc_prenorm_gemm(x, fn, out, sqrsum, n_splits)
+        ref = x.double() @ fn.double().T
+        ref_sq = x.double().square().sum(-1)
+        err = (out.sum(0) - ref).abs().max() / ref.abs().max()
+        err_sq = (sqrsum.sum(0) - ref_sq).abs().max() / ref_sq.abs().max()
+        assert err.item() < 1e-3 and err_sq.item() < 1e-3, (num_tokens, n_splits)
+
+
 @pytest.mark.parametrize(
     "replicated,add_shared,has_shared,expected",
     [

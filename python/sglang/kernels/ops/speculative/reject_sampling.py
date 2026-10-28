@@ -197,9 +197,20 @@ def speculative_sampling_classic_kernel(
 
             norm_sum += tl.sum(val)
 
-    # Pass 2: CDF. Degenerate residual (norm_sum == 0, i.e. p == q everywhere on
-    # rejection) leaves the cumsum at 0 <= target_u, so final_token falls back to
-    # VOCAB_SIZE - 1; acceptable since this case is numerically near-impossible.
+    # FP32 can erase the whole positive residual on rejection (a narrow grammar,
+    # near-identical p and q): sample the target p, a valid distribution, instead.
+    use_target = norm_sum <= 0.0
+    if use_target:
+        for v_start in range(0, VOCAB_SIZE, BLOCK_V):
+            v_offsets = v_start + tl.arange(0, BLOCK_V)
+            p_val = tl.load(
+                tp_base_ptr + v_offsets * stride_tp_v,
+                mask=v_offsets < VOCAB_SIZE,
+                other=0.0,
+            )
+            norm_sum += tl.sum(p_val)
+
+    # Pass 2: CDF.
     target_u = coin_final * norm_sum
     cum_sum = 0.0
     final_token = VOCAB_SIZE - 1
@@ -213,7 +224,7 @@ def speculative_sampling_classic_kernel(
             p_ptr = tp_base_ptr + v_offsets * stride_tp_v
             p_val = tl.load(p_ptr, mask=mask, other=0.0)
 
-            if all_drafts_accepted:
+            if all_drafts_accepted | use_target:
                 val = p_val
             else:
                 q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
@@ -226,7 +237,9 @@ def speculative_sampling_classic_kernel(
             block_cumsum = tl.cumsum(val, axis=0)
             total_cumsum = cum_sum + block_cumsum
 
-            candidates_mask = total_cumsum > target_u
+            # A zero-mass token is never sampled, also where a block's cumsum and
+            # the running sum round differently past the CDF's upper edge.
+            candidates_mask = mask & (val > 0.0) & (total_cumsum > target_u)
             has_match = tl.max(candidates_mask, axis=0)
 
             if has_match:
@@ -235,6 +248,28 @@ def speculative_sampling_classic_kernel(
                 found = 1
 
             cum_sum += tl.sum(val)
+
+    if found == 0:
+        # The CDF missed its upper edge in FP32: take the last token in the support.
+        # A row with no support (NaN target) keeps VOCAB_SIZE - 1.
+        last_supported = -1
+        for v_start in range(0, VOCAB_SIZE, BLOCK_V):
+            v_offsets = v_start + tl.arange(0, BLOCK_V)
+            mask = v_offsets < VOCAB_SIZE
+            p_val = tl.load(tp_base_ptr + v_offsets * stride_tp_v, mask=mask, other=0.0)
+            if all_drafts_accepted | use_target:
+                val = p_val
+            else:
+                q_val = tl.load(
+                    dp_base_ptr_safe + v_offsets * stride_dp_v, mask=mask, other=0.0
+                )
+                q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
+                val = tl.maximum(residual_scale * p_val - q_val, 0.0)
+            last_supported = tl.maximum(
+                last_supported, tl.max(tl.where(mask & (val > 0.0), v_offsets, -1))
+            )
+        if last_supported >= 0:
+            final_token = last_supported
 
     tl.store(Predicts + last_accepted_global_idx, final_token)
 

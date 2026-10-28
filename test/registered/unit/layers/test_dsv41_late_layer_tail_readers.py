@@ -2,8 +2,9 @@
 requests that read prompt rows) and how DP ranks learn each other's. CPU only."""
 
 import unittest
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
@@ -16,7 +17,12 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
     DeepseekV4AttnBackend,
     DSV4Metadata,
+    LateLayerTail,
     late_layer_whole_extend,
+)
+from sglang.srt.layers.cp.interleave import (
+    InterleaveContextParallelMetadata,
+    InterleaveCPStrategy,
 )
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
@@ -25,11 +31,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.runner import eager_runner
+from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.models.deepseek_common import decoder_swa_bounded_replay
 from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     late_layer_dp_counts,
 )
-from sglang.srt.models.deepseek_v4 import DeepseekV4Model
+from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM, DeepseekV4Model
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -382,6 +390,168 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
         self._run(torch.tensor([7, 7, 9]), torch.tensor([2, 3, 3]), positions, q_lora)
         self.assertTrue(torch.equal(self.index_q_lora.q, q_lora.q[:3]))
         self.assertTrue(torch.equal(self.index_q_lora.scale, q_lora.scale[:3]))
+
+
+class _TailBody:
+    """DeepseekV4Model stand-in: returns this rank's share of the tail rows."""
+
+    late_layer_start = 21
+
+    def __init__(self, outputs):
+        self.outputs = outputs
+
+    def __call__(self, input_ids, positions, forward_batch, **kwargs):
+        hidden, pre, aux = self.outputs
+        return (hidden, pre), aux
+
+
+class TestPrefillCpDSparkTailLogits(CustomTestCase):
+    """Prefill CP + DSpark under decoder SWA bounded replay: each rank holds its share
+    of the late-layer tail rows. The logits step must get every tail row in extend
+    order, and DSpark the extend row of each (the full-extend gather raised)."""
+
+    def test_tail_rows_reach_logits_in_extend_order_on_every_rank(self):
+        cp_size = 8
+        extend_lens = [300, 40]
+        total = sum(extend_lens)
+        token_indices, tail_lens_cpu, _ = late_layer_tail_layout(
+            extend_lens_cpu=extend_lens,
+            seq_lens_cpu=extend_lens,
+            tail_len=SWA_WINDOW,
+            device=CPU,
+        )
+        tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32)
+        owner = token_indices % cp_size
+        extend_rows = token_indices.float()[:, None]
+        # Tail-order outputs: hidden, pre-hc-head, packed DSpark aux, extend rows.
+        global_outputs = (
+            extend_rows + torch.arange(4) / 8,
+            extend_rows + torch.arange(16) / 32,
+            extend_rows - torch.arange(12) / 16,
+            token_indices,
+        )
+        extend_counts = torch.bincount(
+            torch.arange(total) % cp_size, minlength=cp_size
+        ).tolist()
+
+        for rank in range(cp_size):
+            parallel = SimpleNamespace(
+                attn_cp_rank=rank, attn_cp_size=cp_size, attn_cp_group=None
+            )
+            positions = torch.cat([torch.arange(n) for n in extend_lens])
+            backend = object.__new__(DeepseekV4AttnBackend)
+            with patch.object(
+                deepseek_v4_backend, "get_parallel", return_value=parallel
+            ):
+                layout = backend._late_layer_tail_cp_layout(
+                    SimpleNamespace(batch_size=len(extend_lens), positions=positions),
+                    token_indices,
+                    tail_lens,
+                )
+            tail = LateLayerTail(
+                token_indices=layout["local_token_indices"],
+                positions=layout["local_positions"],
+                extend_seq_lens=tail_lens,
+                extend_seq_lens_cpu=tail_lens_cpu,
+                swa_out_cache_loc=torch.empty(0),
+                pad_rows=layout["pad_rows"],
+                cp_metadata=layout["cp_metadata"],
+                local_lens_cpu=layout["local_lens_cpu"],
+            )
+            physical = layout["cp_metadata"].per_rank_actual_token[rank]
+
+            def share(value, r, physical=physical):
+                rows = value[owner == r]
+                pad = rows.new_zeros((physical - rows.shape[0], *rows.shape[1:]))
+                return torch.cat([rows, pad])
+
+            def all_gather(out, local, rank=rank, share=share):
+                (value,) = [
+                    v
+                    for v in global_outputs
+                    if v.dtype == local.dtype and v.shape[1:] == local.shape[1:]
+                ]
+                torch.testing.assert_close(local, share(value, rank))
+                out.copy_(torch.cat([share(value, r) for r in range(cp_size)]))
+
+            extend_cp = InterleaveContextParallelMetadata(
+                total_seq_lens=total,
+                bs=len(extend_lens),
+                per_rank_actual_token=[max(extend_counts)] * cp_size,
+                per_rank_logical_token=extend_counts,
+            )
+            fb = ForwardBatch(
+                forward_mode=ForwardMode.EXTEND,
+                batch_size=len(extend_lens),
+                input_ids=torch.arange(total) + 1000,
+                req_pool_indices=torch.tensor([1, 2]),
+                seq_lens=torch.tensor(extend_lens),
+                out_cache_loc=torch.arange(total),
+                seq_lens_sum=total,
+                positions=positions,
+                seq_lens_cpu=torch.tensor(extend_lens),
+                extend_num_tokens=total,
+                extend_seq_lens=torch.tensor(extend_lens),
+                extend_seq_lens_cpu=extend_lens,
+                extend_prefix_lens_cpu=[0, 0],
+                attn_cp_metadata=extend_cp,
+            )
+            logits = Mock(return_value=SimpleNamespace())
+            model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
+            torch.nn.Module.__init__(model)
+            model.model = _TailBody(tuple(share(v, rank) for v in global_outputs[:3]))
+            model.pp_group = SimpleNamespace(is_last_rank=True)
+            model.capture_aux_hidden_states = True
+            model.logits_processor = logits
+            model.lm_head = object()
+
+            @contextmanager
+            def unsharded(input_embeds, positions, forward_batch, input_ids):
+                yield input_embeds, positions, input_ids
+
+            strategy = InterleaveCPStrategy(cp_size=cp_size)
+            interleave = "sglang.srt.layers.cp.interleave"
+            with (
+                self.subTest(rank=rank),
+                patch(
+                    "sglang.srt.models.deepseek_v4.get_attn_backend",
+                    return_value=SimpleNamespace(
+                        tail_forward_metadata=SimpleNamespace(late_layer_tail=tail)
+                    ),
+                ),
+                patch(
+                    "sglang.srt.models.deepseek_v4.get_parallel", return_value=parallel
+                ),
+                patch("sglang.srt.layers.cp.base.get_parallel", return_value=parallel),
+                patch(f"{interleave}.get_parallel", return_value=parallel),
+                patch(f"{interleave}.use_symmetric_memory", return_value=nullcontext()),
+                patch(f"{interleave}.is_allocation_symmetric", return_value=False),
+                patch(
+                    f"{interleave}.attn_cp_all_gather_into_tensor",
+                    side_effect=all_gather,
+                ),
+                patch("sglang.srt.layers.cp.utils.is_cp_active", return_value=True),
+                patch(
+                    "sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy
+                ),
+                patch.object(eager_runner, "cp_shard_model_inputs", unsharded),
+                patch("torch.cuda.current_stream", return_value=None),
+            ):
+                out = EagerRunner._execute_extend_cp(
+                    SimpleNamespace(model_runner=SimpleNamespace(model=model)),
+                    fb,
+                    {"input_embeds": torch.zeros(total, 4)},
+                )
+                self.assertIs(fb.attn_cp_metadata, extend_cp)
+                args, kwargs = logits.call_args
+                torch.testing.assert_close(args[0], fb.input_ids[token_indices])
+                torch.testing.assert_close(args[1], global_outputs[0])
+                self.assertEqual(args[3].extend_seq_lens_cpu, tail_lens_cpu)
+                torch.testing.assert_close(args[4], global_outputs[2])
+                self.assertIsNone(kwargs.get("hidden_states_before_norm"))
+                torch.testing.assert_close(
+                    out.hidden_states_token_indices, token_indices
+                )
 
 
 if __name__ == "__main__":

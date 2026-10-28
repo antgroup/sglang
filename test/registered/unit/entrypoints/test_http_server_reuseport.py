@@ -1,10 +1,13 @@
 """With --enable-http-worker-reuseport every uvicorn worker must own a private
 SO_REUSEPORT listener on the configured address, a replaced worker must get a
 fresh one, and a second server on the same fixed host:port must still fail to
-start instead of silently joining the first server's reuseport group.
+start instead of silently joining the first server's reuseport group. Under
+either multi-worker supervisor, a crashed engine child's SIGQUIT must still tear
+the engine down.
 """
 
 import copy
+import os
 import signal
 import socket
 import sys
@@ -192,6 +195,42 @@ def test_real_uvicorn_worker_accepts_on_private_listener(config):
     finally:
         supervisor.terminate_all()
         supervisor.join_all()
+
+
+@pytest.mark.parametrize("reuseport", [False, True])
+def test_child_crash_sigquit_reaches_engine_teardown(
+    monkeypatch, free_tcp_port, reuseport
+):
+    """A SIGQUIT from a crashed engine child must still run the engine's teardown
+    handler once the supervisor starts; the supervisor must keep SIGTERM."""
+    monkeypatch.setattr(multiprocess, "SIGNALS", dict(SIGNALS))
+    torn_down = []
+    signal.signal(signal.SIGQUIT, lambda signum, frame: torn_down.append(signum))
+    queued = []
+
+    def run(supervisor):
+        for sock in supervisor.sockets:
+            sock.close()
+        os.kill(os.getpid(), signal.SIGQUIT)
+        os.kill(os.getpid(), signal.SIGTERM)
+        queued.extend(supervisor.signal_queue)
+
+    monkeypatch.setattr(multiprocess.Multiprocess, "run", run)
+    http_server._run_uvicorn_workers(
+        app_path="starlette.applications:Starlette",
+        uvicorn_options={
+            "host": "127.0.0.1",
+            "port": free_tcp_port,
+            "workers": 2,
+            "factory": True,
+            "lifespan": "off",
+            "log_level": "error",
+        },
+        reuseport=reuseport,
+    )
+
+    assert torn_down == [signal.SIGQUIT]
+    assert queued == [signal.SIGTERM]
 
 
 if __name__ == "__main__":

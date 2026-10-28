@@ -9,7 +9,10 @@ import torch
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )
-from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftBlockResult,
+    make_next_draft_input,
+)
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     accept_draft_tokens,
 )
@@ -380,6 +383,78 @@ def test_dflash_family_accept_uses_block_verification(any_greedy):
     assert (bonus[sampled] == 4).all()
     token_correct_len, _, _ = accept(False)
     assert (token_correct_len[sampled] == 0).any()
+
+
+@pytest.mark.parametrize("block", [False, True])
+@pytest.mark.parametrize("vocab", [33, 4097, 129280])
+def test_zero_residual_samples_the_target_support(vocab, block):
+    """A rejection whose residual max(p - q, 0) is zero everywhere samples the
+    target p, never a token outside its support (a grammar may forbid it)."""
+    batch = 16
+    rows = torch.arange(batch, device=DEVICE)
+    legal = rows * 2 + 1
+    target = torch.zeros(batch, 2, vocab, device=DEVICE)
+    target[rows, :, legal] = 1
+    # q == p on the bonus row, and the draft token has q == 0, so it is rejected.
+    draft = target[:, :1].clone()
+    candidates = torch.zeros(batch, 2, dtype=torch.int64, device=DEVICE)
+    lengths, tokens = _verify(
+        target,
+        draft,
+        candidates,
+        torch.full((batch, 1), 0.5, device=DEVICE),
+        torch.linspace(0, 1 - 2**-24, batch, device=DEVICE),
+        block=block,
+    )
+    assert (lengths == 0).all()
+    torch.testing.assert_close(tokens[:, 0].long(), legal)
+
+
+@pytest.mark.parametrize("block", [False, True])
+@pytest.mark.parametrize("reject", [False, True])
+@pytest.mark.parametrize("vocab", [4097, 129280])
+def test_cdf_upper_edge_stays_in_the_support(vocab, reject, block):
+    """A final coin at the CDF's upper edge, where FP32 accumulation can miss the
+    total, still samples a token with positive mass: zero-mass tails never."""
+    batch, slots = 128, 6
+    gen = torch.Generator(device=DEVICE).manual_seed(20261021)
+    target = torch.zeros(batch, slots, vocab, device=DEVICE)
+    weights = torch.rand(batch, slots, 17, device=DEVICE, generator=gen)
+    target[:, :, 4:21] = weights / weights.sum(-1, keepdim=True)
+    draft = target[:, :-1].clone()
+    if reject:
+        # The draft overshoots token 4, so the residual is a sliver on token 5.
+        draft[:, :, 4] += 2**-20
+        draft[:, :, 5] -= 2**-20
+    candidates = torch.full((batch, slots), 4, dtype=torch.int64, device=DEVICE)
+    lengths, tokens = _verify(
+        target,
+        draft,
+        candidates,
+        torch.full((batch, slots - 1), 1 - 2**-24 if reject else 0.5, device=DEVICE),
+        torch.full((batch,), 1 - 2**-24, device=DEVICE),
+        block=block,
+    )
+    assert (lengths == (0 if reject else slots - 1)).all()
+    bonus = tokens[torch.arange(batch, device=DEVICE), lengths.long()]
+    assert ((bonus >= 4) & (bonus < 21)).all()
+    if reject:
+        assert (bonus == 5).all()
+
+
+def test_out_of_vocab_bonus_never_becomes_the_next_draft_anchor():
+    """Sampling kernels can return an out-of-vocab id for a NaN target row (the
+    request then finishes as "NaN happened"), but the next draft step embeds its
+    anchor before the host sees it: the anchor must be a vocab row."""
+    vocab = 129280
+    bonus = torch.tensor([-1, 7, vocab, 2**31 - 1, vocab - 1], device=DEVICE)
+    anchors = make_next_draft_input(
+        bonus_tokens=bonus,
+        new_seq_lens=torch.full((5,), 8, device=DEVICE),
+        vocab_size=vocab,
+    ).bonus_tokens
+    assert ((anchors >= 0) & (anchors < vocab)).all()
+    torch.testing.assert_close(anchors[[1, 4]], bonus[[1, 4]])
 
 
 if __name__ == "__main__":

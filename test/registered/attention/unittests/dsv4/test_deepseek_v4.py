@@ -747,6 +747,25 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertNotEqual(grown.data_ptr(), first.data_ptr())
         self.assertEqual(workspace._buffer.data_ptr(), grown.data_ptr())
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA allocator statistics")
+    def test_sparse_prefill_kv_buffer_releases_before_growing(self):
+        """Growing the workspace must not hold the old allocation while making the
+        new one, so the transient is only the growth (sgl-project/sglang#41076)."""
+        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+            SparsePrefillKVBuffer,
+        )
+
+        row_bytes = 512 * torch.bfloat16.itemsize
+        old_rows, new_rows = 32768, 40960  # 32 MiB, then 40 MiB
+        workspace = SparsePrefillKVBuffer(torch.device("cuda"))
+        workspace.get(old_rows)
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        workspace.get(new_rows)
+        transient = torch.cuda.max_memory_allocated() - before
+        self.assertLessEqual(transient, (new_rows - old_rows) * row_bytes)
+
     def test_sparse_prefill_c4_uses_live_extent(self):
         page_table = torch.zeros((2, 4096), dtype=torch.int32)
         for max_seq_len in (3, 4, 255, 256, 259, 260):

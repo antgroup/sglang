@@ -142,6 +142,12 @@ class GenerationBatchResult:
     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
     extra_keep_alive_refs: Optional[List[Any]] = None
 
+    # Owner of the graph-persistent buffers next_token_ids / accept_lens view
+    # (a folded DSpark accept); it fences their reuse on the result's D2H copy.
+    persistent_result_copy_owner: Optional[Any] = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
@@ -170,6 +176,14 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
+        owner = self.persistent_result_copy_owner
+        if owner is not None:
+            # Copy the graph-owned views first, so the reuse fence does not also
+            # wait for the optional outputs' D2H.
+            self._copy_token_results_to_cpu()
+            owner.record_result_copy_done()
+            # Do not retain the graph owner through the result queue.
+            self.persistent_result_copy_owner = None
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(
@@ -198,16 +212,8 @@ class GenerationBatchResult:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
-        self.next_token_ids = _async_d2h(self.next_token_ids)
-
-        if self.accept_lens is not None:
-            self.accept_lens = _async_d2h(self.accept_lens)
-
-        if self.block_accept_lens is not None:
-            self.block_accept_lens = _async_d2h(self.block_accept_lens)
-
-        if self.cap_lens is not None:
-            self.cap_lens = _async_d2h(self.cap_lens)
+        if owner is None:
+            self._copy_token_results_to_cpu()
 
         # Sub-objects only declare their device fields; the single copy+safety
         # primitive (_async_d2h: pinned D2H + record_stream) is injected here so
@@ -229,6 +235,18 @@ class GenerationBatchResult:
         self.copy_auxiliary_output_to_cpu()
 
         self.copy_done.record()
+
+    def _copy_token_results_to_cpu(self) -> None:
+        self.next_token_ids = _async_d2h(self.next_token_ids)
+
+        if self.accept_lens is not None:
+            self.accept_lens = _async_d2h(self.accept_lens)
+
+        if self.block_accept_lens is not None:
+            self.block_accept_lens = _async_d2h(self.block_accept_lens)
+
+        if self.cap_lens is not None:
+            self.cap_lens = _async_d2h(self.cap_lens)
 
     def copy_auxiliary_output_to_cpu(self) -> None:
         if self.logits_output is None or self.auxiliary_host_output is not None:

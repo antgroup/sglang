@@ -110,8 +110,15 @@ def make_next_draft_input(
     *,
     bonus_tokens: torch.Tensor,
     new_seq_lens: torch.Tensor,
+    vocab_size: int,
 ) -> DFlashDraftInputV2:
-    return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
+    # A NaN target row can yield an out-of-vocab bonus (the fused split-vocab argmax
+    # does); the caller keeps the raw id so the request finishes as "NaN happened",
+    # but the next draft step embeds this anchor before the host sees it.
+    return make_draft_input_v2(
+        bonus_tokens=bonus_tokens.clamp(0, vocab_size - 1),
+        new_seq_lens=new_seq_lens,
+    )
 
 
 def resolve_greedy_mask(

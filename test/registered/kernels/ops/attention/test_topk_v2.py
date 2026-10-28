@@ -33,12 +33,15 @@ import sys
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_packed_v2,
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
+    topk_v2_plan_is_written,
 )
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -159,24 +162,14 @@ def _reference(scores, seq_lens, k):
 
 
 def _plan(seq_lens):
-    """Plan, then break stream adjacency with the transform launch.
-
-    The transform kernel prefetches the plan metadata BEFORE its PDL wait, which
-    is only legal while the plan kernel is not the immediately preceding kernel
-    in the stream -- in production the plan is built during per-forward metadata
-    prep, a whole model forward earlier. Launching the two back to back would
-    read the plan through a programmatic dependency that guarantees no memory
-    visibility, so mirror the production separation instead.
-    """
-    metadata = plan_topk_v2(seq_lens)
-    torch.cuda.synchronize()
-    return metadata
+    """Plan on the same stream; correctness must not require a host barrier."""
+    return plan_topk_v2(seq_lens)
 
 
 def _run(scores, seq_lens, page_table, inv_cpu, k):
     batch = scores.shape[0]
-    metadata = _plan(seq_lens)
     out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
+    metadata = _plan(seq_lens)
     topk_transform_paged_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata)
     torch.cuda.synchronize()
     out_cpu = out.cpu().tolist()
@@ -187,8 +180,8 @@ def _run_raw(scores, seq_lens, k):
     """Run with no page table and return the selected indices per row, dropping
     -1 padding -- the selected positions themselves, NOT a page transform."""
     batch = scores.shape[0]
-    metadata = _plan(seq_lens)
     out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
+    metadata = _plan(seq_lens)
     topk_transform_paged_v2(scores, seq_lens, None, out, PAGE_SIZE, metadata)
     torch.cuda.synchronize()
     out_cpu = out.cpu().tolist()
@@ -197,9 +190,9 @@ def _run_raw(scores, seq_lens, k):
 
 def _run_dual(scores, seq_lens, page_table, inv_cpu, k):
     batch = scores.shape[0]
-    metadata = _plan(seq_lens)
     out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
     raw = torch.full_like(out, -1)
+    metadata = _plan(seq_lens)
     topk_transform_paged_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata, raw)
     torch.cuda.synchronize()
     out_cpu = out.cpu().tolist()
@@ -317,6 +310,61 @@ def test_topk_v2_dual_output(batch: int, seq: int) -> None:
     _assert_topk_close(scores.cpu(), ref_raw, direct_raw, batch, seq_lens.cpu(), k)
 
 
+@triton.jit
+def _publish_plan_late_kernel(src, dst, numel, delay_ns, BLOCK: tl.constexpr):
+    # A legal PDL primary: dependents may launch before its stores land.
+    tl.extra.cuda.gdc_launch_dependents()
+    start = tl.extra.cuda.globaltimer()
+    now = start
+    while now - start < delay_ns:
+        now = tl.extra.cuda.globaltimer()
+    offs = tl.arange(0, BLOCK)
+    # Depending on `now` keeps the store after the spin.
+    mask = (offs < numel) & (now >= start)
+    tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
+
+
+@torch.inference_mode()
+def test_topk_v2_reads_plan_after_pdl_wait() -> None:
+    """The persistent cluster pool must take its work count from the plan only
+    after its PDL wait: the preceding kernel may let it launch before storing the
+    plan, and a stale count leaves the pool's rows unselected.
+    """
+    if is_hip():
+        pytest.skip("PDL and the cluster pool are CUDA-only")
+    batch, seq, k = 128, 131072, 512
+    device = "cuda"
+    torch.manual_seed(4242)
+    scores = torch.randn(batch, seq, dtype=torch.float32, device=device)
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    if not topk_v2_plan_is_written(lengths):
+        pytest.skip("this device routes the batch away from the persistent pool")
+    # Route every row to the pool.
+    plan = plan_topk_v2(lengths, static_threshold=32768)
+    assert plan[0, 1].item() == batch
+    metadata = torch.empty_like(plan)
+    out = torch.empty((batch, k), dtype=torch.int32, device=device)
+    block = triton.next_power_of_2(plan.numel())
+
+    def run(delay_ns):
+        metadata.zero_()
+        out.fill_(-2)
+        torch.cuda.synchronize()
+        _publish_plan_late_kernel[(1,)](
+            plan, metadata, plan.numel(), delay_ns, BLOCK=block, num_warps=1
+        )
+        topk_transform_paged_v2(scores, lengths, None, out, PAGE_SIZE, metadata)
+        torch.cuda.synchronize()
+
+    run(0)  # compile both kernels outside the timed window
+    run(2_000_000)
+    out_cpu = out.cpu()
+    assert (out_cpu >= 0).all(), "rows routed to the pool were left unwritten"
+    scores_cpu = scores.cpu()
+    for row in range(batch):
+        _assert_topk_values(scores_cpu[row], out_cpu[row], k)
+
+
 # --- exactness when the coarse histogram cannot discriminate -----------------
 # The tests above draw from ``torch.randn``, which spreads scores over many
 # coarse bins and leaves the threshold bin far below the tie-staging capacity.
@@ -379,27 +427,25 @@ def _narrow_seed(dist, *rest):
     return seed
 
 
-# Longest row that never reaches the CUDA cluster path, which still truncates an
-# overflowing threshold bin (the smallest get_static_cluster_floor in topk_v2.cuh).
-CUDA_MAX_NON_CLUSTER_SEQ = 24576
-
-
 @pytest.mark.parametrize("dist", NARROW_DISTRIBUTIONS)
-@pytest.mark.parametrize("batch,seq", [(6, 8192), (4, 20480), (4, 32768), (4, 65536)])
+@pytest.mark.parametrize(
+    "batch,seq",
+    [(6, 8192), (4, 20480), (4, 32768), (4, 65536), (64, 262144)],
+)
 @torch.inference_mode()
 def test_topk_v2_single_coarse_bin_is_exact(batch: int, seq: int, dist: str) -> None:
-    """No tolerance here: the threshold bin holds the whole row at k=2048, so a
-    dropped candidate is a wrong answer rather than a tie swap. Covers
-    register-path and streaming-path shapes, and a ROCm split-path shape (above
-    split_floor); tie staging is per-template.
+    """No tolerance here: at k=2048 the threshold bin holds every score except 128
+    scattered larger ones, so a dropped candidate is a wrong answer rather than a
+    tie swap. Covers register, streaming and CUDA cluster shapes (small-batch and
+    persistent pool) and a ROCm split-path shape; the scattered scores occupy
+    output slots reserved by every cluster rank before the bin is refined.
     """
-    if not is_hip() and seq > CUDA_MAX_NON_CLUSTER_SEQ:
-        pytest.skip("CUDA may route this shape to the unrefined cluster path")
     torch.manual_seed(_narrow_seed(dist, batch, seq))
     device = "cuda"
     k = 2048
     width = (seq + 3) & ~3
     scores = _single_bin_scores(dist, batch, width, device)[:, :seq]
+    scores[:, torch.randperm(seq, device=device)[:128]] = 2.0
     seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
 
     our_raw = _run_raw(scores, seq_lens, k)

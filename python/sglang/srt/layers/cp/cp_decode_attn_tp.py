@@ -160,6 +160,10 @@ class CpDecodeAttnTpContext:
         for scale_name in ("weight_scale_inv", "weight_scale"):
             if getattr(linear_instance, scale_name, None) is not None:
                 attrs.append((linear_instance, scale_name, dim))
+        # The SM90 block32 FP8 linear runs large-M GEMMs on this BF16 expansion of
+        # the weight (Fp8LinearMethod.process_weights_after_loading_block_quant).
+        if getattr(linear_instance, "_block_fp8_bf16_weight", None) is not None:
+            attrs.append((linear_instance, "_block_fp8_bf16_weight", dim))
         return attrs
 
     # ==================== Context manager ====================

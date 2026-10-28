@@ -287,6 +287,8 @@ class TargetVerifyExecutor:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        if self.verify_epilogue is not None:
+            self.verify_epilogue.wait_for_result_copy_done()
         self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -361,6 +363,8 @@ class TargetVerifyExecutor:
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
+        if self.verify_epilogue is not None:
+            self.verify_epilogue.wait_for_result_copy_done()
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -636,6 +640,10 @@ class DsparkVerifyEpilogue:
         self.out_tokens_buf = torch.zeros(
             (self.max_bs, self.stride), dtype=torch.int64, device=device
         )
+        # The step result's D2H reads these accept buffers on the copy stream,
+        # which the next target verify replay overwrites; this event fences it.
+        self._result_copy_done_event = None
+        self._result_copy_pending = False
         # Under the accept-site broadcast the fused tail serves only simulate_fold,
         # whose broadcast inputs (length, draw) the kernel can take.
         self._tail_broadcasts = bool(fused_accept_tail) and tp_sync.enabled(
@@ -745,6 +753,24 @@ class DsparkVerifyEpilogue:
         )
         if committed_engram and capturing:
             self.folds_engram_commit = True
+
+    def record_result_copy_done(self) -> None:
+        """Called on the copy stream once the step result has read the accept buffers.
+        A later record also covers an earlier pending copy: both are on that stream."""
+        if self._result_copy_done_event is None:
+            device_module = torch.get_device_module(self.correct_len_buf.device)
+            self._result_copy_done_event = device_module.Event()
+        self._result_copy_done_event.record()
+        self._result_copy_pending = True
+
+    def wait_for_result_copy_done(self) -> None:
+        """Gate the next target verify replay, leaving the draft before it overlapped."""
+        if not self._result_copy_pending:
+            return
+        torch.get_device_module(
+            self.correct_len_buf.device
+        ).current_stream().wait_event(self._result_copy_done_event)
+        self._result_copy_pending = False
 
     def run_static(
         self, io: StaticVerifyIO, *, accept, gate: torch.Tensor, kv_projected=False

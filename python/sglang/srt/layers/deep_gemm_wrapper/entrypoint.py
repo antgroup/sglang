@@ -12,6 +12,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -292,6 +293,14 @@ def tf32_hc_prenorm_gemm(
 ):
     if x.shape[0] == 0:
         return
+    if num_splits is not None and get_platform().is_sm90:
+        num_k_blocks = (x.shape[1] + 63) // 64
+        if num_k_blocks % num_splits:
+            # deepseek-ai/DeepGEMM#449: the SM90 kernel silently corrupts `out` here.
+            raise ValueError(
+                f"tf32_hc_prenorm_gemm: num_splits={num_splits} does not divide "
+                f"{num_k_blocks} K blocks, which gives wrong results on SM90"
+            )
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
 
 

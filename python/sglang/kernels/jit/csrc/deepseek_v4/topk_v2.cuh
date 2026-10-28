@@ -584,8 +584,10 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ 
   using ClusterN = impl::TopKCluster<kClusterSize>;
   __shared__ impl::MaxSmem<typename ClusterN::Smem> smem;
   const auto bx = blockIdx.x;
-  const auto num_cluster_items = params.global().num_cluster_items;
+  // The plan may come from the preceding kernel, and a PDL primary's stores are
+  // visible only after the dependency wait.
   device::PDLWaitPrimary<kPDL>();
+  const auto num_cluster_items = params.global().num_cluster_items;
   if (bx >= params.batch_size) return;
   device::PDLTriggerSecondary<kPDL>();
   auto idx = static_cast<int32_t>(num_cluster_items - 1 - bx);
