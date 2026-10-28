@@ -439,6 +439,30 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
     )
 del _fn
 
+# DeepSeek-V4.1 indexer kernels for SM90 (dsv41_sm90_on("indexer")).
+for _mod, _fn in (
+    ("sm90_fp8_prefill", "fp8_index_logits_prefill"),
+    ("sm90_fp8_prefill", "unpack_fp4_index_keys_to_fp8"),
+    ("sm90_fp8_prefill", "quantize_bf16_index_queries_fp8"),
+    ("sm90_fp8_prefill", "finalize_prefill_topk"),
+    ("sm90_fp8_prefill_keys_major", "keys_major_scores"),
+    ("sm90_fp4_indexer", "fp4_index_logits_decode"),
+    ("sm90_candidate", "candidate_block_state"),
+    ("sm90_candidate", "candidate_position_counts"),
+    ("sm90_candidate", "finalize_candidate_topk"),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.dsv41_{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dsv4.{_mod}:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+            ),
+        )
+    )
+del _mod, _fn
+
 # Muse Spark QK norm (+ RoPE, + KV store), built per layer: inventoried through
 # its class methods.
 for _bk in ("torch", "triton", "helion"):

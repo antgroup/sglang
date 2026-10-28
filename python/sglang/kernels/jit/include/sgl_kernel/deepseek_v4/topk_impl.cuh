@@ -59,6 +59,14 @@ SGL_DEVICE T broadcast(T value, uint32_t src = 0) {
 #endif
 }
 
+#ifndef SGL_TOPK_DET_TIES
+#define SGL_TOPK_DET_TIES 0
+#endif
+/// On: exact fp32 copies of the k-th score that straddle the last selected slot
+/// keep their lowest positions, so the selected set does not depend on
+/// shared-memory atomic arrival order. Off keeps the arrival-order subset.
+inline constexpr bool kDetTies = SGL_TOPK_DET_TIES != 0;
+
 template <typename... Smems>
 struct MaxSmem {
   static constexpr size_t kSize = std::max({sizeof(Smems)...});
@@ -336,7 +344,8 @@ struct TopKConfig {
 
   /// Exact radix select over the tie candidates: each thread owns kItems
   /// strided elements (inactive beyond num_ties). Requires
-  /// num_ties <= kItems * kBlockSize.
+  /// num_ties <= kItems * kBlockSize. With kDetTies, copies of one fp32 value
+  /// are then selected by position like the small-tie paths.
   template <uint32_t kItems>
   SGL_DEVICE static void radix_tie_select(  //
       const TieValue* tie_buffer,
@@ -367,18 +376,26 @@ struct TopKConfig {
     if (tx == kRadixSize) smem->counter = smem->counter_final = 0;
     __syncthreads();
     uint32_t total_active = num_ties;
+    // kDetTies: after the four exact-key rounds every active candidate holds the
+    // boundary fp32 value; rounds over the significant bytes of (max_pos - idx)
+    // then keep the lowest positions, the order handle_tie gives small ties.
+    const uint32_t max_pos = problem.seq_len - 1;
+    const int num_rounds = kDetTies ? 4 + ((max_pos >> 24) ? 4 : (max_pos >> 16) ? 3 : (max_pos >> 8) ? 2 : 1) : 4;
+    const auto digit = [&](const int round, const uint32_t i) -> uint32_t {
+      if (!kDetTies || round < 4) return (key[i] >> (24 - round * 8)) & 0xFFu;
+      return ((max_pos - idx[i]) >> ((num_rounds - 1 - round) * 8)) & 0xFFu;
+    };
 
 #pragma unroll
-    for (int round = 0; round < 4; round++) {
-      const uint32_t shift = 24 - round * 8;
+    for (int round = 0; round < num_rounds; round++) {
       const auto hist_idx = round % 2;
       const auto histogram = smem->histogram[hist_idx];
 
 #pragma unroll
       for (uint32_t i = 0; i < kItems; ++i) {
-        if (active[i]) atomicAdd(&histogram[(key[i] >> shift) & 0xFFu], 1);
+        if (active[i]) atomicAdd(&histogram[digit(round, i)], 1);
       }
-      if (round < 3 && tx < kRadixSize) {
+      if (round < num_rounds - 1 && tx < kRadixSize) {
         smem->histogram[hist_idx ^ 1][tx] = 0;
       }
       __syncthreads();
@@ -403,26 +420,26 @@ struct TopKConfig {
       __syncthreads();
 
       const auto [threshold_bin, above_count, equal_count] = smem->match;
-      if (round < 3) total_active = equal_count;
+      if (round < num_rounds - 1) total_active = equal_count;
       topk_remain -= above_count;
 
       // 4. Scatter
 #pragma unroll
       for (uint32_t i = 0; i < kItems; ++i) {
         if (!active[i]) continue;
-        const uint32_t bin = (key[i] >> shift) & 0xFFu;
+        const uint32_t bin = digit(round, i);
         if (bin > threshold_bin) {
           write_pos[i] = atomicAdd(&smem->counter, 1);
           active[i] = false;
         } else if (bin < threshold_bin) {
           active[i] = false;
-        } else if (round == 3) {
+        } else if (round == num_rounds - 1) {
           write_pos[i] = topk - topk_remain + atomicAdd(&smem->counter_final, 1);
         }
-        // my_bin == thr && round < 3: stay active for next round
+        // my_bin == thr && not the last round: stay active for next round
       }
 
-      if (round == 3 || topk_remain == 0) break;
+      if (round == num_rounds - 1 || topk_remain == 0) break;
     }
 
 #pragma unroll
@@ -639,6 +656,40 @@ struct TopKRadixBase : TopKConfig {
       if (lo == 0 || active <= kMaxNumTie) break;
     }
 
+    // More than kMaxNumTie copies of one fp32 value (bucket_mask == 0 here) still
+    // straddle the last slot: kDetTies narrows them on r = max_pos - idx, highest
+    // r (lowest position) first, so the staged subset is not arrival order.
+    const uint32_t max_pos = problem.seq_len - 1;
+    const bool by_pos = kDetTies && active > kMaxNumTie;
+    uint32_t pos_lo = 0;
+    uint32_t pos_mask = ~0u;
+    if (by_pos) {
+      // The first digit holds the top bits of max_pos, so it indexes < kRefineSize bins.
+      constexpr int32_t kBits = kRefineBits;
+      const int32_t top_bit = 31 - __clz(max_pos);  // max_pos >= kMaxNumTie here
+#pragma unroll 1
+      for (int32_t lo = top_bit - top_bit % kBits; lo >= 0; lo -= kBits) {
+#pragma unroll
+        for (uint32_t i = 0; i < kRefineItems; ++i) {
+          hist[tx * kRefineItems + i] = 0;
+        }
+        __syncthreads();
+        scan([&](float val, uint32_t idx) {
+          if (!(val >= v_lo && val < v_hi) || extract_exact_bin(val) != bucket_lo) return;
+          const uint32_t r = max_pos - idx;
+          if (r >= pos_lo && r - pos_lo <= pos_mask) atomicAdd(&hist[(r - pos_lo) >> lo], 1);
+        });
+        __syncthreads();
+        refine_find_threshold(hist, active, remain, handle);
+        const auto match = handle->match;
+        pos_lo |= match.bin << lo;
+        pos_mask = (1u << lo) - 1u;
+        remain -= match.above_count;
+        active = match.equal_count;
+        if (active <= kMaxNumTie) break;
+      }
+    }
+
     // Candidates are never NaN, so keys stay <= key(+inf) and bucket_hi cannot wrap.
     // Staging overwrites the histogram, which refine_find_threshold has consumed.
     const auto bucket_hi = bucket_lo + bucket_mask + 1u;
@@ -647,6 +698,19 @@ struct TopKRadixBase : TopKConfig {
     scan([&](float val, uint32_t idx) {
       if (!(val >= v_lo && val < v_hi)) return;
       const auto key = extract_exact_bin(val);
+      if (by_pos && key == bucket_lo) {
+        const uint32_t r = max_pos - idx;
+        if (r < pos_lo) return;
+        if (r - pos_lo > pos_mask) {
+          const auto pos = atomicAdd(&smem->count_gt, 1);
+          if (pos < topk) [[likely]]
+            problem.emit(pos, idx);
+        } else {
+          const auto slot = atomicAdd(&smem->count_eq, 1);
+          if (slot < kMaxNumTie) smem->tie_values[slot] = {val, idx};
+        }
+        return;
+      }
       if (key >= bucket_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
         if (pos < topk) [[likely]]

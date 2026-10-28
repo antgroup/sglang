@@ -862,5 +862,83 @@ def test_topk_v2_zero_candidates_graph_replay(batch: int, seq: int, k: int) -> N
             _assert_topk_values(scores_cpu[row], out_cpu[row], k)
 
 
+# (positives, exact +0.0 copies): k=512 needs some of the copies; 300 copies reach
+# radix_tie_select<1>, 1500 radix_tie_select<2>, 6000 the refine_ties overflow.
+EXACT_TIE_PATTERNS = {
+    "tie300": (412, 300),
+    "tie1500": (412, 1500),
+    "tie6000": (412, 6000),
+}
+
+
+def _exact_tie_scores(pattern, batch, seq, width, seed):
+    positives, zeros = EXACT_TIE_PATTERNS[pattern]
+    gen = torch.Generator().manual_seed(seed)
+    scores = -1.0 - torch.rand(batch, width, generator=gen)
+    for row in range(batch):
+        perm = torch.randperm(seq, generator=gen)
+        scores[row, perm[:positives]] = 1.0 + torch.rand(positives, generator=gen)
+        scores[row, perm[positives : positives + zeros]] = 0.0
+    scores[:, seq:] = float("nan")
+    return scores.cuda()
+
+
+def _lowest_position_topk(window, k):
+    order = torch.argsort(window.cpu(), descending=True, stable=True)
+    return order[:k].sort().values
+
+
+def _det_ties_paged_cases():
+    for batch, seq in ((4, 8192), (4, 16384), (4, 20480), (4, 131072)):
+        for pattern in EXACT_TIE_PATTERNS:
+            yield pytest.param(pattern, batch, seq)
+
+
+@pytest.mark.parametrize("pattern,batch,seq", list(_det_ties_paged_cases()))
+@pytest.mark.skipif(is_hip(), reason="det_ties serves the CUDA indexer")
+@torch.inference_mode()
+def test_topk_v2_det_ties_keep_lowest_positions(pattern, batch, seq):
+    """With det_ties, copies of the k-th score that straddle the last slot keep
+    the lowest positions on every path (register, streaming, cluster), run after
+    run; an arrival-order subset changes the keys sparse attention reads."""
+    k = 512
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    # Not the kernel right before the top-k: the scores' copy comes between.
+    plan = plan_topk_v2(lengths)
+    scores = _exact_tie_scores(pattern, batch, seq, (seq + 3) // 4 * 4, seq + batch)
+    for _ in range(3):
+        out = torch.empty((batch, k), dtype=torch.int32, device="cuda")
+        topk_transform_paged_v2(scores, lengths, None, out, 1, plan, det_ties=True)
+        for row in range(batch):
+            expected = _lowest_position_topk(scores[row, :seq], k)
+            assert torch.equal(out[row].cpu().long().sort().values, expected), row
+
+
+@pytest.mark.parametrize("pattern", list(EXACT_TIE_PATTERNS))
+@pytest.mark.skipif(is_hip(), reason="det_ties serves the CUDA indexer")
+@torch.inference_mode()
+def test_topk_v2_ragged_det_ties_keep_lowest_positions(pattern):
+    """Same rule on the prefill path, whose windows start mid-vector."""
+    k, seq, start, offset = 512, 8189, 3, 17
+    tied = _exact_tie_scores(pattern, 1, seq, seq, 7)
+    scores = torch.full((1, seq + start + 4), 1000.0, device="cuda")
+    scores[:, start : start + seq] = tied
+    lengths = torch.tensor([seq], dtype=torch.int32, device="cuda")
+    starts = torch.tensor([start], dtype=torch.int32, device="cuda")
+    offsets = torch.tensor([offset], dtype=torch.int32, device="cuda")
+    for _ in range(3):
+        out = torch.empty((1, k), dtype=torch.int32, device="cuda")
+        topk_transform_ragged_v2(
+            scores.clone(),
+            lengths,
+            out_offsets=offsets,
+            out_indices=out,
+            row_starts=starts,
+            det_ties=True,
+        )
+        actual = (out[0] - offset).cpu().long().sort().values
+        assert torch.equal(actual, _lowest_position_topk(tied[0], k))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

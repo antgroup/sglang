@@ -30,6 +30,15 @@ def _jit_topk_v1_module():
 
 @cache_once
 def _jit_topk_v2_module():
+    return _load_topk_v2_module(det_ties=False)
+
+
+@cache_once
+def _jit_topk_v2_det_ties_module():
+    return _load_topk_v2_module(det_ties=True)
+
+
+def _load_topk_v2_module(*, det_ties: bool):
     from sglang.kernels.jit.utils.occupancy import (
         NoSchedulableClustersError,
         get_max_active_clusters,
@@ -60,9 +69,13 @@ def _jit_topk_v2_module():
     if is_hip_runtime():
         # transform_packed only exists under USE_ROCM, see topk_v2.cuh
         wrappers.append(("topk_transform_packed", f"{kernel}::transform_packed"))
+    markers = list(args)
+    if det_ties:
+        extra_cuda_cflags.append("-DSGL_TOPK_DET_TIES=1")
+        markers = ["det_ties", *markers]
     return load_jit(
         make_name("topk_v2"),
-        *args,
+        *markers,
         extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=wrappers,
@@ -176,6 +189,7 @@ def topk_transform_ragged_v2(
     out_offsets: torch.Tensor,
     out_indices: torch.Tensor,
     row_starts: Optional[torch.Tensor] = None,
+    det_ties: bool = False,
 ) -> None:
     """Ragged (prefill) fused top-k for a contiguous-KV score matrix.
 
@@ -192,6 +206,8 @@ def topk_transform_ragged_v2(
     row's window that the 16-byte-aligned read base pulls in are masked out.
     They are invalid for that row and the buffer must have no other consumer.
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
+    ``det_ties`` (CUDA) keeps the lowest positions among exact copies of the
+    k-th score instead of an arrival-order subset.
     """
     if is_xpu():
         torch.ops.sgl_kernel.topk_transform_ragged(
@@ -202,7 +218,7 @@ def topk_transform_ragged_v2(
             row_starts,
         )
         return
-    module = _jit_topk_v2_module()
+    module = _jit_topk_v2_det_ties_module() if det_ties else _jit_topk_v2_module()
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
 
 
@@ -214,6 +230,7 @@ def topk_transform_paged_v2(
     page_size: int,
     metadata: torch.Tensor,
     out_raw_indices: Optional[torch.Tensor] = None,
+    det_ties: bool = False,
 ) -> None:
     """Fused top-k + optional page-table transform (DeepSeek-V4 top-k v2 kernel).
 
@@ -234,7 +251,8 @@ def topk_transform_paged_v2(
     NOTE: every entry of `seq_lens` must be NON-NEGATIVE, and `metadata` must
     come from :func:`plan_topk_v2` over the same `seq_lens` values.
     A length of 0 is the valid way to express "no tokens": the row takes the
-    trivial path and the output is guaranteed to be all -1.
+    trivial path and the output is guaranteed to be all -1. ``det_ties`` (CUDA)
+    as for :func:`topk_transform_ragged_v2`; the plan does not depend on it.
     """
     if is_xpu():
         if out_raw_indices is not None:
@@ -256,7 +274,7 @@ def topk_transform_paged_v2(
             metadata,
         )
         return
-    module = _jit_topk_v2_module()
+    module = _jit_topk_v2_det_ties_module() if det_ties else _jit_topk_v2_module()
     module.topk_transform_paged(
         scores,
         seq_lens,
