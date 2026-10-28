@@ -466,6 +466,78 @@ class TestHummingInactiveRoutes(CustomTestCase):
                     torch.equal(actual.view(torch.int16), expected.view(torch.int16))
                 )
 
+    def test_owner_writes_are_bitwise_the_finalized_rows(self):
+        """A CP rank writes each owner's row block of the deferred sum (plus that
+        block's shared rows) straight into the owner's buffer, per owner or all in
+        one launch; each block must keep the bits of the finalized output's rows."""
+        from sglang.kernels.ops.moe.moe_fused_mul_sum import moe_fused_mul_sum
+
+        generator = torch.Generator(device="cuda").manual_seed(5)
+        for world, rows, top_k, hidden in ((8, 37, 6, 5120), (4, 2048, 6, 5120)):
+            tokens = world * rows
+            values = torch.randn(
+                tokens, top_k, hidden, device="cuda", generator=generator
+            ).to(torch.bfloat16)
+            weights = torch.rand(tokens, top_k, device="cuda", generator=generator)
+            ids = torch.randint(0, 8, (tokens, top_k), device="cuda", dtype=torch.int32)
+            ids[::5, 1] = -1  # a skipped route
+            shared = torch.randn(tokens, hidden, device="cuda", generator=generator)
+            shared = shared.to(torch.bfloat16)
+            kwargs = dict(
+                inputs=values,
+                topk_weights=weights,
+                topk_ids=ids,
+                routed_scaling_factor=2.5,
+            )
+            expected = moe_fused_mul_sum(**kwargs, shared=shared)
+            deferred = humming_runner.HummingDeferredMulSum()
+            deferred.mul_sum_kwargs = dict(
+                kwargs, outputs=torch.empty_like(shared), is_ep=False
+            )
+            blocks = list(shared.split(rows))
+            one_by_one = [torch.empty_like(b) for b in blocks]
+            for p in range(world):
+                deferred.write_rows_with_shared_add(
+                    slice(p * rows, (p + 1) * rows),
+                    outputs=one_by_one[p],
+                    shared=blocks[p],
+                )
+            at_once = [torch.empty_like(b) for b in blocks]
+            deferred.write_all_rows_with_shared_add(
+                rows=rows, rank=world - 1, outputs=at_once, shared=blocks
+            )
+            with self.subTest(world=world, rows=rows):
+                for got in (torch.cat(one_by_one), torch.cat(at_once)):
+                    self.assertTrue(
+                        torch.equal(got.view(torch.int16), expected.view(torch.int16))
+                    )
+
+    def test_w13_input_quant_is_row_local(self):
+        """A CP rank quantizes its own rows for the routed experts before the gather;
+        humming's w13 input quant of any row block must be those rows of the quant
+        of all rows."""
+        from humming import ops
+
+        generator = torch.Generator(device="cuda").manual_seed(9)
+        for rows in (37, 2048):
+            x = torch.randn(8 * rows, 5120, device="cuda", generator=generator)
+            x = (x * 4).to(torch.bfloat16)
+            kw = dict(dtype="float8e4m3", group_size=None, scale_dtype="float32")
+            q_all, s_all = ops.quant_input(inputs=x, **kw)
+            for r in (0, 3, 7):
+                block = slice(r * rows, (r + 1) * rows)
+                q, s = ops.quant_input(inputs=x[block].contiguous(), **kw)
+                with self.subTest(rows=rows, rank=r):
+                    self.assertTrue(
+                        torch.equal(q.view(torch.int8), q_all[block].view(torch.int8))
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            s.reshape(rows, -1).view(torch.int32),
+                            s_all.reshape(8 * rows, -1)[block].view(torch.int32),
+                        )
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

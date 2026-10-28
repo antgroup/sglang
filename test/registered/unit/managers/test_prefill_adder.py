@@ -348,6 +348,40 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_len, 4096)
 
+    def test_late_tail_guard_keeps_the_first_short_chunk_whole(self):
+        """With chunks that leave a window skipping their late layers
+        (late_tail_window), a continuation ending inside the last window must hold
+        a whole window: it shrinks to leave exactly one, or parks the round's
+        budget until one fits. A guard-free adder takes the budget as is."""
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 32768
+        # (fill, prefix, budget, window) -> extend_len, or None when parked.
+        cases = (
+            ((200, 0, 100, 128), 72),
+            ((228, 100, 100, 128), None),
+            ((600, 0, 100, 128), 100),
+            ((200, 0, 300, 128), 200),
+            ((200, 0, 100, 0), 100),
+        )
+        for (fill, prefix, budget, window), expected in cases:
+            with self.subTest(fill=fill, prefix=prefix, budget=budget, window=window):
+                adder = self.create_adder(
+                    self.create_running_batch(), rem_chunk_tokens=budget
+                )
+                adder.late_tail_window = window
+                req = self.create_shared_req("continuation")
+                req.full_untruncated_fill_ids = list(range(fill))
+                req.prefix_len = prefix
+                result = adder.add_chunked_req(req)
+                if expected is None:
+                    self.assertIs(result, req)
+                    self.assertEqual(adder.can_run_list, [])
+                    self.assertEqual(adder.rem_chunk_tokens, 0)
+                else:
+                    self.assertEqual(req.extend_len, expected)
+                    self.assertIs(result, req if expected < fill - prefix else None)
+
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an
         # off-grid chunk leaves the rest of the prompt uncacheable. Without

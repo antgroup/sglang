@@ -275,14 +275,21 @@ def cp_shard_model_inputs(
     complete_position_ids: Any,
     forward_batch,
     complete_input_ids: Optional[Any] = None,
+    sharded_hidden_states: Optional[Any] = None,
 ):
-    """Restore the shared batch so logits processing keeps full-batch metadata."""
+    """Restore the shared batch so logits processing keeps full-batch metadata.
+    ``sharded_hidden_states``: this rank's shard, already built; then
+    ``complete_hidden_states`` is None."""
     assert is_cp_active(forward_batch)
-    sharded_hidden_states = (
-        cp_shard_hidden_states(complete_hidden_states, forward_batch)
+    num_complete_rows = (
+        complete_hidden_states.shape[0]
         if complete_hidden_states is not None
-        else None
+        else complete_position_ids.shape[-1]
     )
+    if sharded_hidden_states is None and complete_hidden_states is not None:
+        sharded_hidden_states = cp_shard_hidden_states(
+            complete_hidden_states, forward_batch
+        )
     sharded_positions = cp_shard_position_ids(complete_position_ids, forward_batch)
     model_input_ids = (
         cp_shard_hidden_states(complete_input_ids, forward_batch)
@@ -302,8 +309,8 @@ def cp_shard_model_inputs(
     spec_hidden_states_backup = None
     if (
         spec_hidden_states is not None
-        and complete_hidden_states is not None
-        and spec_hidden_states.shape[0] == complete_hidden_states.shape[0]
+        and sharded_hidden_states is not None
+        and spec_hidden_states.shape[0] == num_complete_rows
     ):
         spec_hidden_states_backup = spec_hidden_states
         spec_info.hidden_states = cp_shard_hidden_states(

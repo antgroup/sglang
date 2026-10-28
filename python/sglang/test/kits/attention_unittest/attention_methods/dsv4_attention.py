@@ -12,9 +12,11 @@ It does not call any DSV4 backend, FlashMLA, or DSV4 Triton kernel.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Optional
+from unittest import mock
 
 import torch
 from torch import nn
@@ -1696,3 +1698,102 @@ def run_dsv4_compress_attention_case(
     torch.testing.assert_close(
         actual.float(), expected.float(), atol=DSV4_ATOL, rtol=DSV4_RTOL
     )
+
+
+class _CpRankView:
+    """The parallel context as one CP rank of ``cp_size`` sees it; the single-GPU
+    fixture keeps its own topology for everything else."""
+
+    def __init__(self, base, *, cp_rank: int, cp_size: int):
+        self._base = base
+        self.attn_cp_rank = cp_rank
+        self.attn_cp_size = cp_size
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+
+def run_dsv4_sparse_prefill_rows(
+    testcase,
+    case: DSV4AttentionCase,
+    *,
+    cp_rank: Optional[int] = None,
+    cp_size: int = 1,
+    cp_sparse_prefill: bool = True,
+    extra_entries: int = 32,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+) -> Optional[torch.Tensor]:
+    """Extend output of ``case`` (compress ratio 1, 2, 4 or 128) with
+    `SGLANG_OPT_FLASHMLA_SPARSE_PREFILL` on: every row, or with ``cp_rank`` the
+    rows of that interleave CP rank (its metadata after `apply_cp_reindex`, its
+    query rows, CP active) with the backend's ``cp_sparse_prefill`` decision
+    (dsv41_sm90 "cp") set to ``cp_sparse_prefill``. Same cache bytes and seeded
+    indices on every call; None when the extend did not take the sparse prefill.
+    """
+    from sglang.srt.layers.attention import deepseek_v4_backend
+
+    assert case.compress_ratio in (1, 2, 4, 128), case.compress_ratio
+    if case.compress_ratio in (1, 2):
+        extra_entries = max(
+            extra_entries, max(case.seq_lens) // case.compress_ratio + 1
+        )
+    torch.manual_seed(0)
+    fixture = build_dsv4_attention_fixture(
+        testcase,
+        case,
+        dtype=dtype,
+        device=device,
+        compression_ratios=[case.compress_ratio],
+    )
+    fixture.seed_c4_for_sparse_prefill = True
+    fixture.extra_entries = extra_entries  # type: ignore[attr-defined]
+    max_context_len = fixture.runner.req_to_token_pool.req_to_token.shape[1]
+    _populate_swa_kv_cache(fixture, max_context_len=max_context_len, device=device)
+    _populate_extra_kv_cache(fixture, layer_id=0, num_entries=extra_entries)
+    backend = fixture.backend
+    backend.cp_sparse_prefill = cp_sparse_prefill
+
+    q_input, _ = fixture.actual_module.project(fixture.input_hidden)
+    with (
+        torch.no_grad(),
+        forward_context(ForwardContext(attn_backend=backend)),
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True),
+        ExitStack() as cp,
+    ):
+        backend.init_forward_metadata(fixture.forward_batch)
+        if cp_rank is not None:
+            # What the CP metadata init does after the global one: keep this
+            # rank's rows of the per-token fields, then size the FlashMLA buffers.
+            cp.enter_context(
+                mock.patch.object(
+                    deepseek_v4_backend,
+                    "get_parallel",
+                    return_value=_CpRankView(
+                        get_parallel(), cp_rank=cp_rank, cp_size=cp_size
+                    ),
+                )
+            )
+            cp.enter_context(
+                mock.patch.object(
+                    deepseek_v4_backend, "is_cp_active", return_value=True
+                )
+            )
+            core = backend.forward_metadata.core_attn_metadata
+            core.apply_cp_reindex()
+            core.init_flashmla_related(is_prefill=True)
+            q_input = q_input[cp_rank::cp_size]
+        _seed_c4_if_needed(fixture, num_entries=extra_entries)
+        out = backend.forward(
+            q=q_input,
+            k=q_input,
+            v=q_input,
+            layer=fixture.actual_module.attn,
+            forward_batch=fixture.forward_batch,
+            compress_ratio=case.compress_ratio,
+            save_kv_cache=False,
+            attn_sink=fixture.actual_module.attn_sink,
+        )
+        if backend.forward_metadata.sparse_prefill_cache is None:
+            return None
+    return out

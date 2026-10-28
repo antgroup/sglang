@@ -51,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
     world_dp_gather_enabled,
 )
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
@@ -669,6 +670,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
+    # Fill tokens each request still has to prefill after this extend;
+    # gated CP EXTEND from host lists only.
+    extend_remaining_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
     # For DP attention (MLP sync sizes)
@@ -1239,6 +1243,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ).to(device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = list(extend_prefix_lens)
                 ret.extend_seq_lens_cpu = list(extend_seq_lens)
+                if dsv41_sm90_on("cp") and ret.forward_mode == ForwardMode.EXTEND:
+                    from sglang.srt.layers.cp.utils import is_cp_active
+
+                    if is_cp_active(ret):
+                        ret.extend_remaining_lens_cpu = [
+                            len(req.full_untruncated_fill_ids) - prefix_len - extend_len
+                            for req, prefix_len, extend_len in zip(
+                                batch.reqs,
+                                extend_prefix_lens,
+                                extend_seq_lens,
+                                strict=True,
+                            )
+                        ]
             else:
                 # gpu_only: device tensors handed in directly; leave *_cpu unset.
                 assert isinstance(extend_seq_lens, torch.Tensor)

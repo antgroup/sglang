@@ -174,5 +174,56 @@ class TestFixedOrderSplitK(CustomTestCase):
                 self.assertTrue(torch.equal(out, even + odd))
 
 
+class TestBlock32PreQuantized(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (
+            9,
+            0,
+        ):
+            raise unittest.SkipTest("Requires SM90 (Hopper)")
+
+    def test_row_blocks_of_the_quant_take_the_bf16_input_gemm(self):
+        """The CP prefill shared expert takes the gate_up input each rank quantized
+        for its own rows, with row-major scales, on blocks of gathered rows; that
+        must be bitwise the block32 linear's own quant of the block (MN-major
+        scales) on the same DeepGEMM."""
+        gen = torch.Generator(device="cuda").manual_seed(13)
+        n, k, world = 576, 5120, 8
+        w, w_scale = _block32_weight(n, k, gen)
+        for rows in (1024, 2048):
+            x = torch.randn(world * rows, k, device="cuda", generator=gen)
+            x = x.to(torch.bfloat16)
+            per_rank = [
+                block32_act_quant_ue8m0_mn_major(part.contiguous())
+                for part in x.split(rows)
+            ]
+            q_rows = torch.cat([q for q, _ in per_rank])
+            s_rows = torch.cat([s.contiguous() for _, s in per_rank])
+            for lo, hi in ((0, 1), (1, 3)):
+                block = slice(lo * rows, hi * rows)
+                q_ref, s_ref = block32_act_quant_ue8m0_mn_major(x[block].contiguous())
+                expected = fp8_kernel.w8a8_block_fp8_matmul_deepgemm(
+                    q_ref, w, s_ref, w_scale, [32, 32], output_dtype=torch.bfloat16
+                )
+                got = fp8_kernel.w8a8_block_fp8_matmul_deepgemm(
+                    q_rows[block],
+                    w,
+                    s_rows[block],
+                    w_scale,
+                    [32, 32],
+                    output_dtype=torch.bfloat16,
+                )
+                with self.subTest(rows=rows, block=(lo, hi)):
+                    self.assertTrue(
+                        torch.equal(
+                            q_rows[block].view(torch.int8), q_ref.view(torch.int8)
+                        )
+                    )
+                    self.assertTrue(
+                        torch.equal(got.view(torch.int16), expected.view(torch.int16))
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 """Decoder SWA bounded replay: the rows the late layers run (whole extends for
 requests that read prompt rows) and how DP ranks learn each other's. CPU only."""
 
+import random
 import unittest
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -20,10 +21,12 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     LateLayerTail,
     late_layer_whole_extend,
 )
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
     InterleaveCPStrategy,
 )
+from sglang.srt.managers.schedule_policy import late_tail_safe_chunk_len
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import (
@@ -38,6 +41,7 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     late_layer_dp_counts,
 )
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM, DeepseekV4Model
+from sglang.srt.models.deepseek_v4_mhc import HcState
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -127,6 +131,207 @@ class TestWholeExtendLayout(CustomTestCase):
         self.assertEqual(tail_lens, [40])
         expected = torch.full((40,), 300 - 40 - SWA_WINDOW, dtype=torch.int32)
         torch.testing.assert_close(floor, expected)
+
+
+class TestSkipUnreadLateLayers(CustomTestCase):
+    """A CP prefill extend that leaves every request at least a window of fill
+    skips its late layers; PrefillAdder's chunk guard keeps every late-layer row
+    a later extend or decode reads written by an extend that ran them."""
+
+    def _unread(
+        self,
+        remaining,
+        *,
+        whole_extend=None,
+        capture=CaptureHiddenMode.NULL,
+        dspark=False,
+        cp_active=True,
+        encoder_swa_replay=False,
+    ):
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.skip_unread_late_layer_tail = True
+        backend.encoder_row_floor = None
+        backend.model_runner = SimpleNamespace(
+            spec_algorithm=(
+                SpeculativeAlgorithm.DSPARK if dspark else SpeculativeAlgorithm.NONE
+            )
+        )
+        forward_batch = SimpleNamespace(
+            extend_remaining_lens_cpu=remaining,
+            capture_hidden_mode=capture,
+            encoder_swa_replay=encoder_swa_replay,
+        )
+        with patch.object(deepseek_v4_backend, "is_cp_active", return_value=cp_active):
+            return backend._late_layer_tail_unread(
+                forward_batch, whole_extend=whole_extend
+            )
+
+    def test_every_request_must_leave_a_window(self):
+        self.assertTrue(self._unread([SWA_WINDOW, 5000]))
+        self.assertFalse(self._unread([SWA_WINDOW - 1, 5000]))
+        # Not a plain EXTEND from host lists.
+        self.assertFalse(self._unread(None))
+
+    def test_readers_of_the_extend_keep_the_late_layers(self):
+        self.assertFalse(self._unread([5000], whole_extend=[True]))
+        self.assertFalse(self._unread([5000], capture=CaptureHiddenMode.LAST))
+        self.assertFalse(self._unread([5000], capture=CaptureHiddenMode.FULL))
+        self.assertTrue(
+            self._unread([5000], capture=CaptureHiddenMode.FULL, dspark=True)
+        )
+        self.assertFalse(self._unread([5000], cp_active=False))
+        self.assertFalse(self._unread([5000], encoder_swa_replay=True))
+
+    def test_chunk_sequences_read_only_written_late_rows(self):
+        """A forward that runs the late layers writes its tail (last <= window
+        rows) and reads the rows from seq_len - window up to its extend; decode
+        reads the last window. Under the guard every such row was written for any
+        budgets; without it, a short chunk after a skipped one reads rows the
+        skipped chunk never wrote."""
+        page, window = 256, SWA_WINDOW
+        rng = random.Random(0)
+
+        def unwritten_reads(fill, guard):
+            written, start, misses = set(), 0, 0
+            while start < fill:
+                budget = rng.choice((rng.randint(1, 2 * window), rng.randint(1, 4096)))
+                if start == 0:
+                    # A first chunk is cut on a page boundary (PrefillAdder).
+                    ext = fill if fill <= budget else budget // page * page
+                elif guard:
+                    ext = late_tail_safe_chunk_len(
+                        remaining=fill - start, budget=budget, window=window
+                    )
+                else:
+                    ext = budget
+                if ext <= 0:
+                    continue
+                end = min(fill, start + ext)
+                if fill - end < window:
+                    reads = range(max(end - window, 0), start)
+                    misses += sum(row not in written for row in reads)
+                    written.update(range(max(end - window, start), end))
+                start = end
+            decode_reads = range(max(fill - window, 0), fill)
+            return misses + sum(row not in written for row in decode_reads)
+
+        fills = [rng.randint(1, 3000) for _ in range(3000)]
+        self.assertEqual(sum(unwritten_reads(f, guard=True) for f in fills), 0)
+        self.assertGreater(sum(unwritten_reads(f, guard=False) for f in fills), 0)
+
+    def test_skipped_forward_fills_every_late_capture(self):
+        """The skipped forward still hands DSpark one aux slot per captured layer
+        (finalize raises on a missing one) and the tail rows of the switch
+        layer's streams, padded like the tail; the late slots are zeros."""
+        rows, hc, hidden = 10, 4, 6
+        model = DeepseekV4Model.__new__(DeepseekV4Model)
+        torch.nn.Module.__init__(model)
+        model.late_layer_start, model.end_layer = 3, 6
+        model.dspark_layers_to_capture = [1, 4, 5]
+        streams = torch.randn(rows, hc, hidden)
+        pre = torch.randn(rows, hc)
+        tail = LateLayerTail(
+            token_indices=torch.tensor([7, 8, 9]),
+            positions=torch.tensor([7, 8, 9]),
+            extend_seq_lens=torch.tensor([3]),
+            extend_seq_lens_cpu=[3],
+            swa_out_cache_loc=torch.empty(0, dtype=torch.int32),
+            pad_rows=2,
+            skip_layers=True,
+        )
+        packer = AuxHiddenStatePacker(len(model.dspark_layers_to_capture))
+        early = tail.rows(streams)[:, 0]
+        packer.append(early)
+        backend = Mock()
+        with patch(
+            "sglang.srt.models.deepseek_v4.get_attn_backend", return_value=backend
+        ):
+            residual, last_pre, out_tail = model._skip_late_layers(
+                HcState(streams, pre),
+                tail,
+                forward_batch=SimpleNamespace(residual_stream=None),
+                capture_dspark=True,
+                dspark_aux_hidden_states=packer,
+            )
+        backend.skip_late_layer_tail.assert_called_once_with()
+        self.assertIs(out_tail, tail)
+        torch.testing.assert_close(residual, tail.rows(streams))
+        torch.testing.assert_close(last_pre, tail.rows(pre))
+        aux = packer.finalize()
+        torch.testing.assert_close(aux[:, :hidden], early)
+        self.assertEqual(aux.shape, (5, 3 * hidden))
+        self.assertTrue(bool((aux[:, hidden:] == 0).all()))
+
+    def test_host_cp_layout_is_the_device_layout(self):
+        """The host build (no step syncs) gives the device build's layout for
+        every rank, single-request, mixed and whole-extend batches."""
+        cases = (
+            ([5000], [5000], None),
+            ([300, 40, 129, 1], [300, 1064, 129, 2049], None),
+            ([300, 40, 129, 1], [300, 1064, 129, 2049], [False, True, False, False]),
+        )
+        for extend_lens, seq_lens, whole_extend in cases:
+            token_indices, tail_lens_cpu, _ = late_layer_tail_layout(
+                extend_lens_cpu=extend_lens,
+                seq_lens_cpu=seq_lens,
+                tail_len=SWA_WINDOW,
+                device=CPU,
+                whole_extend=whole_extend,
+            )
+            forward_batch = SimpleNamespace(
+                batch_size=len(extend_lens),
+                extend_seq_lens_cpu=extend_lens,
+                positions=torch.cat(
+                    [torch.arange(s - n, s) for n, s in zip(extend_lens, seq_lens)]
+                ),
+            )
+            for cp_size in (1, 2, 4, 8):
+                for rank in range(cp_size):
+                    parallel = SimpleNamespace(attn_cp_rank=rank, attn_cp_size=cp_size)
+                    layouts = []
+                    for host in (False, True):
+                        backend = object.__new__(DeepseekV4AttnBackend)
+                        backend.cp_prefill_async_h2d = host
+                        with patch.object(
+                            deepseek_v4_backend, "get_parallel", return_value=parallel
+                        ):
+                            layouts.append(
+                                backend._late_layer_tail_cp_layout(
+                                    forward_batch,
+                                    token_indices=token_indices,
+                                    tail_lens=torch.tensor(
+                                        tail_lens_cpu, dtype=torch.int32
+                                    ),
+                                    tail_lens_cpu=tail_lens_cpu,
+                                )
+                            )
+                    device_layout, host_layout = layouts
+                    with self.subTest(lens=extend_lens, cp=cp_size, rank=rank):
+                        for key in ("local_token_indices", "local_positions"):
+                            torch.testing.assert_close(
+                                host_layout[key], device_layout[key], rtol=0, atol=0
+                            )
+                        for key in ("local_lens_cpu", "pad_rows"):
+                            self.assertEqual(host_layout[key], device_layout[key])
+                        host_cp, device_cp = (
+                            host_layout["cp_metadata"],
+                            device_layout["cp_metadata"],
+                        )
+                        for key in ("gather_index", "local_index"):
+                            torch.testing.assert_close(
+                                getattr(host_cp, key),
+                                getattr(device_cp, key),
+                                rtol=0,
+                                atol=0,
+                            )
+                        for key in (
+                            "per_rank_actual_token",
+                            "per_rank_logical_token",
+                            "total_seq_lens",
+                        ):
+                            self.assertEqual(
+                                getattr(host_cp, key), getattr(device_cp, key)
+                            )
 
 
 class TestPrefillGraphTailCapacity(CustomTestCase):
@@ -392,6 +597,76 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
         self.assertTrue(torch.equal(self.index_q_lora.scale, q_lora.scale[:3]))
 
 
+class TestDSV41CpCompressorProjectsLocalRows(CustomTestCase):
+    """CP prefill, ratio-1/2 compressor without a pre-gathered projection (the tail
+    source write, eager breaks): under dsv41_sm90 "cp" each rank projects its own
+    rows and gathers the projections; switch off it gathers the hidden rows and
+    projects all of them on every rank (upstream)."""
+
+    def _run(self, *, project_local_rows):
+        cp_size, local, hidden, width = 4, 3, 16, 5
+        backend = object.__new__(deepseek_v4_backend.DeepseekV4AttnBackend)
+        backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
+        backend.cp_compressor_projects_local_rows = project_local_rows
+        backend._low_ratio_compress_torch = MagicMock()
+        projected_rows = []
+
+        def project(x):
+            projected_rows.append(x.shape)
+            return x[:, :width], None
+
+        gathered = []
+
+        def gather(value, forward_batch, stream):
+            gathered.append(value.shape)
+            return value.repeat(cp_size, 1)
+
+        layer = SimpleNamespace(
+            layer_id=3, compressor=SimpleNamespace(project=project), indexer=None
+        )
+        forward_batch = SimpleNamespace(
+            attn_cp_metadata=SimpleNamespace(total_seq_lens=cp_size * local),
+            extend_seq_lens_cpu=[cp_size * local],
+            positions=torch.arange(cp_size * local),
+        )
+        with (
+            get_parallel().override(attn_cp_size=cp_size, attn_cp_rank=1),
+            patch.object(
+                deepseek_v4_backend, "cp_materialize_global_token_order", gather
+            ),
+            patch.object(torch.cuda, "current_stream", return_value=None),
+            patch.object(
+                deepseek_v4_backend,
+                "token_req_indices",
+                return_value=torch.zeros(cp_size * local, dtype=torch.int64),
+            ),
+        ):
+            backend._forward_low_ratio_sources_cp(
+                layer=layer,
+                x=torch.randn(local, hidden),
+                q_lora=None,
+                positions=torch.arange(local),
+                forward_batch=forward_batch,
+                run_compressor=True,
+                run_indexer=False,
+            )
+        args, kwargs = backend._low_ratio_compress_torch.call_args
+        return projected_rows, gathered, args[1], kwargs.get("projected")
+
+    def test_projects_before_the_gather_only_under_the_switch(self):
+        projected_rows, gathered, x, projected = self._run(project_local_rows=True)
+        self.assertEqual(projected_rows, [torch.Size([3, 16])])
+        self.assertEqual(gathered, [torch.Size([3, 5])])
+        self.assertIsNone(x)
+        self.assertEqual(projected[0].shape, torch.Size([12, 5]))
+
+        projected_rows, gathered, x, projected = self._run(project_local_rows=False)
+        self.assertEqual(projected_rows, [])
+        self.assertEqual(gathered, [torch.Size([3, 16])])
+        self.assertEqual(x.shape, torch.Size([12, 16]))
+        self.assertIsNone(projected)
+
+
 class _TailBody:
     """DeepseekV4Model stand-in: returns this rank's share of the tail rows."""
 
@@ -440,13 +715,15 @@ class TestPrefillCpDSparkTailLogits(CustomTestCase):
             )
             positions = torch.cat([torch.arange(n) for n in extend_lens])
             backend = object.__new__(DeepseekV4AttnBackend)
+            backend.cp_prefill_async_h2d = False
             with patch.object(
                 deepseek_v4_backend, "get_parallel", return_value=parallel
             ):
                 layout = backend._late_layer_tail_cp_layout(
                     SimpleNamespace(batch_size=len(extend_lens), positions=positions),
-                    token_indices,
-                    tail_lens,
+                    token_indices=token_indices,
+                    tail_lens=tail_lens,
+                    tail_lens_cpu=tail_lens_cpu,
                 )
             tail = LateLayerTail(
                 token_indices=layout["local_token_indices"],
@@ -506,7 +783,10 @@ class TestPrefillCpDSparkTailLogits(CustomTestCase):
             model.lm_head = object()
 
             @contextmanager
-            def unsharded(input_embeds, positions, forward_batch, input_ids):
+            def unsharded(
+                input_embeds, positions, forward_batch, input_ids, sharded_hidden_states
+            ):
+                assert sharded_hidden_states is None
                 yield input_embeds, positions, input_ids
 
             strategy = InterleaveCPStrategy(cp_size=cp_size)

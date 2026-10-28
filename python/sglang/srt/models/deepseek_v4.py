@@ -160,6 +160,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models import deepseek_v4_attn_proj as dsv41_attn_proj
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models import deepseek_v4_mhc as mhc
+from sglang.srt.models import deepseek_v4_prefill_graph as prefill_graph
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     is_cross_layer_mhc_fusion_enabled,
@@ -184,6 +185,15 @@ from sglang.srt.models.deepseek_v2 import (
     _is_hip,
     _is_npu,
     _is_xpu,
+)
+from sglang.srt.models.deepseek_v4_cp_prefill import (
+    CpMoeSymmTransport,
+    bind_cp_moe_symm_transport,
+    cp_local_router_supported,
+    cp_moe_symm_supported,
+    cp_shard_input_embeds,
+    start_cp_compressor_gather,
+    start_cp_kv_gather,
 )
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 from sglang.srt.models.deepseek_v4_platform_stage import (
@@ -1385,6 +1395,7 @@ class MqaAttentionBase(nn.Module):
 class MQALayer(MqaAttentionBase):
     is_dsv41: bool = False
     use_mega_attention: bool = False
+    cp_prefill_symm: bool = False
 
     def __init__(
         self,
@@ -1519,6 +1530,13 @@ class MQALayer(MqaAttentionBase):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
+        )
+        # The SWA KV and compressor gathers of CP prefill over symmetric memory.
+        self.cp_prefill_symm = (
+            self.is_dsv41
+            and _is_cuda
+            and is_dsa_enable_prefill_cp()
+            and dsv41_sm90_on("cp")
         )
 
         self.use_mega_attention = (
@@ -1891,6 +1909,33 @@ class MQALayer(MqaAttentionBase):
             # the query RoPE fused into this store: HIP, or SM90 attn_proj
             **({} if q_rope is None else {"q": q_rope}),
         )
+
+    def _cp_local_kv(
+        self, x_linear: torch.Tensor, qkv_a: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        if qkv_a is not None:
+            return qkv_a[..., self.q_lora_rank :]
+        kv, _ = self.wkv(x_linear)
+        return kv
+
+    def _start_cp_prefill_gathers(
+        self, *, x, x_linear, qkv_a, forward_batch, attn_backend
+    ) -> Tuple[Optional[Callable], Optional[Callable]]:
+        """Start the CP gathers of this rank's SWA KV and low-ratio compressor
+        projections; each returned call finishes one, None keeps its NCCL path."""
+        finish_kv = start_cp_kv_gather(
+            kv=self._cp_local_kv(x_linear, qkv_a), forward_batch=forward_batch
+        )
+        finish_projected = None
+        if (
+            self.compress_ratio in (1, 2)
+            and attn_backend.cp_low_ratio_compressor_runs(self, forward_batch)
+            and not _low_ratio_sources_break(attn_backend, forward_batch)
+        ):
+            finish_projected = start_cp_compressor_gather(
+                compressor=self.compressor, x=x, forward_batch=forward_batch
+            )
+        return finish_kv, finish_projected
 
     def _compute_kv_bf16(
         self,
@@ -2266,6 +2311,7 @@ class MQALayer(MqaAttentionBase):
         q_rope_out: Optional[torch.Tensor] = None,
         k_nope_out: Optional[torch.Tensor] = None,
         k_rope_out: Optional[torch.Tensor] = None,
+        defer_cp_attention: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
@@ -2277,6 +2323,7 @@ class MQALayer(MqaAttentionBase):
 
         use_cp = is_cp_active(forward_batch)
         kv: Optional[torch.Tensor]
+        finish_cp_kv = finish_cp_projected = None
 
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
@@ -2496,6 +2543,15 @@ class MQALayer(MqaAttentionBase):
             if q_out is not None:
                 q_out.copy_(q)
         else:
+            if use_cp and self.cp_prefill_symm and not defer_cp_attention:
+                # Started before q_b, which hides the transfers; finished below.
+                finish_cp_kv, finish_cp_projected = self._start_cp_prefill_gathers(
+                    x=x,
+                    x_linear=x_linear,
+                    qkv_a=qkv_a,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                )
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
             if _is_hip:
                 q, q_lora, fuse_q_rope = _hip.compute_q_b(
@@ -2539,15 +2595,24 @@ class MQALayer(MqaAttentionBase):
                     forward_batch=forward_batch,
                 )
             elif use_cp:
+                if defer_cp_attention:
+                    # Prefill graph capture: from the gather on, the span through
+                    # the attention core is one eager break (cp_attention).
+                    return q, prefill_graph.CpAttentionInputs(
+                        x,
+                        q_lora,
+                        self._cp_local_kv(x_linear, qkv_a).contiguous(),
+                        positions,
+                    )
                 # every rank writes the whole chunk's window KV with the fused fp32 store
-                if qkv_a is not None:
-                    kv = qkv_a[..., self.q_lora_rank :]
-                else:
-                    kv, _ = self.wkv(x_linear)
-                kv = cp_materialize_global_token_order(
-                    kv.contiguous(),
-                    forward_batch,
-                    torch.cuda.current_stream(),
+                kv = (
+                    finish_cp_kv()
+                    if finish_cp_kv is not None
+                    else cp_materialize_global_token_order(
+                        self._cp_local_kv(x_linear, qkv_a).contiguous(),
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
                 )
                 tail = attn_backend.forward_metadata.late_layer_tail
                 global_positions = (
@@ -2594,6 +2659,11 @@ class MQALayer(MqaAttentionBase):
                     q_lora=q_lora,
                     positions=positions,
                     forward_batch=forward_batch,
+                    cp_projected=(
+                        finish_cp_projected()
+                        if finish_cp_projected is not None
+                        else None
+                    ),
                 )
         else:
             use_npu_cp_full_metadata = use_cp and _is_npu
@@ -2657,6 +2727,7 @@ class MQALayer(MqaAttentionBase):
                 attn_backend,
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
             )
+        cp_capture = prefill_graph.is_capturing()
 
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
@@ -2737,6 +2808,13 @@ class MQALayer(MqaAttentionBase):
                 "SGLANG_DSV4_UNIFIED_KV_FP8=0."
             )
 
+        if cp_capture and (
+            unified
+            or enable_multi_stream
+            or low_ratio_multi_stream
+            or self.use_mega_attention
+        ):
+            raise RuntimeError("prefill graph: unsupported CP attention path")
         tp_slice, q_padded, q_out, q_rope = slice(None), None, None, None
         k_nope, k_rope = None, None
         if self.use_mega_attention:
@@ -2844,6 +2922,7 @@ class MQALayer(MqaAttentionBase):
                 q_rope_out=q_rope,
                 k_nope_out=k_nope,
                 k_rope_out=k_rope,
+                defer_cp_attention=cp_capture,
             )
 
         if unified_fp8_prefill and is_cp_active(forward_batch):
@@ -2909,7 +2988,16 @@ class MQALayer(MqaAttentionBase):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            if cp_capture:
+                if not isinstance(kv, prefill_graph.CpAttentionInputs):
+                    raise RuntimeError("prefill graph: unsupported CP attention path")
+                o = attn_q.new_empty(
+                    (*attn_q.shape[:-1], self.attn_mqa.v_head_dim), dtype=x.dtype
+                )
+                prefill_graph.cp_attention(self, *kv, attn_q, attn_sink, o)
+            elif (
+                forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
+            ):
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                     # TRT-LLM returns BF16 even with FP8 queries.
@@ -3642,6 +3730,18 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         super().__init__(*args, **kwargs)
         self.self_attn.wo_b.reduce_results = False
         self.mlp.reduce_results = False
+        # The CP prefill MoE over symmetric memory (CpMoeSymmTransport), and
+        # whether it routes the CP-local rows itself.
+        self.cp_moe_symm = (
+            self.dsa_enable_prefill_cp
+            and dsv41_sm90_on("cp")
+            and cp_moe_symm_supported(self.mlp)
+        )
+        self.cp_local_router = (
+            self.cp_moe_symm
+            and cp_local_router_supported(self.mlp)
+            and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+        )
         declarations = hc_boundary.stages(self.config, self.layer_id, layer=self)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (declarations[0], self.input_layernorm),
@@ -3673,6 +3773,12 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
             return OverlappedMoeTransport(
                 self.mlp, hidden_states, batch, call.tbo_subbatch_index, overlapped_rows
             )
+        if self.cp_moe_symm:
+            transport = bind_cp_moe_symm_transport(
+                self, hidden_states, batch, call, rows
+            )
+            if transport is not None:
+                return transport
         return hc_boundary.MoeTransport(self, hidden_states, batch, call, rows)
 
     def forward(
@@ -3702,15 +3808,18 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         )
         transport = self.ffn_boundary.transport_context(forward_batch)
         with self.ffn_boundary.exit(forward_batch) as output:
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                input_ids=transport.input_ids,
-                input_ids_global=transport.input_ids_global,
-                skip_shared_experts=transport.do_shared_local,
-                return_moe_output=transport.return_moe_output,
-                leave_output_sum=True,
-            )
+            if isinstance(transport, CpMoeSymmTransport):
+                hidden_states = transport.run_experts(self.mlp)
+            else:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    input_ids=transport.input_ids,
+                    input_ids_global=transport.input_ids_global,
+                    skip_shared_experts=transport.do_shared_local,
+                    return_moe_output=transport.return_moe_output,
+                    leave_output_sum=True,
+                )
             return output.finish(hidden_states)
 
     @functools.cached_property
@@ -3994,6 +4103,7 @@ class DeepseekV4Model(nn.Module):
             and not getattr(config, "language_model_only", False)
         )
         self.decoder_replay_tail = DecoderReplayTail.maybe_create(self)
+        self.prefill_graph = prefill_graph.PrefillGraphRunner.maybe_create(self)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -4145,7 +4255,34 @@ class DeepseekV4Model(nn.Module):
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
-        for i in range(self.start_layer, self.end_layer):
+        use_prefill_graph = (
+            cp_extend
+            and self.prefill_graph is not None
+            and self.prefill_graph.eligible(forward_batch)
+        )
+        first_layer = self.start_layer
+        if use_prefill_graph:
+            head_end = self.end_layer if tail is None else self.late_layer_start
+            head = self.prefill_graph.run_layers(
+                self,
+                region=prefill_graph.FULL if tail is None else prefill_graph.HEAD,
+                start=self.start_layer,
+                end=head_end,
+                state=state,
+                positions=positions,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                hash_ids=hash_ids,
+                forward_batch=forward_batch,
+                tail=tail,
+                capture_dspark=capture_dspark,
+                packer=dspark_aux_hidden_states,
+            )
+            if head is not None:
+                state, first_layer = head, head_end
+            # A capture that failed cleared the stream with its body.
+            hidden_states = residual_batch.set_written(state, forward_batch)
+        for i in range(first_layer, self.end_layer):
             if _is_cuda:
                 layer = self.layers[i]
                 if (
@@ -4187,6 +4324,14 @@ class DeepseekV4Model(nn.Module):
                             positions=positions,
                             forward_batch=forward_batch,
                         )
+                if tail.skip_layers:
+                    return self._skip_late_layers(
+                        state,
+                        tail,
+                        forward_batch=forward_batch,
+                        capture_dspark=capture_dspark,
+                        dspark_aux_hidden_states=dspark_aux_hidden_states,
+                    )
                 # Decode reaches back at most SWA_WINDOW positions.
                 if tail_in_graph:
                     # Eager break: re-run at replay so the backend swaps onto the
@@ -4248,6 +4393,27 @@ class DeepseekV4Model(nn.Module):
                     residual_batch.clear(forward_batch)
                     attn_backend.exit_late_layer_tail(saved_full, forward_batch)
                     return residual, pre, tail
+                if use_prefill_graph:
+                    late = self.prefill_graph.run_layers(
+                        self,
+                        region=prefill_graph.TAIL,
+                        start=i,
+                        end=self.end_layer,
+                        state=state,
+                        positions=positions,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                        hash_ids=hash_ids,
+                        forward_batch=forward_batch,
+                        tail=tail,
+                        capture_dspark=capture_dspark,
+                        packer=dspark_aux_hidden_states,
+                    )
+                    if late is not None:
+                        residual_batch.clear(forward_batch)
+                        attn_backend.exit_late_layer_tail(saved_full, forward_batch)
+                        return late.residual, late.pre, tail
+                    hidden_states = residual_batch.set_written(state, forward_batch)
             if use_tail_graph and tail is None and i == self.late_layer_start:
                 residual, pre, aux = self.decoder_replay_tail.run_idle(
                     state=state,
@@ -4343,6 +4509,29 @@ class DeepseekV4Model(nn.Module):
                 attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return state.residual, state.pre, tail
         return state.residual, state.pre, None
+
+    def _skip_late_layers(
+        self,
+        state: mhc.HcState,
+        tail: LateLayerTail,
+        *,
+        forward_batch: ForwardBatch,
+        capture_dspark: bool,
+        dspark_aux_hidden_states: Optional[AuxHiddenStatePacker],
+    ) -> Tuple[torch.Tensor, torch.Tensor, LateLayerTail]:
+        """End a forward whose late layers no request reads (tail.skip_layers) at
+        the switch. The logits and DSpark consumers still get the tail row layout,
+        filled from the last early layer and zeros; nothing reads those values."""
+        get_attn_backend().skip_late_layer_tail()
+        state = state.take_rows(tail.rows)
+        if capture_dspark:
+            like = state.residual[:, 0]
+            for i in range(self.late_layer_start, self.end_layer):
+                if i in self.dspark_layers_to_capture:
+                    dspark_aux_hidden_states.slot(like).zero_()
+        if _is_cuda:
+            residual_batch.clear(forward_batch)
+        return state.residual, state.pre, tail
 
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
         """DSV4 prefill-only two-batch-overlap gate.
@@ -4807,6 +4996,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             config,
             use_fp8_lm_head=self.fp8_lm_head_use.target and self.pp_group.is_last_rank,
         )
+        # Owner-scattered CP input embedding (cp_shard_input_embeds).
+        self.cp_embed_scatter = (
+            _is_cuda and is_dsa_enable_prefill_cp() and dsv41_sm90_on("cp")
+        )
         self.capture_aux_hidden_states = False
         get_attn_tp_context().init_context(config.q_lora_rank, is_dsa=True)
 
@@ -4984,6 +5177,15 @@ class DeepseekV4ForCausalLM(nn.Module):
     def num_fusable_shared_experts(cls, hf_config) -> int:
         """Shared experts fused as routed slots when fusion is on."""
         return hf_config.n_shared_experts or 0
+
+    def cp_shard_input_embeds(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        """This CP rank's shard of the chunk's input embedding, built without
+        embedding the whole chunk; None: embed the chunk and shard it."""
+        if not self.cp_embed_scatter:
+            return None
+        return cp_shard_input_embeds(self.model.embed_tokens, input_ids, forward_batch)
 
     def prepare_language_model_inputs(
         self,

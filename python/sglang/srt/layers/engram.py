@@ -22,6 +22,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.kernels.ops.communication.cp_prefill_symm import engram_owner_scatter
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
 from sglang.kernels.ops.embeddings.engram_gather import (
     engram_gather,
@@ -43,6 +44,10 @@ from sglang.srt.distributed.device_communicators.cuda_wrapper import (
 )
 from sglang.srt.distributed.parallel_state import inplace_all_reduce
 from sglang.srt.environ import envs
+from sglang.srt.layers.communication.cp_prefill_symm import (
+    cp_group_is_tp_group,
+    get_cp_owner_scatter,
+)
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     dp_gather_replicate,
@@ -1029,6 +1034,9 @@ class EngramEmbedding(nn.Module):
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
         self._sort_host_reads = False
+        # The prefill CP lookup written by each row's owner (_cp_scatter_owned_rows).
+        self._cp_owner_scatter = is_cuda() and dsv41_sm90_on("cp")
+        self._ids_fit_int32 = num_embeddings < 2**31
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
         if (
@@ -1159,11 +1167,49 @@ class EngramEmbedding(nn.Module):
                 (parallel.attn_cp_size * local_rows, *indices.shape[1:])
             )
             attn_cp_all_gather_into_tensor(all_indices, indices.contiguous())
+            if self._cp_owner_scatter:
+                scattered = self._cp_scatter_owned_rows(all_indices, rows=local_rows)
+                if scattered is not None:
+                    return scattered
             start = parallel.attn_cp_rank * local_rows
             return self._lookup(all_indices)[start : start + local_rows]
         if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
             return self._dp_sharded_lookup(indices, forward_batch)
         return self._lookup(indices)
+
+    def _cp_scatter_owned_rows(
+        self, all_indices: torch.Tensor, *, rows: int
+    ) -> Optional[torch.Tensor]:
+        """The CP lookup with each owned row written to its CP rank's symmetric
+        buffer, in place of the zero-filled lookup of every row and its
+        all-reduce: the same rows. None: take that path."""
+        parallel = get_parallel()
+        if (
+            all_indices.dim() != 2
+            or not cp_group_is_tp_group()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        cols = all_indices.shape[1]
+        comm = get_cp_owner_scatter(
+            parallel.attn_cp_group, user="engram", width=cols * self.dim
+        )
+        if comm is None or rows > comm.max_rows:
+            return None
+        engram_owner_scatter(
+            *self._table_ptrs(),
+            all_indices,
+            comm.dst_table,
+            self.dim,
+            FP8_BLOCK_SIZE,
+            self.row_start,
+            self.row_start + self.rows,
+            rows=rows,
+            ids_fit_int32=self._ids_fit_int32,
+            # Two programs per expected owned id.
+            num_programs=2 * -(-all_indices.numel() // self.tp_size),
+        )
+        return comm.finish(rows).view(rows, cols, self.dim)
 
     def dequant_staged(
         self,

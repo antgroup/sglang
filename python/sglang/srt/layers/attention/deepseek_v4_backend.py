@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import functools
+import itertools
 import logging
 from dataclasses import dataclass, field
 from typing import (
@@ -110,6 +111,7 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer_len,
     set_local_dp_buffer_len,
 )
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import (
@@ -144,7 +146,7 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.common import async_h2d, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.attention.flash_mla_interface import FlashMLASchedMeta
@@ -960,6 +962,9 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     # into the extend, padding rows to a dummy row past the end.
     scatter_indices: Optional[torch.Tensor] = None
     real_rows_count: Optional[int] = None
+    # No request reads this forward's late layers, so they do not run; their
+    # outputs keep this row layout (DeepseekV4AttnBackend._late_layer_tail_unread).
+    skip_layers: bool = False
 
     def rows(self, t: torch.Tensor) -> torch.Tensor:
         rows = self.real_rows(t)
@@ -973,12 +978,100 @@ class LateLayerTail(msgspec.Struct, frozen=True):
         )
 
 
+class SkippedLateLayerTail(msgspec.Struct, frozen=True):
+    """tail_forward_metadata of a forward whose late layers do not run: the row
+    layout their outputs keep, without attention metadata."""
+
+    late_layer_tail: LateLayerTail
+
+
 def _tail_rows(
     t: torch.Tensor, *, token_indices: torch.Tensor, contiguous_start: Optional[int]
 ) -> torch.Tensor:
     if contiguous_start is not None:
         return t[contiguous_start:]
     return t[token_indices]
+
+
+class _TailCpRows(msgspec.Struct, frozen=True):
+    """Rank assignment of the bounded-replay tail rows under interleave CP."""
+
+    counts: List[int]
+    max_local: int
+    gather_index: torch.Tensor
+    local_metadata_rows: torch.Tensor
+    # This rank's tail rows as indices into the full extend.
+    local_extend_rows: torch.Tensor
+    local_lens_cpu: List[int]
+    pad_rows: int
+
+
+def _tail_cp_rows(
+    *,
+    token_indices: torch.Tensor,
+    tail_lens: torch.Tensor,
+    batch_size: int,
+    cp_rank: int,
+    cp_size: int,
+) -> _TailCpRows:
+    """Computed on token_indices' device; host inputs keep it free of device syncs."""
+    device = token_indices.device
+    total = token_indices.shape[0]
+    owner_rank = token_indices % cp_size
+    counts = torch.bincount(owner_rank, minlength=cp_size).tolist()
+    max_local = max(counts)
+    order = torch.argsort(owner_rank, stable=True)
+    rank_starts = torch.tensor(
+        [sum(counts[:r]) for r in range(cp_size)],
+        dtype=torch.int64,
+        device=device,
+    )
+    slot = torch.empty_like(owner_rank)
+    slot[order] = torch.arange(total, device=device) - rank_starts[owner_rank[order]]
+    gather_index = owner_rank * max_local + slot
+
+    local_tail_rows = (owner_rank == cp_rank).nonzero().squeeze(1)
+    pad_rows = max_local - counts[cp_rank]
+    # Give each rank distinct padding rows in the compact tail metadata.
+    pad_start = total + sum(max_local - c for c in counts[:cp_rank])
+    local_metadata_rows = torch.cat(
+        [
+            local_tail_rows,
+            torch.arange(pad_start, pad_start + pad_rows, device=device),
+        ]
+    )
+    tail_request_ids = torch.repeat_interleave(
+        torch.arange(batch_size, device=device),
+        tail_lens.to(torch.int64),
+        output_size=total,
+    )
+    return _TailCpRows(
+        counts=counts,
+        max_local=max_local,
+        gather_index=gather_index,
+        local_metadata_rows=local_metadata_rows,
+        local_extend_rows=token_indices[local_tail_rows],
+        local_lens_cpu=torch.bincount(
+            tail_request_ids[local_tail_rows], minlength=batch_size
+        ).tolist(),
+        pad_rows=pad_rows,
+    )
+
+
+def _host_tail_token_indices(
+    extend_lens_cpu: List[int], tail_lens_cpu: List[int]
+) -> torch.Tensor:
+    """late_layer_tail_layout's token indices, built on the host: each request's
+    tail is the last tail_len rows of its extend."""
+    ends = list(itertools.accumulate(extend_lens_cpu))
+    return torch.cat(
+        [torch.arange(end - t, end) for end, t in zip(ends, tail_lens_cpu, strict=True)]
+    )
+
+
+def _async_h2d_tensor(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    pin = is_pin_memory_available(device)
+    return (t.pin_memory() if pin else t).to(device, non_blocking=pin)
 
 
 def _late_layer_whole_extend(
@@ -1306,9 +1399,35 @@ class DeepseekV4AttnBackend(
             get_exec().features.enable_decoder_swa_bounded_replay
         )
         # The model switches onto this metadata in enter_late_layer_tail.
-        self.tail_forward_metadata: Optional[DSV4Metadata] = None
+        self.tail_forward_metadata: Optional[
+            Union[DSV4Metadata, SkippedLateLayerTail]
+        ] = None
         # Set by write_tail_source_kv until exit_late_layer_tail.
         self.tail_source_kv_layer_id: Optional[int] = None
+        # CP prefill metadata copied from host lists without a host sync.
+        self.cp_prefill_async_h2d = dsv41_sm90_on("cp")
+        # CP-local query rows take sparse prefill over gathered SWA and compressed KV;
+        # flash_mla_sparse_fwd replaces the paged decode kernel. One cold 128K request
+        # on 8x H20 (TP8 + prefill CP8): 198.9 vs 216.1 + 6.7 ms of attention per rank.
+        self.cp_sparse_prefill = dsv41_sm90_on("cp")
+        # The replicated low-ratio compressor projects this rank's rows and gathers
+        # the projections, instead of gathering the hidden rows and projecting all
+        # of them on every rank.
+        self.cp_compressor_projects_local_rows = dsv41_sm90_on("cp")
+        # CP prefill chunks no request reads past the switch skip the late layers
+        # (_late_layer_tail_unread). Every DP rank must take the same branch, and
+        # the routed-expert / indexer captures record every layer. PrefillAdder's
+        # chunk guard (late_tail_safe_chunk_len) works in the model's window.
+        features = get_exec().features
+        self.skip_unread_late_layer_tail = (
+            dsv41_sm90_on("cp")
+            and self.enable_decoder_swa_bounded_replay
+            and not model_runner.is_draft_worker
+            and model_runner.sliding_window_size == SWA_WINDOW
+            and get_parallel().attn_dp_size == 1
+            and not features.enable_return_routed_experts
+            and not features.enable_return_indexer_topk
+        )
         # The live batch of the prefill-graph replay; a tail break needs its exact rows.
         self.prefill_graph_replay_batch: Optional[ForwardBatch] = None
         # Prefill CUDA graph tail block (bounded replay inside the graph): row
@@ -1821,20 +1940,27 @@ class DeepseekV4AttnBackend(
         *,
         for_prefill_graph: bool = False,
         max_seq_len_override: Optional[int] = None,
-    ) -> DSV4Metadata:
+    ) -> Union[DSV4Metadata, SkippedLateLayerTail]:
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
         device = forward_batch.out_cache_loc.device
+        whole_extend = late_layer_whole_extend(
+            forward_batch, dspark=self.model_runner.spec_algorithm.is_dspark()
+        )
         token_indices, tail_lens_cpu, swa_replay_start = late_layer_tail_layout(
             extend_lens_cpu=extend_lens_cpu,
             seq_lens_cpu=seq_lens_cpu.tolist(),
             tail_len=SWA_WINDOW,
             device=device,
-            whole_extend=late_layer_whole_extend(
-                forward_batch, dspark=self.model_runner.spec_algorithm.is_dspark()
-            ),
+            whole_extend=whole_extend,
         )
+        if not for_prefill_graph and self._late_layer_tail_unread(
+            forward_batch, whole_extend=whole_extend
+        ):
+            return self._skipped_late_layer_tail(
+                forward_batch, token_indices=token_indices, tail_lens_cpu=tail_lens_cpu
+            )
         if self.encoder_row_floor is not None:
             # Folded hits: a tail row never reads below its request's replay start.
             swa_replay_start = torch.maximum(
@@ -1900,7 +2026,12 @@ class DeepseekV4AttnBackend(
             )
         tail_lens = async_h2d(tail_lens_cpu, dtype=torch.int32, device=device)
         cp_tail = (
-            self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
+            self._late_layer_tail_cp_layout(
+                forward_batch,
+                token_indices=token_indices,
+                tail_lens=tail_lens,
+                tail_lens_cpu=tail_lens_cpu,
+            )
             if is_cp_active(forward_batch)
             else None
         )
@@ -2003,70 +2134,187 @@ class DeepseekV4AttnBackend(
             metadata.low_ratio_index_plans = {}
         return metadata
 
+    def _late_layer_tail_unread(
+        self, forward_batch: ForwardBatch, *, whole_extend: Optional[List[bool]]
+    ) -> bool:
+        """No request reads this prefill CP extend's late layers: each still has at
+        least a window of fill tokens after it, so a later extend of its own writes
+        every late-layer row that decode or a later chunk reads (PrefillAdder keeps
+        the chunk that first leaves less than a window self-contained; a radix hit
+        re-prefills its last window, swa_reprefill_tail_tokens)."""
+        if not self.skip_unread_late_layer_tail:
+            return False
+        remaining = forward_batch.extend_remaining_lens_cpu
+        capture = forward_batch.capture_hidden_mode
+        return bool(
+            remaining
+            and min(remaining) >= SWA_WINDOW
+            # Prompt logprobs or captured hidden states read rows of this extend.
+            and whole_extend is None
+            and is_cp_active(forward_batch)
+            and not forward_batch.encoder_swa_replay
+            and self.encoder_row_floor is None
+            # DSpark injects the tail's aux states, read only in the draft window.
+            and (
+                capture == CaptureHiddenMode.NULL
+                or (
+                    capture == CaptureHiddenMode.FULL
+                    and self.model_runner.spec_algorithm.is_dspark()
+                )
+            )
+        )
+
+    def _skipped_late_layer_tail(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        token_indices: torch.Tensor,
+        tail_lens_cpu: List[int],
+    ) -> SkippedLateLayerTail:
+        """The tail row layout of an unread CP extend (_late_layer_tail_unread)."""
+        tail_lens = async_h2d(
+            tail_lens_cpu, dtype=torch.int32, device=forward_batch.out_cache_loc.device
+        )
+        cp_tail = self._late_layer_tail_cp_layout(
+            forward_batch,
+            token_indices=token_indices,
+            tail_lens=tail_lens,
+            tail_lens_cpu=tail_lens_cpu,
+        )
+        return SkippedLateLayerTail(
+            late_layer_tail=LateLayerTail(
+                token_indices=cp_tail["local_token_indices"],
+                positions=cp_tail["local_positions"],
+                extend_seq_lens=tail_lens,
+                extend_seq_lens_cpu=tail_lens_cpu,
+                # The skipped layers write no KV; an empty location fails loudly.
+                swa_out_cache_loc=forward_batch.out_cache_loc.new_empty(
+                    0, dtype=torch.int32
+                ),
+                pad_rows=cp_tail["pad_rows"],
+                cp_metadata=cp_tail["cp_metadata"],
+                local_lens_cpu=cp_tail["local_lens_cpu"],
+                skip_layers=True,
+            )
+        )
+
     def _late_layer_tail_cp_layout(
         self,
         forward_batch: ForwardBatch,
+        *,
         token_indices: torch.Tensor,
         tail_lens: torch.Tensor,
+        tail_lens_cpu: List[int],
     ) -> dict:
         cp_rank = get_parallel().attn_cp_rank
         cp_size = get_parallel().attn_cp_size
-        device = token_indices.device
-        total = token_indices.shape[0]
-        owner_rank = token_indices % cp_size
-        counts = torch.bincount(owner_rank, minlength=cp_size).tolist()
-        max_local = max(counts)
-        order = torch.argsort(owner_rank, stable=True)
-        rank_starts = torch.tensor(
-            [sum(counts[:r]) for r in range(cp_size)],
-            dtype=torch.int64,
-            device=device,
-        )
-        slot = torch.empty_like(owner_rank)
-        slot[order] = (
-            torch.arange(total, device=device) - rank_starts[owner_rank[order]]
-        )
-        gather_index = owner_rank * max_local + slot
+        if self.cp_prefill_async_h2d:
+            # The same rows from host copies of the layout, so no step syncs.
+            rows = _tail_cp_rows(
+                token_indices=_host_tail_token_indices(
+                    forward_batch.extend_seq_lens_cpu, tail_lens_cpu
+                ),
+                tail_lens=torch.tensor(tail_lens_cpu),
+                batch_size=forward_batch.batch_size,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+            )
+            device = token_indices.device
+            gather_index, local_metadata_rows, local_extend_rows = (
+                _async_h2d_tensor(t, device)
+                for t in (
+                    rows.gather_index,
+                    rows.local_metadata_rows,
+                    rows.local_extend_rows,
+                )
+            )
+        else:
+            device = token_indices.device
+            total = token_indices.shape[0]
+            owner_rank = token_indices % cp_size
+            counts = torch.bincount(owner_rank, minlength=cp_size).tolist()
+            max_local = max(counts)
+            order = torch.argsort(owner_rank, stable=True)
+            rank_starts = torch.tensor(
+                [sum(counts[:r]) for r in range(cp_size)],
+                dtype=torch.int64,
+                device=device,
+            )
+            slot = torch.empty_like(owner_rank)
+            slot[order] = (
+                torch.arange(total, device=device) - rank_starts[owner_rank[order]]
+            )
+            gather_index = owner_rank * max_local + slot
 
-        local_tail_rows = (owner_rank == cp_rank).nonzero().squeeze(1)
-        pad_rows = max_local - counts[cp_rank]
-        # Give each rank distinct padding rows in the compact tail metadata.
-        pad_start = total + sum(max_local - c for c in counts[:cp_rank])
-        local_metadata_rows = torch.cat(
-            [
-                local_tail_rows,
-                torch.arange(pad_start, pad_start + pad_rows, device=device),
-            ]
-        )
-        tail_request_ids = torch.repeat_interleave(
-            torch.arange(forward_batch.batch_size, device=device),
-            tail_lens.to(torch.int64),
-            output_size=total,
-        )
+            local_tail_rows = (owner_rank == cp_rank).nonzero().squeeze(1)
+            pad_rows = max_local - counts[cp_rank]
+            # Give each rank distinct padding rows in the compact tail metadata.
+            pad_start = total + sum(max_local - c for c in counts[:cp_rank])
+            local_metadata_rows = torch.cat(
+                [
+                    local_tail_rows,
+                    torch.arange(pad_start, pad_start + pad_rows, device=device),
+                ]
+            )
+            tail_request_ids = torch.repeat_interleave(
+                torch.arange(forward_batch.batch_size, device=device),
+                tail_lens.to(torch.int64),
+                output_size=total,
+            )
+            local_positions = torch.cat(
+                [
+                    forward_batch.positions[token_indices[local_tail_rows]],
+                    forward_batch.positions.new_zeros(pad_rows),
+                ]
+            )
+            cp_metadata = InterleaveContextParallelMetadata(
+                per_rank_actual_token=[max_local] * cp_size,
+                max_rank_len=[max_local] * cp_size,
+                total_seq_lens=total,
+                bs=forward_batch.batch_size,
+                per_rank_logical_token=counts,
+                gather_index=gather_index,
+                local_index=local_metadata_rows,
+            )
+            return dict(
+                cp_metadata=cp_metadata,
+                local_token_indices=(token_indices[local_tail_rows] - cp_rank)
+                // cp_size,
+                local_positions=local_positions,
+                local_lens_cpu=torch.bincount(
+                    tail_request_ids[local_tail_rows],
+                    minlength=forward_batch.batch_size,
+                ).tolist(),
+                pad_rows=pad_rows,
+            )
         local_positions = torch.cat(
             [
-                forward_batch.positions[token_indices[local_tail_rows]],
-                forward_batch.positions.new_zeros(pad_rows),
+                forward_batch.positions[local_extend_rows],
+                forward_batch.positions.new_zeros(rows.pad_rows),
             ]
         )
         cp_metadata = InterleaveContextParallelMetadata(
-            per_rank_actual_token=[max_local] * cp_size,
-            max_rank_len=[max_local] * cp_size,
-            total_seq_lens=total,
+            per_rank_actual_token=[rows.max_local] * cp_size,
+            max_rank_len=[rows.max_local] * cp_size,
+            total_seq_lens=token_indices.shape[0],
             bs=forward_batch.batch_size,
-            per_rank_logical_token=counts,
+            per_rank_logical_token=rows.counts,
             gather_index=gather_index,
             local_index=local_metadata_rows,
         )
         return dict(
             cp_metadata=cp_metadata,
-            local_token_indices=(token_indices[local_tail_rows] - cp_rank) // cp_size,
+            local_token_indices=(local_extend_rows - cp_rank) // cp_size,
             local_positions=local_positions,
-            local_lens_cpu=torch.bincount(
-                tail_request_ids[local_tail_rows], minlength=forward_batch.batch_size
-            ).tolist(),
-            pad_rows=pad_rows,
+            local_lens_cpu=rows.local_lens_cpu,
+            pad_rows=rows.pad_rows,
         )
+
+    def skip_late_layer_tail(self) -> None:
+        """The model ends the forward at the switch (LateLayerTail.skip_layers),
+        after any write_tail_source_kv; no tail pass takes that source layer over."""
+        assert self.tail_forward_metadata.late_layer_tail.skip_layers
+        self.tail_source_kv_layer_id = None
 
     def write_tail_source_kv(
         self, *, layer, x, positions, forward_batch: ForwardBatch
@@ -2090,6 +2338,9 @@ class DeepseekV4AttnBackend(
         exit_late_layer_tail."""
         tail_metadata = self.tail_forward_metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
+        assert not tail_metadata.late_layer_tail.skip_layers, (
+            "this forward skips its late layers"
+        )
         saved = (
             self.forward_metadata,
             forward_batch.attn_cp_metadata,
@@ -2923,7 +3174,7 @@ class DeepseekV4AttnBackend(
         return (
             not self.trtllm_attn
             and forward_batch.forward_mode.is_extend_without_speculative()
-            and not is_cp_active(forward_batch)
+            and (not is_cp_active(forward_batch) or self.cp_sparse_prefill)
             and not get_platform().is_sm120
             and self.forward_metadata.late_layer_tail is None
             and (
@@ -2974,11 +3225,29 @@ class DeepseekV4AttnBackend(
             extend_seq_lens = tail.extend_seq_lens
             extend_seq_lens_cpu = tail.extend_seq_lens_cpu
         assert extend_seq_lens_cpu is not None
-        num_global_queries = sum(extend_seq_lens_cpu)
-        assert num_qo_tokens >= num_global_queries, (
-            "DSV4 sparse prefill requires global query rows: "
-            f"allocated {num_qo_tokens}, but request offsets cover {num_global_queries}. "
-            "CP-local queries must use paged attention."
+        cp_active = is_cp_active(forward_batch)
+        # Under CP the query rows are this rank's interleaved share of the extend.
+        cp_query_lens_cpu = (
+            interleave_rows_per_request(
+                _as_int_list(extend_seq_lens_cpu),
+                get_parallel().attn_cp_rank,
+                get_parallel().attn_cp_size,
+            )
+            if cp_active
+            else None
+        )
+        num_queries = sum(cp_query_lens_cpu if cp_active else extend_seq_lens_cpu)
+        assert num_qo_tokens >= num_queries, (
+            (
+                "DSV4 sparse prefill requires the query rows of every request: "
+                f"allocated {num_qo_tokens}, but request offsets cover {num_queries}."
+            )
+            if dsv41_sm90_on("cp")
+            else (
+                "DSV4 sparse prefill requires global query rows: "
+                f"allocated {num_qo_tokens}, but request offsets cover {num_queries}. "
+                "CP-local queries must use paged attention."
+            )
         )
         # Reject undersized query buffers before accessing attention metadata.
         request_layout = core_attn_metadata.request_window_layout
@@ -2992,22 +3261,17 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
             )
         )
-        if is_cp_active(forward_batch):
-            query_lens = torch.tensor(
-                interleave_rows_per_request(
-                    _as_int_list(extend_seq_lens_cpu),
-                    get_parallel().attn_cp_rank,
-                    get_parallel().attn_cp_size,
-                ),
-                dtype=torch.int32,
-                device=extend_seq_lens.device,
+        if cp_active:
+            to_device = async_h2d if self.cp_prefill_async_h2d else torch.tensor
+            query_lens = to_device(
+                cp_query_lens_cpu, dtype=torch.int32, device=extend_seq_lens.device
             )
         else:
             query_lens = extend_seq_lens.to(torch.int32)
         # padding rows are never combined
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
         if request_layout is not None:
-            assert not is_cp_active(forward_batch)
+            assert not cp_active
             query_pos = request_layout.pos.to(torch.int32)
         if query_pos.shape[0] < num_qo_tokens:
             query_pos = _pad_tensor_to_size(query_pos, num_qo_tokens, value=0)
@@ -3416,8 +3680,11 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         run_compressor: bool = True,
         run_indexer: bool = True,
+        cp_projected: Optional[Tuple[Optional[torch.Tensor], ...]] = None,
     ) -> None:
-        """Runs on every ratio 1/2 layer before its attention."""
+        """Runs on every ratio 1/2 layer before its attention. ``cp_projected``:
+        the compressor projections of every CP row in global token order, when the
+        caller gathered them (see cp_low_ratio_compressor_runs)."""
         if forward_batch.forward_mode.is_idle():
             return
         if forward_batch.encoder_swa_replay:
@@ -3434,8 +3701,10 @@ class DeepseekV4AttnBackend(
                 forward_batch=forward_batch,
                 run_compressor=run_compressor,
                 run_indexer=run_indexer,
+                cp_projected=cp_projected,
             )
             return
+        assert cp_projected is None
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
         if hoisted_pos is None:
@@ -3509,8 +3778,29 @@ class DeepseekV4AttnBackend(
         if run_indexer and layer.indexer is not None:
             self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
 
+    def cp_low_ratio_compressor_runs(self, layer, forward_batch: ForwardBatch) -> bool:
+        """Whether forward_low_ratio_sources runs ``layer``'s compressor on the CP
+        path, over the projections of every CP row."""
+        return (
+            layer.compressor is not None
+            and not forward_batch.forward_mode.is_idle()
+            and not forward_batch.encoder_swa_replay
+            and layer.layer_id != self.tail_source_kv_layer_id
+            and dsa_use_prefill_cp(forward_batch)
+            and forward_batch.forward_mode.is_extend()
+        )
+
     def _forward_low_ratio_sources_cp(
-        self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
+        self,
+        *,
+        layer,
+        x,
+        q_lora,
+        positions,
+        forward_batch,
+        run_compressor,
+        run_indexer,
+        cp_projected=None,
     ) -> None:
         # Every rank writes the whole prompt's compressed state, scoring its own rows.
         cp_meta = forward_batch.attn_cp_metadata
@@ -3528,7 +3818,31 @@ class DeepseekV4AttnBackend(
             req_global = token_req_indices(forward_batch, num_tokens=total)
             pos_global = forward_batch.positions[:total].to(torch.int64)
         num_local = sum(q_lens_cpu)
-        if run_compressor and layer.compressor is not None:
+        assert cp_projected is None or (run_compressor and layer.compressor is not None)
+        if cp_projected is not None:
+            self._low_ratio_compress_torch(
+                layer, None, req_global, pos_global, projected=cp_projected
+            )
+        elif (
+            run_compressor
+            and layer.compressor is not None
+            and self.cp_compressor_projects_local_rows
+        ):
+            stream = torch.cuda.current_stream()
+            projected = tuple(
+                (
+                    cp_materialize_global_token_order(
+                        value.contiguous(), forward_batch, stream
+                    )[:total]
+                    if value is not None
+                    else None
+                )
+                for value in layer.compressor.project(x)
+            )
+            self._low_ratio_compress_torch(
+                layer, None, req_global, pos_global, projected=projected
+            )
+        elif run_compressor and layer.compressor is not None:
             x_global = cp_materialize_global_token_order(
                 x.contiguous(), forward_batch, torch.cuda.current_stream()
             )[:total]

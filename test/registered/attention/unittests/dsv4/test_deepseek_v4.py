@@ -27,6 +27,7 @@ from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import
     run_dsv4_attention_case,
     run_dsv4_compress_attention_case,
     run_dsv4_draft_extend_attention_case,
+    run_dsv4_sparse_prefill_rows,
     run_dsv4_target_verify_attention_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
@@ -216,6 +217,59 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
                 compress_ratio=case.compress_ratio,
             ):
                 run_dsv4_compress_attention_case(self, case, sparse_prefill=True)
+
+    # Totals divisible by the CP sizes tested. The c128 prefixes leave a rank's last
+    # row of a request short of the request's last c128 block, and two requests put
+    # a request boundary inside a rank's rows (the c1/c2/c4 seeding needs one).
+    CP_SPARSE_PREFILL_CASES = tuple(
+        DSV4AttentionCase(
+            name=name,
+            backend="dsv4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=prefix_lens,
+            extend_lens=extend_lens,
+            compress_ratio=ratio,
+        )
+        for name, prefix_lens, extend_lens, ratio in (
+            ("dsv4_cp_c4_extend", (64,), (16,), 4),
+            ("dsv4_cp_c128_extend", (255,), (17,), 128),
+            ("dsv4_cp_c128_extend_two_requests", (255, 128), (17, 15), 128),
+            ("dsv4_cp_c2_extend", (33,), (8,), 2),
+            ("dsv4_cp_c1_extend", (20,), (12,), 1),
+        )
+    )
+
+    def test_cp_sparse_prefill_rows_bitwise_whole_extend(self):
+        # dsv41_sm90 "cp": a CP rank's rows take the sparse prefill; its chunk cache
+        # spans the whole extend, so each row is bitwise the whole extend's row.
+        for case in self.CP_SPARSE_PREFILL_CASES:
+            whole = run_dsv4_sparse_prefill_rows(self, case)
+            self.assertIsNotNone(whole, case.name)
+            for cp_size in (2, 4, 8):
+                if case.num_input_tokens % cp_size:
+                    continue
+                for cp_rank in range(cp_size):
+                    with self.subTest(case=case.name, cp_size=cp_size, rank=cp_rank):
+                        rows = run_dsv4_sparse_prefill_rows(
+                            self, case, cp_rank=cp_rank, cp_size=cp_size
+                        )
+                        self.assertIsNotNone(rows, "CP rows took the paged path")
+                        torch.testing.assert_close(
+                            rows, whole[cp_rank::cp_size], atol=0, rtol=0
+                        )
+
+    def test_cp_rows_stay_paged_without_cp_sparse_prefill(self):
+        # Switch off: CP rows keep the upstream paged decode kernel.
+        rows = run_dsv4_sparse_prefill_rows(
+            self,
+            self.CP_SPARSE_PREFILL_CASES[0],
+            cp_rank=1,
+            cp_size=4,
+            cp_sparse_prefill=False,
+        )
+        self.assertIsNone(rows)
 
     def test_eagle_target_verify_chain_cases(self):
         for case in self.TARGET_VERIFY_CASES:

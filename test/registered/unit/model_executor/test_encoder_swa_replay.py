@@ -139,6 +139,7 @@ def _backend(fx):
     backend = object.__new__(DeepseekV4AttnBackend)
     backend.encoder_replay = False
     backend.encoder_row_floor = fx.folded.row_floor
+    backend.skip_unread_late_layer_tail = False
     backend.req_to_token = fx.req_to_token
     backend.page_size = 256
     backend.index_topk = 512

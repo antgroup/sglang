@@ -102,3 +102,16 @@ for _fn in ("all_gather_matmul", "matmul_reduce_scatter"):
         )
     )
 del _fn
+
+# DeepSeek-V4.1 CP prefill over symmetric memory: the reduce-scatter's slot sum
+# and the owner writes of sharded lookups into peers' buffers.
+for _fn in ("sum_slots", "embed_owner_scatter", "engram_owner_scatter"):
+    register_kernel(
+        KernelSpec(
+            op=f"communication.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.communication.cp_prefill_symm:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn

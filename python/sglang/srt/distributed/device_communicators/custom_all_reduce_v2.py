@@ -509,6 +509,9 @@ class CustomAllReduceV2:
         )
         self._register_graph_inputs()
 
+    def discard_pending_graph_inputs(self) -> None:
+        self._graph_inputs.clear()
+
     def _register_graph_inputs(self) -> None:
         if not self._graph_inputs:
             return

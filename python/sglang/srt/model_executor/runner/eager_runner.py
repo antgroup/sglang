@@ -373,6 +373,7 @@ class EagerRunner(BaseRunner):
         rank-local slice, then gather hidden states before the logits step.
         """
         model = self.model_runner.model
+        local_embeds = None
 
         if prepare_inputs := getattr(model, "prepare_cp_inputs", None):
             input_embeds, positions, model_kwargs = prepare_inputs(
@@ -380,7 +381,12 @@ class EagerRunner(BaseRunner):
             )
         else:
             input_embeds = kwargs.get("input_embeds")
-            if input_embeds is None:
+            if input_embeds is None and (
+                shard_embeds := getattr(model, "cp_shard_input_embeds", None)
+            ):
+                # The model may build this rank's shard directly; None embeds the chunk.
+                local_embeds = shard_embeds(forward_batch.input_ids, forward_batch)
+            if input_embeds is None and local_embeds is None:
                 input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
             positions = forward_batch.positions
             model_kwargs = {}
@@ -392,6 +398,7 @@ class EagerRunner(BaseRunner):
             positions,
             forward_batch,
             forward_batch.input_ids,
+            sharded_hidden_states=local_embeds,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
             model_kwargs["input_embeds"] = sharded_input_embeds
             hidden_states = model.model(

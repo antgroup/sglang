@@ -29,7 +29,7 @@ After all-gather, tokens are restored to the original order:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -83,6 +83,66 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     # Only sequence-dependent graph segments use this capacity. Eager cache
     # operations and gathers must continue using total_seq_lens (live tokens).
     graph_num_tokens: Optional[int] = None
+
+
+def interleave_gather_layout(
+    metadata: InterleaveContextParallelMetadata,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    local_rows: int,
+) -> Tuple[int, int]:
+    """(rows this rank sends, rows per rank slot) of an interleave CP all-gather of
+    ``local_rows``-row shards; a slot is zero-padded past the rows sent."""
+    total_tokens = int(metadata.total_seq_lens)
+    if total_tokens < 0:
+        raise RuntimeError(
+            f"Invalid interleave CP total_seq_lens={total_tokens}; expected >= 0."
+        )
+
+    logical_rank_lens = (
+        metadata.per_rank_logical_token or metadata.per_rank_actual_token
+    )
+    local_logical_len = logical_rank_lens[cp_rank]
+    if local_rows < local_logical_len:
+        raise RuntimeError(
+            "Interleave CP gather received an unexpected local token count: "
+            f"rank={cp_rank}, got={local_rows}, "
+            f"expected_at_least={local_logical_len}, "
+            f"total={total_tokens}, cp_size={cp_size}."
+        )
+    return local_logical_len, max(metadata.per_rank_actual_token)
+
+
+def interleave_global_order(
+    gathered: torch.Tensor,
+    metadata: InterleaveContextParallelMetadata,
+    *,
+    cp_size: int,
+    physical_rank_len: int,
+) -> torch.Tensor:
+    """The rank-major gather of interleave_gather_layout's slots in global token order."""
+    if metadata.gather_index is not None:
+        return gathered.index_select(0, metadata.gather_index)
+
+    total_tokens = int(metadata.total_seq_lens)
+    # Equal per-rank lengths: one interleave copy restores the original
+    # token order; cheaper than the index_select fallback below.
+    actual = metadata.per_rank_actual_token
+    if total_tokens == cp_size * physical_rank_len and all(
+        int(n) == physical_rank_len for n in actual
+    ):
+        return (
+            gathered.view(cp_size, physical_rank_len, *gathered.shape[1:])
+            .transpose(0, 1)
+            .reshape(total_tokens, *gathered.shape[1:])
+        )
+
+    flat_indices = torch.arange(total_tokens, device=gathered.device)
+    gather_indices = (
+        flat_indices % cp_size
+    ) * physical_rank_len + flat_indices // cp_size
+    return gathered.index_select(0, gather_indices)
 
 
 def is_interleave_extend(forward_batch):
@@ -280,25 +340,9 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         if metadata is None:
             raise RuntimeError("Interleave CP gather requires attn_cp_metadata.")
 
-        total_tokens = int(metadata.total_seq_lens)
-        if total_tokens < 0:
-            raise RuntimeError(
-                f"Invalid interleave CP total_seq_lens={total_tokens}; expected >= 0."
-            )
-
-        logical_rank_lens = (
-            metadata.per_rank_logical_token or metadata.per_rank_actual_token
+        local_logical_len, physical_rank_len = interleave_gather_layout(
+            metadata, cp_rank=self.cp_rank, cp_size=self.cp_size, local_rows=x.shape[0]
         )
-        local_logical_len = logical_rank_lens[self.cp_rank]
-        if x.shape[0] < local_logical_len:
-            raise RuntimeError(
-                "Interleave CP gather received an unexpected local token count: "
-                f"rank={self.cp_rank}, got={x.shape[0]}, "
-                f"expected_at_least={local_logical_len}, "
-                f"total={total_tokens}, cp_size={self.cp_size}."
-            )
-
-        physical_rank_len = max(metadata.per_rank_actual_token)
         if physical_rank_len == 0:
             return x.new_empty((0, *x.shape[1:]))
 
@@ -315,27 +359,12 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         ):
             gathered = x.new_empty((self.cp_size * physical_rank_len, *x.shape[1:]))
         attn_cp_all_gather_into_tensor(gathered, padded_x.contiguous())
-
-        if metadata.gather_index is not None:
-            return gathered.index_select(0, metadata.gather_index)
-
-        # Equal per-rank lengths: one interleave copy restores the original
-        # token order; cheaper than the index_select fallback below.
-        actual = metadata.per_rank_actual_token
-        if total_tokens == self.cp_size * physical_rank_len and all(
-            int(n) == physical_rank_len for n in actual
-        ):
-            return (
-                gathered.view(self.cp_size, physical_rank_len, *x.shape[1:])
-                .transpose(0, 1)
-                .reshape(total_tokens, *x.shape[1:])
-            )
-
-        flat_indices = torch.arange(total_tokens, device=x.device)
-        gather_indices = (
-            flat_indices % self.cp_size
-        ) * physical_rank_len + flat_indices // self.cp_size
-        return gathered.index_select(0, gather_indices)
+        return interleave_global_order(
+            gathered,
+            metadata,
+            cp_size=self.cp_size,
+            physical_rank_len=physical_rank_len,
+        )
 
     def get_supported_attention_backend(self):
         return [CPAttentionBackendKind.DSA]

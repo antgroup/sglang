@@ -244,3 +244,160 @@ def moe_fused_mul_sum(
         )
 
     return outputs
+
+
+@triton.jit
+def _mul_sum_rows_store(
+    inputs_ptr,
+    topk_weights_ptr,
+    top_ids_ptr,
+    out_ptr,
+    shared_ptr,
+    offs_m,
+    offs_r,
+    offs_k,
+    m_mask,
+    mask,
+    stride_m,
+    top_k: tl.constexpr,
+    size: tl.constexpr,
+    routed_scaling_factor: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_SHARED: tl.constexpr,
+):
+    # moe_fused_mul_sum_kernel's arithmetic (with topk_ids, no expert map) for rows
+    # offs_m, stored at rows offs_r of out_ptr; shared_ptr rows are offs_r too.
+    a_base = inputs_ptr + (offs_m * stride_m)[:, None] + offs_k[None, :]
+    b_base = topk_weights_ptr + offs_m * top_k
+    acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+    for n in tl.static_range(top_k):
+        b_val = tl.load(b_base + n, mask=m_mask, other=0.0).to(tl.float32)
+        if routed_scaling_factor != 1.0:
+            b_val = b_val * routed_scaling_factor
+        id_val = tl.load(top_ids_ptr + offs_m * top_k + n, mask=m_mask, other=0)
+        expert_mask = id_val >= 0
+        b_val = tl.where(expert_mask, b_val, 0.0)
+        a_vec = tl.load(
+            a_base + n * size, mask=mask & expert_mask[:, None], other=0.0
+        ).to(tl.float32)
+        acc += a_vec * b_val[:, None]
+    out = acc.to(out_ptr.dtype.element_ty)
+    if HAS_SHARED:
+        shared = tl.load(
+            shared_ptr + (offs_r * size)[:, None] + offs_k[None, :],
+            mask=mask,
+            other=0.0,
+        )
+        out = (out.to(tl.float32) + shared.to(tl.float32)).to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + (offs_r * size)[:, None] + offs_k[None, :], out, mask=mask)
+
+
+@triton.jit(do_not_specialize=["rows", "rank"])
+def _moe_fused_mul_sum_scatter_kernel(
+    inputs_ptr,
+    topk_weights_ptr,
+    top_ids_ptr,
+    out_ptrs,
+    shared_ptrs,
+    rows,
+    rank,
+    stride_m,
+    top_k: tl.constexpr,
+    size: tl.constexpr,
+    routed_scaling_factor: tl.constexpr,
+    WORLD: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_SHARED: tl.constexpr,
+):
+    pid_k = tl.program_id(0)
+    pid = tl.program_id(1)
+    # Consecutive programs take consecutive targets (own rows last), so every
+    # target's writes are in flight at once.
+    t = pid % WORLD
+    m_block = (pid // WORLD).to(tl.int64)
+    p = (rank + 1 + t) % WORLD
+    offs_r = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    m_mask = offs_r < rows
+    mask = m_mask[:, None] & (offs_k < size)[None, :]
+    offs_m = p.to(tl.int64) * rows + offs_r
+    for i in tl.static_range(WORLD):
+        if p == i:
+            _mul_sum_rows_store(
+                inputs_ptr,
+                topk_weights_ptr,
+                top_ids_ptr,
+                out_ptrs[i],
+                shared_ptrs[i],
+                offs_m,
+                offs_r,
+                offs_k,
+                m_mask,
+                mask,
+                stride_m,
+                top_k,
+                size,
+                routed_scaling_factor,
+                BLOCK_M,
+                BLOCK_K,
+                HAS_SHARED,
+            )
+
+
+def moe_fused_mul_sum_scatter(
+    inputs: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    rows: int,
+    rank: int,
+    outputs: list,
+    shared: list | None = None,
+    routed_scaling_factor: float | None = None,
+) -> None:
+    """moe_fused_mul_sum (with ``topk_ids``) of ``W = len(outputs)`` consecutive row
+    blocks in one launch: the weighted sum of rows ``[p * rows, (p + 1) * rows)``,
+    plus ``shared[p]`` as the ``shared=`` path adds it, goes to ``outputs[p]``
+    ([rows, hidden] contiguous, e.g. a peer's symmetric slot). Bitwise
+    ``moe_fused_mul_sum(inputs[p * rows:(p + 1) * rows], ..., outputs=outputs[p],
+    shared=shared[p])`` for every p: the per-row arithmetic does not depend on the
+    tiling."""
+    assert inputs.ndim == 3 and inputs.is_contiguous() and topk_weights.is_contiguous()
+    num_tokens, top_k, size = inputs.shape
+    world = len(outputs)
+    assert num_tokens == world * rows and topk_weights.shape == (num_tokens, top_k)
+    assert topk_ids.shape == (num_tokens, top_k) and topk_ids.is_contiguous()
+    for out in outputs:
+        assert out.shape == (rows, size) and out.is_contiguous()
+        assert out.dtype == inputs.dtype
+    if shared is not None:
+        assert len(shared) == world
+        for sh in shared:
+            assert sh.shape == (rows, size) and sh.is_contiguous()
+    if rows == 0 or isinstance(inputs, FakeTensor):
+        return
+    BLOCK_M, BLOCK_K, num_warps, num_stages = _heuristic_config(
+        rows, top_k, size, inputs.element_size()
+    )
+    grid = (triton.cdiv(size, BLOCK_K), world * triton.cdiv(rows, BLOCK_M))
+    _moe_fused_mul_sum_scatter_kernel[grid](
+        inputs,
+        topk_weights,
+        topk_ids,
+        tuple(outputs),
+        tuple(shared) if shared is not None else tuple(outputs),
+        rows,
+        rank,
+        top_k * size,
+        top_k,
+        size,
+        1.0 if routed_scaling_factor is None else routed_scaling_factor,
+        world,
+        BLOCK_M,
+        BLOCK_K,
+        HAS_SHARED=shared is not None,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
