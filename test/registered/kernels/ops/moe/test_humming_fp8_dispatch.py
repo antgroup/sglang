@@ -10,6 +10,7 @@ from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute_with_scale
 from sglang.srt.layers.moe.moe_runner import humming as humming_runner
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -258,6 +259,79 @@ class TestHummingFp8Dispatch(CustomTestCase):
                             bool(actual_scale[expert, valid:].isnan().all())
                         )
 
+    def test_w2_input_fusion_is_bitwise_the_two_kernel_path(self):
+        """The SM90 MoE path's fused SwiGLU + W2 input quant must keep the bits of
+        the clamped SwiGLU followed by the dynamic per-row FP8 quant (any row count,
+        the 512 + 64 column split of TP4's 576, clamped and special values); a
+        grouped input scale is a different quant and must not take the kernel."""
+        from humming.config.enum import MmaType
+
+        def make_runner(sm90_moe, intermediate, group):
+            with get_flags().dsv41_sm90.override(
+                subsystems=frozenset({"moe"}) if sm90_moe else frozenset()
+            ):
+                runner = humming_runner.HummingRunnerCore(
+                    MoeRunnerConfig(
+                        num_experts=8,
+                        num_local_experts=8,
+                        intermediate_size_per_partition=intermediate,
+                        top_k=6,
+                        activation="silu",
+                        is_gated=True,
+                        swiglu_limit=10.0,
+                        gate_up_interleaved=False,
+                    )
+                )
+            runner.layer = SimpleNamespace(
+                humming_metas={
+                    "w13": SimpleNamespace(c_dtype=humming_runner.dtypes.bfloat16),
+                    "w2": SimpleNamespace(
+                        a_dtype=humming_runner.dtypes.float8e4m3,
+                        input_scale_group_size=group,
+                        as_dtype=humming_runner.dtypes.float32,
+                        mma_type=MmaType.WGMMA,
+                    ),
+                }
+            )
+            return runner
+
+        self.assertFalse(make_runner(True, 768, 128)._act_quant_is_fusable())
+        generator = torch.Generator(device="cuda").manual_seed(2)
+        special = [0.0, -0.0, 1e-38, 3e38, -3e38, float("inf"), -10.0, 9.99]
+        for rows, intermediate in ((1, 576), (4099, 576), (300, 288)):
+            magnitude = torch.exp2(
+                torch.randint(-20, 8, (rows, 1), device="cuda", generator=generator)
+            )
+            gate_up = (
+                torch.randn(rows, 2 * intermediate, device="cuda", generator=generator)
+                * magnitude
+            ).to(torch.bfloat16)
+            gate_up[0, : len(special)] = torch.tensor(special)
+            gate_up[0, intermediate : intermediate + len(special)] = torch.tensor(
+                special
+            )
+            results = []
+            for sm90_moe in (False, True):
+                runner = make_runner(sm90_moe, intermediate, 0)
+                activation_output = torch.full(
+                    (rows, intermediate), float("nan"), device="cuda"
+                ).to(torch.bfloat16)
+                buffers = {
+                    "gate_up_output": gate_up,
+                    "activation_output": activation_output,
+                    "quanted_down_input": torch.empty(
+                        rows, intermediate, dtype=torch.float8_e4m3fn, device="cuda"
+                    ),
+                }
+                results.append(runner._w2_input(buffers))
+            # The fused path never writes the BF16 activation.
+            self.assertTrue(bool(activation_output.isnan().all()))
+            (q0, s0), (q1, s1) = results
+            with self.subTest(rows=rows, intermediate=intermediate):
+                self.assertEqual(s0.shape, s1.shape)
+                self.assertTrue(torch.equal(q0.view(torch.uint8), q1.view(torch.uint8)))
+                self.assertTrue(torch.equal(s0.view(torch.int32), s1.view(torch.int32)))
+
 
 class TestHummingInactiveRoutes(CustomTestCase):
     @classmethod
@@ -358,6 +432,39 @@ class TestHummingInactiveRoutes(CustomTestCase):
         self.assertTrue(torch.isfinite(actual).all().item())
         torch.testing.assert_close(actual, reference, rtol=1e-2, atol=1e-2)
         self.assertEqual(torch.count_nonzero(actual[2]).item(), 0)
+
+    def test_shared_add_is_bitwise_the_separate_add(self):
+        """The deferred routed sum with the shared expert folded in must keep the
+        bits of the weighted sum stored in BF16 followed by ``routed += shared``."""
+        from sglang.kernels.ops.moe.moe_fused_mul_sum import moe_fused_mul_sum
+
+        generator = torch.Generator(device="cuda").manual_seed(3)
+        for tokens, top_k, hidden in ((1, 6, 5120), (37, 3, 5120), (1025, 6, 4096)):
+            values = torch.randn(
+                tokens, top_k, hidden, device="cuda", generator=generator
+            ).to(torch.bfloat16)
+            weights = torch.rand(tokens, top_k, device="cuda", generator=generator)
+            ids = torch.randint(0, 8, (tokens, top_k), device="cuda", dtype=torch.int32)
+            shared = torch.randn(tokens, hidden, device="cuda", generator=generator).to(
+                torch.bfloat16
+            )
+            kwargs = dict(
+                inputs=values,
+                topk_weights=weights,
+                topk_ids=ids,
+                routed_scaling_factor=1.5,
+            )
+            expected = moe_fused_mul_sum(**kwargs)
+            expected += shared
+            deferred = humming_runner.HummingDeferredMulSum()
+            deferred.mul_sum_kwargs = dict(
+                kwargs, outputs=torch.empty_like(shared), is_ep=False
+            )
+            actual = deferred.finalize_with_shared_add(shared)
+            with self.subTest(tokens=tokens, top_k=top_k, hidden=hidden):
+                self.assertTrue(
+                    torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+                )
 
 
 if __name__ == "__main__":

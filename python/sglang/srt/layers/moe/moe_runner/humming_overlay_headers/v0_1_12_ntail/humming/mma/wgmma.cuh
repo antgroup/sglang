@@ -1,0 +1,313 @@
+// Modified copy of humming-kernels 0.1.12 include/humming/mma/wgmma.cuh (Apache-2.0).
+// SGLang header overlay v0_1_12_ntail (DeepSeek-V4.1 SM90 MoE path); see
+// sglang/srt/layers/moe/moe_runner/humming_overlay.py. Changes: indexed-MoE m-blocks (block_m 16 / 32, and 48 / 64
+// with one warpgroup along M and warp N 16) issue the narrowest m64n{8g}k32 wgmma that covers their valid rows;
+// run<groups> is picked once per block by kernel/humming.cuh. Identical to the v0_1_12_bm32 overlay for block_m 16 / 32.
+
+#pragma once
+
+#include <humming/utils/all.cuh>
+
+
+template <uint32_t swizzle_bytes = 128>
+CUDA_INLINE uint64_t make_wgmma_smem_desc(uint32_t addr) {
+  static_assert(swizzle_bytes == 128 || swizzle_bytes == 64);
+
+  constexpr uint64_t swizzle_type = swizzle_bytes == 128 ? 1 : 2;
+  constexpr uint64_t stride = (swizzle_bytes * 8) >> 4;
+  constexpr uint64_t desc_base = (swizzle_type << 62) | (stride << 32);
+
+  uint64_t desc = desc_base;
+  reinterpret_cast<uint32_t *>(&desc)[0] = (addr >> 4);
+
+  return desc;
+};
+
+
+template <class Ctx, class ArithClass>
+struct WGMMA {
+public:
+  using MmaOpClass = typename Ctx::MmaOpClass;
+  using MmaShape = typename Ctx::MmaShape;
+  using SharedStorage = typename Ctx::SharedStorage;
+  using BlockShape = typename Ctx::BlockShape;
+  using WarpShape = typename Ctx::WarpShape;
+  using ElementA = typename Ctx::ElementA;
+  using ElementB = typename Ctx::ElementB;
+  using CRegistersType = typename MmaOpClass::CRegisters;
+  using CRegistersArrayType = CRegistersType[WarpShape::N * 4 / MmaShape::N][WarpShape::M / MmaShape::M];
+
+  static constexpr bool kHasZeroPoint = Ctx::kHasZeroPoint;
+  static constexpr bool kIsFpZeroPoint = Ctx::kIsFpZeroPoint;
+  static constexpr bool kUseFusedE8m0Scale = Ctx::kUseFusedE8m0Scale;
+
+  static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
+  static constexpr uint32_t kSwizzleBytes = ElementA::kBits * BlockShape::K >= 1024 ? 128 : 64;
+  static constexpr uint32_t kNumWarpShapeNSplits = WarpShape::N == ElementA::kBits * 2 ? 2 : 1;
+
+  static constexpr bool kUsePackedKLayout = Ctx::kUsePackedKLayout;
+  static constexpr uint32_t kPackedKFactor = Ctx::kPackedKFactor;
+  static constexpr uint32_t kWarpIters = Ctx::kWarpIters;
+  static constexpr uint32_t kNumKSlabs = WarpShape::K / kPartMmaShapeK;
+  static constexpr uint32_t kRegsBKDim = kUsePackedKLayout ? kNumKSlabs : (kPartMmaShapeK / MmaShape::K);
+
+  Ctx &ctx;
+  ArithClass &arith;
+  uint32_t regs_qb[2][ElementB::kBits * (16 / ElementA::kBits)];
+  typename MmaOpClass::BRegisters regs_b[2][kUsePackedKLayout ? 1 : (WarpShape::N * 4 / MmaShape::N / kPackedKFactor)][kRegsBKDim];
+  CRegistersArrayType regs_c[2];
+  uint32_t smem_offset = 0;
+
+  // [sglang] Narrow wgmma for m-blocks whose valid rows fit in fewer 8-row groups (block_m 16 / 32, and
+  // block_m 48 / 64 with one warpgroup along M; fp8 x fp8 -> f32). The n{8g} accumulator fragment is the
+  // prefix (cols 0..8g-1) of the full one and n{8g} reads the first 8g rows of the same B smem tile, so only
+  // the issued instruction changes. Rows past the issued groups stay zero; they are padding and never written
+  // out. The kernel picks run<g> once per block.
+  static constexpr uint32_t kNumNGroups = MmaShape::M / 8;
+  // block_m 48 / 64: with one wgmma per k32 slab (warp N 16), or two with a long K loop (w13, K 5120).
+  // Two with a short K (TP8 w2 [64,128,64], K 320) slowed full blocks by ~10% (register pressure of the
+  // extra loop copies), so those keep upstream's kernel.
+  static constexpr bool kNSelCapable = ((MmaShape::M == 16 || MmaShape::M == 32) ||
+                                        ((MmaShape::M == 48 || MmaShape::M == 64) && BlockShape::M == MmaShape::M &&
+                                         (WarpShape::N * 4 / MmaShape::N == 1 || Ctx::ProblemShape::K >= 1024))) &&
+                                       ElementA::kBits == 8 &&
+                                       sizeof(typename MmaOpClass::CRegisters) == MmaShape::M / 2 * sizeof(float);
+  uint32_t num_n_groups = kNumNGroups;
+
+  template <uint32_t kGroups>
+  CUDA_INLINE static void fma_narrow(uint64_t &desc, uint32_t *a, float *d, bool pred) {
+    static_assert(kGroups >= 1 && kGroups <= 7);
+    if constexpr (kGroups == 1) {
+      asm volatile(
+          "{\n"
+          ".reg .pred p;\n"
+          "setp.ne.b32 p, %9, 0;\n"
+          "wgmma.mma_async.sync.aligned.m64n8k32.f32.e4m3.e4m3 {%0, %1, %2, %3}, "
+          "{%4, %5, %6, %7}, %8, p, 1, 1;\n"
+          "}\n"
+          : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+          : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc), "r"((uint32_t)pred));
+    } else if constexpr (kGroups == 2) {
+      asm volatile(
+          "{\n"
+          ".reg .pred p;\n"
+          "setp.ne.b32 p, %13, 0;\n"
+          "wgmma.mma_async.sync.aligned.m64n16k32.f32.e4m3.e4m3 {%0, %1, %2, %3, %4, %5, %6, %7}, "
+          "{%8, %9, %10, %11}, %12, p, 1, 1;\n"
+          "}\n"
+          : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+          : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc), "r"((uint32_t)pred));
+    } else if constexpr (kGroups == 3) {
+      asm volatile(
+          "{\n"
+          ".reg .pred p;\n"
+          "setp.ne.b32 p, %17, 0;\n"
+          "wgmma.mma_async.sync.aligned.m64n24k32.f32.e4m3.e4m3 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11}, "
+          "{%12, %13, %14, %15}, %16, p, 1, 1;\n"
+          "}\n"
+          : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11])
+          : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc), "r"((uint32_t)pred));
+    } else if constexpr (kGroups == 4) {
+      asm volatile(
+          "{\n"
+          ".reg .pred p;\n"
+          "setp.ne.b32 p, %21, 0;\n"
+          "wgmma.mma_async.sync.aligned.m64n32k32.f32.e4m3.e4m3 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, "
+          "{%16, %17, %18, %19}, %20, p, 1, 1;\n"
+          "}\n"
+          : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
+          : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc), "r"((uint32_t)pred));
+    } else if constexpr (kGroups == 5) {
+      asm volatile(
+          "{\n"
+          ".reg .pred p;\n"
+          "setp.ne.b32 p, %25, 0;\n"
+          "wgmma.mma_async.sync.aligned.m64n40k32.f32.e4m3.e4m3 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19}, "
+          "{%20, %21, %22, %23}, %24, p, 1, 1;\n"
+          "}\n"
+          : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19])
+          : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc), "r"((uint32_t)pred));
+    } else if constexpr (kGroups == 6) {
+      asm volatile(
+          "{\n"
+          ".reg .pred p;\n"
+          "setp.ne.b32 p, %29, 0;\n"
+          "wgmma.mma_async.sync.aligned.m64n48k32.f32.e4m3.e4m3 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23}, "
+          "{%24, %25, %26, %27}, %28, p, 1, 1;\n"
+          "}\n"
+          : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23])
+          : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc), "r"((uint32_t)pred));
+    } else if constexpr (kGroups == 7) {
+      asm volatile(
+          "{\n"
+          ".reg .pred p;\n"
+          "setp.ne.b32 p, %33, 0;\n"
+          "wgmma.mma_async.sync.aligned.m64n56k32.f32.e4m3.e4m3 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27}, "
+          "{%28, %29, %30, %31}, %32, p, 1, 1;\n"
+          "}\n"
+          : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27])
+          : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc), "r"((uint32_t)pred));
+    }
+  }
+
+  CUDA_INLINE
+  WGMMA(Ctx &ctx, ArithClass &arith)
+      : ctx(ctx), arith(arith) {
+    constexpr uint32_t kSwizzleSizeK = kSwizzleBytes * 8 / ElementA::kBits;
+    static_assert(kSwizzleSizeK >= WarpShape::K);
+
+    const uint32_t row_offset = ctx.m_warp_offset();
+    const uint32_t col_offset = ctx.k_warp_offset();
+
+    smem_offset = row_offset * (kSwizzleBytes / 16);
+    smem_offset += (col_offset % kSwizzleSizeK) * ElementA::kBits / 128;
+    smem_offset += (col_offset / kSwizzleSizeK) * (BlockShape::M * kSwizzleBytes / 16);
+    smem_offset = smem_offset * sizeof(int4);
+  }
+
+  CUDA_INLINE
+  void zero_accum() {
+    if constexpr (kNSelCapable && Ctx::kIsIndexedGemm) {
+      // moe_align_block_size puts an expert's valid rows first in its blocks; padding slots hold
+      // an index >= shape_m * top_k (the epilogue skips those rows), so rows 8, 16, 24 decide.
+      const uint32_t num_rows = ctx.params.shape_m * ctx.params.top_k;
+      num_n_groups = 1;
+      PRAGMA_UNROLL
+      for (uint32_t g = 1; g < kNumNGroups; g++) num_n_groups += ctx.smem.wr_row_index[8 * g] < num_rows;
+    }
+    uint32_t *regs_c_ptr = regs_c_as_ptr();
+    PRAGMA_UNROLL
+    for (uint32_t i = 0; i < sizeof(regs_c) / 4; i++) {
+      regs_c_ptr[i] = 0;
+    };
+  };
+
+  CUDA_INLINE
+  void transform_b(uint32_t buffer_id, uint32_t iter_id) {
+    if constexpr (std::is_same<ElementA, ElementB>::value) return;
+
+    if constexpr (kUseFusedE8m0Scale) {
+      uint32_t *regs_b_ptr = reinterpret_cast<uint32_t *>(regs_b[buffer_id]);
+      fused_dequant_for_mxfp4<ElementA, WarpShape::N / 16, true>(regs_qb[buffer_id], regs_b_ptr, arith.bs[buffer_id]);
+    } else {
+      if constexpr (ElementB::kBits == 1 && kNumWarpShapeNSplits == 2) {
+        regs_qb[buffer_id][0] = regs_qb[buffer_id][0] >> (ctx.warp_id() % 2 * (ElementA::kBits / 2));
+      }
+
+      constexpr uint32_t kTransformIters = kUsePackedKLayout ? kNumKSlabs : (WarpShape::N / (MmaShape::N / 4));
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < kTransformIters; i++) {
+        uint32_t *regs_b_ptr;
+        if constexpr (kUsePackedKLayout) {
+          regs_b_ptr = reinterpret_cast<uint32_t *>(regs_b[buffer_id][0][i]);
+        } else {
+          regs_b_ptr = reinterpret_cast<uint32_t *>(regs_b[buffer_id][i / kPackedKFactor][i % kPackedKFactor]);
+        }
+        uint32_t zp_index = kUsePackedKLayout ? iter_id : i;
+        uint4 zp_vals = arith.prepare_zp_for_dequant(buffer_id, zp_index);
+        uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
+        dequant<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint, kNumWarpShapeNSplits>(regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
+        arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
+      };
+    }
+  };
+
+  // kGroups: 8-row groups the issued wgmma covers; 0 = all (the stock instruction).
+  template <uint32_t kGroups = 0>
+  CUDA_INLINE
+  void run(uint32_t stage_id, uint32_t iter_id) {
+    static_assert(WarpShape::M == MmaShape::M);
+    static_assert(kPartMmaShapeK == MmaShape::K);
+    uint32_t buffer_id = iter_id % 2;
+
+    const uint32_t smem_base = cast_smem_ptr_to_uint(&ctx.smem);
+    constexpr uint32_t kItersPerHalf = kWarpIters / kPackedKFactor;
+    constexpr uint32_t kNumIters = kUsePackedKLayout ? 1 : (WarpShape::N / (MmaShape::N / 4) / kPackedKFactor);
+    constexpr uint32_t kRunKLoop = kUsePackedKLayout ? kNumKSlabs : kPackedKFactor;
+
+    uint32_t delta_m = kUsePackedKLayout ? iter_id : 0;
+    uint32_t delta_j = final_regs_c_index() == 0 ? delta_m : 0;
+
+    wgmma_fence();
+    may_fence_regs(delta_j);
+
+    PRAGMA_UNROLL
+    for (uint32_t k = 0; k < kRunKLoop; k++) {
+      uint32_t k_slab = kUsePackedKLayout ? k : ((iter_id % kItersPerHalf) * kPackedKFactor + k);
+      uint32_t smem_addr = smem_base + offsetof(SharedStorage, stages) + stage_id * sizeof(typename SharedStorage::StageStorage);
+      smem_addr += k_slab * 2 * sizeof(int4) + smem_offset;
+      uint64_t desc = make_wgmma_smem_desc<kSwizzleBytes>(smem_addr);
+
+      bool scale_d = true;
+      if constexpr (ElementA::kBits != 16 && Ctx::kInputScaleGroupSize > 0) {
+        scale_d = (k_slab * kPartMmaShapeK) % Ctx::kInputScaleGroupSize > 0;
+      }
+      if constexpr (!kUseFusedE8m0Scale && ElementA::kBits != 16 && Ctx::kWeightScaleGroupSize > 0) {
+        scale_d = scale_d && (k_slab * kPartMmaShapeK) % Ctx::kWeightScaleGroupSize > 0;
+      }
+
+      PRAGMA_UNROLL
+      for (uint32_t j = 0; j < kNumIters; j++) {
+        if constexpr (kNSelCapable && kGroups != 0 && kGroups < kNumNGroups) {
+          fma_narrow<kGroups>(desc, reinterpret_cast<uint32_t *>(regs_b[buffer_id][j][k]), reinterpret_cast<float *>(regs_c[0][delta_j + j][0]), scale_d);
+        } else {
+          MmaOpClass::fma(desc, regs_b[buffer_id][j][k], regs_c[0][delta_j + j][0], scale_d);
+        }
+      }
+    }
+
+    wgmma_commit();
+    wgmma_wait<0>();
+    may_fence_regs(delta_j);
+
+    PRAGMA_UNROLL
+    for (uint32_t k = 0; k < kRunKLoop; k++) {
+      PRAGMA_UNROLL
+      for (uint32_t j = 0; j < kNumIters; j++) {
+        arith.may_apply_as_and_bs_on_wgmma_c(regs_c_as_ptr(), j, k, iter_id, delta_m);
+      }
+    }
+  };
+
+  CUDA_INLINE void may_fence_regs(uint32_t delta_j) {
+    if constexpr (final_regs_c_index() != 0) {
+      constexpr uint32_t kNumIters = kUsePackedKLayout ? 1 : (WarpShape::N / (MmaShape::N / 4) / kPackedKFactor);
+      PRAGMA_UNROLL
+      for (uint32_t j = 0; j < kNumIters; j++)
+        fence_regs(regs_c[0][delta_j + j][0]);
+    }
+  }
+
+  template <class T>
+  CUDA_INLINE void fence_regs(T &regs) {
+    PRAGMA_UNROLL
+    for (uint32_t r = 0; r < sizeof(T) / 4; r++) {
+      warpgroup_fence_operand(reinterpret_cast<uint32_t *>(regs)[r]);
+    }
+  };
+
+  template <class T = uint32_t>
+  CUDA_INLINE T *regs_qb_as_ptr(uint32_t buffer_id) {
+    if constexpr (std::is_same<ElementA, ElementB>::value) {
+      return reinterpret_cast<T *>(regs_b[buffer_id]);
+    } else {
+      return reinterpret_cast<T *>(regs_qb[buffer_id]);
+    };
+  };
+
+  template <class T = uint32_t>
+  CUDA_INLINE T *regs_c_as_ptr(uint32_t buffer_id = 0) {
+    return reinterpret_cast<T *>(regs_c[buffer_id]);
+  };
+
+  static constexpr uint32_t final_regs_c_index() {
+    if constexpr (ElementA::kBits < 16 && Ctx::kInputScaleGroupSize > 0) return 1;
+    if constexpr (ElementA::kBits < 16 && !kUseFusedE8m0Scale && (Ctx::kIsGroupWeightScale || Ctx::kIsBlockWeightScale)) return 1;
+    return 0;
+  };
+
+  template <class T = uint32_t>
+  CUDA_INLINE T *final_regs_c_as_ptr() {
+    return regs_c_as_ptr<T>(final_regs_c_index());
+  };
+};

@@ -1,0 +1,72 @@
+{
+ "meta": {
+  "device": "NVIDIA H20-3e",
+  "humming": "0.1.12 + sglang header overlay v0_1_12_bm32",
+  "generator": "DSpark draft MoE (E=128, top-3), TP4 (w13 1152) and TP8 (w13 576, w2 K 320) keys: per measured M (1..16384 tokens) the equal-block_m (w13, w2) pair without stream-K minimizing the worst routing's time ratio to its best pair (draft blocks of 5 correlated tokens, eps 0.1, and uniform routing; M <= 16 correlated only), candidates = humming's heuristic tiles with stream-K off, the main tables' non-stream-K tiles and narrow-N decode tiles; rows split at geometric midpoints between measured M",
+  "roles": "every role (DSpark draft MoE)",
+  "also_read_by": "NVIDIA H20 (same tables)"
+ },
+ "tables": {
+  "E=128,w13=576x5120,w2=5120x320,a=float8e4m3/g0,b=float4e2m1/float8e8m0/g32,gemm=indexed": {
+   "w13": [
+    [0, 36, {"block_shape": [8, 64, 512], "num_ctas_per_sm": 1, "num_sms": 78, "num_stages": 4, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 128]}],
+    [36, 66, {"block_shape": [8, 64, 256], "num_ctas_per_sm": 2, "num_sms": 78, "num_stages": 7, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 128]}],
+    [66, 81, {"block_shape": [8, 64, 128], "num_ctas_per_sm": 3, "num_sms": 234, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 128]}],
+    [81, 105, {"block_shape": [8, 64, 128], "num_ctas_per_sm": 3, "num_sms": 78, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 128]}],
+    [105, 132, {"block_shape": [8, 64, 128], "num_ctas_per_sm": 3, "num_sms": 312, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 128]}],
+    [132, 588, {"block_shape": [8, 64, 128], "num_ctas_per_sm": 3, "num_sms": 234, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 128]}],
+    [588, 831, {"block_shape": [16, 64, 128], "num_ctas_per_sm": 3, "num_sms": 468, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 16, 128]}],
+    [831, 1314, {"block_shape": [16, 64, 128], "num_ctas_per_sm": 3, "num_sms": 312, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 16, 128]}],
+    [1314, 2148, {"block_shape": [32, 64, 128], "num_ctas_per_sm": 4, "num_sms": 156, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 16, 128]}],
+    [2148, 9714, {"block_shape": [32, 64, 128], "num_ctas_per_sm": 3, "num_sms": 312, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 16, 128]}],
+    [9714, 17379, {"block_shape": [32, 64, 128], "num_ctas_per_sm": 4, "num_sms": 156, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 16, 128]}],
+    [17379, 1073741824, {"block_shape": [64, 64, 128], "num_ctas_per_sm": 3, "num_sms": 1024, "num_stages": 4, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [64, 16, 128]}]
+   ],
+   "w2": [
+    [0, 3, {"block_shape": [8, 128, 64], "num_ctas_per_sm": 1, "num_sms": 156, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 64]}],
+    [3, 27, {"block_shape": [8, 128, 64], "num_ctas_per_sm": 3, "num_sms": 156, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 64]}],
+    [27, 36, {"block_shape": [8, 128, 64], "num_ctas_per_sm": 3, "num_sms": 117, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 64]}],
+    [36, 54, {"block_shape": [8, 128, 64], "num_ctas_per_sm": 3, "num_sms": 156, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 64]}],
+    [54, 132, {"block_shape": [8, 256, 64], "num_ctas_per_sm": 4, "num_sms": 78, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 64, 64]}],
+    [132, 588, {"block_shape": [8, 256, 64], "num_ctas_per_sm": 4, "num_sms": 156, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 64, 64]}],
+    [588, 1314, {"block_shape": [16, 256, 64], "num_ctas_per_sm": 4, "num_sms": 468, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 64, 64]}],
+    [1314, 9714, {"block_shape": [32, 128, 64], "num_ctas_per_sm": 4, "num_sms": 1024, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 32, 64]}],
+    [9714, 17379, {"block_shape": [32, 128, 64], "num_ctas_per_sm": 2, "num_sms": 2048, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 32, 64]}],
+    [17379, 1073741824, {"block_shape": [64, 128, 64], "num_ctas_per_sm": 4, "num_sms": 78, "num_stages": 6, "num_write_splits": 2, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [64, 32, 64]}]
+   ]
+  },
+  "E=128,w13=1152x5120,w2=5120x576,a=float8e4m3/g0,b=float4e2m1/float8e8m0/g32,gemm=indexed": {
+   "w13": [
+    [0, 9, {"block_shape": [8, 64, 256], "num_ctas_per_sm": 1, "num_sms": 156, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 64]}],
+    [9, 18, {"block_shape": [8, 64, 256], "num_ctas_per_sm": 3, "num_sms": 39, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 64]}],
+    [18, 45, {"block_shape": [8, 64, 128], "num_ctas_per_sm": 3, "num_sms": 78, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 128]}],
+    [45, 66, {"block_shape": [8, 128, 128], "num_ctas_per_sm": 4, "num_sms": 39, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 128]}],
+    [66, 105, {"block_shape": [8, 128, 128], "num_ctas_per_sm": 3, "num_sms": 156, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 128]}],
+    [105, 132, {"block_shape": [8, 128, 128], "num_ctas_per_sm": 4, "num_sms": 234, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 128]}],
+    [132, 228, {"block_shape": [8, 128, 128], "num_ctas_per_sm": 3, "num_sms": 234, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 128]}],
+    [228, 372, {"block_shape": [16, 128, 128], "num_ctas_per_sm": 3, "num_sms": 156, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 32, 128]}],
+    [372, 588, {"block_shape": [16, 128, 128], "num_ctas_per_sm": 3, "num_sms": 1024, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 32, 128]}],
+    [588, 1074, {"block_shape": [16, 128, 64], "num_ctas_per_sm": 4, "num_sms": 312, "num_stages": 7, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 32, 64]}],
+    [1074, 1662, {"block_shape": [16, 128, 128], "num_ctas_per_sm": 4, "num_sms": 234, "num_stages": 4, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 32, 128]}],
+    [1662, 9714, {"block_shape": [32, 128, 128], "num_ctas_per_sm": 4, "num_sms": 2048, "num_stages": 4, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 32, 128]}],
+    [9714, 1073741824, {"block_shape": [32, 128, 128], "num_ctas_per_sm": 1, "num_sms": 4096, "num_stages": 4, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 32, 128]}]
+   ],
+   "w2": [
+    [0, 3, {"block_shape": [8, 128, 64], "num_ctas_per_sm": 1, "num_sms": 156, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 64]}],
+    [3, 9, {"block_shape": [8, 128, 64], "num_ctas_per_sm": 3, "num_sms": 78, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 64]}],
+    [9, 12, {"block_shape": [8, 128, 64], "num_ctas_per_sm": 1, "num_sms": 312, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 64]}],
+    [12, 45, {"block_shape": [8, 128, 64], "num_ctas_per_sm": 4, "num_sms": 78, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 64]}],
+    [45, 66, {"block_shape": [8, 256, 64], "num_ctas_per_sm": 4, "num_sms": 156, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 64, 64]}],
+    [66, 81, {"block_shape": [8, 128, 64], "num_ctas_per_sm": 4, "num_sms": 156, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 64]}],
+    [81, 132, {"block_shape": [8, 256, 64], "num_ctas_per_sm": 4, "num_sms": 78, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 64, 64]}],
+    [132, 228, {"block_shape": [8, 256, 64], "num_ctas_per_sm": 4, "num_sms": 156, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 64, 64]}],
+    [228, 372, {"block_shape": [16, 256, 64], "num_ctas_per_sm": 4, "num_sms": 1024, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 64, 64]}],
+    [372, 588, {"block_shape": [16, 256, 64], "num_ctas_per_sm": 4, "num_sms": 468, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 64, 64]}],
+    [588, 1074, {"block_shape": [16, 256, 64], "num_ctas_per_sm": 4, "num_sms": 234, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 64, 64]}],
+    [1074, 1662, {"block_shape": [16, 256, 64], "num_ctas_per_sm": 4, "num_sms": 468, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 64, 64]}],
+    [1662, 9714, {"block_shape": [32, 128, 64], "num_ctas_per_sm": 4, "num_sms": 1024, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 32, 64]}],
+    [9714, 1073741824, {"block_shape": [32, 256, 64], "num_ctas_per_sm": 4, "num_sms": 4096, "num_stages": 4, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 64, 64]}]
+   ]
+  }
+ }
+}

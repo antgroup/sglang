@@ -88,6 +88,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
 from sglang.srt.layers.layer_boundary import append_stages, get_attn_tp_context
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -3201,6 +3202,11 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             hidden=config.hidden_size,
             pre_from_prev=self.hc_pre_from_prev_sublayer,
             cp_prefill=self.dsa_enable_prefill_cp,
+            sm90=(
+                mhc.sm90_hc_rows(torch.cuda.get_device_name())
+                if dsv41_sm90_on("mhc") and self.hc_pre_from_prev_sublayer
+                else None
+            ),
         )
         self.attn_hc: Optional[mhc.HcSubLayer] = None
         self.ffn_hc: Optional[mhc.HcSubLayer] = None
@@ -3280,6 +3286,8 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             self.hc_pre_from_prev_sublayer
             and (get_platform().is_sm100 or get_platform().is_sm90)
             and self.hc_attn_fn.shape == (24, 20480)
+            # The SM90 switch path reads the fp32 weights only.
+            and self.hc_cfg.sm90 is None
             and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
             and getattr(self.config, "model_type", None) == "deepseek_v41"
             and not is_batch_invariant_mode_enabled()

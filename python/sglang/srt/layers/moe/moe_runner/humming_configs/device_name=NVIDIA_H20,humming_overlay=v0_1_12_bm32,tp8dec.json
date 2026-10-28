@@ -1,0 +1,67 @@
+{
+ "meta": {
+  "device": "NVIDIA H20",
+  "humming": "0.1.12 + sglang header overlay v0_1_12_bm32 (also read by v0_1_12_ntail)",
+  "generator": "H20 tuning run (2026-10-24): TP8 key (PD decode: TP8 MoE under DP8 attention) rows of 384..1024 tokens re-picked on H20 over 900 no-stream-K bm16/bm32 tiles x grid sizes, w13+w2 pair with equal block_m minimizing the worst ratio to the best pair over corr:0.1 and uniform routing by sustained (power-capped) medians, kept only when >= 1% faster than the current pair under both; outputs bitwise identical to the main-table picks; rows outside 192..1536 tokens are the main table",
+  "repicked_rows": [
+   1152,
+   9216
+  ],
+  "roles": "decode (H20 only)"
+ },
+ "tables": {
+  "E=384,w13=576x5120,w2=5120x320,a=float8e4m3/g0,b=float4e2m1/float8e8m0/g32,gemm=indexed": {
+   "w13": [
+    [0, 6, {"block_shape": [8, 64, 512], "num_ctas_per_sm": 1, "num_sms": 78, "num_stages": 4, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 128]}],
+    [6, 12, {"block_shape": [8, 64, 128], "num_ctas_per_sm": 3, "num_sms": 78, "num_stages": 5, "use_f16_accum": false, "use_stream_k": true, "warp_shape": [8, 16, 128]}],
+    [12, 18, {"block_shape": [8, 64, 128], "num_ctas_per_sm": 4, "num_sms": 78, "num_stages": 6, "use_f16_accum": false, "use_stream_k": true, "warp_shape": [8, 16, 128]}],
+    [18, 30, {"block_shape": [8, 64, 128], "num_ctas_per_sm": 3, "num_sms": 78, "num_stages": 5, "use_f16_accum": false, "use_stream_k": true, "warp_shape": [8, 16, 128]}],
+    [30, 42, {"block_shape": [8, 64, 128], "num_ctas_per_sm": 4, "num_sms": 78, "num_stages": 6, "use_f16_accum": false, "use_stream_k": true, "warp_shape": [8, 16, 128]}],
+    [42, 60, {"block_shape": [8, 64, 256], "num_ctas_per_sm": 2, "num_sms": 78, "num_stages": 7, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 128]}],
+    [60, 84, {"block_shape": [8, 64, 128], "num_ctas_per_sm": 4, "num_sms": 78, "num_stages": 6, "use_f16_accum": false, "use_stream_k": true, "warp_shape": [8, 16, 128]}],
+    [84, 138, {"block_shape": [8, 64, 128], "num_ctas_per_sm": 3, "num_sms": 78, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 128]}],
+    [138, 234, {"block_shape": [8, 64, 128], "num_ctas_per_sm": 3, "num_sms": 312, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 128]}],
+    [234, 666, {"block_shape": [8, 64, 128], "num_ctas_per_sm": 3, "num_sms": 234, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 128]}],
+    [666, 858, {"block_shape": [16, 64, 128], "num_ctas_per_sm": 3, "num_sms": 312, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 16, 128]}],
+    [858, 1050, {"block_shape": [16, 64, 128], "num_ctas_per_sm": 3, "num_sms": 468, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 16, 128]}],
+    [1050, 1152, {"block_shape": [16, 64, 128], "num_ctas_per_sm": 3, "num_sms": 1024, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 16, 128]}],
+    [1152, 2688, {"block_shape": [16, 64, 128], "num_ctas_per_sm": 2, "num_sms": 1024, "num_stages": 7, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 16, 128]}],
+    [2688, 4224, {"block_shape": [16, 64, 128], "num_ctas_per_sm": 3, "num_sms": 1024, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 16, 128]}],
+    [4224, 5376, {"block_shape": [32, 64, 128], "num_ctas_per_sm": 2, "num_sms": 1024, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 16, 128]}],
+    [5376, 9216, {"block_shape": [32, 64, 128], "num_ctas_per_sm": 2, "num_sms": 312, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 16, 128]}],
+    [9216, 10644, {"block_shape": [32, 64, 64], "num_ctas_per_sm": 4, "num_sms": 312, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 16, 64]}],
+    [10644, 13740, {"block_shape": [32, 64, 128], "num_ctas_per_sm": 4, "num_sms": 156, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 16, 128]}],
+    [13740, 16824, {"block_shape": [48, 64, 128], "num_ctas_per_sm": 4, "num_sms": 468, "num_stages": 4, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [48, 16, 128]}],
+    [16824, 21282, {"block_shape": [64, 64, 64], "num_ctas_per_sm": 4, "num_sms": 78, "num_stages": 6, "use_f16_accum": false, "use_stream_k": true, "warp_shape": [64, 16, 64]}],
+    [21282, 42564, {"block_shape": [32, 64, 128], "num_ctas_per_sm": 3, "num_sms": 312, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 16, 128]}],
+    [42564, 60198, {"block_shape": [48, 64, 64], "num_ctas_per_sm": 4, "num_sms": 312, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [48, 16, 64]}],
+    [60198, 1073741824, {"block_shape": [64, 64, 128], "num_ctas_per_sm": 4, "num_sms": 624, "num_stages": 4, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [64, 16, 128]}]
+   ],
+   "w2": [
+    [0, 6, {"block_shape": [8, 128, 64], "num_ctas_per_sm": 2, "num_sms": 156, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 64]}],
+    [6, 18, {"block_shape": [8, 128, 64], "num_ctas_per_sm": 3, "num_sms": 117, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 64]}],
+    [18, 30, {"block_shape": [8, 128, 64], "num_ctas_per_sm": 1, "num_sms": 312, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 64]}],
+    [30, 42, {"block_shape": [8, 64, 64], "num_ctas_per_sm": 4, "num_sms": 156, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 16, 64]}],
+    [42, 60, {"block_shape": [8, 256, 64], "num_ctas_per_sm": 4, "num_sms": 156, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 64, 64]}],
+    [60, 84, {"block_shape": [8, 256, 64], "num_ctas_per_sm": 4, "num_sms": 78, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 64, 64]}],
+    [84, 138, {"block_shape": [8, 128, 64], "num_ctas_per_sm": 4, "num_sms": 156, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 32, 64]}],
+    [138, 234, {"block_shape": [8, 256, 64], "num_ctas_per_sm": 4, "num_sms": 156, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 64, 64]}],
+    [234, 666, {"block_shape": [8, 256, 64], "num_ctas_per_sm": 4, "num_sms": 156, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [8, 64, 64]}],
+    [666, 1050, {"block_shape": [16, 256, 64], "num_ctas_per_sm": 4, "num_sms": 468, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 64, 64]}],
+    [1050, 1152, {"block_shape": [16, 256, 64], "num_ctas_per_sm": 4, "num_sms": 1024, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 64, 64]}],
+    [1152, 2688, {"block_shape": [16, 256, 64], "num_ctas_per_sm": 4, "num_sms": 312, "num_stages": 4, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 64, 64]}],
+    [2688, 3456, {"block_shape": [16, 256, 64], "num_ctas_per_sm": 4, "num_sms": 1024, "num_stages": 4, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 64, 64]}],
+    [3456, 4224, {"block_shape": [16, 256, 64], "num_ctas_per_sm": 4, "num_sms": 312, "num_stages": 4, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [16, 64, 64]}],
+    [4224, 9216, {"block_shape": [32, 128, 64], "num_ctas_per_sm": 6, "num_sms": 1024, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 32, 64]}],
+    [9216, 10644, {"block_shape": [32, 128, 64], "num_ctas_per_sm": 2, "num_sms": 2048, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 32, 64]}],
+    [10644, 13740, {"block_shape": [32, 128, 64], "num_ctas_per_sm": 4, "num_sms": 2048, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 32, 64]}],
+    [13740, 16824, {"block_shape": [48, 128, 64], "num_ctas_per_sm": 4, "num_sms": 2048, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [48, 16, 64]}],
+    [16824, 21282, {"block_shape": [64, 128, 64], "num_ctas_per_sm": 4, "num_sms": 78, "num_stages": 6, "num_write_splits": 2, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [64, 32, 64]}],
+    [21282, 30102, {"block_shape": [32, 128, 64], "num_ctas_per_sm": 4, "num_sms": 2048, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 32, 64]}],
+    [30102, 42564, {"block_shape": [32, 128, 64], "num_ctas_per_sm": 4, "num_sms": 1024, "num_stages": 5, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [32, 32, 64]}],
+    [42564, 60198, {"block_shape": [48, 128, 64], "num_ctas_per_sm": 4, "num_sms": 4096, "num_stages": 6, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [48, 16, 64]}],
+    [60198, 1073741824, {"block_shape": [64, 128, 64], "num_ctas_per_sm": 4, "num_sms": 78, "num_stages": 6, "num_write_splits": 2, "use_f16_accum": false, "use_stream_k": false, "warp_shape": [64, 32, 64]}]
+   ]
+  }
+ }
+}

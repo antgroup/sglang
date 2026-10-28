@@ -174,6 +174,15 @@ for _fn in ("swiglu_oai_mxfp8", "swiglu_oai_mxfp8_deepgemm"):
         )
     )
 del _fn
+# Clamped SwiGLU fused with Humming's per-row FP8 quant of the MoE down input.
+register_kernel(
+    KernelSpec(
+        op="activation.silu_mul_fp8_row_quant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.silu_mul_fp8_row_quant:silu_mul_fp8_row_quant",
+        capabilities=CUDA_ONLY,
+    )
+)
 for _fn in ("silu_and_mul_clamp", "silu_and_mul_contig_post_quant"):
     register_kernel(
         KernelSpec(

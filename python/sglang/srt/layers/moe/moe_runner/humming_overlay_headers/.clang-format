@@ -1,0 +1,4 @@
+# Modified copies of humming-kernels headers; keep them byte-comparable with
+# the humming-kernels sources they patch so each overlay diffs cleanly.
+DisableFormat: true
+SortIncludes: Never

@@ -13,8 +13,10 @@ def moe_fused_mul_sum_kernel(
     outputs_ptr,
     top_ids_ptr,
     expert_map_ptr,
+    shared_ptr,
     num_tokens,
     stride_m,
+    stride_shared_m,
     has_expert_map: tl.constexpr,
     has_topk_ids: tl.constexpr,
     top_k: tl.constexpr,
@@ -22,6 +24,7 @@ def moe_fused_mul_sum_kernel(
     routed_scaling_factor: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    HAS_SHARED: tl.constexpr = False,
 ):
     pid_k = tl.program_id(0)
     pid_m = tl.program_id(1).to(tl.int64)
@@ -73,12 +76,20 @@ def moe_fused_mul_sum_kernel(
             ).to(tl.float32)
         acc += a_vec * b_val[:, None]
 
+    out = acc.to(outputs_ptr.dtype.element_ty)
+    if HAS_SHARED:
+        # Round the routed sum to the output dtype first, then add in fp32 and
+        # round again: bitwise ``routed += shared`` on the stored routed sum.
+        shared = tl.load(
+            shared_ptr + (offs_m * stride_shared_m)[:, None] + offs_k[None, :],
+            mask=mask,
+            other=0.0,
+        )
+        out = (out.to(tl.float32) + shared.to(tl.float32)).to(
+            outputs_ptr.dtype.element_ty
+        )
     out_ptrs = outputs_ptr + (offs_m * size)[:, None] + offs_k[None, :]
-    tl.store(
-        out_ptrs,
-        acc.to(outputs_ptr.dtype.element_ty),
-        mask=mask,
-    )
+    tl.store(out_ptrs, out, mask=mask)
 
 
 def _heuristic_config(
@@ -159,6 +170,7 @@ def moe_fused_mul_sum(
     expert_map: torch.Tensor | None = None,
     routed_scaling_factor: float | None = None,
     is_ep: bool = False,
+    shared: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Fused kernel for MoE (Mixture of Experts) to perform weighted summation
@@ -175,6 +187,9 @@ def moe_fused_mul_sum(
             skip the corresponding input load. Shape: (num_tokens, top_k).
         expert_map: Optional mapping for Expert Parallelism. A value < 0
             indicates an invalid token/expert pair that will be skipped.
+        shared: Optional (num_tokens, hidden_size) tensor (e.g. the shared
+            expert output) added to the weighted sum after it is rounded to
+            the output dtype, exactly like a separate in-place add.
 
     Returns:
         The fused weighted sum of expert outputs.
@@ -195,6 +210,8 @@ def moe_fused_mul_sum(
 
     assert outputs.shape == output_shape
     assert topk_weights.shape == (num_tokens, top_k)
+    if shared is not None:
+        assert shared.shape == output_shape and shared.stride(1) == 1
 
     if not isinstance(inputs, FakeTensor):
         BLOCK_M, BLOCK_K, num_warps, num_stages = _heuristic_config(
@@ -210,8 +227,10 @@ def moe_fused_mul_sum(
             outputs,
             topk_ids,
             expert_map,
+            shared,
             num_tokens,
             top_k * size,
+            shared.stride(0) if shared is not None else 0,
             expert_map is not None,
             topk_ids is not None,
             top_k,
@@ -219,6 +238,7 @@ def moe_fused_mul_sum(
             1.0 if routed_scaling_factor is None else routed_scaling_factor,
             BLOCK_M,
             BLOCK_K,
+            HAS_SHARED=shared is not None,
             num_warps=num_warps,
             num_stages=num_stages,
         )

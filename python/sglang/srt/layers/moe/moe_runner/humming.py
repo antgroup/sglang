@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterator, Optional
 from weakref import WeakValueDictionary
 
 import torch
 
+from sglang.kernels.ops.activation.silu_mul_fp8_row_quant import silu_mul_fp8_row_quant
 from sglang.kernels.ops.moe.ep_moe_kernels import (
     moe_permute,
     moe_permute_with_scale,
@@ -16,6 +19,7 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
 )
 from sglang.kernels.ops.moe.moe_fused_mul_sum import moe_fused_mul_sum
 from sglang.srt.environ import envs
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on, dsv41_sm90_role
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -25,6 +29,11 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_fused_func,
     register_post_permute,
     register_pre_permute,
+)
+from sglang.srt.layers.moe.moe_runner.humming_overlay import installed_overlay_tables
+from sglang.srt.layers.moe.moe_runner.humming_tuned_configs import (
+    lookup_tuned_tables,
+    tuned_layer_key,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils.custom_op import register_custom_op
@@ -43,6 +52,38 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+class HummingDeferredMulSum:
+    """The routed weighted sum an indexed-GEMM run skipped inside
+    humming_deferred_mul_sum_context; mul_sum_kwargs stays None when no run
+    deferred (another runner, gemm type or an empty batch)."""
+
+    def __init__(self) -> None:
+        self.mul_sum_kwargs: Optional[dict[str, Any]] = None
+
+    def finalize_with_shared_add(self, shared: Optional[torch.Tensor]) -> torch.Tensor:
+        """The routed output with ``shared`` added in the same kernel, bitwise
+        the non-deferred output followed by ``routed += shared``."""
+        assert self.mul_sum_kwargs is not None
+        return moe_fused_mul_sum(**self.mul_sum_kwargs, shared=shared)
+
+
+_deferred_mul_sum: contextvars.ContextVar[Optional[HummingDeferredMulSum]] = (
+    contextvars.ContextVar("humming_deferred_mul_sum", default=None)
+)
+
+
+@contextmanager
+def humming_deferred_mul_sum_context() -> Iterator[HummingDeferredMulSum]:
+    """Indexed-GEMM runs inside return their (unwritten) output buffer and leave
+    the final weighted sum to ``finalize_with_shared_add``."""
+    deferred = HummingDeferredMulSum()
+    token = _deferred_mul_sum.set(deferred)
+    try:
+        yield deferred
+    finally:
+        _deferred_mul_sum.reset(token)
 
 
 try:
@@ -67,6 +108,20 @@ def get_standard_humming_moe_gemm_type() -> HummingGemmType:
     logger.info_once(f"Using {gemm_type.value} gemm for humming moe")
 
     return gemm_type
+
+
+def _without_stream_k(configs):
+    """``configs`` ([[lo, hi, cfg], ...]) with every tile config data-parallel.
+
+    Humming's stream-K epilogue adds a tile's K slices into the bf16 output in
+    place and in arrival order, so the result depends on timing and rounds each
+    partial to bf16; on the H20 W4A8 MoE short prompts' first tokens then
+    changed run to run and, without a BOS token, collapsed to unrelated tokens.
+    """
+    return [
+        [lo, hi, {**cfg, "use_stream_k": False} if cfg.get("use_stream_k") else cfg]
+        for lo, hi, cfg in configs
+    ]
 
 
 @dataclass
@@ -155,6 +210,10 @@ class HummingRunnerCore(MoeRunnerCore):
         self.swiglu_limit = config.swiglu_limit
         self.layer: torch.nn.Module | None = None
         self.humming_gemm_configs = {}
+        # The DeepSeek-V4.1 SM90 path: H20 tile tables, no stream-K, and the gate/up
+        # activation fused with the per-row FP8 quant of the down-projection input.
+        self._sm90_moe = dsv41_sm90_on("moe")
+        self._sm90_role = dsv41_sm90_role()
         HummingRunnerCore.runner_cores[id(self)] = self
 
     @property
@@ -169,18 +228,27 @@ class HummingRunnerCore(MoeRunnerCore):
             "use_f16_accum": envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
             "gemm_type": humming_gemm_type.value,
         }
-        w13_tuning_config = HummingMethod.get_default_tuning_configs(
-            layer=self.layer,
-            use_f16_accum=envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
-            gemm_type=humming_gemm_type,
-            sublayer_name="w13",
+        tuned_tables = (
+            self._sm90_tuned_tables(humming_gemm_type) if self._sm90_moe else None
         )
-        w2_tuning_config = HummingMethod.get_default_tuning_configs(
-            layer=self.layer,
-            use_f16_accum=envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
-            gemm_type=humming_gemm_type,
-            sublayer_name="w2",
-        )
+        if tuned_tables is not None:
+            w13_tuning_config, w2_tuning_config = tuned_tables
+        else:
+            w13_tuning_config = HummingMethod.get_default_tuning_configs(
+                layer=self.layer,
+                use_f16_accum=envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
+                gemm_type=humming_gemm_type,
+                sublayer_name="w13",
+            )
+            w2_tuning_config = HummingMethod.get_default_tuning_configs(
+                layer=self.layer,
+                use_f16_accum=envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
+                gemm_type=humming_gemm_type,
+                sublayer_name="w2",
+            )
+        if self._sm90_moe:
+            w13_tuning_config = _without_stream_k(w13_tuning_config)
+            w2_tuning_config = _without_stream_k(w2_tuning_config)
         self.humming_gemm_configs[humming_gemm_type.value] = {
             "compute_config": compute_config,
             "w13_tuning_config": w13_tuning_config,
@@ -191,6 +259,22 @@ class HummingRunnerCore(MoeRunnerCore):
         }
 
         return self.humming_gemm_configs[humming_gemm_type.value]
+
+    def _sm90_tuned_tables(self, humming_gemm_type: HummingGemmType):
+        # The tables were measured with fp32 accumulation.
+        if envs.SGLANG_HUMMING_USE_F16_ACCUM.get():
+            return None
+        metas = self.layer.humming_metas
+        return lookup_tuned_tables(
+            key=tuned_layer_key(
+                w13_meta=metas["w13"],
+                w2_meta=metas["w2"],
+                gemm_type=humming_gemm_type.value,
+            ),
+            device_name=torch.cuda.get_device_name(),
+            role=self._sm90_role,
+            overlays=installed_overlay_tables(),
+        )
 
     def estimate_local_valid_shape_m(
         self,
@@ -461,6 +545,49 @@ class HummingRunnerCore(MoeRunnerCore):
             sublayer_name="w2",
         )
 
+    def _w2_input(
+        self, buffers: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The W2 input and its scale from the gate/up output (indexed and grouped
+        contiguous runs)."""
+        if self._sm90_moe and self._act_quant_is_fusable():
+            gate_up = buffers["gate_up_output"]
+            # quanted_down_input shares a workspace with gate_up_output, which
+            # the fused kernel is still reading.
+            out = torch.empty(
+                (gate_up.shape[0], gate_up.shape[1] // 2),
+                dtype=torch.float8_e4m3fn,
+                device=gate_up.device,
+            )
+            return silu_mul_fp8_row_quant(
+                gate_up, swiglu_limit=self.swiglu_limit, out=out
+            )
+        self.apply_activation(
+            inputs=buffers["gate_up_output"],
+            outputs=buffers["activation_output"],
+        )
+        return HummingMethod.may_quant_input(
+            layer=self.layer,
+            inputs=buffers["activation_output"],
+            quanted_input=buffers.get("quanted_down_input", None),
+            sublayer_name="w2",
+        )
+
+    def _act_quant_is_fusable(self) -> bool:
+        """Whether apply_activation + the W2 input quant is the Triton SwiGLU
+        and Humming's dynamic per-row float8e4m3 quant (float32 scale) on BF16
+        gate/up output, which silu_mul_fp8_row_quant reproduces bitwise."""
+        w13_meta = self.layer.humming_metas["w13"]
+        w2_meta = self.layer.humming_metas["w2"]
+        return (
+            self.activation == "silu"
+            and self.swiglu_limit is not None
+            and w13_meta.c_dtype == dtypes.bfloat16
+            and w2_meta.a_dtype == dtypes.float8e4m3
+            and not w2_meta.input_scale_group_size
+            and w2_meta.as_dtype == dtypes.float32
+        )
+
     def run(
         self,
         runner_input: HummingRunnerInput,
@@ -572,17 +699,7 @@ class HummingRunnerCore(MoeRunnerCore):
             **moe_kwargs1,
         )
 
-        self.apply_activation(
-            inputs=buffers["gate_up_output"],
-            outputs=buffers["activation_output"],
-        )
-
-        inputs, input_scale = HummingMethod.may_quant_input(
-            layer=self.layer,
-            inputs=buffers["activation_output"],
-            quanted_input=buffers.get("quanted_down_input", None),
-            sublayer_name="w2",
-        )
+        inputs, input_scale = self._w2_input(buffers)
 
         HummingMethod.forward_layer(
             layer=self.layer,
@@ -596,7 +713,7 @@ class HummingRunnerCore(MoeRunnerCore):
         routed_scaling_factor = (
             self.config.routed_scaling_factor if apply_routed_scaling_factor else None
         )
-        moe_fused_mul_sum(
+        mul_sum_kwargs = dict(
             inputs=buffers["down_output"].view(*topk_ids.shape, -1),
             topk_weights=topk_weights,
             topk_ids=topk_ids,
@@ -604,6 +721,11 @@ class HummingRunnerCore(MoeRunnerCore):
             routed_scaling_factor=routed_scaling_factor,
             outputs=buffers["output"],
         )
+        deferred = _deferred_mul_sum.get()
+        if deferred is not None:
+            deferred.mul_sum_kwargs = mul_sum_kwargs
+        else:
+            moe_fused_mul_sum(**mul_sum_kwargs)
 
         return buffers["output"]
 
@@ -670,17 +792,7 @@ class HummingRunnerCore(MoeRunnerCore):
             sublayer_name="w13",
         )
 
-        self.apply_activation(
-            inputs=buffers["gate_up_output"],
-            outputs=buffers["activation_output"],
-        )
-
-        inputs, input_scale = HummingMethod.may_quant_input(
-            layer=self.layer,
-            inputs=buffers["activation_output"],
-            quanted_input=buffers.get("quanted_down_input", None),
-            sublayer_name="w2",
-        )
+        inputs, input_scale = self._w2_input(buffers)
 
         HummingMethod.forward_layer(
             layer=self.layer,

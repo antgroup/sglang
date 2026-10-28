@@ -6,8 +6,10 @@ from humming.layer import HummingInputSchema, HummingMethod
 from humming.schema import BaseWeightSchema
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on, dsv41_sm90_role
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.moe_runner.humming_overlay import install_sm90_overlay
 from sglang.srt.runtime_context import get_exec
 
 
@@ -80,7 +82,24 @@ def make_humming_deepep_input_schema(
     return HummingInputSchema(a_dtype="float8e4m3", input_scale_group_size=128)
 
 
+def _moe_pad_multiples() -> tuple[int, int]:
+    """Per-rank MoE weight padding multiples (w13 N, w2 K).
+
+    256/128 pads TP8 DeepSeek-V4.1 (I=288 per rank) to w13 N=768 and w2 K=384:
+    whole all-zero tiles that are still read and multiplied. The humming kernels
+    only need N and K to be multiples of 64 (weight repack, 8-bit-activation K
+    step), so the SM90 path keeps 576/320. Padding sits at the end of N/K and
+    never changes the K order of a real output element.
+    """
+    if dsv41_sm90_on("moe"):
+        return 64, 64
+    return 256, 128
+
+
 def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
+    if dsv41_sm90_on("moe"):
+        # Before any humming kernel of this process is built (weight transforms included).
+        install_sm90_overlay(role=dsv41_sm90_role())
     weight_schema = BaseWeightSchema.from_config(quant_config)
     input_quant_config = envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG.get() or {}
     if humming_is_layer_skipped(input_quant_config, layer.layer_name):
@@ -104,6 +123,7 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
 
     layer.weight_schemas = {}
     layer.input_schemas = {}
+    pad_n, pad_k = _moe_pad_multiples()
 
     for sublayer_name in shape_config:
         # Step 1: convert weight to humming standard format
@@ -148,8 +168,8 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
             layer=layer,
             shape_n=shape_n,
             shape_k=shape_k,
-            pad_n_to_multiple=256,
-            pad_k_to_multiple=128,
+            pad_n_to_multiple=pad_n,
+            pad_k_to_multiple=pad_k,
             input_schema=sub_input_schema,
             weight_schema=weight_schema_new,
             has_bias=layer.with_bias,

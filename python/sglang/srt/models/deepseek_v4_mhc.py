@@ -102,6 +102,42 @@ HcTriplet = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 MHC_POST_MULT_VALUE = 2.0
 
 
+class Sm90HcRows(msgspec.Struct, frozen=True):
+    """Row thresholds of the DeepSeek-V4.1 SM90 mHC path (`HcConfig.sm90`). Each
+    picks between kernels that write the same bits, so it moves only time; a
+    None minimum never takes the kernel."""
+
+    partial_v2_min: Optional[int]
+    partial_wgmma_min: Optional[int]
+    stats_stream_max: int
+    combine_norm_min: Optional[int]
+    post_combine_norm_min: Optional[int]
+
+
+# Measured on H20 at the V4.1 shapes (hidden 5120, hc_mult 4); kernels on Triton 3.8.
+_SM90_ROWS_H20 = Sm90HcRows(
+    partial_v2_min=2,
+    partial_wgmma_min=128,
+    stats_stream_max=384,
+    combine_norm_min=1024,
+    post_combine_norm_min=2048,
+)
+_SM90_ROWS = {"NVIDIA H20": _SM90_ROWS_H20, "NVIDIA H20-3e": _SM90_ROWS_H20}
+# Untuned SM90 parts: the production partial, upstream's 64-row stats stream and
+# no norm folds.
+_SM90_ROWS_DEFAULT = Sm90HcRows(
+    partial_v2_min=None,
+    partial_wgmma_min=None,
+    stats_stream_max=64,
+    combine_norm_min=None,
+    post_combine_norm_min=None,
+)
+
+
+def sm90_hc_rows(device_name: str) -> Sm90HcRows:
+    return _SM90_ROWS.get(device_name, _SM90_ROWS_DEFAULT)
+
+
 class HcConfig(NamedTuple):
     """Everything about a layer's mHC that is fixed for the model's lifetime."""
 
@@ -112,6 +148,9 @@ class HcConfig(NamedTuple):
     hidden: int
     pre_from_prev: bool
     cp_prefill: bool
+    # Set with dsv41_sm90_on("mhc"): exact tf32x3 stats with the TileLang sinkhorn
+    # and posts fused with the next collapse; None keeps the upstream kernels.
+    sm90: Optional[Sm90HcRows] = None
 
 
 class HcSubLayer(NamedTuple):
@@ -146,9 +185,16 @@ class HcQuantized(NamedTuple):
     pair: Tuple[torch.Tensor, torch.Tensor]
 
 
-HcPreOutput: TypeAlias = Union[HcNormed, HcQuantized]
-"""The next sublayer's input, built by the previous post; a receiver skips step 2
-(and ``pre``) entirely. Always normed -- combine and norm travel together."""
+class HcCombined(NamedTuple):
+    """Summed but not normed (the SM90 fused post below the norm-fold rows); the
+    receiver applies its own norm."""
+
+    rows: torch.Tensor
+
+
+HcPreOutput: TypeAlias = Union[HcNormed, HcQuantized, HcCombined]
+"""The next sublayer's input, built by the previous post; a receiver skips the
+collapse (and ``pre``). Normed unless it is an `HcCombined`."""
 
 
 class AttnOutput(NamedTuple):
@@ -216,16 +262,16 @@ class HcState(msgspec.Struct):
 
     def take_rows(self, rows: Callable[[torch.Tensor], torch.Tensor]) -> HcState:
         """Keep only the rows ``rows`` selects -- the late-layer tail's narrowing.
-        A normed ``input`` and the ``stats`` are per row, so they are narrowed with
-        the residual; a quantized input is dropped (its MXFP8 scales are swizzled
-        per 128-row tile) and the next combine rebuilds it."""
+        A normed or combined ``input`` and the ``stats`` are per row, so they are
+        narrowed with the residual; a quantized input is dropped (its MXFP8 scales
+        are swizzled per 128-row tile) and the next combine rebuilds it."""
         pre = None if self.pre is None else rows(self.pre)
         assert self.streams is not None
         if isinstance(self.streams, HcPending):  # HIP-only path
             return HcState(HcPending(*(rows(t) for t in self.streams)), pre)
         input = None
-        if isinstance(self.input, HcNormed):
-            input = HcNormed(rows(self.input.rows))
+        if isinstance(self.input, (HcNormed, HcCombined)):
+            input = type(self.input)(rows(self.input.rows))
         stats = None if self.stats is None else tuple(rows(t) for t in self.stats)
         return HcState(rows(self.streams), pre, input, stats)
 
@@ -307,6 +353,8 @@ def use_stats_stream(cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor
     decode_like = forward_batch.forward_mode.is_decode() or (
         forward_batch.forward_mode.is_target_verify() and x.shape[0] > 0
     )
+    if cfg.sm90 is not None:
+        return decode_like and 0 < x.shape[0] <= cfg.sm90.stats_stream_max
     return decode_like and (
         not get_platform().is_sm90
         or x.shape[0] == 1
@@ -321,7 +369,10 @@ def mix_stats(
     if stats_stream is None:
         return _mix_stats_impl(hc, x)
     main_stream = torch.cuda.current_stream()
-    x.record_stream(stats_stream)
+    # x is the residual, alive until the post that joins this stream; the SM90 path
+    # does not record it, which would pin every layer's residual in the graph pool.
+    if hc.cfg.sm90 is None:
+        x.record_stream(stats_stream)
     with torch.cuda.stream(stats_stream):
         coefficients = _mix_stats_impl(hc, x)
     for coefficient in coefficients:
@@ -339,6 +390,8 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     cfg = hc.cfg
 
     x_flat = x.flatten(1)
+    if cfg.sm90 is not None and x.shape[0] > 1 and x.dtype == torch.bfloat16:
+        return _mix_stats_sm90(hc, x_flat)
 
     from sglang.srt.batch_invariant_ops import (
         is_batch_invariant_mode_enabled,
@@ -435,6 +488,26 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     return pre.squeeze(1), post.squeeze(1), comb.squeeze(1)
 
 
+def _mix_stats_sm90(hc: HcSubLayer, x_flat: torch.Tensor) -> HcTriplet:
+    """The multi-row triplet bitwise the split-K stats and the TileLang sinkhorn,
+    whatever the batch size (one row keeps the fused Triton sinkhorn above)."""
+    from sglang.kernels.ops.layernorm.mhc_mix_sm90 import hc_mix_stats_split_sinkhorn
+
+    cfg = hc.cfg
+    return hc_mix_stats_split_sinkhorn(
+        x_flat,
+        hc.fn,
+        hc.scale,
+        hc.base,
+        cfg.mult,
+        cfg.sinkhorn_iters,
+        cfg.rms_eps,
+        cfg.eps,
+        v2_min_rows=cfg.sm90.partial_v2_min,
+        wgmma_min_rows=cfg.sm90.partial_wgmma_min,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Step 2 -- collapse the streams and normalize
 # ---------------------------------------------------------------------------
@@ -461,6 +534,8 @@ def combine(
         return shortcut.rows
     if isinstance(shortcut, HcNormed):
         return shortcut.rows
+    if isinstance(shortcut, HcCombined):
+        return hc.norm(shortcut.rows)
     return _combine(hc, state, quantized)
 
 
@@ -479,6 +554,8 @@ def _combine(
 
     if apply_pre is None:
         return norm(x[:, 0, :])
+    if cfg.sm90 is not None:
+        return _combine_sm90(cfg, norm, x, apply_pre)
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
     hopper_fused = (
@@ -515,6 +592,39 @@ def _combine(
 
         return hc_combine_norm(x_flat, apply_pre, norm.weight, norm.variance_epsilon)
     return norm(mhc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
+
+
+def _sm90_norm_folds(norm: RMSNorm, rows: int, min_rows: Optional[int]) -> bool:
+    """Whether a fused collapse may apply ``norm`` itself: the kernels repeat the
+    FlashInfer RMSNorm that ``RMSNorm.forward_cuda`` runs for these weights."""
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    return (
+        min_rows is not None
+        and rows >= min_rows
+        and norm.weight.dtype == torch.bfloat16
+        and norm.weight.shape == (5120,)
+        and not norm.cast_x_before_out_mul
+        and norm.variance_size_override is None
+        and not is_batch_invariant_mode_enabled()
+    )
+
+
+def _combine_sm90(
+    cfg: HcConfig, norm: RMSNorm, x: torch.Tensor, pre: torch.Tensor
+) -> torch.Tensor:
+    """``norm(mhc_combine(x, pre))``, in one launch from ``combine_norm_min`` rows."""
+    from sglang.kernels.ops.layernorm.mhc import mhc_combine
+    from sglang.kernels.ops.layernorm.mhc_post_combine_norm import (
+        can_use_mhc_combine_norm,
+        mhc_combine_norm,
+    )
+
+    if _sm90_norm_folds(
+        norm, x.shape[0], cfg.sm90.combine_norm_min
+    ) and can_use_mhc_combine_norm(x, pre, norm.weight):
+        return mhc_combine_norm(x, pre, norm.weight, norm.variance_epsilon)
+    return norm(mhc_combine(x.flatten(1), pre, cfg.mult, x.dtype))
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +781,10 @@ def _post_fusion(
     combine computes itself."""
     cfg = hc.cfg
     pre, post_mix, comb = coefficients
+    if cfg.sm90 is not None and next is not None and y.shape[0] > 0:
+        fused = _post_fusion_sm90(cfg, y, residual, coefficients, next.norm)
+        if fused is not None:
+            return fused
     if (
         next is not None
         and next.norm_fusable
@@ -733,6 +847,43 @@ def _post_fusion(
         )
         return HcState(updated, pre, HcNormed(normalized))
     return HcState(post(cfg, y, residual, post_mix, comb), pre)
+
+
+def _post_fusion_sm90(
+    cfg: HcConfig,
+    y: torch.Tensor,
+    residual: torch.Tensor,
+    coefficients: HcTriplet,
+    norm: RMSNorm,
+) -> Optional[HcState]:
+    """``post`` and the next sublayer's collapse in one launch, bitwise the two
+    apart; from ``post_combine_norm_min`` rows the next norm is folded in too."""
+    from sglang.kernels.ops.layernorm.mhc_post_combine import (
+        can_use_mhc_post_combine,
+        mhc_post_combine,
+    )
+    from sglang.kernels.ops.layernorm.mhc_post_combine_norm import (
+        can_use_mhc_post_combine_norm,
+        mhc_post_combine_norm,
+    )
+
+    pre, post_mix, comb = coefficients
+    # The fused kernels repeat the split-h / TileLang post that `post` runs here.
+    if (
+        envs.SGLANG_OPT_USE_FLASHINFER_MHC.get()
+        or not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
+        or not can_use_mhc_post_combine(y, residual, post_mix, comb, pre)
+    ):
+        return None
+    if _sm90_norm_folds(
+        norm, y.shape[0], cfg.sm90.post_combine_norm_min
+    ) and can_use_mhc_post_combine_norm(y, residual, post_mix, comb, pre, norm.weight):
+        updated, normalized = mhc_post_combine_norm(
+            y, residual, post_mix, comb, pre, norm.weight, norm.variance_epsilon
+        )
+        return HcState(updated, pre, HcNormed(normalized))
+    updated, combined = mhc_post_combine(y, residual, post_mix, comb, pre)
+    return HcState(updated, pre, HcCombined(combined))
 
 
 def run_attn_post(

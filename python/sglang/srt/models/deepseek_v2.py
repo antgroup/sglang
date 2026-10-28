@@ -24,6 +24,7 @@ import logging
 from contextlib import contextmanager, nullcontext
 from functools import cached_property
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -84,6 +85,7 @@ from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -231,6 +233,9 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner.humming import HummingDeferredMulSum
 
 if _use_aiter:
     from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
@@ -616,7 +621,7 @@ class MoEOutput(NamedTuple):
         shared = None if self.shared_is_replicated else self.shared
         if isinstance(self.routed, FlashInferTrtllmDeferredFinalizeOutput):
             return finalize_flashinfer_trtllm_deferred_output(self.routed, shared)
-        return maybe_fuse_routed_scale_and_shared_add(
+        return _merge_routed_and_shared(
             self.experts,
             self.routed,
             shared,
@@ -629,6 +634,45 @@ class MergedMoEOutput(MoEOutput):
 
     def get_merged(self) -> torch.Tensor:
         return self.routed
+
+
+def _uses_humming_moe(experts: nn.Module) -> bool:
+    """Whether the routed experts run the Humming runner, whose routed output
+    takes the shared expert with a plain ``routed += shared``."""
+    from sglang.srt.layers.quantization.humming import HummingMoEMethod
+    from sglang.srt.layers.quantization.mxfp4_humming_moe import (
+        Mxfp4HummingMoEMethod,
+    )
+
+    return isinstance(experts, FusedMoE) and isinstance(
+        experts.quant_method, (HummingMoEMethod, Mxfp4HummingMoEMethod)
+    )
+
+
+def _routed_or_deferred(
+    routed: torch.Tensor, deferred: Optional[HummingDeferredMulSum]
+) -> Union[torch.Tensor, HummingDeferredMulSum]:
+    """The handle of a humming run that left its weighted sum unwritten, else
+    ``routed``."""
+    if deferred is not None and deferred.mul_sum_kwargs is not None:
+        return deferred
+    return routed
+
+
+def _merge_routed_and_shared(
+    experts: nn.Module,
+    routed: Union[torch.Tensor, HummingDeferredMulSum],
+    shared: Optional[torch.Tensor],
+    routed_scaling_factor: float,
+) -> torch.Tensor:
+    if not isinstance(routed, torch.Tensor):
+        from sglang.srt.layers.moe.moe_runner.humming import HummingDeferredMulSum
+
+        if isinstance(routed, HummingDeferredMulSum):
+            return routed.finalize_with_shared_add(shared)
+    return maybe_fuse_routed_scale_and_shared_add(
+        experts, routed, shared, routed_scaling_factor
+    )
 
 
 def _scale_routed_and_add_shared(
@@ -1007,6 +1051,11 @@ class DeepseekV2MoE(nn.Module):
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
+        # DeepSeek-V4.1 SM90: the humming runner leaves its routed weighted sum to
+        # the shared add, which then runs in the same kernel (bitwise the same).
+        self._humming_fused_shared_add = (
+            dsv41_sm90_on("moe") and _is_cuda and _uses_humming_moe(self.experts)
+        )
 
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
@@ -1224,12 +1273,19 @@ class DeepseekV2MoE(nn.Module):
             )
         elif use_flashinfer_trtllm_bypass:
             final_hidden_states = self.experts.forward_impl(hidden_states, topk_output)
-        elif routed_pre_quant_input is not None:
-            final_hidden_states = self.experts(
-                hidden_states, topk_output, pre_quant_input=routed_pre_quant_input
-            )
         else:
-            final_hidden_states = self.experts(hidden_states, topk_output)
+            with self._routed_sum_deferral(
+                has_shared_output and not self._shared_expert_tp1
+            ) as deferred:
+                if routed_pre_quant_input is not None:
+                    final_hidden_states = self.experts(
+                        hidden_states,
+                        topk_output,
+                        pre_quant_input=routed_pre_quant_input,
+                    )
+                else:
+                    final_hidden_states = self.experts(hidden_states, topk_output)
+            final_hidden_states = _routed_or_deferred(final_hidden_states, deferred)
         if (
             not _is_cuda
             and not _is_musa
@@ -1283,7 +1339,7 @@ class DeepseekV2MoE(nn.Module):
                 shared_output,
             )
         else:
-            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+            final_hidden_states = _merge_routed_and_shared(
                 self.experts,
                 final_hidden_states,
                 None if self._shared_expert_tp1 else shared_output,
@@ -1401,17 +1457,24 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        if pre_quant_input is not None:
-            final_hidden_states = self.experts(
-                hidden_states,
-                topk_output,
-                pre_quant_input=pre_quant_input,
-            )
-        else:
-            final_hidden_states = self.experts(
-                hidden_states,
-                topk_output,
-            )
+        with self._routed_sum_deferral(
+            hidden_states.shape[0] > 0
+            and not self._fuse_shared_experts_inside_sbo
+            and not skip_shared_experts
+            and not self._shared_expert_tp1
+        ) as deferred:
+            if pre_quant_input is not None:
+                final_hidden_states = self.experts(
+                    hidden_states,
+                    topk_output,
+                    pre_quant_input=pre_quant_input,
+                )
+            else:
+                final_hidden_states = self.experts(
+                    hidden_states,
+                    topk_output,
+                )
+        final_hidden_states = _routed_or_deferred(final_hidden_states, deferred)
         if (
             not _is_cuda
             and not _is_musa
@@ -1442,7 +1505,7 @@ class DeepseekV2MoE(nn.Module):
                 shared_is_replicated=self._shared_expert_tp1,
             )
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+        final_hidden_states = _merge_routed_and_shared(
             self.experts,
             final_hidden_states,
             None if self._shared_expert_tp1 else shared_output,
@@ -1459,6 +1522,17 @@ class DeepseekV2MoE(nn.Module):
         ):
             final_hidden_states += shared_output
         return final_hidden_states
+
+    def _routed_sum_deferral(self, eligible: bool):
+        """A humming indexed-GEMM run inside leaves its weighted sum to
+        _merge_routed_and_shared when ``eligible`` (a shared output to fold in)."""
+        if self._humming_fused_shared_add and eligible:
+            from sglang.srt.layers.moe.moe_runner.humming import (
+                humming_deferred_mul_sum_context,
+            )
+
+            return humming_deferred_mul_sum_context()
+        return nullcontext()
 
     def _adds_replicated_output(self) -> bool:
         """Whether this rank adds the replicated TP1 shared-expert output."""

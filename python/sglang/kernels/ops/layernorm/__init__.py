@@ -43,6 +43,24 @@ for _mod, _fn in _HC_NORM_KERNELS:
     )
 del _mod, _fn
 
+# DeepSeek-V4.1 SM90 mHC kernels, bitwise the stats, post and collapse they replace.
+_SM90_ONLY = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))})
+for _mod, _fn, _bk, _caps in (
+    ("mhc_mix_sm90", "hc_mix_stats_split_sinkhorn", KernelBackend.TRITON, _SM90_ONLY),
+    ("mhc_post_combine", "mhc_post_combine", KernelBackend.TRITON, CUDA_ONLY),
+    ("mhc_post_combine_norm", "mhc_post_combine_norm", KernelBackend.JIT, CUDA_ONLY),
+    ("mhc_post_combine_norm", "mhc_combine_norm", KernelBackend.JIT, CUDA_ONLY),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=_bk,
+            target=f"sglang.kernels.ops.layernorm.{_mod}:{_fn}",
+            capabilities=_caps,
+        )
+    )
+del _mod, _fn, _bk, _caps
+
 for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):
     register_kernel(
         KernelSpec(
