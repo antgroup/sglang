@@ -172,6 +172,34 @@ MultimodalDataInputFormat = Union[
     MultimodalDataInputItem,
 ]
 
+# MetadataBuffers keeps bootstrap_room in a uint64 tensor (int64 on NPU), and
+# torch converts a Python int through int64 on the way in.
+_MAX_BOOTSTRAP_ROOM = 2**63 - 1
+
+
+def bootstrap_params_error(
+    *, bootstrap_room: Any = None, bootstrap_port: Any = None
+) -> Optional[str]:
+    """Why a PD bootstrap room or port is unusable, or None if it is usable."""
+    if bootstrap_room is not None and not (
+        _is_plain_int(bootstrap_room) and 0 <= bootstrap_room <= _MAX_BOOTSTRAP_ROOM
+    ):
+        return (
+            "bootstrap_room must be an integer in [0, 2**63 - 1], "
+            f"got {bootstrap_room!r}."
+        )
+    if bootstrap_port is not None and not (
+        _is_plain_int(bootstrap_port) and 1 <= bootstrap_port <= 65535
+    ):
+        return (
+            f"bootstrap_port must be an integer in [1, 65535], got {bootstrap_port!r}."
+        )
+    return None
+
+
+def _is_plain_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
 
 @dataclass
 class GenerateReqInput:
@@ -440,9 +468,24 @@ class GenerateReqInput:
             self._normalize_batch_inputs()
 
         self._validate_rid_uniqueness()
+        # Again after the batch expansion, which offsets each sample's room.
+        self._validate_bootstrap_params()
+
+    def _validate_bootstrap_params(self):
+        """An out-of-range room fails the PD prefill scheduler on every rank
+        when it reaches the metadata buffer, not just this request."""
+        rooms = self.bootstrap_room
+        ports = self.bootstrap_port
+        for room in rooms if isinstance(rooms, list) else [rooms]:
+            if (error := bootstrap_params_error(bootstrap_room=room)) is not None:
+                raise ValueError(error)
+        for port in ports if isinstance(ports, list) else [ports]:
+            if (error := bootstrap_params_error(bootstrap_port=port)) is not None:
+                raise ValueError(error)
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
+        self._validate_bootstrap_params()
         if (
             self.text is None and self.input_ids is None and self.input_embeds is None
         ) or (

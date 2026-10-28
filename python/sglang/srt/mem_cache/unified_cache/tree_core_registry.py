@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
@@ -42,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 
 def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
+    if params.decoder_swa_bounded_replay and dsv41_sm90_on("runtime"):
+        return "the DeepSeek-V4.1 SWA replay proof lives on Python tree nodes"
     if params.enable_session_radix_cache:
         return "session-aware caching requires the Python TreeCore"
     if params.tree_components is not None and set(params.tree_components) - {

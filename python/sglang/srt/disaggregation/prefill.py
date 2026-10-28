@@ -472,8 +472,18 @@ class PrefillBootstrapQueue:
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            self.fail_before_handoff(req, message)
             return True
         return False
+
+    def fail_before_handoff(self, req: Req, failure_reason: str) -> None:
+        """Tell decode about a request retired before it got a KV sender;
+        otherwise decode waits for KV until its own waiting timeout."""
+        if req.bootstrap_room is None or req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+            return
+        self.kv_manager.fail_room_before_handoff(
+            bootstrap_room=req.bootstrap_room, failure_reason=failure_reason
+        )
 
     def _process_req(self, req: Req) -> None:
         """
@@ -686,6 +696,7 @@ class SchedulerDisaggregationPrefillMixin:
         while True:
             if self.gracefully_exit:
                 break
+            self.disagg_prefill_bootstrap_queue.kv_manager.note_scheduler_tick()
 
             # Receive requests
             self.ingest_requests()
@@ -780,6 +791,7 @@ class SchedulerDisaggregationPrefillMixin:
         while True:
             if self.gracefully_exit:
                 break
+            self.disagg_prefill_bootstrap_queue.kv_manager.note_scheduler_tick()
 
             # Stop dispatching at pause requests while waiting for a batch result.
             received_inputs = self.ingest_requests(

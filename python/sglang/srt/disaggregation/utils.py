@@ -521,6 +521,32 @@ class MetadataBuffers:
         if self.kv_checksum is not None:
             self.kv_checksum[idx] = 0
 
+    def reset_for_fake_transfer(self, idx: int) -> None:
+        """Initialize a slot that no prefill sender will write. A recycled slot
+        still holds the previous owner's cache stats, logprobs, hidden states
+        and DSA top-k positions, which can lie beyond the new request's KV."""
+        for buf in (
+            self.output_ids,
+            self.cached_tokens,
+            self.output_token_logprobs_val,
+            self.output_token_logprobs_idx,
+            self.output_top_logprobs_val,
+            self.output_top_logprobs_idx,
+            self.output_token_sampling_mask_len,
+            self.output_token_sampling_mask_idx,
+            self.output_token_sampling_logprobs,
+            self.output_topk_p,
+            self.output_topk_index,
+            self.output_hidden_states,
+            self.bootstrap_room,
+            self.kv_checksum,
+        ):
+            if buf is not None:
+                buf[idx].zero_()
+        if self.output_dsa_topk_indices is not None:
+            # Zero is a valid position; -1 is the "not written" fill.
+            self.output_dsa_topk_indices[idx].fill_(-1)
+
     def get_buf_infos(self):
         bufs = [
             self.output_ids,

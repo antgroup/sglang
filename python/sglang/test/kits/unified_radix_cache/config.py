@@ -23,6 +23,7 @@ class CacheConfig:
     sliding_window_size: Optional[int] = None
     draft_swa_window: int = 0
     decoder_swa_bounded_replay: bool = False
+    attn_cp_size: int = 1
 
     enable_mamba_extra_buffer: bool = False
     mamba_cache_size: int = 20

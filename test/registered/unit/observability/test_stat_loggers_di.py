@@ -249,6 +249,10 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             name="sglang:num_decode_deferred_kv_release_reqs",
             labelnames=self.labels.keys(),
         )
+        self.collector.num_decode_quarantined_kv_release_reqs = _RecordingMetric(
+            name="sglang:num_decode_quarantined_kv_release_reqs",
+            labelnames=self.labels.keys(),
+        )
 
     def test_records_duration_and_bounded_outcome(self):
         self.collector.observe_decode_deferred_kv_release(
@@ -274,6 +278,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = []
         queue._deferred_releases = [object(), object(), object()]
+        queue._quarantined = [object()]
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.scheduler = SimpleNamespace(
             enable_hierarchical_cache=False,
@@ -304,6 +309,9 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         collector.num_decode_deferred_kv_release_reqs = (
             self.collector.num_decode_deferred_kv_release_reqs
         )
+        collector.num_decode_quarantined_kv_release_reqs = (
+            self.collector.num_decode_quarantined_kv_release_reqs
+        )
         collector.labels = self.labels
         collector.log_stats.side_effect = lambda stats: (
             SchedulerMetricsCollector.log_stats(collector, stats)
@@ -332,12 +340,18 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             reporter._maybe_log_idle_metrics()
             self.assertEqual(reporter.stats.num_decode_deferred_kv_release_reqs, 3)
             queue._deferred_releases.clear()
+            queue._quarantined.clear()
             reporter._maybe_log_idle_metrics()
             self.assertEqual(reporter.stats.num_decode_deferred_kv_release_reqs, 0)
 
         self.assertEqual(
             self.collector.num_decode_deferred_kv_release_reqs.sets,
             [(self.labels, 3), (self.labels, 0)],
+        )
+        # Drain-timed-out holds are reported apart from the in-drain ones.
+        self.assertEqual(
+            self.collector.num_decode_quarantined_kv_release_reqs.sets,
+            [(self.labels, 1), (self.labels, 0)],
         )
 
     def test_decode_report_logs_current_deferred_release_count(self):
@@ -347,6 +361,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = []
         queue._deferred_releases = [object(), object()]
+        queue._quarantined = []
         batch = SimpleNamespace(
             reqs=[],
             seq_lens_cpu=None,
@@ -403,6 +418,9 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         collector = MagicMock()
         collector.num_decode_deferred_kv_release_reqs = (
             self.collector.num_decode_deferred_kv_release_reqs
+        )
+        collector.num_decode_quarantined_kv_release_reqs = (
+            self.collector.num_decode_quarantined_kv_release_reqs
         )
         collector.labels = self.labels
         collector.log_stats.side_effect = lambda stats: (

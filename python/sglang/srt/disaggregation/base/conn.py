@@ -168,6 +168,18 @@ class BaseKVManager(ABC):
             f"{type(self).__name__} does not support PD role switch teardown"
         )
 
+    def note_scheduler_tick(self) -> None:
+        """Called once per prefill scheduler loop iteration (liveness for /health)."""
+
+    def fail_room_before_handoff(
+        self, *, bootstrap_room: int, failure_reason: str
+    ) -> None:
+        """Tell decode that a request failed before it got a KV sender.
+
+        No-op for backends without a prefill-to-decode status channel; their
+        decode side only learns of the failure from its own waiting timeout.
+        """
+
 
 class BaseKVSender(ABC):
     @abstractmethod

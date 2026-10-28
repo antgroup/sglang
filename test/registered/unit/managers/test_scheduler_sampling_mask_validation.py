@@ -1,4 +1,4 @@
-"""Reject PD sampling-mask requests before entering transfer queues."""
+"""Reject unservable PD requests before they enter the transfer queues."""
 
 import unittest
 from http import HTTPStatus
@@ -16,31 +16,33 @@ from sglang.srt.managers.scheduler import Scheduler
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+def _make_scheduler(mode):
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.enable_session_radix_cache = False
+    scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
+    scheduler.disaggregation_mode = mode
+    scheduler.disagg_metadata_buffers = SimpleNamespace(enable_sampling_mask=False)
+    scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+    scheduler.tokenizer = None
+    scheduler.dllm_config = None
+    scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
+    scheduler._record_kv_event_lora_name = MagicMock()
+    scheduler.spec_algorithm = SimpleNamespace(
+        is_dflash_family=lambda: False,
+        is_uno=lambda: False,
+    )
+    scheduler.init_req_max_new_tokens = MagicMock()
+    scheduler._add_request_to_queue = MagicMock()
+    scheduler.output_streamer = MagicMock()
+    return scheduler
+
+
 class TestSchedulerSamplingMaskValidation(CustomTestCase):
     def test_disabled_pd_masks_return_bad_request_before_admission(self):
         """Neither PD role may queue mask requests without metadata buffers."""
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
-                scheduler = Scheduler.__new__(Scheduler)
-                scheduler.enable_session_radix_cache = False
-                scheduler.model_config = SimpleNamespace(
-                    hf_eos_token_id={1}, vocab_size=128
-                )
-                scheduler.disaggregation_mode = mode
-                scheduler.disagg_metadata_buffers = SimpleNamespace(
-                    enable_sampling_mask=False
-                )
-                scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
-                scheduler.tokenizer = None
-                scheduler.dllm_config = None
-                scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
-                scheduler._record_kv_event_lora_name = MagicMock()
-                scheduler.spec_algorithm = SimpleNamespace(
-                    is_dflash_family=lambda: False,
-                    is_uno=lambda: False,
-                )
-                scheduler._add_request_to_queue = MagicMock()
-                scheduler.output_streamer = MagicMock()
+                scheduler = _make_scheduler(mode)
                 recv_req = MagicMock(
                     session_params=None,
                     session_id=None,
@@ -63,6 +65,30 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST
                 )
                 scheduler._add_request_to_queue.assert_not_called()
+
+    def test_unusable_bootstrap_room_fails_alone_before_pd_admission(self):
+        """A room outside int64 crashed the metadata write on every prefill rank;
+        a request that bypassed the tokenizer's check must fail on its own."""
+        scheduler = _make_scheduler(DisaggregationMode.PREFILL)
+        recv_req = MagicMock(
+            session_params=None,
+            session_id=None,
+            input_embeds=None,
+            bootstrap_port=8998,
+            bootstrap_room=9296062612936937257,
+        )
+        req = MagicMock(return_sampling_mask=False)
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
+                return_value=1,
+            ),
+            patch("sglang.srt.managers.scheduler.Req", return_value=req),
+        ):
+            scheduler.handle_generate_request(recv_req)
+        req.set_finish_with_abort.assert_called_once()
+        self.assertIn("bootstrap_room", req.set_finish_with_abort.call_args.args[0])
+        scheduler._add_request_to_queue.assert_called_once_with(req)
 
 
 if __name__ == "__main__":

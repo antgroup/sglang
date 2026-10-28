@@ -24,7 +24,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferKVChunk,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -653,7 +653,7 @@ class TestNixlDecodeListener(CustomTestCase):
 
 
 class TestNixlNodeFailure(CustomTestCase):
-    def _make_manager(self):
+    def _make_manager(self, *, track_prefill_loss=False):
         mgr = object.__new__(NixlKVManager)
         mgr.connection_lock = threading.Lock()
         # Connection keys are "{addr}_{dp_rank}_{cp_rank}_{tp_rank}".
@@ -669,6 +669,8 @@ class TestNixlNodeFailure(CustomTestCase):
         mgr.addr_to_rooms_tracker = defaultdict(set)
         mgr.addr_to_rooms_tracker["10.0.0.1:8998"] = {3, 4, 5}
         mgr.heartbeat_failures = {"10.0.0.1:8998": 2, "10.0.0.2:8998": 1}
+        if track_prefill_loss:
+            mgr.prefill_lost_at = {}
         mgr.request_status = {
             3: KVPoll.WaitingForInput,
             4: KVPoll.Transferring,
@@ -684,15 +686,18 @@ class TestNixlNodeFailure(CustomTestCase):
         return mgr
 
     def test_handle_node_failure_removes_connections_and_marks_pending_rooms(self):
-        mgr = self._make_manager()
+        mgr = self._make_manager(track_prefill_loss=True)
 
-        mgr._handle_node_failure("10.0.0.1:8998")
+        with get_flags().dsv41_sm90.override(subsystems=frozenset({"pd"})):
+            mgr._handle_node_failure("10.0.0.1:8998")
 
         self.assertNotIn("10.0.0.1:8998_0_0_0", mgr.connection_pool)
         self.assertNotIn("10.0.0.1:8998_0_0_1", mgr.connection_pool)
         self.assertIn("10.0.0.2:8998_0_0_0", mgr.connection_pool)
         self.assertNotIn("10.0.0.1:8998", mgr.prefill_info_table)
         self.assertNotIn("10.0.0.1:8998", mgr.addr_to_rooms_tracker)
+        # The loss time reclaims KV quarantined after a drain timeout on it.
+        self.assertEqual(list(mgr.prefill_lost_at), ["10.0.0.1:8998"])
         self.assertEqual(mgr.request_status[3], KVPoll.Failed)
         self.assertEqual(mgr.request_status[4], KVPoll.Failed)
         self.assertEqual(mgr.request_status[5], KVPoll.Success)
@@ -700,6 +705,11 @@ class TestNixlNodeFailure(CustomTestCase):
         self.assertIn(4, mgr.failure_records)
         self.assertNotIn(5, mgr.failure_records)
         self.assertEqual(mgr.heartbeat_failures, {"10.0.0.2:8998": 1})
+
+        mgr = self._make_manager()
+        with get_flags().dsv41_sm90.override(subsystems=frozenset()):
+            mgr._handle_node_failure("10.0.0.1:8998")
+        self.assertNotIn("prefill_lost_at", vars(mgr))
 
     def test_a_prefill_reached_again_after_a_loss_needs_its_misses_again(self):
         """A prefill dropped after max_failures missed heartbeats, then reached
@@ -735,7 +745,8 @@ class TestNixlNodeFailure(CustomTestCase):
             mgr.prefill_info_table[failed] = object()
 
         mgr._handle_node_failure = lost
-        mgr._start_heartbeat_checker_thread().join(10)
+        with get_flags().dsv41_sm90.override(subsystems=frozenset()):
+            mgr._start_heartbeat_checker_thread().join(10)
         self.assertEqual(probes, [])
         self.assertEqual(losses, [addr])
 

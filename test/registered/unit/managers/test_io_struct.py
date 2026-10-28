@@ -430,6 +430,40 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req[0].sampling_logprobs_mode, "selected")
         self.assertEqual(req[1].sampling_logprobs_mode, "support")
 
+    def test_bootstrap_room_and_port_must_fit_the_pd_transfer(self):
+        """An out-of-range room crashed every PD prefill rank when it reached the
+        metadata buffer; it must be a ValueError (HTTP 400) at the request."""
+        int64_max = 2**63 - 1
+        rejected = {
+            "room above int64": dict(bootstrap_room=9296062612936937257),
+            "negative room": dict(bootstrap_room=-1),
+            "string room": dict(bootstrap_room="7"),
+            "bool room": dict(bootstrap_room=True),
+            "room in a batch": dict(text=["a", "b"], bootstrap_room=[0, 2**64]),
+            "room offset by n": dict(
+                bootstrap_room=int64_max, sampling_params={"n": 2}
+            ),
+            "port zero": dict(bootstrap_port=0),
+            "port above 65535": dict(bootstrap_port=65536),
+            "string port": dict(bootstrap_port="8998"),
+        }
+        for name, fields in rejected.items():
+            with self.subTest(name):
+                req = GenerateReqInput(**{"text": "Hello", **fields})
+                with self.assertRaisesRegex(ValueError, "bootstrap_"):
+                    req.normalize_batch_and_arguments()
+
+        accepted = {
+            "room zero": dict(bootstrap_room=0, bootstrap_port=1),
+            "room int64 max": dict(bootstrap_room=int64_max, bootstrap_port=65535),
+            "batch": dict(text=["a", "b"], bootstrap_room=[0, int64_max]),
+            "no bootstrap": dict(),
+        }
+        for name, fields in accepted.items():
+            with self.subTest(name):
+                req = GenerateReqInput(**{"text": "Hello", **fields})
+                req.normalize_batch_and_arguments()
+
     def test_single_image_to_list_of_lists(self):
         """Test that a single image is converted to a list of single-image lists."""
         req = copy.deepcopy(self.base_req)

@@ -252,7 +252,11 @@ class TestDisaggregationWire(unittest.TestCase):
                             c.args[1]
                             for c in manager._send_multipart_locked.call_args_list
                         ],
-                        [[b"42", b"0", b"0"], [b"43", b"4", b"0"]],
+                        # A Failed status carries its reason frame.
+                        [
+                            [b"42", b"0", b"0", expected_reason.encode()],
+                            [b"43", b"4", b"0"],
+                        ],
                     )
                     good_writes = [
                         call("decode:43", [(0x1040, 0x20A0, 32)]),

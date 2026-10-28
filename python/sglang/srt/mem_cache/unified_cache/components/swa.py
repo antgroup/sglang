@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -95,6 +96,16 @@ class SWAComponent(TreeComponent):
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
         ) // params.page_size
+        # DeepSeek-V4.1 SM90: a mid-prompt insert keeps exactly the window's pages
+        # below its end instead of one page more.
+        self.exact_window_mid_prompt = dsv41_sm90_on("runtime")
+        # A CP prefill chunk leaving a window of its request's fill tokens can skip
+        # its late layers (DeepseekV4AttnBackend._late_layer_tail_unread).
+        self.cp_may_skip_late_layers = (
+            dsv41_sm90_on("cp")
+            and params.decoder_swa_bounded_replay
+            and params.attn_cp_size > 1
+        )
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
 
@@ -354,6 +365,54 @@ class SWAComponent(TreeComponent):
             case _:
                 raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
+    def _record_replay_range(self, node: UnifiedTreeNode, params: InsertParams):
+        if not self.exact_window_mid_prompt:
+            return
+        metadata = node.component_data[self.component_type].metadata
+        metadata.pop("replay_range", None)
+        if params.swa_replay_range is not None:
+            metadata["replay_range"] = params.swa_replay_range
+
+    def bounded_replay_match_limit(
+        self, params: MatchPrefixParams, result: MatchResult
+    ) -> Optional[int]:
+        """Under decoder SWA bounded replay, the raw-token cap a match needs, or None
+        when the late-layer rows a short extend reads from the cache,
+        [extend_end - window, match_end), were computed by an earlier forward
+        (the ``replay_range`` the insert recorded). Unknown provenance fails closed:
+        the cap holds a full window back, as without the proof."""
+        floor = max(0, params.swa_replay_end - self.sliding_window_size)
+        device_end = result.device_prefix_len
+        # FULL can stay device-resident while only SWA needs a host reload;
+        # host_hit_length counts FULL and is not the best node's absolute end.
+        best_end = device_end
+        node = self.tree_core.node_by_id(result.best_match_node)
+        while node.id != result.last_device_node:
+            if node is self.tree_core.root_node:
+                return floor
+            best_end += len(node.key)
+            node = node.parent
+        for node_id, end, device_only in (
+            (result.last_device_node, device_end, True),
+            (result.best_match_node, best_end, False),
+        ):
+            node = self.tree_core.node_by_id(node_id)
+            while end > floor:
+                if node is self.tree_core.root_node:
+                    return floor
+                start = end - len(node.key)
+                cd = node.component_data[self.component_type]
+                if cd.value is not None:
+                    proof = cd.metadata.get("replay_range")
+                elif not device_only and cd.host_value is not None:
+                    proof = cd.metadata.get("host_replay_range")
+                else:
+                    proof = None
+                if proof is None or proof[0] > max(start, floor) or proof[1] < end:
+                    return floor
+                end, node = start, node.parent
+        return None
+
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
@@ -498,6 +557,7 @@ class SWAComponent(TreeComponent):
             if live_start is None:
                 continue
             result.record_adopted_range(self.component_type, live_start, end)
+            self._record_replay_range(fragment, params)
             self._recover_from_incoming(
                 node=fragment,
                 incoming_full=value_slice[
@@ -532,7 +592,9 @@ class SWAComponent(TreeComponent):
             )
             # Older fragments publish first so the tail remains more-MRU.
             if parent is not None:
+                self._record_replay_range(parent, params)
                 self._publish_window(node=parent, cache_actions=cache_actions)
+            self._record_replay_range(fragment, params)
             self._publish_window(node=fragment, cache_actions=cache_actions)
             result.record_adopted_range(self.component_type, live_start, end)
 
@@ -680,6 +742,13 @@ class SWAComponent(TreeComponent):
             ):
                 host_lru.insert_mru(child)
 
+        if self.exact_window_mid_prompt:
+            # A replay proof is an absolute interval, valid for both halves.
+            for key in ("replay_range", "host_replay_range"):
+                proof = child.component_data[self.component_type].metadata.get(key)
+                if proof is not None:
+                    new_parent.component_data[self.component_type].metadata[key] = proof
+
         # The window-boundary uuids mark the node's older edge, which the
         # split moves to the parent — both tiers migrate with it.
         new_parent.component_data[self.component_type].metadata["uuid"] = (
@@ -715,6 +784,8 @@ class SWAComponent(TreeComponent):
             freed = self.reclaimable_value_len(node)
             self.tree_core.component_evictable_size_[ct] -= freed
             cd.value = None
+            if self.exact_window_mid_prompt:
+                cd.metadata.pop("replay_range", None)
 
         # Host layer
         host_lru = self.tree_core.host_lru_lists[ct]
@@ -722,6 +793,8 @@ class SWAComponent(TreeComponent):
             host_freed = len(cd.host_value)
             host_frees[ct].append(cd.host_value)
             cd.host_value = None
+            if self.exact_window_mid_prompt:
+                cd.metadata.pop("host_replay_range", None)
             if host_lru.in_list(node):
                 host_lru.remove_node(node)
 
@@ -1008,6 +1081,17 @@ class SWAComponent(TreeComponent):
         insert_params.set_evicted_seqlen(
             self.component_type, req.kv.get_evicted_seqlen(self.component_type)
         )
+        if (
+            self.cache.swa_replay_proof
+            and not self.tree_core.is_eagle
+            and not self._late_window_maybe_skipped(req, token_ids_len)
+        ):
+            # Every forward that ran its late layers wrote its final window's rows; a
+            # short extend only ran after its cached part of that window was proven.
+            insert_params.swa_replay_range = (
+                max(0, token_ids_len - self.sliding_window_size),
+                token_ids_len,
+            )
 
         # A recurrent checkpoint must stay attached to its exact token prefix.
         # Let MambaComponent select the insertion length for hybrid caches.
@@ -1027,9 +1111,19 @@ class SWAComponent(TreeComponent):
         insert_params.swa_branching_seqlen = branching_seqlen
         return effective_cache_len
 
+    def _late_window_maybe_skipped(self, req: Req, token_ids_len: int) -> bool:
+        if not self.cp_may_skip_late_layers:
+            return False
+        # The forward ending at token_ids_len left this many fill tokens; with a
+        # window of them it may have stopped before the late layers.
+        remaining = len(req.full_untruncated_fill_ids) - token_ids_len
+        return remaining >= self.sliding_window_size
+
     def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
         if self.sliding_window_size is None:
             return
+        # pre_len is the last position of the key being inserted.
+        key_end = pre_len + 1
         free_swa_out_of_window_slots(
             req,
             pre_len,
@@ -1038,7 +1132,17 @@ class SWAComponent(TreeComponent):
             req_to_token_pool=self.cache.req_to_token_pool,
             token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
             retain_floor=self.cache.swa_retain_floor(req),
+            retain_key_end=key_end if self._is_mid_prompt(req, key_end) else None,
         )
+
+    def _is_mid_prompt(self, req: Req, key_end: int) -> bool:
+        # Every later insert of a mid-prompt key is longer. The prompt's own insert
+        # keeps the default extra page, which a finished key shortened by bigram or
+        # page alignment still needs.
+        if not self.exact_window_mid_prompt:
+            return False
+        prompt_key_len = len(req.origin_input_ids) - int(self.tree_core.is_eagle)
+        return key_end < prompt_key_len
 
     def free_out_of_window_slots(
         self, req: Req, pre_len: int, insert_params: InsertParams
@@ -1342,6 +1446,10 @@ class SWAComponent(TreeComponent):
                 assert cd.value is not None and cd.host_value is None
                 size = len(cd.value)
                 cd.host_value = xfer.host_indices[offset : offset + size].clone()
+                if self.exact_window_mid_prompt:
+                    cd.metadata.pop("host_replay_range", None)
+                    if "replay_range" in cd.metadata:
+                        cd.metadata["host_replay_range"] = cd.metadata["replay_range"]
                 offset += size
             assert offset == len(xfer.host_indices)
             return
@@ -1363,6 +1471,12 @@ class SWAComponent(TreeComponent):
                 self.tree_core.set_component_device_value(
                     n.id, self.component_type, swa_chunk
                 )
+                if self.exact_window_mid_prompt:
+                    cd_n.metadata.pop("replay_range", None)
+                    if "host_replay_range" in cd_n.metadata:
+                        cd_n.metadata["replay_range"] = cd_n.metadata[
+                            "host_replay_range"
+                        ]
                 assert cd_full_n.value is not None and len(cd_full_n.value) == n_tokens
                 full_chunks.append(cd_full_n.value)
                 swa_chunks.append(swa_chunk)
@@ -1400,6 +1514,9 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         cd = node.component_data[ct]
         cd.host_value = host_indices.clone()
+        if self.exact_window_mid_prompt:
+            # Storage does not carry the replay proof; fail closed.
+            cd.metadata.pop("host_replay_range", None)
         host_lru = self.tree_core.host_lru_lists[ct]
         if cd.value is None and not host_lru.in_list(node):
             host_lru.insert_mru(node)

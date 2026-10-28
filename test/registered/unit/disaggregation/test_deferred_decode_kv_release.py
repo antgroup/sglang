@@ -7,6 +7,8 @@ reused by another request). The pages are released once every prefill rank acks
 that its transfer drained (CommonKVManager.is_abort_release_safe). Device
 destinations may also release on timeout; host destinations require the ack.
 All decode attention-TP ranks must agree on holding and releasing each request.
+With the DeepSeek-V4.1 PD switch a timed-out device hold is quarantined instead,
+until a late ack or until its prefill has been declared lost for the reclaim delay.
 """
 
 import datetime
@@ -98,6 +100,7 @@ def _make_manager():
     mgr._deferred_abort_ack_tracker = {}
     mgr._deferred_abort_generation = 0
     mgr.enable_deferred_decode_kv_release = True
+    mgr.prefill_lost_at = {}
     return mgr
 
 
@@ -483,6 +486,8 @@ class _FakeIdxAllocator:
 def _make_queue(timeout=30.0, enable_metrics=False):
     q = DecodeTransferQueue.__new__(DecodeTransferQueue)
     q._deferred_releases = []
+    q.quarantine_timed_out_releases = False
+    q._quarantined = []
     q.queue = []
     q.gloo_group = dist.group.WORLD
     q.tp_rank = 0
@@ -509,11 +514,15 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     return q
 
 
-def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
+def _make_decode_req(room, idx, mgr, n_prefill_ranks=1, init_time=1000.0):
     receiver = SimpleNamespace(
         kv_mgr=mgr,
+        bootstrap_addr="10.0.0.1:8998",
+        # Wall time the room's metadata went out (CommonKVReceiver.send_metadata).
+        init_time=init_time,
         abort_notified=True,
         ensure_abort_notified=MagicMock(),
+        resend_abort_notification=MagicMock(),
         failure_exception=lambda: None,
         poll=lambda: KVPoll.Failed,
         # One entry per prefill rank the decode notified of the abort; its length
@@ -703,6 +712,157 @@ class TestResolveDeferredReleases(CustomTestCase):
                 nprocs=2,
                 join=True,
             )
+
+
+class TestQuarantineTimedOutReleases(CustomTestCase):
+    """DeepSeek-V4.1 PD: a drain that timed out may belong to a prefill that is
+    lost but still writing, so its pages must stay out of reuse while the
+    instance keeps serving, and come back only on a late ack or after the
+    prefill has been declared lost for the reclaim delay."""
+
+    def setUp(self):
+        super().setUp()
+        _run_as_single_rank(self)
+        self.mgr = _make_manager()
+        self.q = _make_queue(enable_metrics=True)
+        self.q.quarantine_timed_out_releases = True
+        release = patch.object(decode_mod, "release_kv_cache")
+        self.release = release.start()
+        self.addCleanup(release.stop)
+
+    def _quarantine(self, room, idx, *, init_time=1000.0):
+        dreq = _make_decode_req(room, idx, self.mgr, init_time=init_time)
+        generation = self.mgr.register_deferred_abort_room(room)
+        self.q._deferred_releases.append((dreq, 10.0, float("-inf"), idx, 1))
+        with patch.object(decode_mod.time, "monotonic", return_value=40.0):
+            self.q.resolve_deferred_releases()
+        return dreq, generation
+
+    def _resolve_at(self, wall_time):
+        with (
+            patch.object(decode_mod.time, "monotonic", return_value=50.0),
+            patch.object(decode_mod.time, "time", return_value=wall_time),
+        ):
+            self.q.resolve_deferred_releases()
+
+    def test_timed_out_hold_is_quarantined_not_released(self):
+        dreq, _ = self._quarantine(300, 3)
+        self._resolve_at(9000.0)  # neither acked nor lost: still held
+        self.release.assert_not_called()
+        self.assertEqual(self.q._deferred_releases, [])
+        self.assertEqual([e[0] for e in self.q._quarantined], [dreq])
+        # The idle leak check must keep skipping while the pages are held.
+        self.assertTrue(self.q.has_pending_deferred_releases())
+        self.assertEqual(self.q.req_to_metadata_buffer_idx_allocator.freed, [])
+        # One more ABORT in case the first one or its ack was dropped.
+        dreq.kv_receiver.resend_abort_notification.assert_called_once_with()
+        self.q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_not_called()
+
+    def test_quarantine_reclaimed_by_late_ack(self):
+        dreq, generation = self._quarantine(310, 3)
+        self.mgr.note_abort_ack(310, 0, generation)
+        self._resolve_at(1001.0)
+        self.release.assert_called_once_with(
+            dreq.req, self.q.tree_cache, checkpoint=False
+        )
+        self.assertFalse(self.q.has_pending_deferred_releases())
+        self.assertEqual(self.q.req_to_metadata_buffer_idx_allocator.freed, [3])
+        self.q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_called_once_with(
+            duration_seconds=40.0, outcome="reclaimed"
+        )
+
+    def test_quarantine_reclaimed_once_prefill_lost_for_the_delay(self):
+        self._quarantine(320, 4, init_time=1000.0)
+        self.mgr.prefill_lost_at["10.0.0.1:8998"] = 1100.0
+        self._resolve_at(1399.0)  # lost, but within the reclaim delay
+        self.release.assert_not_called()
+        self._resolve_at(1400.0)
+        self.release.assert_called_once()
+        self.assertEqual(self.q._quarantined, [])
+        self.assertEqual(self.q.req_to_metadata_buffer_idx_allocator.freed, [4])
+
+    def test_loss_before_the_room_existed_does_not_reclaim(self):
+        """A loss of the same address before this room's metadata went out was
+        an earlier prefill process, not this room's writer."""
+        self._quarantine(330, 5, init_time=2000.0)
+        self.mgr.prefill_lost_at["10.0.0.1:8998"] = 1500.0
+        self._resolve_at(9000.0)
+        self.release.assert_not_called()
+        self.assertEqual(len(self.q._quarantined), 1)
+
+    def test_one_expired_rank_quarantines_and_reclaim_waits_for_all(self):
+        dreq = _make_decode_req(340, 6, self.mgr)
+        generation = self.mgr.register_deferred_abort_room(340)
+        self.mgr.note_abort_ack(340, 0, generation)  # drained on this rank
+        self.q._deferred_releases.append((dreq, 10.0, 1e9, 6, 1))
+
+        def peer(state):
+            def reduce(states, **_):
+                states.fill_(min(states.tolist()[0], state))
+
+            return reduce
+
+        with (
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_reduce") as reduce,
+        ):
+            self.q.gloo_group = object()
+            reduce.side_effect = peer(decode_mod._HOLD_EXPIRED)
+            self._resolve_at(1001.0)
+            self.release.assert_not_called()
+            self.assertEqual([e[0] for e in self.q._quarantined], [dreq])
+            reduce.side_effect = peer(decode_mod._HOLD_PENDING)
+            self._resolve_at(1002.0)
+            self.release.assert_not_called()
+            reduce.side_effect = peer(decode_mod._HOLD_DRAINED)
+            self._resolve_at(1003.0)
+            self.release.assert_called_once()
+
+
+class TestDecodeQueueUnderRetraction(CustomTestCase):
+    """Retracted requests waiting for memory must stop new admissions only:
+    finished transfers still own destination pages, and leaving them in the
+    transfer queue can starve the very requests waiting for that memory."""
+
+    def _process(self, *, retracted, host_receive_threshold):
+        transferred = object()
+        prealloc = SimpleNamespace(
+            retracted_queue=retracted,
+            resume_retracted_reqs=MagicMock(return_value=[]),
+            pop_preallocated=MagicMock(return_value=([object()], [])),
+        )
+        scheduler = SimpleNamespace(
+            scheduler_stage_metrics=None,
+            enable_decode_hicache=False,
+            enable_hisparse=False,
+            waiting_queue=[],
+            disagg_decode_prealloc_queue=prealloc,
+            disagg_decode_transfer_queue=MagicMock(
+                pop_transferred=MagicMock(return_value=[transferred])
+            ),
+        )
+        disagg = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False,
+            disaggregation_decode_polling_interval=1,
+            disaggregation_decode_host_receive_threshold=host_receive_threshold,
+        )
+        with patch.object(decode_mod, "get_disagg", return_value=disagg):
+            decode_mod.SchedulerDisaggregationDecodeMixin.process_decode_queue(
+                scheduler
+            )
+        return scheduler, prealloc, transferred
+
+    def test_pending_retraction_blocks_only_new_admission(self):
+        for threshold in (1, 0.5):
+            for retracted in ([], [object()]):
+                with self.subTest(threshold=threshold, retracted=bool(retracted)):
+                    scheduler, prealloc, transferred = self._process(
+                        retracted=retracted, host_receive_threshold=threshold
+                    )
+                    self.assertEqual(scheduler.waiting_queue, [transferred])
+                    self.assertEqual(
+                        prealloc.pop_preallocated.call_count, 0 if retracted else 1
+                    )
 
 
 def _run_release_consensus(rank: int, rendezvous: str) -> None:

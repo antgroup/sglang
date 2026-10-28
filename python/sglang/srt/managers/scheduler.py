@@ -191,6 +191,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     UpdateWeightVersionReqOutput,
+    bootstrap_params_error,
     sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
@@ -2473,6 +2474,8 @@ class Scheduler(
         return get_serving().tokenizer_path
 
     def init_request_receiver(self) -> None:
+        # Arrivals the DP controller weighs against what it sent (DeepSeek-V4.1 decode).
+        self.num_received_reqs = 0
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -2484,9 +2487,20 @@ class Scheduler(
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
+            fail_before_handoff=(
+                self.disagg_prefill_bootstrap_queue.fail_before_handoff
+                if self.disaggregation_mode == DisaggregationMode.PREFILL
+                else None
+            ),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
+            count_received_reqs=(
+                self._count_received_reqs if dsv41_sm90_on("runtime") else None
+            ),
         )
+
+    def _count_received_reqs(self, num_reqs: int) -> None:
+        self.num_received_reqs += num_reqs
 
     def init_dp_attn_adapter(self) -> None:
         # Spec workers have no .model_runner of their own; the prefill graph
@@ -2631,6 +2645,7 @@ class Scheduler(
             ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
+            get_num_received_reqs=lambda: self.num_received_reqs,
             get_waiting_storage_span=self.tree_cache.waiting_storage_span,
         )
 
@@ -3161,6 +3176,18 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            # Requests that bypass the tokenizer's validation get it here.
+            error_msg = bootstrap_params_error(
+                bootstrap_room=recv_req.bootstrap_room,
+                bootstrap_port=recv_req.bootstrap_port,
+            )
+            if error_msg is not None:
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+
         if req.return_sampling_mask:
             if (
                 self.disaggregation_mode != DisaggregationMode.NULL
@@ -3480,6 +3507,8 @@ class Scheduler(
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.update_finish_state()
         self.output_streamer.stream_output([req], req.return_logprob)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.disagg_prefill_bootstrap_queue.fail_before_handoff(req, reason.message)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -4114,6 +4143,7 @@ class Scheduler(
                 num_allocatable_reqs=self.get_num_allocatable_reqs(
                     running_bs, running_batch=running_batch
                 ),
+                num_waiting_reqs=len(self.waiting_queue),
             )
         ):
             return None, running_batch

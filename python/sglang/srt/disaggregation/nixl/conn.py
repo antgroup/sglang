@@ -3314,10 +3314,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             return True
         room_to_be_aborted = notification.room
 
-        room_active = (
-            room_to_be_aborted in self.request_status
-            and self.check_status(room_to_be_aborted) != KVPoll.Success
-        )
+        # One read: the scheduler thread may pop the room at any moment.
+        room_status = self.request_status.get(room_to_be_aborted)
+        room_active = room_status is not None and room_status != KVPoll.Success
         if room_active:
             self.record_failure(
                 room_to_be_aborted,
@@ -3389,28 +3388,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
-                room = int(room)
-                if room not in self.transfer_infos:
-                    self.transfer_infos[room] = {}
-                self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
-                    waiting_req_bytes
+                self._accept_decode_registration(
+                    peer_key=agent_name,
+                    transfer_info=TransferInfo.from_zmq(waiting_req_bytes),
                 )
-                required_dst_info_num = self.transfer_infos[room][
-                    agent_name
-                ].required_dst_info_num
-                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
-                if len(self.transfer_infos[room]) == required_dst_info_num:
-                    self.resolve_kv_replica_factor(self.transfer_infos[room])
-                    self.req_to_decode_prefix_len[room] = next(
-                        (
-                            info.decode_prefix_len
-                            for info in self.transfer_infos[room].values()
-                            if info.decode_prefix_len is not None
-                        ),
-                        0,
-                    )
-                    logger.debug(f"{room=} is bootstrapped")
-                    self.update_status(room, KVPoll.WaitingForInput)
 
         def bootstrap_thread_guarded():
             try:

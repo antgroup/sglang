@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
@@ -264,6 +265,17 @@ class UnifiedRadixCache(BasePrefixCache):
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
+        # DeepSeek-V4.1 SM90: under bounded replay, record which late-layer SWA rows
+        # each insert computed and reuse a cached tail that has that proof.
+        self.swa_replay_proof = (
+            self.decoder_swa_bounded_replay
+            and self.is_swa_enabled
+            and dsv41_sm90_on("runtime")
+            and isinstance(self.tree_core, UnifiedTreeCore)
+            # The replay writes the model's window; a draft that widens the
+            # retained window reads rows beyond it that nobody wrote.
+            and params.swa_retain_window == params.sliding_window_size
+        )
 
         if (
             page_interleave_shard_size(params.token_to_kv_pool_allocator) > 1
@@ -623,7 +635,36 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
+        if self._checks_swa_replay_proof() and params.swa_replay_end is not None:
+            params, result = self._cap_unproven_swa_tail(params, result)
         return self._finalize_match_result(params, result)
+
+    def _checks_swa_replay_proof(self) -> bool:
+        # A linker loads SWA without the proof.
+        return self.swa_replay_proof and self.linker is None
+
+    def _cap_unproven_swa_tail(
+        self, params: MatchPrefixParams, result: MatchResult
+    ) -> tuple[MatchPrefixParams, MatchResult]:
+        limit = self.components[ComponentType.SWA].bounded_replay_match_limit(
+            params, result
+        )
+        if limit is None:
+            return params, result
+        key = params.key
+        params = replace(
+            params,
+            key=RadixKey(
+                key.token_ids,
+                key.extra_key,
+                is_bigram=key.is_bigram,
+                limit=min(key._raw_len(), limit),
+                cache_salt=key.cache_salt,
+            ),
+        )
+        result = self.tree_core.match_prefix(params)
+        self._apply_cache_actions(result.cache_actions)
+        return params, result
 
     def _finalize_match_result(
         self, params: MatchPrefixParams, result: MatchResult
@@ -1231,6 +1272,15 @@ class UnifiedRadixCache(BasePrefixCache):
 
         radix_key = radix_key.page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
+        if not is_finished and self._lacks_swa_replay_proof(radix_key, len(token_ids)):
+            # The insert would repoint this row onto tree SWA whose late-layer rows
+            # this request's next forward reads but nobody computed; keep the row
+            # private until the request finishes.
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req, is_finished=is_finished, insert_params=insert_params
+                )
+            return
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
         insert_params.key = radix_key
@@ -1370,6 +1420,15 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
     # ---- Internal Helpers ----
+
+    def _lacks_swa_replay_proof(self, radix_key: RadixKey, extend_end: int) -> bool:
+        if not self._checks_swa_replay_proof():
+            return False
+        params = MatchPrefixParams(key=radix_key, swa_replay_end=extend_end)
+        existing = self.tree_core.match_prefix(params)
+        self._apply_cache_actions(existing.cache_actions)
+        swa = self.components[ComponentType.SWA]
+        return swa.bounded_replay_match_limit(params, existing) is not None
 
     def _apply_cache_actions(
         self, actions: list[CacheAction | ComponentAction]
@@ -3753,7 +3812,12 @@ class UnifiedRadixCache(BasePrefixCache):
         swa = self.components.get(ComponentType.SWA)
         if swa is None or not swa.sliding_window_size:
             return 0
-        if self.decoder_swa_bounded_replay and not self.session.will_lend_record(req):
+        if (
+            self.decoder_swa_bounded_replay
+            and not self.session.will_lend_record(req)
+            # The proof check caps the match at its actual boundary instead.
+            and not self._checks_swa_replay_proof()
+        ):
             return swa.sliding_window_size
         if not is_unified_kv_triton():
             return 0

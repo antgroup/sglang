@@ -1188,6 +1188,7 @@ class TestPrefillAdder(CustomTestCase):
                     req.sampling_params.ignore_eos = ignore_eos
                     req.return_logprob = False
                     req.time_stats.trace_ctx = MagicMock()
+                    req.bootstrap_room = None
 
                     result = adder.add_one_req(
                         req, has_chunked_req=False, truncation_align_size=None

@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from collections import defaultdict
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
@@ -10,6 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
     Req,
+    ReqKvInfo,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -35,8 +37,12 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
+    CacheTransferPhase,
     ComponentType,
     EvictLayer,
+)
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
+    resolve_tree_core_backend,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     EvictDeviceLeafResult,
@@ -49,6 +55,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     _OngoingWriteThrough,
 )
 from sglang.srt.runtime_context import (
+    get_flags,
     get_serving,
     publish,
     reset_context,
@@ -1988,6 +1995,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         cache.session = mock.Mock()
         cache.session.try_match_prefix.return_value = None
         cache.tree_core = mock.Mock()
+        cache.swa_replay_proof = False
         order = mock.Mock()
         cache.linker = order.linker
         cache.token_to_kv_pool_allocator = order.allocator
@@ -2331,6 +2339,273 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(
                     cache.swa_reprefill_tail_tokens(), 128 if bounded_replay else 0
                 )
                 self.assertEqual(self._matched_len(cache, prompt), matched)
+
+
+class TestDsv41SwaReplayProof(
+    UnifiedRadixCacheDecoderSwaBoundedReplayHoldBackFixtures, CustomTestCase
+):
+    """dsv41_sm90_on("runtime") under decoder SWA bounded replay: a match keeps a
+    short tail when the tree recorded that the late-layer rows it reads were
+    computed, and holds a window back otherwise."""
+
+    def _fixture(self, page_size=1, *, runtime_on=True, cp_on=False, attn_cp_size=1):
+        cfg = CacheConfig(
+            page_size=page_size,
+            kv_size=4096,
+            max_context_len=4096,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=128,
+            decoder_swa_bounded_replay=True,
+            attn_cp_size=attn_cp_size,
+        )
+        flags = {"runtime"} if runtime_on else set()
+        if cp_on:
+            flags.add("cp")
+        with get_flags().dsv41_sm90.override(subsystems=frozenset(flags)):
+            return build_fixture(cfg, tree_core_backend="python")
+
+    def _insert_computed(
+        self, cache, allocator, tokens, end, *, evicted=0, fill_len=None
+    ):
+        # Model execution is the boundary: a forward ending at `end` computed the
+        # late-layer rows of [end - 128, end) only, and left fill_len - end tokens.
+        value = allocator.full_attn_allocator.alloc(len(tokens))
+        swa = allocator.swa_attn_allocator.alloc(len(tokens))
+        allocator.set_full_to_swa_mapping(value, swa)
+        params = InsertParams(key=RadixKey(array("q", tokens)), value=value)
+        kv = ReqKvInfo()
+        kv.set_evicted_seqlen(ComponentType.SWA, evicted)
+        fill_ids = array("q", range(end if fill_len is None else fill_len))
+        cache.components[ComponentType.SWA].prepare_for_caching_req(
+            SimpleNamespace(
+                kv=kv, swa_branching_seqlen=None, full_untruncated_fill_ids=fill_ids
+            ),
+            params,
+            token_ids_len=end,
+            is_finished=True,
+        )
+        return cache.insert(params)
+
+    def test_proven_tail_is_reused_instead_of_a_full_window_replay(self):
+        # Pages below 256 are SWA-evicted: holding a window back misses all KV,
+        # unless the extend is a full window long anyway.
+        for extra in (1, 40, 127, 128):
+            for runtime_on in (False, True):
+                with self.subTest(runtime_on=runtime_on, extra=extra):
+                    cache, allocator, _ = self._fixture(256, runtime_on=runtime_on)
+                    tokens = list(range(512))
+                    self._insert_computed(cache, allocator, tokens, 512, evicted=256)
+                    prompt = tokens + list(range(1000, 1000 + extra))
+                    matched = 512 if runtime_on or extra >= 128 else 0
+                    self.assertEqual(self._matched_len(cache, prompt), matched)
+
+    def test_a_cp_chunk_that_may_skip_its_late_layers_proves_no_window(self):
+        """Under the cp subsystem a CP prefill chunk leaving a window of its fill
+        tokens stops before the late layers; a short tail must not reuse its window."""
+        for runtime_on, cp_on, attn_cp_size, left, matched in (
+            (True, True, 2, 512, 0),
+            # A forward leaving less than a window ran its late layers.
+            (True, True, 2, 127, 512),
+            (True, True, 1, 512, 512),
+            (True, False, 2, 512, 512),
+            # Switch off: upstream holds a window back on every match.
+            (False, True, 2, 127, 0),
+        ):
+            with self.subTest(
+                runtime_on=runtime_on, cp_on=cp_on, cp=attn_cp_size, left=left
+            ):
+                cache, allocator, _ = self._fixture(
+                    256, runtime_on=runtime_on, cp_on=cp_on, attn_cp_size=attn_cp_size
+                )
+                tokens = list(range(512))
+                self._insert_computed(
+                    cache, allocator, tokens, 512, evicted=256, fill_len=512 + left
+                )
+                self.assertEqual(self._matched_len(cache, tokens + [999] * 40), matched)
+
+    def test_only_the_short_tail_read_range_needs_the_proof(self):
+        cache, allocator, _ = self._fixture(256)
+        tokens = list(range(512))
+        # An unaligned extend ended at 552; only [424, 552) was computed.
+        self._insert_computed(cache, allocator, tokens, 552)
+        self.assertEqual(self._matched_len(cache, tokens + [999] * 40), 512)
+        # A shorter extend also reads [404, 424), which nobody computed.
+        self.assertEqual(self._matched_len(cache, tokens + [999] * 20), 256)
+
+    def test_split_keeps_the_proof_without_certifying_older_rows(self):
+        cache, allocator, _ = self._fixture()
+        tokens = list(range(512))
+        self._insert_computed(cache, allocator, tokens, 512)
+        self.assertEqual(self._matched_len(cache, tokens[:480] + [999] * 40), 480)
+        self.assertEqual(self._matched_len(cache, tokens[:400] + [999] * 40), 312)
+        self.assertEqual(self._matched_len(cache, tokens + [999] * 40), 512)
+
+    def test_a_deduplicated_insert_cannot_certify_the_kept_swa(self):
+        cache, allocator, _ = self._fixture()
+        tokens = list(range(512))
+        self._insert_computed(cache, allocator, tokens, 608)
+        self._insert_computed(cache, allocator, tokens, 512)
+        # The second insert's [384, 512) was discarded; the kept SWA lacks [424, 480).
+        self.assertEqual(self._matched_len(cache, tokens + [999] * 40), 424)
+
+    def test_checkpoint_keeps_a_fresh_window_off_unproven_tree_swa(self):
+        """A request that replayed a window must not be repointed onto tree SWA whose
+        late-layer rows in that window nobody computed: its next forward reads them."""
+        cache, allocator, pool = self._fixture()
+        tokens = list(range(512))
+        self._insert_computed(cache, allocator, tokens, 608)
+        prompt = array("q", tokens + [999] * 40)
+        req = Req(
+            rid="fresh-window",
+            origin_input_text="",
+            origin_input_ids=prompt,
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        pool.alloc([req])
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = prompt
+        req.extend_end = len(prompt)
+        fresh = allocator.alloc(len(prompt))
+        pool.write((req.kv.req_pool_idx, slice(0, len(prompt))), fresh)
+        req.kv.kv_committed_len = len(prompt)
+        req.kv.kv_allocated_len = len(prompt)
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock = None
+        req.extra_key = None
+        cache.checkpoint(req, up_to=len(prompt))
+        torch.testing.assert_close(
+            pool.req_to_token[req.kv.req_pool_idx, 424:552],
+            fresh[424:].to(pool.req_to_token.dtype),
+        )
+        self.assertEqual(req.kv.cache_protected_len, 0)
+        req.finished_reason = FINISH_LENGTH(length=0)
+        release_kv_cache(req, cache, checkpoint=True)
+        cache.sanity_check()
+
+    def test_hicache_reload_restores_the_host_proof_and_storage_fails_closed(self):
+        cache, allocator, _ = self._fixture(256)
+        tokens = list(range(512))
+        inserted = self._insert_computed(cache, allocator, tokens, 512)
+        node = cache.tree_core.node_by_id(inserted.last_device_node)
+        swa = cache.components[ComponentType.SWA]
+        size = len(node.key)
+        host = torch.arange(size, dtype=torch.int64)
+        swa.commit_hicache_transfer(
+            node,
+            CacheTransferPhase.BACKUP_HOST,
+            [
+                PoolTransfer(
+                    name=PoolName.SWA, host_indices=host, nodes_to_load=[node.id]
+                )
+            ],
+            cache_actions=[],
+        )
+
+        def evict_device():
+            device_frees, host_frees = defaultdict(list), defaultdict(list)
+            cache.tree_core._evict_component_and_detach_lru(
+                node,
+                swa,
+                device_frees=device_frees,
+                host_frees=host_frees,
+                cache_actions=[],
+                target=EvictLayer.DEVICE,
+            )
+            cache._free_values(device_frees, host_frees)
+
+        def load_back():
+            actions = []
+            swa.commit_hicache_transfer(
+                node,
+                CacheTransferPhase.LOAD_BACK,
+                [
+                    PoolTransfer(
+                        name=PoolName.SWA,
+                        host_indices=host,
+                        device_indices=allocator.swa_attn_allocator.alloc(size),
+                        nodes_to_load=[node.id],
+                    )
+                ],
+                cache_actions=actions,
+            )
+            cache._apply_cache_actions(actions)
+
+        evict_device()
+        load_back()
+        self.assertEqual(self._matched_len(cache, tokens + [999] * 40), 512)
+        # Storage pages carry no proof: the same bytes cannot certify the tail.
+        evict_device()
+        swa._attach_swa_host_value(node, host)
+        load_back()
+        self.assertEqual(self._matched_len(cache, tokens + [999] * 40), 256)
+
+    def test_the_switch_selects_the_python_tree_core_under_bounded_replay(self):
+        # The proof lives on Python tree nodes; the Rust core would hold a window back.
+        params = SimpleNamespace(decoder_swa_bounded_replay=True)
+        with get_flags().dsv41_sm90.override(subsystems=frozenset({"runtime"})):
+            self.assertEqual(resolve_tree_core_backend("rust", params), "python")
+
+
+class TestDsv41SwaExactWindowRetain(SWAWindowUnderBigramKeyFixtures, CustomTestCase):
+    """dsv41_sm90_on("runtime"): a mid-prompt checkpoint frees SWA down to the
+    window's whole pages below the inserted key; the prompt's own insert keeps the
+    default extra page."""
+
+    cfg = CacheConfig(
+        page_size=256,
+        components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=128,
+        kv_size=4096,
+        max_context_len=4096,
+    )
+
+    def _checkpoint(self, *, up_to: int, runtime_on: bool):
+        flags = frozenset({"runtime"}) if runtime_on else frozenset()
+        with get_flags().dsv41_sm90.override(subsystems=flags):
+            cache, allocator, pool = build_fixture(self.cfg, tree_core_backend="python")
+        tokens = array("q", range(1024))
+        req = Req(
+            rid="mid-prompt",
+            origin_input_text="",
+            origin_input_ids=tokens,
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        pool.alloc([req])
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = tokens
+        req.extend_end = up_to
+        pool.write(
+            (req.kv.req_pool_idx, slice(0, up_to)), self._alloc_paged(allocator, up_to)
+        )
+        req.kv.kv_committed_len = up_to
+        req.kv.kv_allocated_len = up_to
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock = None
+        req.extra_key = None
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            cache.checkpoint(req, up_to=up_to)
+        cache.sanity_check()
+        return cache, req
+
+    def test_mid_prompt_checkpoint_keeps_one_window_of_pages(self):
+        for runtime_on, freed_to in ((False, 0), (True, 256)):
+            with self.subTest(runtime_on=runtime_on):
+                cache, req = self._checkpoint(up_to=512, runtime_on=runtime_on)
+                self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), freed_to)
+                # The kept page still holds a window behind the inserted key.
+                probe = RadixKey(array("q", list(range(512)) + [9999] * 8))
+                self.assertEqual(
+                    cache.match_prefix(MatchPrefixParams(key=probe)).device_prefix_len,
+                    512,
+                )
+
+    def test_prompt_end_checkpoint_keeps_the_default_extra_page(self):
+        for runtime_on in (False, True):
+            with self.subTest(runtime_on=runtime_on):
+                _, req = self._checkpoint(up_to=1024, runtime_on=runtime_on)
+                self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), 512)
 
 
 if __name__ == "__main__":

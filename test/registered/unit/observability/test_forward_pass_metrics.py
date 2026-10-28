@@ -949,6 +949,7 @@ class TestIdleMetrics(CustomTestCase):
         self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
             queue=[*host_reqs, types.SimpleNamespace(host_staged=False, priority=1)],
             num_pending_deferred_releases=lambda: 0,
+            num_quarantined_releases=lambda: 0,
         )
         for _ in host_reqs:
             collector.increment_decode_host_receive_reqs()

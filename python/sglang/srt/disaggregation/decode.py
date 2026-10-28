@@ -78,6 +78,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -148,6 +149,16 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+
+# A quarantined hold is reclaimed this long after the heartbeat declared its
+# prefill lost; a lost prefill must be dead by then. A hung one is declared lost
+# after the bootstrap stall timeout (180 s) and killed by its scheduler watchdog
+# (300 s by default), so this must exceed 120 s; 300 s leaves a wide margin.
+_LOST_PREFILL_KV_RECLAIM_DELAY_S = 300.0
+
+# Per-rank state of a held release, MIN-reduced so one expired rank quarantines
+# the hold everywhere and recycling waits for every rank's drain.
+_HOLD_EXPIRED, _HOLD_PENDING, _HOLD_DRAINED = 0, 1, 2
 
 
 def _bootstrap_addr(req: Req) -> str:
@@ -839,6 +850,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
+            if is_rebootstrap:
+                # A recovery attempt waits under fresh deadlines (the waiting
+                # queue timeout reads wait_queue_entry_time); arrival and TTFT
+                # stay those of the original request.
+                req.time_stats.decode_prealloc_queue_entry_time = time.perf_counter()
+                req.time_stats.bootstrap_done_time = 0.0
+                req.time_stats.wait_queue_entry_time = 0.0
             decode_req = self._create_receiver_and_enqueue(
                 req, is_rebootstrap=is_rebootstrap
             )
@@ -2566,6 +2584,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # or timed out. Entries:
         # (decode_req, start_time, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
+        # DeepSeek-V4.1 PD: a hold whose drain timed out moves here instead of
+        # being released, since a lost prefill may still write its pages; same
+        # entry layout. See _resolve_releases_with_quarantine.
+        self.quarantine_timed_out_releases = dsv41_sm90_on("pd")
+        self._quarantined: Optional[
+            List[Tuple[DecodeRequest, float, float, int, int]]
+        ] = [] if self.quarantine_timed_out_releases else None
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2598,9 +2623,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return False
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
+        idx = decode_req.metadata_buffer_index
+        if _is_fake_transfer(decode_req.req):
+            # No prefill writes a fake transfer's slot (health checks, warmup).
+            self.metadata_buffers.reset_for_fake_transfer(idx)
         # Keep the checksum before the metadata slot is freed; it is verified
         # when the request enters a batch.
-        idx = decode_req.metadata_buffer_index
         if self.scheduler.kv_checksum_computer is not None:
             digest, signature = self.metadata_buffers.get_kv_checksum(idx)
             decode_req.req.expected_kv_checksum = (
@@ -3029,10 +3057,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.kv_receiver = None
 
     def has_pending_deferred_releases(self) -> bool:
-        return bool(self._deferred_releases)
+        return bool(self._deferred_releases) or bool(self._quarantined)
 
     def num_pending_deferred_releases(self) -> int:
         return len(self._deferred_releases)
+
+    def num_quarantined_releases(self) -> int:
+        return len(self._quarantined) if self._quarantined is not None else 0
 
     def _observe_deferred_kv_release(
         self, duration_seconds: float, outcome: str
@@ -3045,6 +3076,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def resolve_deferred_releases(self) -> None:
         """Release drained transfers; device destinations may also time out."""
+        if self.quarantine_timed_out_releases:
+            self._resolve_releases_with_quarantine()
+            return
         if not self._deferred_releases:
             return
         now = time.monotonic()
@@ -3107,11 +3141,114 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 outcome=outcome,
             )
 
+    def _resolve_releases_with_quarantine(self) -> None:
+        """resolve_deferred_releases, except that a device hold whose drain timed
+        out is quarantined, not released: its prefill may be lost but still
+        writing. A quarantined hold is reclaimed on a late drain ACK, or once
+        the heartbeat has declared its prefill lost for the reclaim delay."""
+        if not self._deferred_releases and not self._quarantined:
+            return
+        now = time.monotonic()
+        wall_now = time.time()
+        held, quarantined = self._deferred_releases, self._quarantined
+        states = [self._held_release_state(entry, now) for entry in held] + [
+            _HOLD_DRAINED
+            if self._quarantine_reclaimable(entry, wall_now)
+            else _HOLD_PENDING
+            for entry in quarantined
+        ]
+        # Acks, deadlines and losses are rank-local; the reduced states keep
+        # admission and later collective shapes identical on every rank.
+        states = all_reduce_flags(
+            flags=states, group=self.gloo_group, op=torch.distributed.ReduceOp.MIN
+        )
+        to_release, still_held, newly_quarantined, still_quarantined = [], [], [], []
+        for entry, state in zip(held, states[: len(held)]):
+            if state == _HOLD_DRAINED:
+                to_release.append((entry, "drained"))
+            elif state == _HOLD_EXPIRED:
+                newly_quarantined.append(entry)
+            else:
+                still_held.append(entry)
+        for entry, state in zip(quarantined, states[len(held) :]):
+            if state == _HOLD_DRAINED:
+                to_release.append((entry, "reclaimed"))
+            else:
+                still_quarantined.append(entry)
+        # Commit the survivors before releasing so a _do_release exception can't
+        # leave a released entry in the list (double-free / None receiver on retry).
+        self._deferred_releases = still_held
+        self._quarantined = still_quarantined + newly_quarantined
+        for entry in newly_quarantined:
+            self._quarantine(entry)
+        for entry, outcome in to_release:
+            self._release_held(entry, now=now, outcome=outcome)
+
+    def _held_release_state(self, entry, now: float) -> int:
+        decode_req, _, deadline, _, required_acks = entry
+        if self._is_host_destination(decode_req):
+            drained = decode_req.kv_receiver.is_abort_release_safe()
+            # A host destination owns its drain tracking and never expires.
+            return _HOLD_DRAINED if drained else _HOLD_PENDING
+        if decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
+            decode_req.req.bootstrap_room, required_acks
+        ):
+            return _HOLD_DRAINED
+        return _HOLD_EXPIRED if now >= deadline else _HOLD_PENDING
+
+    def _quarantine_reclaimable(self, entry, wall_now: float) -> bool:
+        decode_req, _, _, _, required_acks = entry
+        receiver = decode_req.kv_receiver
+        kv_mgr = receiver.kv_mgr
+        if kv_mgr.is_abort_release_safe(decode_req.req.bootstrap_room, required_acks):
+            return True
+        # A loss declared before the room's metadata went out was an earlier
+        # prefill process, which could never have written these pages.
+        lost_at = kv_mgr.prefill_lost_at.get(receiver.bootstrap_addr)
+        return (
+            lost_at is not None
+            and lost_at >= (receiver.init_time or 0.0)
+            and wall_now - lost_at >= _LOST_PREFILL_KV_RECLAIM_DELAY_S
+        )
+
+    def _quarantine(self, entry) -> None:
+        decode_req = entry[0]
+        logger.error(
+            f"PD drain timeout for room {decode_req.req.bootstrap_room}: holding "
+            f"its KV out of reuse until prefill {decode_req.kv_receiver.bootstrap_addr} "
+            "acks or has been declared lost for "
+            f"{_LOST_PREFILL_KV_RECLAIM_DELAY_S:.0f} s; serving continues."
+        )
+        # One more ABORT under a fresh generation, in case the first one or its
+        # ACK was dropped by a prefill that is still alive.
+        decode_req.kv_receiver.resend_abort_notification()
+
+    def _release_held(self, entry, *, now: float, outcome: str) -> None:
+        decode_req, start_time, _, idx, _ = entry
+        room = decode_req.req.bootstrap_room
+        if outcome == "reclaimed":
+            logger.warning(
+                f"Reclaiming quarantined KV of room {room}: its prefill acked "
+                "late or has been lost for the reclaim delay."
+            )
+        try:
+            self._do_release(decode_req, idx)
+        except Exception:
+            # Isolate a failed release so the rest still run; entry already dropped.
+            logger.exception(f"Deferred KV release failed for room {room}")
+            outcome = "error"
+        self._observe_deferred_kv_release(
+            duration_seconds=max(0.0, now - start_time),
+            outcome=outcome,
+        )
+
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
         self.queue.clear()
         # Pool is being torn down; drop held entries without per-request release.
         self._deferred_releases.clear()
+        if self._quarantined is not None:
+            self._quarantined.clear()
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""
@@ -3469,9 +3606,10 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
-            return
+        # While retracted requests wait for memory, admit no new transfers, but
+        # still retire finished ones: they hold destination pages the
+        # retracted requests may be waiting for.
+        admit_new = not self.disagg_decode_prealloc_queue.retracted_queue
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -3480,7 +3618,10 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            if get_disagg().disaggregation_decode_host_receive_threshold == 1:
+            if (
+                admit_new
+                and get_disagg().disaggregation_decode_host_receive_threshold == 1
+            ):
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
             transferred_reqs = (
@@ -3491,7 +3632,10 @@ class SchedulerDisaggregationDecodeMixin:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(transferred_reqs)
-            if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+            if (
+                admit_new
+                and get_disagg().disaggregation_decode_host_receive_threshold < 1
+            ):
                 # Give completed host transfers device space before new arrivals.
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)

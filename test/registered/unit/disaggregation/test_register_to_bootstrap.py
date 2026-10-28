@@ -190,6 +190,9 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr._register_topology_row = CommonKVManager._register_topology_row.__get__(
             mgr, CommonKVManager
         )
+        mgr._bootstrap_server_url = CommonKVManager._bootstrap_server_url.__get__(
+            mgr, CommonKVManager
+        )
 
         # Set attributes that register_to_bootstrap reads
         mgr.dist_init_addr = dist_init_addr

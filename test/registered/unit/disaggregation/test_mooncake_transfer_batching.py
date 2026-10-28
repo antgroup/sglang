@@ -12,7 +12,11 @@ import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
+from sglang.srt.disaggregation.mooncake.conn import (
+    MooncakeKVManager,
+    MooncakeKVSender,
+    TransferWorkerHealth,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -473,9 +477,15 @@ class TestMooncakeEarlySend(CustomTestCase):
         ready.synchronize.assert_not_called()
         indices_ready.synchronize.assert_not_called()
 
-    def _worker(self, event):
+    def _worker(self, event, prefill_kv_indices=(0,), dst_kv_indices=(10,)):
         chunk = TransferKVChunk(
-            1, [0], slice(0, 1), False, None, None, wait_event=event
+            1,
+            list(prefill_kv_indices),
+            slice(0, len(prefill_kv_indices)),
+            False,
+            None,
+            None,
+            wait_event=event,
         )
         queue = SimpleQueue()
         queue.put(chunk)
@@ -484,7 +494,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             is_dummy=False,
             mooncake_session_id="peer",
             dst_device_kv_indices=None,
-            dst_kv_indices=[10],
+            dst_kv_indices=list(dst_kv_indices),
         )
         registration = SimpleNamespace(
             requires_dcp_relayout=False,
@@ -512,11 +522,24 @@ class TestMooncakeEarlySend(CustomTestCase):
             kv_args=SimpleNamespace(kv_data_ptrs=[1]),
             is_mla_backend=True,
             send_kvcache=MagicMock(return_value=0),
+            conclude_failure=MagicMock(),
             _maybe_ack_drained_abort=MagicMock(),
             bootstrap_port=8998,
+            transfer_health=None,
         )
         manager.check_status = lambda room: manager.request_status[room]
         return manager, queue
+
+    def test_short_decode_destination_fails_instead_of_truncating(self):
+        """Decode registering fewer KV pages than prefill holds means the two
+        sides disagree on the prompt; the room must fail, not receive a prefix."""
+        manager, queue = self._worker(
+            None, prefill_kv_indices=(0, 1), dst_kv_indices=(10,)
+        )
+        MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
+        manager.send_kvcache.assert_not_called()
+        manager.conclude_failure.assert_called_once()
+        self.assertEqual(manager.conclude_failure.call_args.kwargs["bootstrap_room"], 1)
 
     def test_worker_waits_before_reading_kv(self):
         ready = MagicMock()
@@ -578,6 +601,52 @@ class TestMooncakeEarlySend(CustomTestCase):
         manager, queue = self._worker(None)
         MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
         manager.send_kvcache.assert_called_once()
+
+
+class TestMooncakeTransferHealth(CustomTestCase):
+    """A dead or stuck transfer worker must fail the prefill scheduler: its
+    queue shard would otherwise hang every room hashed to it while the rank
+    looks healthy, and its unfinished writes forbid reusing those pages."""
+
+    def test_worker_exception_reaches_the_scheduler_poll(self):
+        manager, queue = TestMooncakeEarlySend._worker(self, None)
+        manager.transfer_health = TransferWorkerHealth(stall_timeout=300)
+        manager.send_kvcache.side_effect = RuntimeError("injected")
+        with self.assertRaises(RuntimeError):
+            MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
+        manager.check_transfer_health = lambda: MooncakeKVManager.check_transfer_health(
+            manager
+        )
+        sender = MooncakeKVSender.__new__(MooncakeKVSender)
+        sender.kv_mgr = manager
+        with self.assertRaisesRegex(RuntimeError, "worker 0: injected"):
+            sender.poll()
+        self.assertEqual(manager.transfer_health.busy_since, {})
+
+    def test_exited_or_stalled_worker_is_unhealthy(self):
+        dead = TransferWorkerHealth(stall_timeout=300)
+        dead.workers.append(SimpleNamespace(is_alive=lambda: False))
+        with self.assertRaisesRegex(RuntimeError, "transfer worker 0 exited"):
+            dead.check()
+
+        with patch("sglang.srt.disaggregation.mooncake.conn.time") as clock:
+            clock.monotonic.return_value = 1000.0
+            busy = TransferWorkerHealth(stall_timeout=300)
+            busy.busy_since[0] = 701.0
+            busy.check()  # 299 s on one chunk
+            stuck = TransferWorkerHealth(stall_timeout=300)
+            stuck.busy_since[0] = 700.0
+            with self.assertRaisesRegex(RuntimeError, "no progress for 300s"):
+                stuck.check()
+            # The error sticks once the worker is declared unhealthy.
+            stuck.busy_since.clear()
+            with self.assertRaisesRegex(RuntimeError, "no progress for 300s"):
+                stuck.check()
+
+    def test_workers_stopped_by_teardown_are_not_a_failure(self):
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.transfer_health = None  # what teardown() leaves
+        MooncakeKVManager.check_transfer_health(manager)
 
 
 class TestMooncakeStagingDeviceType(unittest.TestCase):

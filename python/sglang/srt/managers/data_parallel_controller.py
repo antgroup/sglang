@@ -19,6 +19,7 @@ import multiprocessing as mp
 import signal
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -28,6 +29,7 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_rank_to_dp_rank,
@@ -36,6 +38,11 @@ from sglang.srt.elastic_ep.topology import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.layers.dsv41_sm90 import (
+    dsv41_sm90_on,
+    dsv41_sm90_role,
+    initialize_dsv41_sm90,
+)
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -119,12 +126,44 @@ class LoadBalanceMethod(Enum):
             raise ValueError(f"Invalid load balance method: {method}") from exc
 
 
+def dsv41_counts_in_flight(
+    *, load_balance_method: LoadBalanceMethod, elastic_dp: bool
+) -> bool:
+    """DeepSeek-V4.1 decode: a burst outruns the 20 ms snapshot refresh and stacks
+    onto the ranks a stale snapshot shows lightest, past their cap."""
+    return (
+        dsv41_sm90_on("runtime")
+        and dsv41_sm90_role() == "decode"
+        # Only these methods refresh from snapshots, which retire the counted sends.
+        and load_balance_method
+        in (LoadBalanceMethod.TOTAL_REQUESTS, LoadBalanceMethod.TOTAL_TOKENS)
+        # The budget covers the launch ranks only.
+        and not elastic_dp
+    )
+
+
+def _estimated_tokens(req: Req) -> int:
+    return len(req.input_ids) if req.input_ids is not None else 0
+
+
 class DPBudget:
-    def __init__(self, num_dp_ranks: int):
+    def __init__(self, num_dp_ranks: int, *, count_in_flight: bool = False):
         self.num_dp_ranks = num_dp_ranks
         self.total_requests = [0] * num_dp_ranks
         self.total_tokens = [0] * num_dp_ranks
         self.last_timestamp = [0.0] * num_dp_ranks
+        # Count the requests sent to a rank that its last snapshot does not include
+        # yet (sent minus the rank's received counter) instead of letting a refresh
+        # erase them, and skip ranks at their request cap.
+        self.count_in_flight = count_in_flight
+        self.num_sent = [0] * num_dp_ranks if count_in_flight else None
+        self.num_received = [0] * num_dp_ranks if count_in_flight else None
+        # Estimated tokens of each in-flight request, oldest first: a socket keeps
+        # order, so the oldest sends are the ones a newer snapshot has received.
+        self.in_flight_tokens: list[deque[int]] | None = (
+            [deque() for _ in range(num_dp_ranks)] if count_in_flight else None
+        )
+        self.max_running_requests = [0] * num_dp_ranks if count_in_flight else None
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -136,8 +175,30 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            if self.count_in_flight:
+                self._retire_received(load)
+
+    def _retire_received(self, load) -> None:
+        rank = load.dp_rank
+        self.max_running_requests[rank] = load.max_running_requests
+        self.num_received[rank] = max(self.num_received[rank], load.num_received_reqs)
+        in_flight = self.in_flight_tokens[rank]
+        num_in_flight = max(0, self.num_sent[rank] - self.num_received[rank])
+        while len(in_flight) > num_in_flight:
+            in_flight.popleft()
+
+    def note_sent(self, rank: int, estimated_tokens: int) -> None:
+        """Count a request sent to ``rank`` outside ``dispatch`` (routed, health check)."""
+        if self.count_in_flight:
+            self.num_sent[rank] += 1
+            self.in_flight_tokens[rank].append(estimated_tokens)
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
+        if self.count_in_flight and method in (
+            LoadBalanceMethod.TOTAL_REQUESTS,
+            LoadBalanceMethod.TOTAL_TOKENS,
+        ):
+            return self._dispatch_counting_in_flight(estimated_tokens)
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
@@ -152,6 +213,28 @@ class DPBudget:
         # Increment the load of that worker by one as a heuristic
         self.total_requests[target_rank] += 1
         self.total_tokens[target_rank] += estimated_tokens
+        return target_rank
+
+    def _dispatch_counting_in_flight(self, estimated_tokens: int) -> int:
+        loads = [
+            (
+                self.total_requests[i] + len(self.in_flight_tokens[i]),
+                self.total_tokens[i] + sum(self.in_flight_tokens[i]),
+            )
+            for i in range(self.num_dp_ranks)
+        ]
+        # A rank at its cap would only queue the request while another has room.
+        ranks = [
+            i
+            for i in range(self.num_dp_ranks)
+            if not self.max_running_requests[i]
+            or loads[i][0] < self.max_running_requests[i]
+        ] or range(self.num_dp_ranks)
+        # Requests before tokens, for both methods: every attention-DP rank pads its
+        # decode batch to the largest rank's, so the step time follows the busiest
+        # rank's request count more than its token count.
+        target_rank = min(ranks, key=lambda i: loads[i])
+        self.note_sent(target_rank, estimated_tokens)
         return target_rank
 
 
@@ -221,7 +304,13 @@ class DataParallelController:
             self.max_dp_size - self.launch_dp_size
         )
 
-        self.dp_budget = DPBudget(get_parallel().num_dp_ranks)
+        self.dp_budget = DPBudget(
+            get_parallel().num_dp_ranks,
+            count_in_flight=dsv41_counts_in_flight(
+                load_balance_method=self.load_balance_method,
+                elastic_dp=self.max_dp_size > self.launch_dp_size,
+            ),
+        )
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
             caller="DataParallelController",
@@ -860,6 +949,9 @@ class DataParallelController:
             active
         )
         logger.debug(f"Choose worker {slot} for health check")
+        # The scheduler counts health checks among the requests it received.
+        if self.dp_budget.count_in_flight:
+            self.dp_budget.note_sent(slot, _estimated_tokens(req))
         sock_send(self.workers[slot], req)
 
     def maybe_external_dp_rank_routing(self, req: Req):
@@ -873,6 +965,8 @@ class DataParallelController:
             ):
                 raise ValueError(f"DP rank {rank} is not active.")
             logger.debug(f"Direct routing to DP rank {rank}")
+            if self.dp_budget.count_in_flight:
+                self.dp_budget.note_sent(rank, _estimated_tokens(req))
             sock_send(self.workers[rank], req)
             return True
         return False
@@ -961,6 +1055,9 @@ def run_data_parallel_controller_process(
     # This process reads the config namespaces before spawning schedulers.
     publish(server_args, role="dp_controller")
     configure_logger(server_args)
+    if envs.SGLANG_OPT_DSV41_SM90.get():
+        # This process asks the switch too: the dispatch policy.
+        initialize_dsv41_sm90(model_config=model_config_of(server_args))
     if get_observability().enable_trace:
         process_tracing_init(
             get_observability().otlp_traces_endpoint,

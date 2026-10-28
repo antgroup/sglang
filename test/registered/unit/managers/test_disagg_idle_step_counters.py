@@ -629,7 +629,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         )
         scheduler.process_input_requests = Mock()
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            pop_bootstrapped=Mock(return_value=[])
+            pop_bootstrapped=Mock(return_value=[]),
+            kv_manager=SimpleNamespace(note_scheduler_tick=lambda: None),
         )
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
             prefetch_prefill_dp_rank_queries=Mock(), queue=[]

@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 import msgspec
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.scheduler_stage_metrics import (
     FORWARD_OVERLAP_CATEGORIES,
@@ -141,6 +142,7 @@ class SchedulerStats:
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_host_receive_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_deferred_kv_release_reqs: int = 0
+    num_decode_quarantined_kv_release_reqs: int = 0
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
@@ -623,6 +625,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.num_decode_quarantined_kv_release_reqs = None
+        if dsv41_sm90_on("pd"):
+            self.num_decode_quarantined_kv_release_reqs = Gauge(
+                name="sglang:num_decode_quarantined_kv_release_reqs",
+                documentation=(
+                    "The number of failed decode requests whose KV allocations are "
+                    "held out of reuse after their drain timed out, until a late "
+                    "acknowledgement or until their prefill has been lost long enough."
+                ),
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
         self.decode_deferred_kv_release_seconds = Histogram(
             name="sglang:decode_deferred_kv_release_seconds",
             documentation="Histogram of time spent holding deferred decode KV releases.",
@@ -1443,7 +1457,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def observe_decode_deferred_kv_release(
         self, duration_seconds: float, outcome: str
     ) -> None:
-        if outcome not in ("drained", "timeout", "error"):
+        # "reclaimed": a quarantined hold freed by a late ACK or a lost prefill.
+        if outcome not in ("drained", "timeout", "error") and not (
+            outcome == "reclaimed" and dsv41_sm90_on("pd")
+        ):
             raise ValueError(f"Invalid deferred KV release outcome: {outcome}")
         self._log_histogram(self.decode_deferred_kv_release_seconds, duration_seconds)
         self.decode_deferred_kv_release_total.labels(
@@ -1704,6 +1721,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self.num_decode_deferred_kv_release_reqs,
             stats.num_decode_deferred_kv_release_reqs,
         )
+        if self.num_decode_quarantined_kv_release_reqs is not None:
+            self._log_gauge(
+                self.num_decode_quarantined_kv_release_reqs,
+                stats.num_decode_quarantined_kv_release_reqs,
+            )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )

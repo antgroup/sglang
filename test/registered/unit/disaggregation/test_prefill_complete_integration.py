@@ -2,7 +2,7 @@
 
 import threading
 import unittest
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -100,6 +100,7 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.bootstrap_timeout = 3
         mgr.req_to_decode_prefix_len = {}
         mgr.transfer_infos = {}
+        mgr._failed_room_tombstones = OrderedDict()
         mgr._deferred_ack_targets = {}
         mgr._deferred_ack_poisoned_rooms = set()
         mgr.required_prefill_response_num_table = {}
@@ -806,6 +807,7 @@ class TestAllocationIntegration(CustomTestCase):
             bootstrap_host="prefill",
             bootstrap_port=8998,
             disagg_prefill_dp_rank=3,
+            time_stats=SimpleNamespace(),
         )
         queue.kv_manager = SimpleNamespace(
             prefill_info_table={"prefill:8998": SimpleNamespace(dp_size=4)}

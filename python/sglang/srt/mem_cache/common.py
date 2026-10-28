@@ -84,6 +84,7 @@ def free_swa_out_of_window_slots(
     component_type: ComponentType = ComponentType.SWA,
     free_segment: Callable[..., None] | None = None,
     eviction_interval: int = 1,
+    retain_key_end: int | None = None,
 ) -> None:
     if not req.kv.holds_kv:
         return
@@ -108,6 +109,12 @@ def free_swa_out_of_window_slots(
         # Nothing is inserted into a tree, so no tombstone-leaf concern; evict
         # up to the window boundary (the trailing floor keeps it page-aligned).
         evict_threshold = pre_len - sliding_window_size
+    elif retain_key_end is not None:
+        # The insert ends at page_floor(retain_key_end); keep exactly the whole pages
+        # that cover one window below it.
+        evict_threshold = page_align_floor(retain_key_end, page_size) - ceil_align(
+            sliding_window_size, page_size
+        )
     else:
         # Prefix-sharing cache: keep max(window, page) rounded up to whole pages, so
         # a key that ends at page_floor(pre_len) still has a full window of live SWA,
@@ -234,6 +241,7 @@ def match_kv_cache(
             key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
             cow_mamba=cow_mamba,
             req=req,
+            swa_replay_end=len(token_ids),
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():

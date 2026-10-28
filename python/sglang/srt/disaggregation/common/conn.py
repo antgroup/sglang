@@ -6,7 +6,7 @@ import dataclasses
 import logging
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
 from typing import (
     Dict,
@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsv41_spec_layout,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 from sglang.srt.runtime_context import (
@@ -74,6 +75,16 @@ logger = logging.getLogger(__name__)
 
 ABORT_TAG = b"ABORT"
 ABORT_ACK_TAG = b"ABORT_ACK"
+
+# The scheduler, control and transfer threads share a room's status and
+# registrations; held for those transitions only, never across network I/O.
+_room_state_lock = threading.RLock()
+
+# A prefill rank whose scheduler loop (or its liveness report) is older than this
+# fails the bootstrap /health that the decode heartbeat polls. 180 s is far above
+# a healthy loop iteration on H20 PD (a cold 128K prefill with JIT compiles took
+# 47 s); decode.py's reclaim delay depends on it.
+_PREFILL_STALL_TIMEOUT_S = 180.0
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -290,9 +301,9 @@ class CommonKVManager(BaseKVManager):
 
     # Wire layout of the prefill->decode terminal status message. The legacy
     # layout (mooncake, and ascend which inherits it) is three untagged frames
-    # ``[room, status, prefill_rank]``; backends whose control socket also
-    # carries tagged messages prefix a tag frame and may append a reason:
-    # ``[tag, room, status, prefill_rank, reason]``.
+    # ``[room, status, prefill_rank]``, plus a reason frame on Failed; backends
+    # whose control socket also carries tagged messages prefix a tag frame and
+    # always append a reason: ``[tag, room, status, prefill_rank, reason]``.
     kv_status_msg_tag: Optional[bytes] = None
     kv_status_msg_carries_reason: bool = False
     sender_trace_module: Optional[str] = None
@@ -302,6 +313,7 @@ class CommonKVManager(BaseKVManager):
 
     kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
+    _liveness_thread: Optional[threading.Thread] = None
 
     # Logical-page KV sharding (PD prefill only): this rank's slot in the
     # shard group. Each rank owns a subset of logical KV pages.
@@ -446,6 +458,10 @@ class CommonKVManager(BaseKVManager):
                 self.bootstrap_port
             )
             self.register_to_bootstrap()
+            self._scheduler_tick: Optional[float] = None
+            # The Rust server keeps its own registry and has no liveness route.
+            if dsv41_sm90_on("pd") and not envs.SGLANG_RUST_SERVER.get():
+                self._start_liveness_reporter()
             self.transfer_infos = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
@@ -458,6 +474,11 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+            # Rooms that failed before a decode registered: room -> (reason,
+            # monotonic expiry), in expiry order. See fail_room_before_handoff.
+            self._failed_room_tombstones: OrderedDict[int, Tuple[str, float]] = (
+                OrderedDict()
+            )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.enable_staging: bool = False
             self._staging_handler = None
@@ -475,6 +496,10 @@ class CommonKVManager(BaseKVManager):
             # reuse.
             self._deferred_abort_ack_tracker: Dict[int, DeferredAbortAckState] = {}
             self._deferred_abort_generation = 0
+            if dsv41_sm90_on("pd"):
+                # bootstrap_addr -> wall time the heartbeat last declared that prefill
+                # lost; reclaims KV quarantined after a drain timeout.
+                self.prefill_lost_at: Dict[str, float] = {}
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
@@ -648,6 +673,15 @@ class CommonKVManager(BaseKVManager):
         raise NotImplementedError
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
+        with _room_state_lock:
+            failed_now = self._transition_status(bootstrap_room, status)
+        if failed_now and self.deferred_bootstrap is not None:
+            self._notify_bootstrap(
+                bootstrap_room, self.deferred_bootstrap.fail(bootstrap_room)
+            )
+
+    def _transition_status(self, bootstrap_room: int, status: KVPoll) -> bool:
+        """Caller holds _room_state_lock; True when the room is now Failed."""
         current = self.request_status.get(bootstrap_room)
         if current is None:
             # The room does not exist yet, or clear() already popped it. Only a
@@ -662,19 +696,16 @@ class CommonKVManager(BaseKVManager):
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
                 self._staging_outstanding.pop(bootstrap_room, None)
                 self.request_status[bootstrap_room] = status
-            return
+            return False
         if status == KVPoll.Failed:
             self.request_status[bootstrap_room] = KVPoll.Failed
-            if self.deferred_bootstrap is not None:
-                self._notify_bootstrap(
-                    bootstrap_room, self.deferred_bootstrap.fail(bootstrap_room)
-                )
-            return
+            return True
         if current == KVPoll.Failed:
             # Failed is terminal. It also sorts lowest, so the max() below would
             # happily promote it back to Transferring or Success.
-            return
+            return False
         self.request_status[bootstrap_room] = max(current, status)
+        return False
 
     def _notify_bootstrap(self, room: int, notification: BootstrapNotification) -> None:
         if notification is None:
@@ -745,7 +776,7 @@ class CommonKVManager(BaseKVManager):
             str(int(status)).encode("ascii"),
             str(self._prefill_unique_rank()).encode("ascii"),
         ]
-        if self.kv_status_msg_carries_reason:
+        if self.kv_status_msg_carries_reason or status == KVPoll.Failed:
             parts.append((failure_reason or "").encode("utf-8"))
         if self.kv_status_msg_tag is not None:
             parts.insert(0, self.kv_status_msg_tag)
@@ -862,32 +893,40 @@ class CommonKVManager(BaseKVManager):
         Runs more than once for a room when a staging chunk is deferred past the
         last one. ``targets`` defaults to the room's non-dummy decode endpoints.
         """
-        if bootstrap_room not in self.request_status:
-            # The sender already cleared this room. Concluding now would
-            # re-create it in request_status and leave a failure record that a
-            # request reusing this bootstrap_room would adopt as its own.
-            return None
-        if status == KVPoll.Success:
-            with self.failure_lock:
-                recorded = self.failure_records.get(bootstrap_room)
-            if recorded is not None:
-                status = KVPoll.Failed
-                failure_reason = recorded
-            elif self.request_status.get(bootstrap_room) == KVPoll.Failed:
-                status = KVPoll.Failed
-                failure_reason = (
-                    failure_reason or "Room marked Failed before the transfer ended"
-                )
-        if status == KVPoll.Failed:
-            with self.failure_lock:
-                # Keep the first root cause; later callers see the symptom.
-                failure_reason = self.failure_records.setdefault(
-                    bootstrap_room, failure_reason or "KV transfer failed"
-                )
+        with _room_state_lock:
+            if bootstrap_room not in self.request_status:
+                # The sender already cleared this room. Concluding now would
+                # re-create it in request_status and leave a failure record that
+                # a request reusing this bootstrap_room would adopt as its own.
+                return None
+            if status == KVPoll.Success:
+                with self.failure_lock:
+                    recorded = self.failure_records.get(bootstrap_room)
+                if recorded is not None:
+                    status = KVPoll.Failed
+                    failure_reason = recorded
+                elif self.request_status.get(bootstrap_room) == KVPoll.Failed:
+                    status = KVPoll.Failed
+                    failure_reason = (
+                        failure_reason or "Room marked Failed before the transfer ended"
+                    )
+            if status == KVPoll.Failed:
+                with self.failure_lock:
+                    # Keep the first root cause; later callers see the symptom.
+                    failure_reason = self.failure_records.setdefault(
+                        bootstrap_room, failure_reason or "KV transfer failed"
+                    )
+                if bootstrap_room not in self.transfer_infos:
+                    # No decode registered yet; answer it when it does.
+                    self._remember_failed_room(bootstrap_room, failure_reason)
 
-        if targets is None:
-            targets = self._room_notify_targets(bootstrap_room)
-        self.update_status(bootstrap_room, status)
+            if targets is None:
+                targets = self._room_notify_targets(bootstrap_room)
+            failed_now = self._transition_status(bootstrap_room, status)
+        if failed_now and self.deferred_bootstrap is not None:
+            self._notify_bootstrap(
+                bootstrap_room, self.deferred_bootstrap.fail(bootstrap_room)
+            )
         if status == KVPoll.Success and self.deferred_bootstrap is not None:
             # Success permits decode to reuse the room after true retraction.
             # Publish it from sender.clear(), after worker and scheduler cleanup.
@@ -914,6 +953,111 @@ class CommonKVManager(BaseKVManager):
             targets=targets,
             failure_reason=failure_reason,
         )
+
+    def fail_room_before_handoff(
+        self, *, bootstrap_room: int, failure_reason: str
+    ) -> None:
+        """Fail a room whose request retired before it got a KV sender.
+
+        No sender will ever transfer or conclude the room, so tell every decode
+        endpoint registered so far, drop the room's prefill-side state, and keep
+        a tombstone that answers a decode registering later.
+        """
+        with _room_state_lock:
+            self._remember_failed_room(bootstrap_room, failure_reason)
+            room_infos = self.transfer_infos.pop(bootstrap_room, None) or {}
+            self.request_status.pop(bootstrap_room, None)
+            self.req_to_decode_prefix_len.pop(bootstrap_room, None)
+        if self.deferred_bootstrap is not None:
+            self._notify_bootstrap(
+                bootstrap_room, self.deferred_bootstrap.fail(bootstrap_room)
+            )
+        # Dummy registrations included: no rank will ever send this room's KV.
+        targets = list(
+            dict.fromkeys(
+                (info.endpoint, info.dst_port) for info in room_infos.values()
+            )
+        )
+        logger.info(
+            "Failing room %s before KV handoff, %d decode endpoint(s) registered: %s",
+            bootstrap_room,
+            len(targets),
+            failure_reason,
+        )
+        self.send_kv_status_message(
+            targets=targets,
+            bootstrap_room=bootstrap_room,
+            status=KVPoll.Failed,
+            failure_reason=failure_reason,
+        )
+
+    def _accept_decode_registration(self, *, peer_key: str, transfer_info) -> None:
+        """Register one decode destination of a room, or fail that decode at once
+        when the room already failed. Atomic with fail_room_before_handoff, so a
+        failure cannot slip in between the check and the registration."""
+        room = transfer_info.room
+        with _room_state_lock:
+            failure_reason = self._failed_room_reason(room)
+            if failure_reason is None:
+                self._register_decode_destination(
+                    room=room, peer_key=peer_key, transfer_info=transfer_info
+                )
+                return
+        logger.info(
+            "Failing late decode registration for room %s: %s", room, failure_reason
+        )
+        self.send_kv_status_message(
+            targets=[(transfer_info.endpoint, transfer_info.dst_port)],
+            bootstrap_room=room,
+            status=KVPoll.Failed,
+            failure_reason=failure_reason,
+        )
+
+    def _register_decode_destination(
+        self, *, room: int, peer_key: str, transfer_info
+    ) -> None:
+        """Caller holds _room_state_lock."""
+        room_infos = self.transfer_infos.setdefault(room, {})
+        room_infos[peer_key] = transfer_info
+        if len(room_infos) == transfer_info.required_dst_info_num:
+            self.resolve_kv_replica_factor(room_infos)
+            self.req_to_decode_prefix_len[room] = next(
+                (
+                    info.decode_prefix_len
+                    for info in room_infos.values()
+                    if info.decode_prefix_len is not None
+                ),
+                0,
+            )
+            self.update_status(room, KVPoll.WaitingForInput)
+
+    def _remember_failed_room(
+        self, bootstrap_room: int, failure_reason: Optional[str]
+    ) -> None:
+        """Caller holds _room_state_lock."""
+        now = time.monotonic()
+        self._prune_failed_room_tombstones(now)
+        # A live sender stops waiting for decode after bootstrap_timeout; the
+        # tombstone covers a decode that registers within the same window.
+        self._failed_room_tombstones[bootstrap_room] = (
+            failure_reason or "KV transfer failed",
+            now + self.bootstrap_timeout,
+        )
+        self._failed_room_tombstones.move_to_end(bootstrap_room)
+
+    def _failed_room_reason(self, bootstrap_room: int) -> Optional[str]:
+        """Caller holds _room_state_lock."""
+        self._prune_failed_room_tombstones(time.monotonic())
+        tombstone = self._failed_room_tombstones.get(bootstrap_room)
+        return None if tombstone is None else tombstone[0]
+
+    def _prune_failed_room_tombstones(self, now: float) -> None:
+        tombstones = self._failed_room_tombstones
+        while tombstones:
+            _, expiry = next(iter(tombstones.values()))
+            if expiry > now:
+                return
+            tombstones.popitem(last=False)
 
     def apply_prefill_status(
         self,
@@ -1556,8 +1700,7 @@ class CommonKVManager(BaseKVManager):
             )
         return synced_port
 
-    def register_to_bootstrap(self):
-        """Register prefill server info to bootstrap server via HTTP PUT."""
+    def _bootstrap_server_url(self, path: str) -> str:
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
             host = NetworkAddress.parse(self.dist_init_addr).resolved().host
@@ -1570,9 +1713,11 @@ class CommonKVManager(BaseKVManager):
             # here — it can resolve to a different family than the listener,
             # e.g. IPv6 while the server is bound to 0.0.0.0.)
             host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+        return f"{NetworkAddress(host, self.bootstrap_port).to_url()}{path}"
 
-        bootstrap_na = NetworkAddress(host, self.bootstrap_port)
-        url = f"{bootstrap_na.to_url()}/route"
+    def register_to_bootstrap(self):
+        """Register prefill server info to bootstrap server via HTTP PUT."""
+        url = self._bootstrap_server_url("/route")
         attn_tp = (self.attn_tp_size, self.attn_tp_rank)
         attn_cp = (self.attn_cp_size, self.attn_cp_rank)
         if get_parallel().enable_cp_tp_group_sharing:
@@ -1628,6 +1773,54 @@ class CommonKVManager(BaseKVManager):
             return
 
         self._register_topology_row(url, payload)
+
+    def note_scheduler_tick(self) -> None:
+        if dsv41_sm90_on("pd"):
+            self._scheduler_tick = time.monotonic()
+
+    def _start_liveness_reporter(self) -> None:
+        # The bootstrap server ages these reports (CommonKVBootstrapServer._stalled_ranks)
+        # so /health fails for a rank that is dead (silent) or hung (growing age).
+        url = self._bootstrap_server_url("/rank_liveness")
+        rank = {
+            "dp_group": (
+                self.attn_dp_rank if self.system_dp_size == 1 else self.system_dp_rank
+            ),
+            "cp_rank": self.attn_cp_rank,
+            "tp_rank": self.attn_tp_rank,
+            "pp_rank": self.pp_rank,
+        }
+        interval = max(envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0)
+        self._liveness_stop = threading.Event()
+
+        def report() -> None:
+            session = requests.Session()
+            try:
+                while not self._liveness_stop.wait(interval):
+                    tick = self._scheduler_tick
+                    if tick is None:  # the scheduler loop has not started yet
+                        continue
+                    try:
+                        session.put(
+                            url,
+                            json={**rank, "loop_age": time.monotonic() - tick},
+                            timeout=(2, 3),
+                        )
+                    except Exception:
+                        pass  # the server ages a silent rank
+            finally:
+                session.close()
+
+        self._liveness_thread = threading.Thread(
+            target=report, daemon=True, name="pd-rank-liveness"
+        )
+        self._liveness_thread.start()
+
+    def _stop_liveness_reporter(self) -> None:
+        if self._liveness_thread is not None:
+            self._liveness_stop.set()
+            # Allow the reporter's connect/read timeouts (2 + 3 s) to finish.
+            self._liveness_thread.join(timeout=6.0)
 
     def _register_topology_row(self, url: str, payload: Dict) -> None:
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
@@ -2072,6 +2265,8 @@ class CommonKVManager(BaseKVManager):
             for k in keys_to_remove:
                 del self.connection_pool[k]
             self.prefill_info_table.pop(failed_bootstrap_addr, None)
+            if dsv41_sm90_on("pd"):
+                self.prefill_lost_at[failed_bootstrap_addr] = time.time()
             # A prefill that a later request reaches again starts with no
             # misses; a kept count would drop it at its first missed heartbeat.
             self.heartbeat_failures.pop(failed_bootstrap_addr, None)
@@ -2086,10 +2281,9 @@ class CommonKVManager(BaseKVManager):
 
         affected_rooms = []
         for room in possible_affected_rooms:
-            if (
-                room in self.request_status
-                and self.check_status(room) != KVPoll.Success
-            ):
+            # One read: the scheduler thread may clear the room at any moment.
+            room_status = self.request_status.get(room)
+            if room_status is not None and room_status != KVPoll.Success:
                 self.record_failure(
                     room,
                     f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
@@ -2415,13 +2609,14 @@ class CommonKVSender(BaseKVSender):
                 == KVPoll.Success,
             )
             self._owns_bootstrap_room = False
-        if self.conclude_state is None:
-            status = self.kv_mgr.request_status.get(self.bootstrap_room)
-            if status in (KVPoll.Success, KVPoll.Failed):
-                self.conclude_state = status
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
-        self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        with _room_state_lock:
+            if self.conclude_state is None:
+                status = self.kv_mgr.request_status.get(self.bootstrap_room)
+                if status in (KVPoll.Success, KVPoll.Failed):
+                    self.conclude_state = status
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+            self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+            self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         # A sender can be cleared while a counted transfer is still writing:
         # keep the target for the worker, or ACK now if nothing is in flight.
         self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
@@ -2971,6 +3166,12 @@ class CommonKVReceiver(BaseKVReceiver):
             self._send_abort_notification(force_arm=force_arm)
             self.abort_notified = True
 
+    def resend_abort_notification(self) -> None:
+        """ABORT the room again under a fresh drain generation, for a hold whose
+        first ABORT or drain ACK may have been dropped."""
+        if self.abort_notified:
+            self._send_abort_notification(force_arm=True)
+
     def _send_abort_notification(self, *, force_arm: bool = False):
         # Both abort() and the waiting timeout reach here. Once metadata is
         # published (init_time set) prefill may be writing, so arm the ACK
@@ -3041,6 +3242,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.entry_cleanup_interval = (
             envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
         )
+        # (dp_group, cp_rank, tp_rank, pp_rank) -> (monotonic receive time,
+        # reported scheduler loop age); see CommonKVManager._start_liveness_reporter.
+        self.rank_liveness: Optional[
+            Dict[Tuple[int, int, int, int], Tuple[float, float]]
+        ] = {} if dsv41_sm90_on("pd") else None
 
         # Start bootstrap server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
@@ -3068,9 +3274,32 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
         self.app.router.add_get("/health", self._handle_health_check)
+        if dsv41_sm90_on("pd"):
+            self.app.router.add_put("/rank_liveness", self._handle_rank_liveness)
 
     async def _handle_health_check(self, request):
+        if dsv41_sm90_on("pd"):
+            stalled = self._stalled_ranks(time.monotonic())
+            if stalled:
+                return web.Response(
+                    text=f"Prefill ranks stalled: {', '.join(stalled)}", status=503
+                )
         return web.Response(text="OK", status=200)
+
+    async def _handle_rank_liveness(self, request: web.Request):
+        data = await request.json()
+        key = (data["dp_group"], data["cp_rank"], data["tp_rank"], data["pp_rank"])
+        self.rank_liveness[key] = (time.monotonic(), float(data["loop_age"]))
+        return web.Response(text="OK", status=200)
+
+    def _stalled_ranks(self, now: float) -> List[str]:
+        # A rank that never reported (switch off, loop not started) counts as live.
+        stalled = []
+        for (dp, cp, tp, pp), (seen, loop_age) in sorted(self.rank_liveness.items()):
+            age = loop_age + (now - seen)
+            if age > _PREFILL_STALL_TIMEOUT_S:
+                stalled.append(f"DP{dp} CP{cp} TP{tp} PP{pp} {age:.0f}s")
+        return stalled
 
     async def _handle_route(self, request: web.Request):
         method = request.method

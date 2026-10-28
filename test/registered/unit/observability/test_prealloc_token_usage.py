@@ -68,7 +68,9 @@ def _reporter(*, counts, pool_stats):
             queue=[], pre_allocated_token_counts=lambda: counts
         ),
         disagg_decode_transfer_queue=SimpleNamespace(
-            queue=[], num_pending_deferred_releases=lambda: 0
+            queue=[],
+            num_pending_deferred_releases=lambda: 0,
+            num_quarantined_releases=lambda: 0,
         ),
         pool_stats_observer=SimpleNamespace(get_pool_stats=lambda: pool_stats),
     )

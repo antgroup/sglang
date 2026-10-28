@@ -55,7 +55,7 @@ def _make_req(prompt_len=1500, session=None):
     return req
 
 
-def _make_scheduler():
+def _make_scheduler(mode=DisaggregationMode.PREFILL):
     """One stub for both halves.
 
     `retire_unadmitted_request` is a spy wrapping the real method, so a door
@@ -64,6 +64,8 @@ def _make_scheduler():
     retirement passes every door test.
     """
     sched = SimpleNamespace(
+        disaggregation_mode=mode,
+        disagg_prefill_bootstrap_queue=MagicMock(),
         output_streamer=MagicMock(),
         beam_coordinator=MagicMock(),
         _release_aborted_request=MagicMock(),
@@ -136,17 +138,25 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                 self.assertFalse(req.finished())
                 self.assertEqual(len(req.origin_input_ids), 1)
 
-                sched = _make_scheduler()
+                fail_before_handoff = MagicMock()
                 if door == "prefill":
+                    sched = _make_scheduler(DisaggregationMode.PREFILL)
+                    sched.disagg_prefill_bootstrap_queue.fail_before_handoff = (
+                        fail_before_handoff
+                    )
                     q = _prefill_queue(sched)
                     _admit_prefill(q, req)
                     q.create_sender.assert_not_called()
                     self.assertEqual(q.queue, [])
+                    # Decode registered this room too and must not wait on it.
+                    fail_before_handoff.assert_called_once_with(req, ERROR_MSG)
                 else:
+                    sched = _make_scheduler(DisaggregationMode.DECODE)
                     q = _decode_queue(sched)
                     _admit_decode(q, req)
                     q._create_receiver_and_enqueue.assert_not_called()
                     self.assertEqual(q.pending_reqs, [])
+                    fail_before_handoff.assert_not_called()
                 sched.retire_unadmitted_request.assert_called_once_with(req)
 
     def test_reentering_prefill_request_is_not_retired(self):
@@ -331,6 +341,45 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
 
         session.abort_req.assert_not_called()
         self.assertIs(req.session, session)
+
+
+class TestDecodeRebootstrapDeadlines(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def test_rebootstrap_waits_under_fresh_deadlines(self):
+        """A V4.1 rebootstrap re-enters the waiting queue after a long decode
+        or a weight-update pause; with the first attempt's timestamps the
+        waiting-queue timeout aborts it at once."""
+        for flags in ({"is_rebootstrap": True}, {"is_retracted": True}):
+            with self.subTest(**flags):
+                req = _make_req(prompt_len=16)
+                req.output_ids = [11, 12]
+                req.time_stats.decode_prealloc_queue_entry_time = 1.0
+                req.time_stats.bootstrap_done_time = 2.0
+                req.time_stats.wait_queue_entry_time = 3.0
+                q = _decode_queue(_make_scheduler(DisaggregationMode.DECODE))
+                with (
+                    patch(
+                        "sglang.srt.disaggregation.decode.dsv4_needs_rebootstrap",
+                        return_value=True,
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.decode.time.perf_counter",
+                        return_value=1000.0,
+                    ),
+                ):
+                    _admit_decode(q, req, **flags)
+                stats = req.time_stats
+                self.assertEqual(stats.decode_prealloc_queue_entry_time, 1000.0)
+                self.assertEqual(stats.bootstrap_done_time, 0.0)
+                self.assertEqual(stats.wait_queue_entry_time, 0.0)
+                self.assertEqual(
+                    q._create_receiver_and_enqueue.call_args.kwargs,
+                    {"is_rebootstrap": True},
+                )
 
 
 if __name__ == "__main__":

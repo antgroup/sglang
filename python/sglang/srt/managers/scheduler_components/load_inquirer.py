@@ -55,6 +55,7 @@ class SchedulerLoadInquirer:
     get_total_prefill_uncached_tokens: Callable
     get_total_prefill_busy_us: Callable
     get_decode_moment_totals: Callable
+    get_num_received_reqs: Callable[[], int] = lambda: 0
     get_waiting_storage_span: (
         Callable[[CacheRequestHandle], tuple[int, int] | None] | None
     ) = None
@@ -240,6 +241,7 @@ class SchedulerLoadInquirer:
             num_prealloc_ready_tokens=num_prealloc_ready_tokens,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
+            num_received_reqs=self.get_num_received_reqs(),
             token_usage=round(kv_token_usage, 4),
             gen_throughput=round(stats.gen_throughput, 2),
             cache_hit_rate=round(stats.cache_hit_rate, 4),

@@ -30,9 +30,20 @@ from sglang.srt.managers.data_parallel_controller import (
     DPBudget,
     LoadBalanceMethod,
     WorkerPortHandshake,
+    dsv41_counts_in_flight,
+)
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
-from sglang.srt.runtime_context import get_context
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    num_dispatched_reqs,
+)
+from sglang.srt.runtime_context import get_context, get_flags
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -296,6 +307,201 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         )
         self.assertEqual(budget.total_requests, [10, 2, 30])
         self.assertEqual(budget.total_tokens, [100, 50, 300])
+
+
+class TestDPBudgetCountInFlight(CustomTestCase):
+    """DeepSeek-V4.1 decode dispatch: sends a snapshot has not received yet survive
+    its refresh, and full ranks are skipped."""
+
+    def test_stale_snapshot_does_not_erase_in_flight_sends(self):
+        # 8 ranks x cap 16 and a 128-request burst, refreshed from snapshots taken
+        # before any of it arrived: the refresh reset the per-dispatch increments and
+        # stacked ranks past the cap (17-18 on some ranks, 15 on others).
+        budget = DPBudget(num_dp_ranks=8, count_in_flight=True)
+        counts = [0] * 8
+        for i in range(128):
+            if i % 10 == 0:
+                budget.update_budget(
+                    [
+                        _load(
+                            dp_rank=r, timestamp=float(i + 1), max_running_requests=16
+                        )
+                        for r in range(8)
+                    ]
+                )
+            rank = budget.dispatch(
+                LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=61440
+            )
+            counts[rank] += 1
+        self.assertEqual(counts, [16] * 8)
+
+    def test_received_requests_retire_without_double_count(self):
+        budget = DPBudget(num_dp_ranks=2, count_in_flight=True)
+        for _ in range(4):
+            budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        self.assertEqual([len(q) for q in budget.in_flight_tokens], [2, 2])
+        # Rank 0 received one of its two; its snapshot counts it as waiting.
+        budget.update_budget(
+            [_load(dp_rank=0, timestamp=1.0, num_waiting_reqs=1, num_received_reqs=1)]
+        )
+        self.assertEqual(len(budget.in_flight_tokens[0]), 1)
+        self.assertEqual(budget.total_requests[0] + len(budget.in_flight_tokens[0]), 2)
+
+    def test_tokens_of_oldest_sends_retire_first(self):
+        budget = DPBudget(num_dp_ranks=1, count_in_flight=True)
+        budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=100)
+        budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=7)
+        budget.update_budget([_load(dp_rank=0, timestamp=1.0, num_received_reqs=1)])
+        self.assertEqual(list(budget.in_flight_tokens[0]), [7])
+
+    def test_full_rank_is_skipped_while_another_has_room(self):
+        budget = DPBudget(num_dp_ranks=3, count_in_flight=True)
+        budget.update_budget(
+            [
+                _load(
+                    dp_rank=0,
+                    timestamp=1.0,
+                    num_running_reqs=16,
+                    num_total_tokens=10,
+                    max_running_requests=16,
+                ),
+                _load(
+                    dp_rank=1,
+                    timestamp=1.0,
+                    num_running_reqs=4,
+                    num_total_tokens=900,
+                    max_running_requests=16,
+                ),
+                _load(
+                    dp_rank=2,
+                    timestamp=1.0,
+                    num_running_reqs=5,
+                    num_total_tokens=950,
+                    max_running_requests=16,
+                ),
+            ]
+        )
+        # Rank 0 has the fewest tokens but is at its cap; rank 1 has fewer requests.
+        self.assertEqual(
+            budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=1), 1
+        )
+
+    def test_all_full_falls_back_to_least_loaded(self):
+        budget = DPBudget(num_dp_ranks=2, count_in_flight=True)
+        budget.update_budget(
+            [
+                _load(
+                    dp_rank=0,
+                    timestamp=1.0,
+                    num_running_reqs=16,
+                    num_waiting_reqs=2,
+                    max_running_requests=16,
+                ),
+                _load(
+                    dp_rank=1,
+                    timestamp=1.0,
+                    num_running_reqs=16,
+                    num_waiting_reqs=1,
+                    max_running_requests=16,
+                ),
+            ]
+        )
+        self.assertEqual(budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS), 1)
+
+    def test_total_tokens_orders_by_request_count_first(self):
+        budget = DPBudget(num_dp_ranks=2, count_in_flight=True)
+        budget.update_budget(
+            [
+                _load(
+                    dp_rank=0, timestamp=1.0, num_running_reqs=6, num_total_tokens=100
+                ),
+                _load(
+                    dp_rank=1, timestamp=1.0, num_running_reqs=2, num_total_tokens=5000
+                ),
+            ]
+        )
+        self.assertEqual(
+            budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=10), 1
+        )
+
+    def test_routed_and_health_check_sends_count_as_in_flight(self):
+        """The scheduler counts every generate request it receives, health checks
+        and externally routed ones included; a send the controller does not count
+        lets received outrun sent and retires a later request still in flight."""
+        ctl = _make_controller(num_dp_ranks=2)
+        ctl.dp_budget = DPBudget(num_dp_ranks=2, count_in_flight=True)
+        ctl.load_balance_method = LoadBalanceMethod.TOTAL_TOKENS
+        ctl.dispatch_health_check(_req(rid="HEALTH_CHECK", input_ids=[1]))
+        ctl.total_tokens_scheduler(_req(routed_dp_rank=0, input_ids=[1, 2, 3]))
+        self.assertEqual(list(ctl.dp_budget.in_flight_tokens[0]), [1, 3])
+        # Rank 0 has received the health check only.
+        ctl.dp_budget.update_budget(
+            [_load(dp_rank=0, timestamp=1.0, num_received_reqs=1)]
+        )
+        self.assertEqual(list(ctl.dp_budget.in_flight_tokens[0]), [3])
+
+    def test_scheduler_counts_on_arrival_what_the_controller_counts_as_sent(self):
+        """Every generate / embedding request (a batch by its sub-requests) counts as
+        received on arrival, before a busy rank skips a health check or the EPD
+        receiver aborts one, else sent - received grows until every rank looks
+        full. Control messages are not counted."""
+        batch_gen = MagicMock(spec=BatchTokenizedGenerateReqInput)
+        batch_gen.__len__.return_value = 3
+        batch_emb = MagicMock(spec=BatchTokenizedEmbeddingReqInput)
+        batch_emb.__len__.return_value = 2
+        recv_reqs = [
+            MagicMock(spec=TokenizedGenerateReqInput),
+            MagicMock(spec=TokenizedEmbeddingReqInput),
+            batch_gen,
+            batch_emb,
+            MagicMock(spec=AbortReq),
+            SimpleNamespace(),
+        ]
+        self.assertEqual(num_dispatched_reqs(recv_reqs), 7)
+        self.assertEqual(num_dispatched_reqs(None), 0)
+
+    def test_off_keeps_the_upstream_counters(self):
+        budget = DPBudget(num_dp_ranks=2)
+        budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        budget.note_sent(1, 5)
+        self.assertEqual(budget.total_requests, [1, 0])
+        self.assertIsNone(budget.num_sent)
+        self.assertIsNone(budget.num_received)
+        self.assertIsNone(budget.in_flight_tokens)
+        self.assertIsNone(budget.max_running_requests)
+
+    def test_counts_only_for_v41_decode_with_a_snapshot_refreshed_method(self):
+        # Round robin and bootstrap-room routing never refresh, so nothing would
+        # retire what they count.
+        decode = dict(subsystems=frozenset({"runtime"}), role="decode")
+        cases = (
+            (decode, LoadBalanceMethod.TOTAL_TOKENS, False, True),
+            (decode, LoadBalanceMethod.TOTAL_REQUESTS, False, True),
+            (decode, LoadBalanceMethod.ROUND_ROBIN, False, False),
+            (decode, LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM, False, False),
+            (decode, LoadBalanceMethod.TOTAL_TOKENS, True, False),
+            (
+                dict(subsystems=frozenset({"runtime"}), role="mix"),
+                LoadBalanceMethod.TOTAL_TOKENS,
+                False,
+                False,
+            ),
+            (
+                dict(subsystems=frozenset(), role=""),
+                LoadBalanceMethod.TOTAL_TOKENS,
+                False,
+                False,
+            ),
+        )
+        for flags, method, elastic_dp, expected in cases:
+            with self.subTest(flags=flags, method=method, elastic_dp=elastic_dp):
+                with get_flags().dsv41_sm90.override(**flags):
+                    self.assertEqual(
+                        dsv41_counts_in_flight(
+                            load_balance_method=method, elastic_dp=elastic_dp
+                        ),
+                        expected,
+                    )
 
 
 class TestRoundRobinScheduler(CustomTestCase):

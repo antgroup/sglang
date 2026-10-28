@@ -1,4 +1,4 @@
-"""Focused CPU contracts for DeepSeek V4 NPU HiCache L2."""
+"""Focused CPU contracts for DeepSeek V4 HiCache L2 (NPU, and V4.1 --hicache-size)."""
 
 import unittest
 from types import MethodType, SimpleNamespace
@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
 )
+from sglang.srt.runtime_context import get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -318,6 +319,179 @@ class TestDSV4PoolAssembly(CustomTestCase):
         self.assertEqual((k_host.item_bytes, scale_host.item_bytes), (128, 64))
         self.assertEqual((k_host.slot_page_size, scale_host.slot_page_size), (128, 128))
         self.assertIs(built_controller, controller)
+
+
+def _v41_gpu_kvcache():
+    """Non-unified GPU V4.1 geometry: C4 (+ fused indexer and compressor states),
+    C128, shared C1/C2 sources, paged SWA, and a DSpark draft's SWA layers."""
+
+    def rows(num_rows, row_bytes):
+        return torch.empty((num_rows, row_bytes), dtype=torch.uint8)
+
+    def state(ring_size, slot_bytes):
+        kv_score = torch.empty((8, slot_bytes), dtype=torch.uint8)
+        return SimpleNamespace(
+            ring_size=ring_size, kv_score_buffer=SimpleNamespace(kv_score=kv_score)
+        )
+
+    def low_ratio_index_pool():
+        # 256-token pages over 64-slot index pages: 4 index rows per FULL page.
+        return SimpleNamespace(page_size=64, index_k_with_scale_buffer=[rows(21, 32)])
+
+    kvcache = SimpleNamespace(
+        start_layer=0,
+        end_layer=4,
+        size=10 * 256,
+        swa_size=4 * 256,
+        swa_page_size=256,
+        layer_mapping=[
+            SimpleNamespace(compress_ratio=ratio, compress_layer_id=index)
+            for ratio, index in ((4, 0), (128, 0), (4, 1), (128, 1))
+        ],
+        swa_kv_pool=SimpleNamespace(
+            page_size=256, bytes_per_page_padded=1000, kv_buffer=[rows(5, 1000)] * 4
+        ),
+        c4_kv_pool=SimpleNamespace(
+            bytes_per_page_padded=300, kv_buffer=[rows(5, 300)] * 2
+        ),
+        c4_indexer_kv_pool=SimpleNamespace(index_k_with_scale_buffer=[rows(5, 70)] * 2),
+        c128_kv_pool=SimpleNamespace(
+            bytes_per_page_padded=20, kv_buffer=[rows(5, 20)] * 2
+        ),
+        compress_state_pools={0: state(2, 40), 2: state(2, 40)},
+        indexer_compress_state_pools={0: state(3, 8), 2: state(3, 8)},
+        sources_by_ratio={1: [3], 2: [1]},
+        kv_pools={
+            1: SimpleNamespace(kv_buffer=[rows(5, 500)]),
+            2: SimpleNamespace(kv_buffer=[rows(5, 250)]),
+        },
+        index_pools={1: low_ratio_index_pool(), 2: low_ratio_index_pool()},
+    )
+    params = SimpleNamespace(
+        page_size=256,
+        token_to_kv_pool_allocator=SimpleNamespace(
+            size_full=kvcache.size,
+            swa_attn_allocator=SimpleNamespace(alloc=None, free=None),
+        ),
+        mtp_draft_device_pools=[
+            SimpleNamespace(swa_kv_pool=SimpleNamespace(kv_buffer=[rows(5, 1000)] * 3))
+        ],
+        tp_cache_group=None,
+        attn_cp_cache_group=None,
+        attn_tp_cache_group=None,
+        pp_cache_group=None,
+    )
+    return kvcache, params
+
+
+def _build_v41_stack(*, hicache_size_gb, runtime_on):
+    """Run the V4 stack builder with recording host pools; returns
+    {pool name: (bytes per host page, host pages)}."""
+    kvcache, params = _v41_gpu_kvcache()
+    memory = SimpleNamespace(
+        hicache_size=hicache_size_gb,
+        hicache_ratio=2.0,
+        hicache_mem_layout="page_first",
+        hicache_write_policy="write_through",
+        hicache_io_backend="kernel",
+        hicache_host_memory_mode="cache",
+    )
+    pools = {}
+
+    def paged(**kwargs):
+        page_bytes = len(kwargs["device_buffers"]) * kwargs["item_bytes"]
+        pools[kwargs["pool_name"]] = (page_bytes, kwargs["num_host_pages"])
+
+    def state(**kwargs):
+        page_bytes = sum(
+            pool.ring_size * pool.kv_score_buffer.kv_score[0].nbytes
+            for pool in kwargs["state_pools"]
+        )
+        pools[kwargs["pool_name"]] = (page_bytes, kwargs["num_host_pages"])
+
+    flags = frozenset({"runtime"}) if runtime_on else frozenset()
+    with (
+        get_flags().dsv41_sm90.override(subsystems=flags),
+        patch.object(assembler, "get_memory", return_value=memory),
+        patch.object(assembler, "_get_allocator_type", return_value="default"),
+        patch.object(assembler, "LogicalHostPool"),
+        patch.object(assembler, "DeepSeekV4PagedHostPool", side_effect=paged),
+        patch.object(assembler, "DeepSeekV4StateHostPool", side_effect=state),
+        patch.object(assembler, "build_pool_entry"),
+        patch.object(assembler, "HostPoolGroup"),
+        patch.object(assembler, "HybridCacheController"),
+    ):
+        assembler.build_deepseek_v4_hicache_stack(
+            params=params, kvcache=kvcache, load_cache_event=None, storage_backend=None
+        )
+    return pools
+
+
+class TestDSV41HiCacheSize(CustomTestCase):
+    """--hicache-size for DeepSeek-V4.1 (dsv41_sm90_on("runtime")): GB per rank over
+    every host pool, keeping the device FULL:SWA page ratio."""
+
+    _SWA_SPACE = (
+        str(PoolName.SWA),
+        str(PoolName.DEEPSEEK_V4_C4_STATE),
+        str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
+    )
+
+    def test_budget_covers_every_host_pool_the_stack_builds(self):
+        budget_gb = 1e-4
+        pools = _build_v41_stack(hicache_size_gb=budget_gb, runtime_on=True)
+        full_space = {k: v for k, v in pools.items() if k not in self._SWA_SPACE}
+        swa_space = {k: v for k, v in pools.items() if k in self._SWA_SPACE}
+        self.assertEqual(len(swa_space), 3)
+        # C4, its indexer, C128 (a FULL-page sidecar on GPU), C1/C2 KV and indexers.
+        self.assertEqual(len(full_space), 7)
+        (num_full,) = {pages for _, pages in full_space.values()}
+        (num_swa,) = {pages for _, pages in swa_space.values()}
+        self.assertEqual(num_swa, max(1, num_full * 4 // 10))
+        full_bytes = sum(page_bytes for page_bytes, _ in full_space.values())
+        swa_bytes = sum(page_bytes for page_bytes, _ in swa_space.values())
+        budget = int(budget_gb * 1e9)
+        self.assertLessEqual(num_full * full_bytes + num_swa * swa_bytes, budget)
+        # Maximal: one more FULL page (and its share of SWA) would not fit.
+        next_swa = max(1, (num_full + 1) * 4 // 10)
+        self.assertGreater((num_full + 1) * full_bytes + next_swa * swa_bytes, budget)
+
+    def test_switch_off_keeps_the_upstream_rejection(self):
+        with self.assertRaisesRegex(ValueError, "does not support --hicache-size"):
+            _build_v41_stack(hicache_size_gb=1e-4, runtime_on=False)
+
+    def test_fit_is_the_largest_feasible_page_count(self):
+        for page_bytes, device_pages in (
+            ((7, 3, 0), (10, 4, None)),
+            ((0, 5, 2), (3, 8, None)),
+            ((4, 0, 6), (6, 2, 3)),
+        ):
+            full_pages, swa_pages, c128_pages = device_pages
+
+            def cost(n):
+                swa = max(1, n * swa_pages // full_pages)
+                c128 = n if c128_pages is None else max(1, n * c128_pages // full_pages)
+                return n * page_bytes[0] + swa * page_bytes[1] + c128 * page_bytes[2]
+
+            for budget in (40, 101, 997):
+                with self.subTest(page_bytes=page_bytes, budget=budget):
+                    best = max(n for n in range(1, 2000) if cost(n) <= budget)
+                    got = assembler._deepseek_v4_fixed_host_pages(
+                        budget_bytes=budget,
+                        page_bytes=assembler._DeepSeekV4HostPageBytes(*page_bytes),
+                        device_full_pages=full_pages,
+                        device_swa_pages=swa_pages,
+                        device_c128_pages=c128_pages,
+                    )
+                    self.assertEqual(got[0], best)
+        with self.assertRaisesRegex(ValueError, "cannot hold one"):
+            assembler._deepseek_v4_fixed_host_pages(
+                budget_bytes=9,
+                page_bytes=assembler._DeepSeekV4HostPageBytes(7, 3, 0),
+                device_full_pages=10,
+                device_swa_pages=4,
+                device_c128_pages=None,
+            )
 
 
 if __name__ == "__main__":

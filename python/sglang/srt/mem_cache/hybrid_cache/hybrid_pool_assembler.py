@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -25,6 +26,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     LogicalHostPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.base import sync_fixed_hicache_size
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -643,6 +645,7 @@ def _deepseek_v4_num_host_pages(
     kvcache: Any,
     page_size: int,
     swa_page_size: int,
+    layer_mappings: _DeepSeekV4LayerMappings,
 ) -> tuple[int, int, int]:
     allocator = params.token_to_kv_pool_allocator
     device_full_size = getattr(allocator, "size_full", kvcache.size)
@@ -651,9 +654,22 @@ def _deepseek_v4_num_host_pages(
     device_swa_pages = (kvcache.swa_size + swa_page_size - 1) // swa_page_size
 
     if get_memory().hicache_size > 0:
-        raise ValueError(
-            "DeepSeek V4 HiCache currently does not support --hicache-size; "
-            "use --hicache-ratio instead."
+        if not dsv41_sm90_on("runtime"):
+            raise ValueError(
+                "DeepSeek V4 HiCache currently does not support --hicache-size; "
+                "use --hicache-ratio instead."
+            )
+        c128_attn_allocator = getattr(allocator, "c128_attn_allocator", None)
+        return _deepseek_v4_fixed_host_pages(
+            budget_bytes=int(get_memory().hicache_size * 1e9),
+            page_bytes=_deepseek_v4_host_page_bytes(
+                kvcache=kvcache, params=params, layer_mappings=layer_mappings
+            ),
+            device_full_pages=device_full_pages,
+            device_swa_pages=device_swa_pages,
+            device_c128_pages=(
+                None if c128_attn_allocator is None else c128_attn_allocator.num_pages
+            ),
         )
     ratio = get_memory().hicache_ratio
     full_host_pages = int(device_full_pages * ratio)
@@ -667,6 +683,125 @@ def _deepseek_v4_num_host_pages(
     if c128_attn_allocator is not None:
         c128_host_pages = int(c128_attn_allocator.num_pages * ratio)
     return full_host_pages, swa_host_pages, c128_host_pages
+
+
+class _DeepSeekV4HostPageBytes(NamedTuple):
+    """Host bytes per page of each page space the V4 stack mirrors."""
+
+    full: int
+    swa: int
+    c128: int
+
+
+def _deepseek_v4_host_page_bytes(
+    *, kvcache: Any, params: CacheInitParams, layer_mappings: _DeepSeekV4LayerMappings
+) -> _DeepSeekV4HostPageBytes:
+    """Price every host pool build_deepseek_v4_hicache_stack builds, draft SWA
+    included; the logical anchor holds no data."""
+    page_size = params.page_size
+    is_unified_kv = getattr(kvcache, "_unified_kv", False)
+    full = swa = c128 = 0
+    if layer_mappings.c4:
+        buffers, item_bytes = _dsv4_compressed_region_buffers(kvcache, 4)
+        full += len(buffers) * item_bytes
+        full += sum(
+            len(region.device_buffers) * region.item_bytes
+            for region in _dsv4_indexer_regions(kvcache, page_size)
+        )
+        full += _dsv4_rope_sibling_bytes(kvcache, 4)
+        if not is_unified_kv:
+            for state_pools in (
+                kvcache.compress_state_pools,
+                kvcache.indexer_compress_state_pools,
+            ):
+                for layer_id in layer_mappings.c4_state_global_layers:
+                    state = state_pools[layer_id]
+                    swa += state.ring_size * state.kv_score_buffer.kv_score[0].nbytes
+    if layer_mappings.c128:
+        buffers, item_bytes = _dsv4_compressed_region_buffers(kvcache, 128)
+        c128 += len(buffers) * item_bytes + _dsv4_rope_sibling_bytes(kvcache, 128)
+    full += sum(
+        len(buffers) * buffers[0].shape[1] * buffers[0].element_size()
+        for _, _, buffers, _ in _dsv4_low_ratio_regions(kvcache, page_size)
+    )
+    if not is_unified_kv and kvcache.swa_kv_pool is not None:
+        num_swa_layers = len(kvcache.swa_kv_pool.kv_buffer) + sum(
+            len(pool.swa_kv_pool.kv_buffer) for pool in params.mtp_draft_device_pools
+        )
+        swa += kvcache.swa_kv_pool.bytes_per_page_padded * num_swa_layers
+    return _DeepSeekV4HostPageBytes(full=full, swa=swa, c128=c128)
+
+
+def _dsv4_rope_sibling_bytes(kvcache: Any, ratio: int) -> int:
+    sibling = _dsv4_rope_sibling(kvcache, ratio)
+    if sibling is None:
+        return 0
+    _, device_buffers, item_bytes = sibling
+    return len(device_buffers) * item_bytes
+
+
+def _deepseek_v4_fixed_host_pages(
+    *,
+    budget_bytes: int,
+    page_bytes: _DeepSeekV4HostPageBytes,
+    device_full_pages: int,
+    device_swa_pages: int,
+    device_c128_pages: Optional[int],
+) -> tuple[int, int, int]:
+    """(FULL, SWA, C128) host pages: the most FULL pages whose mirrors fit
+    ``budget_bytes``, with SWA scaled by the device FULL:SWA page ratio. C128
+    follows FULL unless it has its own device allocator (NPU)."""
+
+    def pages(num_full: int) -> tuple[int, int, int]:
+        num_swa = max(1, num_full * device_swa_pages // device_full_pages)
+        if device_c128_pages is None:
+            return num_full, num_swa, num_full
+        return (
+            num_full,
+            num_swa,
+            max(1, num_full * device_c128_pages // device_full_pages),
+        )
+
+    def cost(num_full: int) -> int:
+        num_full, num_swa, num_c128 = pages(num_full)
+        return (
+            num_full * page_bytes.full
+            + num_swa * page_bytes.swa
+            + num_c128 * page_bytes.c128
+        )
+
+    if device_full_pages <= 0 or sum(page_bytes) <= 0:
+        raise ValueError(
+            f"Invalid DeepSeek V4 HiCache geometry: {device_full_pages} device "
+            f"FULL pages, {page_bytes}"
+        )
+    if cost(1) > budget_bytes:
+        raise ValueError(
+            f"--hicache-size {budget_bytes / 1e9:.3f} GB cannot hold one DeepSeek V4 "
+            f"host page of every pool ({cost(1)} bytes)"
+        )
+    lo, hi = 1, 2
+    while cost(hi) <= budget_bytes:
+        if hi > budget_bytes:
+            # Only SWA has data and the device has no SWA pages to scale it by.
+            raise ValueError(f"Invalid DeepSeek V4 HiCache geometry: {page_bytes}")
+        lo, hi = hi, 2 * hi
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if cost(mid) <= budget_bytes:
+            lo = mid
+        else:
+            hi = mid
+    # PP stages own different layers: every stage takes the smallest page count.
+    host_pages = pages(sync_fixed_hicache_size(lo, budget_bytes))
+    logger.info(
+        "DeepSeek V4 HiCache --hicache-size %.3f GB per rank: FULL %d, SWA %d, "
+        "C128 %d host pages, %.3f GB of host data.",
+        budget_bytes / 1e9,
+        *host_pages,
+        cost(host_pages[0]) / 1e9,
+    )
+    return host_pages
 
 
 def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int]:
@@ -1002,6 +1137,7 @@ def build_deepseek_v4_hicache_stack(
         kvcache=kvcache,
         page_size=page_size,
         swa_page_size=kvcache.swa_page_size,
+        layer_mappings=layer_mappings,
     )
 
     logical_host_pool = LogicalHostPool(

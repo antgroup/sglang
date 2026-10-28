@@ -256,6 +256,7 @@ class SchedulerPPMixin:
         send_release_work = []
 
         while True:
+            self.disagg_prefill_bootstrap_queue.kv_manager.note_scheduler_tick()
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]

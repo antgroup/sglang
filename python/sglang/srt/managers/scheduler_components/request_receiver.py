@@ -56,6 +56,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def num_dispatched_reqs(recv_reqs: Optional[List]) -> int:
+    """Requests the DP controller counts as sent: each generate / embedding
+    request, a batch by its sub-requests."""
+    num_reqs = 0
+    for req in recv_reqs or ():
+        if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+            num_reqs += 1
+        elif isinstance(
+            req, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+        ):
+            num_reqs += len(req)
+    return num_reqs
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
     recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy, RustServer]
@@ -68,8 +82,13 @@ class SchedulerRequestReceiver:
     max_recv_per_poll: int
     stream_output: Callable[..., None]
     get_last_batch: Callable[[], Any]
+    # PD prefill only: tells decode about a request retired before its handoff.
+    fail_before_handoff: Optional[Callable[[Any, str], None]] = None
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
+    # Told how many dispatched requests arrived, before the EPD receiver can hold
+    # or abort one and before a busy rank skips a health check.
+    count_received_reqs: Optional[Callable[[int], None]] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -99,6 +118,8 @@ class SchedulerRequestReceiver:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs, local_reqs)
+        if self.count_received_reqs is not None:
+            self.count_received_reqs(num_dispatched_reqs(recv_reqs))
 
         if get_parallel().pp_rank == 0:
             self.unwrap_pickle_wrapper(recv_reqs)
@@ -242,6 +263,8 @@ class SchedulerRequestReceiver:
                     status_code = HTTPStatus(int(error_code))
                 prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
+                if self.fail_before_handoff is not None:
+                    self.fail_before_handoff(req, req.finished_reason.message)
         return recv_reqs
 
     def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:

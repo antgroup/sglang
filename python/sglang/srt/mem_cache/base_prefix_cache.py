@@ -70,6 +70,9 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    # Admission only: the request's extend end before page alignment and logprob
+    # caps; internal rematches leave it unset.
+    swa_replay_end: Optional[int] = None
 
 
 @dataclasses.dataclass
@@ -90,6 +93,8 @@ class InsertParams:
     # SWA specific
     prev_prefix_len: int = 0
     swa_branching_seqlen: Optional[int] = None
+    # Absolute interval whose late-layer SWA rows bounded replay computed.
+    swa_replay_range: Optional[tuple[int, int]] = None
 
     # General
     component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
