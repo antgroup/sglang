@@ -236,6 +236,50 @@ def custom_all_reduce(
 
 
 @cache_once
+def get_pull_collective_module(dtype: torch.dtype, world_size: int) -> Module:
+    args = make_cpp_args(dtype, world_size, is_arch_support_pdl())
+    return load_jit(
+        "pull_collective",
+        *args,
+        cuda_files=["distributed/custom_all_reduce.cuh"],
+        cuda_wrappers=[
+            ("reduce_scatter", f"PullCollectiveKernel<{args}>::reduce_scatter"),
+            ("all_gather", f"PullCollectiveKernel<{args}>::all_gather"),
+        ],
+    )
+
+
+@debug_kernel_api
+def custom_reduce_scatter(
+    comm: Communicator,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    graph_params: torch.Tensor | None = None,
+) -> None:
+    """Rank-ordered sum of ``input`` over the ranks, keeping this rank's equal
+    flat shard in ``output``: bitwise the shard ``2shot_pull`` leaves there.
+    ``graph_params`` is the row of peer mappings of ``input`` under CUDA-graph
+    capture; without it ``input`` is staged through the pull workspace."""
+    module = get_pull_collective_module(input.dtype, comm.world_size)
+    module.reduce_scatter(comm, input, output, graph_params)
+
+
+@debug_kernel_api
+def custom_all_gather(
+    comm: Communicator,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    graph_params: torch.Tensor | None = None,
+) -> None:
+    """Every rank's ``input`` concatenated rank-major into ``output`` along the
+    flat axis; ``graph_params`` as in :func:`custom_reduce_scatter`."""
+    module = get_pull_collective_module(input.dtype, comm.world_size)
+    module.all_gather(comm, input, output, graph_params)
+
+
+@cache_once
 def get_fused_parallel_qknorm_module(
     dtype: torch.dtype, world_size: int, q_dim: int, k_dim: int
 ) -> Module:

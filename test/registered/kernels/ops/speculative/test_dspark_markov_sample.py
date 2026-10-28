@@ -6,7 +6,11 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+from sglang.kernels.ops.speculative.dspark.markov_sample import (
+    MarkovSampleStep,
+    argmax_packet_width,
+    sharded_row_argmax,
+)
 from sglang.test.test_utils import CustomTestCase
 
 DEVICE = torch.device("cuda")
@@ -277,6 +281,194 @@ class TestMarkovSampleStep(CustomTestCase):
                 tokens, logits_out = run(rank, lambda _: stacked)
                 self.assertTrue(torch.equal(tokens, full))
                 self.assertTrue(torch.equal(logits_out, full_logits))
+
+    def test_local_sharded_logits_gather_to_full_vocab(self):
+        # Without gather_logits each rank keeps only its slice of the logits and
+        # picks by candidates (the V4.1 SM90 draft graph); the slices gathered
+        # afterwards are the full vocab's logits, and the tokens its tokens.
+        g = torch.Generator(device=DEVICE).manual_seed(3)
+        rows, shard = 32, 5000
+        vocab = 2 * shard - 7
+        base = torch.randn(rows, 3 * shard, generator=g, device=DEVICE)
+        bias = torch.randn(rows, vocab, generator=g, device=DEVICE)
+        temps = torch.rand(rows, generator=g, device=DEVICE)
+        temps[:8] = 0.0
+        full_logits = torch.empty(rows, vocab, device=DEVICE)
+        full = _call(
+            MarkovSampleStep.triton,
+            base=base[:, :vocab].contiguous(),
+            bias=bias,
+            temps=temps,
+            step_dtype=torch.float32,
+            logits_out=full_logits,
+        )
+        for impl in (MarkovSampleStep.triton, MarkovSampleStep.torch):
+            partials = {}
+
+            def run(rank, gather):
+                start = rank * shard
+                logits_out = torch.empty(rows, shard, device=DEVICE)
+                tokens = _call(
+                    impl,
+                    base=base[:, start : start + shard].contiguous(),
+                    bias=bias[:, start : start + shard].contiguous(),
+                    temps=temps,
+                    step_dtype=torch.float32,
+                    vocab_start=start,
+                    gather=gather,
+                    logits_out=logits_out,
+                )
+                return tokens, logits_out
+
+            for rank in range(3):
+                run(rank, lambda p, rank=rank: partials.setdefault(rank, p.clone()))
+            stacked = torch.cat([partials[rank] for rank in range(3)])
+            kept = []
+            for rank in range(3):
+                tokens, logits_out = run(rank, lambda _: stacked)
+                self.assertTrue(torch.equal(tokens, full))
+                kept.append(logits_out)
+            gathered = torch.cat(kept, dim=1)[:, :vocab]
+            self.assertTrue(torch.equal(gathered, full_logits))
+
+
+def _shard(full, *, world, partition):
+    """The padded TP shards of ``full``; NaN padding, which must never win."""
+    rows, vocab = full.shape
+    padded = torch.full(
+        (rows, world * partition), float("nan"), dtype=full.dtype, device=DEVICE
+    )
+    padded[:, :vocab] = full
+    return [s.contiguous() for s in padded.split(partition, dim=1)]
+
+
+def _rank_argmax(shard, *, rank, partition, vocab, gather):
+    start = rank * partition
+    return sharded_row_argmax(
+        shard,
+        valid_width=max(0, min(partition, vocab - start)),
+        vocab_start=start,
+        gather=gather,
+    )
+
+
+def _stacked_packets(shards, *, partition, vocab):
+    """Every rank's packet, stacked in rank order as the group gather does."""
+    packets = []
+
+    def keep(packet):
+        packets.append(packet)
+        return packet
+
+    for rank, shard in enumerate(shards):
+        _rank_argmax(shard, rank=rank, partition=partition, vocab=vocab, gather=keep)
+    stacked = torch.cat(packets)
+    assert stacked.shape[1] == argmax_packet_width(partition)
+    return stacked
+
+
+class TestShardedRowArgmax(CustomTestCase):
+    """Equals torch.argmax over the gathered, cropped FP32 logits on every rank."""
+
+    def _special_rows(self, vocab, partition, g):
+        rows = torch.randn(8, vocab, generator=g, device=DEVICE)
+        boundary = min(partition, vocab - 1)
+        # A tie straddling the first shard boundary goes to the lower id.
+        rows[0, boundary - 1] = rows[0, boundary] = 50.0
+        # A tie across two 4096-column blocks of one shard.
+        rows[1, 4095] = rows[1, 4096] = 60.0
+        # The first NaN wins over larger values and later NaNs.
+        rows[2, 0] = float("inf")
+        rows[2, min(partition + 7, vocab - 2)] = rows[2, vocab - 1] = float("nan")
+        rows[3, :] = -float("inf")
+        rows[4, :] = 0.0
+        # -0 and +0 tie: the lower id wins whatever the sign.
+        rows[5, :] = -float("inf")
+        rows[5, vocab - 1] = 0.0
+        rows[5, vocab - 2] = -0.0
+        rows[6, vocab - 1] = 1e4
+        return rows
+
+    def test_matches_gathered_argmax(self):
+        g = torch.Generator(device=DEVICE).manual_seed(4)
+        # (world, partition, vocab): TP8 at the DeepSeek-V4.1 vocab, a ragged last
+        # shard, an all-padding last shard, and one rank.
+        layouts = [
+            (8, 16160, 129280),
+            (3, 9000, 25000),
+            (3, 5000, 9993),
+            (1, 8197, 8197),
+        ]
+        for world, partition, vocab in layouts:
+            for dtype in (torch.bfloat16, torch.float32):
+                random_rows = torch.randn(40, vocab, generator=g, device=DEVICE) * 4
+                full = torch.cat(
+                    [random_rows, self._special_rows(vocab, partition, g)]
+                ).to(dtype)
+                ref = full.float().argmax(dim=-1)
+                shards = _shard(full, world=world, partition=partition)
+                stacked = _stacked_packets(shards, partition=partition, vocab=vocab)
+                # The NVLink push transport turns every +0 word into -0, index 0 too.
+                pushed = stacked.clone()
+                words = pushed.view(torch.int32)
+                words[words == 0] = torch.iinfo(torch.int32).min
+                for name, gathered in (("ring", stacked), ("push", pushed)):
+                    for rank, shard in enumerate(shards):
+                        with self.subTest(
+                            world=world, vocab=vocab, dtype=dtype, rank=rank, via=name
+                        ):
+                            out = _rank_argmax(
+                                shard,
+                                rank=rank,
+                                partition=partition,
+                                vocab=vocab,
+                                gather=lambda _, gathered=gathered: gathered,
+                            )
+                            self.assertTrue(torch.equal(out, ref))
+
+    def test_graph_replay_matches_gathered_argmax(self):
+        # The verify graph replays one capture over each step's logits.
+        world, partition, vocab, rows = 2, 9000, 17000, 24
+        g = torch.Generator(device=DEVICE).manual_seed(5)
+        local = torch.empty(rows, partition, dtype=torch.bfloat16, device=DEVICE)
+        gathered = torch.empty(
+            world * rows, argmax_packet_width(partition), device=DEVICE
+        )
+
+        def step():
+            return _rank_argmax(
+                local,
+                rank=1,
+                partition=partition,
+                vocab=vocab,
+                gather=lambda _: gathered,
+            )
+
+        step()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = step()
+        for replay in range(3):
+            full = (torch.randn(rows, vocab, generator=g, device=DEVICE) * 4).to(
+                torch.bfloat16
+            )
+            full[replay, partition + replay] = float("nan")
+            shards = _shard(full, world=world, partition=partition)
+            gathered.copy_(_stacked_packets(shards, partition=partition, vocab=vocab))
+            local.copy_(shards[1])
+            graph.replay()
+            self.assertTrue(torch.equal(out, full.float().argmax(dim=-1)))
+
+    def test_zero_rows(self):
+        empty = torch.empty(0, 16160, dtype=torch.bfloat16, device=DEVICE)
+        out = sharded_row_argmax(
+            empty,
+            valid_width=16160,
+            vocab_start=0,
+            gather=lambda _: self.fail("an empty batch gathered"),
+        )
+        self.assertEqual(out.shape, (0,))
+        self.assertEqual(out.dtype, torch.int64)
 
 
 if __name__ == "__main__":

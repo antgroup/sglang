@@ -203,11 +203,12 @@ def _launch_partial(
     has_sampled_rows,
     vocab_start=0,
     select=True,
+    block=_BLOCK,
 ):
     # Returns the [rows, parts * 2] (value, index bits) candidates of each block.
     rows, padded = base_logits.shape
     # The padded width fixes the transport shape on every rank; WIDTH masks padding.
-    parts = triton.cdiv(padded, _BLOCK)
+    parts = triton.cdiv(padded, block)
     assert parts > 0
     partial = torch.empty(
         (rows, parts, 2), device=base_logits.device, dtype=torch.float32
@@ -228,7 +229,7 @@ def _launch_partial(
         parts,
         key,
         step,
-        _BLOCK,
+        block,
         _ROUND_CODE[step_dtype],
         bias is not None,
         store is not None,
@@ -240,10 +241,76 @@ def _launch_partial(
     return partial.view(rows, parts * 2)
 
 
+def _launch_finish(gathered: torch.Tensor, rows: int) -> torch.Tensor:
+    # [world * rows, parts * 2] candidates, rank-major -> [rows] global token ids.
+    parts = gathered.shape[1] // 2
+    world = gathered.shape[0] // rows
+    result = torch.empty(rows, device=gathered.device, dtype=torch.int64)
+    _markov_sample_finish_kernel[(rows,)](
+        gathered,
+        result,
+        rows,
+        parts,
+        world,
+        triton.next_power_of_2(parts * world),
+        num_warps=4,
+    )
+    return result
+
+
+# Larger than _BLOCK to shrink the gathered packet (eight FP32 words per row at
+# TP8, vocab 129280); not re-tuned, greedy rows have no Philox work.
+_ARGMAX_BLOCK = 4096
+
+
+def argmax_packet_width(partition: int) -> int:
+    """FP32 words per row that ``sharded_row_argmax`` hands to its gather."""
+    return 2 * triton.cdiv(partition, _ARGMAX_BLOCK)
+
+
+def sharded_row_argmax(
+    logits: torch.Tensor,
+    *,
+    valid_width: int,
+    vocab_start: int,
+    gather: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """``all_gather(dim=-1)[:, :vocab].float().argmax(-1)`` of vocab-parallel
+    logits: the lowest index among equal maxima, the lowest NaN if a row has one.
+
+    ``logits`` is this rank's ``[rows, partition]`` slice; its first ``valid_width``
+    columns are the global ids from ``vocab_start``. ``gather`` stacks every rank's
+    ``[rows, argmax_packet_width(partition)]`` packet in group order."""
+    assert logits.ndim == 2 and logits.stride(1) == 1 and logits.is_cuda
+    assert logits.dtype in _ROUND_CODE, logits.dtype
+    rows, partition = logits.shape
+    assert 0 <= valid_width <= partition
+    assert 0 <= vocab_start < _NO_INDEX.value - partition
+    if rows == 0:
+        return torch.empty(0, device=logits.device, dtype=torch.int64)
+    partial = _launch_partial(
+        logits,
+        None,
+        width=valid_width,
+        store=None,
+        # Typed for the compiled noise branch, which greedy rows never run.
+        temperatures=torch.empty(1, device=logits.device, dtype=torch.float32),
+        key=0,
+        offset=torch.empty(1, device=logits.device, dtype=torch.int64),
+        step=0,
+        step_dtype=torch.float32,
+        has_sampled_rows=False,
+        vocab_start=vocab_start,
+        block=_ARGMAX_BLOCK,
+    )
+    return _launch_finish(gather(partial), rows)
+
+
 class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
     the rank's padded shard ``base_logits``. Sharded, ``gather`` exchanges
-    per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole.
+    per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole;
+    without ``gather_logits`` the kept ``logits_out`` is the rank's slice.
     ``has_sampled_rows=False`` argmaxes every row."""
 
     @classmethod
@@ -276,10 +343,9 @@ class MarkovSampleStep:
         assert vocab_start % 4 == 0, vocab_start
         if logits_out is not None:
             assert logits_out.dtype == step_dtype and logits_out.stride(1) == 1
-            if gather is None:
+            if gather is None or gather_logits is None:
                 assert logits_out.shape == base_logits.shape
             else:
-                assert gather_logits is not None
                 assert logits_out.shape[0] == base_logits.shape[0]
 
     @classmethod
@@ -320,7 +386,7 @@ class MarkovSampleStep:
             step_dtype=step_dtype,
             has_sampled_rows=has_sampled_rows,
         )
-        if gather is not None and logits_out is not None:
+        if gather is not None and gather_logits is not None and logits_out is not None:
             local = torch.empty(
                 base_logits.shape, device=base_logits.device, dtype=step_dtype
             )
@@ -336,19 +402,7 @@ class MarkovSampleStep:
                 vocab_start=vocab_start,
             )
             gathered = partial if gather is None else gather(partial)
-        parts = gathered.shape[1] // 2
-        world = gathered.shape[0] // rows
-        result = torch.empty(rows, device=base_logits.device, dtype=torch.int64)
-        _markov_sample_finish_kernel[(rows,)](
-            gathered,
-            result,
-            rows,
-            parts,
-            world,
-            triton.next_power_of_2(parts * world),
-            num_warps=4,
-        )
-        return result
+        return _launch_finish(gathered, rows)
 
     @classmethod
     def torch(
@@ -384,7 +438,7 @@ class MarkovSampleStep:
         value = base_logits.to(torch.float32, copy=True)
         value[:, :width] += bias.float()
         value = value.to(step_dtype).float()
-        if gather is not None and logits_out is not None:
+        if gather is not None and gather_logits is not None and logits_out is not None:
             full = gather_logits(value.to(step_dtype))[:, : logits_out.shape[1]]
             return cls.torch(
                 base_logits=full,

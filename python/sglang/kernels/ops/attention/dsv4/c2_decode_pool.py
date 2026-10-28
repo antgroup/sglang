@@ -1,5 +1,6 @@
-"""Fused ratio-2 decode pair-pooling, bitwise identical to the torch pool_pairs
-path; a rounding difference here can change the indexer's top-k selection."""
+"""Fused ratio-2 decode / target-verify pair-pooling, bitwise identical to the
+torch pool_pairs path; a rounding difference here can change the indexer's
+top-k selection."""
 
 from typing import Tuple
 
@@ -28,6 +29,7 @@ def _c2_decode_pool_kernel(
     STATE_SCORE_STRIDE: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    IN_BATCH_PREDECESSOR: tl.constexpr = False,
 ):
     row = tl.program_id(0)
 
@@ -53,13 +55,46 @@ def _c2_decode_pool_kernel(
 
     kv = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
     score = tl.load(score_ptr + row * D + offs, mask=mask, other=0.0)
-    p_kv = tl.load(state_kv_ptr + r * STATE_KV_STRIDE + offs, mask=mask, other=0.0)
-    p_score = tl.load(
-        state_score_ptr + r * STATE_SCORE_STRIDE + offs, mask=mask, other=0.0
-    )
+    if IN_BATCH_PREDECESSOR:
+        # A verify row whose predecessor is the previous row of the same request
+        # reads its projection, not the ring slot another program is writing.
+        prev_req = tl.load(req_ptr + row - 1, mask=row > 0, other=-1)
+        prev_pos = tl.load(pos_ptr + row - 1, mask=row > 0, other=-2)
+        prev_raw_loc = tl.load(raw_out_loc_ptr + row - 1, mask=row > 0, other=0)
+        in_batch = (
+            (row > 0)
+            & (req == prev_req)
+            & (pos == prev_pos + 1)
+            & (raw_loc != 0)
+            & (prev_raw_loc != 0)
+        )
+        p_kv = tl.load(
+            state_kv_ptr + r * STATE_KV_STRIDE + offs,
+            mask=mask & ~in_batch,
+            other=0.0,
+        )
+        p_score = tl.load(
+            state_score_ptr + r * STATE_SCORE_STRIDE + offs,
+            mask=mask & ~in_batch,
+            other=0.0,
+        )
+        batch_p_kv = tl.load(
+            kv_ptr + (row - 1) * D + offs, mask=mask & in_batch, other=0.0
+        )
+        batch_p_score = tl.load(
+            score_ptr + (row - 1) * D + offs, mask=mask & in_batch, other=0.0
+        )
+        p_kv = tl.where(in_batch, batch_p_kv, p_kv)
+        p_score = tl.where(in_batch, batch_p_score, p_score)
+    else:
+        p_kv = tl.load(state_kv_ptr + r * STATE_KV_STRIDE + offs, mask=mask, other=0.0)
+        p_score = tl.load(
+            state_score_ptr + r * STATE_SCORE_STRIDE + offs, mask=mask, other=0.0
+        )
 
     if RING_SIZE:
-        # Each live request has one decode row. Pad rows never modify the ring.
+        # Decode has one row per request; verify rows write consecutive, distinct
+        # ring positions. Pad rows never modify the ring.
         write_row = req * RING_SIZE + pos % RING_SIZE
         tl.store(
             state_kv_ptr + write_row * STATE_KV_STRIDE + offs,
@@ -114,13 +149,18 @@ def c2_decode_pool(
     pad_row: int,
     *,
     ring_size: int = 0,
+    in_batch_predecessor: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Ratio-2 decode pair pooling; updates `state_kv` / `state_score` in place.
 
     With ring_size > 0 the state halves may be views of an interleaved
     CompressStatePool ring, one row per request otherwise; pad_row is the
-    padded-graph-row sentinel and is never written.
+    padded-graph-row sentinel and is never written. in_batch_predecessor
+    (target verify, ring only) takes several rows per request, consecutive in
+    row order and position and fewer than ring_size, so the carried
+    predecessor of a request's first row stays readable.
     """
+    assert ring_size > 0 or not in_batch_predecessor
     assert kv.is_contiguous() and score.is_contiguous()
     assert state_kv.stride(1) == state_score.stride(1) == 1
     assert kv.dtype == torch.float32 and score.dtype == torch.float32
@@ -128,6 +168,8 @@ def c2_decode_pool(
     pooled = torch.empty_like(kv)
     group_pos = torch.empty_like(pos)
     slots = torch.empty(n, dtype=out_loc.dtype, device=out_loc.device)
+    if n == 0:
+        return pooled, group_pos, slots
     _c2_decode_pool_kernel[(n,)](
         kv,
         score,
@@ -146,6 +188,7 @@ def c2_decode_pool(
         STATE_SCORE_STRIDE=state_score.stride(0),
         D=D,
         BLOCK_D=triton.next_power_of_2(D),
+        IN_BATCH_PREDECESSOR=in_batch_predecessor,
         num_warps=4,
     )
     return pooled, group_pos, slots

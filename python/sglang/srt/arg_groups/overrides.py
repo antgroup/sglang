@@ -951,6 +951,23 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
 )
 
 
+def _dsv41_sm90_mix_decode(view: Any, model_config: Any) -> bool:
+    """dsv41_sm90 "mix_decode": the TP decode all-reduces stay on custom all-reduce
+    v2, whose rank-order sum the TP-SP reduce-scatter reproduces; on 8x H20
+    (TP8 + prefill CP8) its multicast decode all-reduce is ~22 us where FlashInfer's
+    two-shot takes ~63 us (c64 verify, 384 x 5120 bf16)."""
+    from sglang.srt.layers.dsv41_sm90 import resolve_dsv41_sm90_from_env
+
+    if view.disable_custom_all_reduce:
+        return False
+    selection = resolve_dsv41_sm90_from_env(
+        model_config=model_config,
+        disaggregation_mode=view.disaggregation_mode,
+        encoder_only=view.encoder_only,
+    )
+    return "mix_decode" in selection.subsystems and selection.role == "mix"
+
+
 @register_post_process
 def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     """Enable supported FlashInfer AllReduce fusion after CP and A2A resolution.
@@ -983,7 +1000,7 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         and view.tp_size == 4
         and view.nnodes == 1
         and not view.disable_custom_all_reduce
-    )
+    ) or _dsv41_sm90_mix_decode(view, model_config)
     if (
         view.flashinfer_allreduce_fusion_backend is None
         and (is_mimo or model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS)

@@ -83,6 +83,41 @@ class TestHostTableStartup(CustomTestCase):
                 self.assertEqual(events, expected)
 
 
+class TestHostTableSortedReads(CustomTestCase):
+    def _sort_ids_of_lookup(self, *, switch_on: bool, ids: int) -> bool:
+        parallel = SimpleNamespace(tp_size=8, tp_rank=0, tp_group=None)
+        with (
+            patch.object(engram, "get_parallel", return_value=parallel),
+            patch.object(engram, "dsv41_sm90_on", return_value=switch_on),
+        ):
+            embedding = engram.EngramEmbedding(64, 128, 0, column_bounds=(0, 64))
+        # A per-rank host shard on a GPU without host page tables.
+        embedding.host_table = SimpleNamespace(layout="per_rank")
+        embedding._host_table_ptrs = (0, 0)
+        embedding._sort_host_reads = True
+        calls = []
+        with (
+            patch.object(engram, "_cuda_kernels", return_value=True),
+            patch.object(
+                engram,
+                "engram_gather",
+                side_effect=lambda *a, sort_ids, **k: calls.append(sort_ids),
+            ),
+        ):
+            embedding._owned_rows(torch.zeros(ids, dtype=torch.int64))
+        return calls[0]
+
+    def test_decode_lookups_read_unsorted_under_the_switch(self):
+        """The address-order sort of a host-table lookup only pays back from about
+        147K ids (H20-3e): a decode / verify lookup (24 ids per token) must skip it
+        under the switch, a 16K-token prefill chunk must keep it, and off the
+        upstream sort stays at every size."""
+        decode, prefill_chunk = 64 * 6 * 24, 16384 * 24
+        self.assertFalse(self._sort_ids_of_lookup(switch_on=True, ids=decode))
+        self.assertTrue(self._sort_ids_of_lookup(switch_on=True, ids=prefill_chunk))
+        self.assertTrue(self._sort_ids_of_lookup(switch_on=False, ids=decode))
+
+
 class TestHostTableModuleConversion(CustomTestCase):
     def _embedding(self, host: bool):
         embedding = engram.EngramEmbedding.__new__(engram.EngramEmbedding)

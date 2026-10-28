@@ -1,12 +1,17 @@
 """CPU unit tests for the DeepSeek-V4.1 SM90 optimization switch."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from sglang.srt.arg_groups.overrides import _dsv41_sm90_mix_decode
+from sglang.srt.environ import envs
 from sglang.srt.layers.dsv41_sm90 import (
     SUBSYSTEMS,
     dsv41_sm90_lossy,
     dsv41_sm90_on,
     resolve_dsv41_sm90,
+    resolve_dsv41_sm90_from_env,
 )
 from sglang.srt.runtime_context import get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -59,6 +64,19 @@ class TestResolveDsv41Sm90(CustomTestCase):
         """Unused optimization lists must not make a switch-off startup fail."""
         selection = _resolve(enabled=False, disable=("mch",), lossy=("mhc",))
         self.assertEqual(selection, _resolve(enabled=False))
+        with (
+            envs.SGLANG_OPT_DSV41_SM90.override(False),
+            envs.SGLANG_OPT_DSV41_SM90_DISABLE.override("mch"),
+            envs.SGLANG_OPT_DSV41_SM90_LOSSY.override("mhc"),
+        ):
+            self.assertEqual(
+                resolve_dsv41_sm90_from_env(
+                    model_config=None,
+                    disaggregation_mode="null",
+                    encoder_only=False,
+                ),
+                selection,
+            )
 
     def test_unknown_names_fail_when_on(self):
         with self.assertRaisesRegex(ValueError, "SGLANG_OPT_DSV41_SM90_DISABLE"):
@@ -74,6 +92,39 @@ class TestResolveDsv41Sm90(CustomTestCase):
         ):
             selection = _resolve(disaggregation_mode=mode, encoder_only=encoder_only)
             self.assertEqual(selection.role, role)
+
+
+class TestMixDecodeKeepsCustomAllReduce(unittest.TestCase):
+    """Server-arg resolution asks the switch envs before any worker has the flags:
+    only an on switch for V4.1 on SM90, mix role, mix_decode kept, may stop the
+    FlashInfer all-reduce auto-enable."""
+
+    def _ask(self, *, on=True, model_type="deepseek_v41", disable=(), **view):
+        args = dict(
+            disaggregation_mode="null",
+            encoder_only=False,
+            disable_custom_all_reduce=False,
+        )
+        args.update(view)
+        model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
+        with (
+            envs.SGLANG_OPT_DSV41_SM90.override(on),
+            envs.SGLANG_OPT_DSV41_SM90_DISABLE.override(",".join(disable)),
+            patch("sglang.srt.layers.dsv41_sm90.is_sm90_supported", return_value=True),
+        ):
+            return _dsv41_sm90_mix_decode(SimpleNamespace(**args), model_config)
+
+    def test_only_the_mix_decode_selection_keeps_it(self):
+        self.assertTrue(self._ask())
+        for kwargs in (
+            dict(on=False),
+            dict(model_type="deepseek_v4"),
+            dict(disable=("mix_decode",)),
+            dict(disaggregation_mode="decode"),
+            dict(encoder_only=True),
+            dict(disable_custom_all_reduce=True),
+        ):
+            self.assertFalse(self._ask(**kwargs), kwargs)
 
 
 class TestDsv41Sm90Accessors(unittest.TestCase):

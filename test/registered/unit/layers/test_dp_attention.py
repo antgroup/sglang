@@ -5,9 +5,13 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+    CustomAllReduceV2,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     _DpGatheredBufferWrapper,
+    _nvlink_dp_comm,
     get_dp_global_num_tokens,
     get_global_dp_buffer_len,
     get_local_dp_buffer_len,
@@ -98,6 +102,40 @@ class TestSetDpBufferLenFromBatch(unittest.TestCase):
         ):
             set_dp_buffer_len_from_batch(batch)
         self.assertEqual(get_local_dp_buffer_len(), 0)
+
+
+class TestNvlinkDpComm(unittest.TestCase):
+    """The DP MoE gather / combine leave NCCL only on the DeepSeek-V4.1 decode
+    role under the switch, with attention DP spanning the whole TP group."""
+
+    def setUp(self):
+        self.comm = CustomAllReduceV2.__new__(CustomAllReduceV2)
+        self.comm.disabled = False
+
+    def _comm(self, *, subsystems=frozenset({"decode"}), role="decode", **parallel):
+        parallel = dict(tp_group=SimpleNamespace(ca_comm=self.comm), **parallel)
+        parallel.setdefault("tp_size", 8)
+        parallel.setdefault("attn_dp_size", 8)
+        with (
+            get_flags().dsv41_sm90.override(subsystems=subsystems, role=role),
+            get_parallel().override(**parallel),
+        ):
+            return _nvlink_dp_comm()
+
+    def test_decode_role_takes_the_tp_groups_custom_all_reduce(self):
+        self.assertIs(self._comm(), self.comm)
+
+    def test_every_other_case_keeps_the_nccl_path(self):
+        self.assertIsNone(self._comm(subsystems=frozenset(), role=""))
+        self.assertIsNone(self._comm(role="mix"))
+        self.assertIsNone(self._comm(role="prefill"))
+        self.assertIsNone(self._comm(subsystems=frozenset({"moe", "fp8_gemm"})))
+        # A partial attention-DP group has no equal per-rank shards of the buffer.
+        self.assertIsNone(self._comm(attn_dp_size=4))
+        self.comm.disabled = True
+        self.assertIsNone(self._comm())
+        self.comm = object()
+        self.assertIsNone(self._comm())
 
 
 if __name__ == "__main__":

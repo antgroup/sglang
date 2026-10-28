@@ -9,6 +9,8 @@ from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -161,6 +163,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     _sampling_accept_graph = None
     _rejection_noise = None
+    _target_logits_processor = None
     _sim_draw_ahead = False
     num_sim_draws_ahead = 0
     _prepare_inputs_once = False
@@ -488,6 +491,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 f"{self._simulate_acc_len}."
             )
 
+        self._target_logits_processor = self._maybe_defer_verify_gather()
         self._verify_executor = TargetVerifyExecutor(
             target_worker=self.target_worker,
             gamma=self.gamma,
@@ -500,6 +504,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulated_correct_len=self._simulated_correct_len,
             block_verification=get_spec().speculative_use_block_verification,
             rejection_noise=self._rejection_noise,
+            target_logits_processor=self._target_logits_processor,
         )
 
         self._forced_budget_frac: Optional[float] = None
@@ -516,6 +521,35 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+    def _maybe_defer_verify_gather(self) -> Optional[LogitsProcessor]:
+        """dsv41_sm90 decode: static target-verify logits stay vocab shards, the
+        folded greedy accept argmaxes them in-graph and other steps gather them.
+        Runs before the target graphs are captured; None keeps the full gather."""
+        epilogue = self._verify_epilogue
+        if (
+            not dsv41_sm90_on("decode")
+            or epilogue is None
+            or self._verify_planner.mode_value != "static"
+            # Both read the full logits inside a graph.
+            or epilogue.simulate_fold
+            or self._sampling_accept_graph is not None
+            # Both argmax the logits of folded steps on the host.
+            or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
+            or envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
+        ):
+            return None
+        target_model = self.model_runner.model
+        processor = target_model.logits_processor
+        if not processor.defer_plain_verify_gather(
+            unwrap_lora_layer(target_model.lm_head),
+            prefer_nvlink=envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
+        ):
+            return None
+        epilogue.vocab_shard_argmax = processor.deferred_argmax
+        if get_parallel().tp_rank == 0:
+            logger.info("DSpark verify: vocab-sharded greedy accept in the graph.")
+        return processor
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -1175,6 +1209,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
+                    # Only the folded greedy accept reads no full logits.
+                    keep_vocab_shard=fold_eligible and not batch.return_logprob,
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
@@ -1198,6 +1234,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             and can_run_cuda_graph
             and (run_compact or self._verify_planner.mode_value == "static")
         )
+        if (
+            self._target_logits_processor is not None
+            and logits_output.next_token_logits is None
+            and not folded_accept
+        ):
+            raise RuntimeError(
+                "DSpark verify dropped the vocab-shard logits of an unfolded accept."
+            )
         region_accept = None
         if (
             not folded_accept

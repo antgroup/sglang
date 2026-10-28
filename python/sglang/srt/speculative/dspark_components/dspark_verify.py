@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import Optional
+from typing import Callable, Optional
 
 import msgspec
 import torch
@@ -36,7 +36,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
 )
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import (
     FutureRelayBuffers,
     offer_future_relay_buffers,
@@ -137,6 +137,8 @@ def candidate_request_length_bound(
 
 class TargetVerifyExecutor:
     _rejection_noise = None
+    # Set when the target defers its verify gather (defer_plain_verify_gather).
+    _target_logits_processor: Optional[LogitsProcessor] = None
 
     def __init__(
         self,
@@ -152,8 +154,10 @@ class TargetVerifyExecutor:
         simulated_correct_len: Optional[torch.Tensor] = None,
         block_verification: bool = False,
         rejection_noise: Optional[RejectionNoise] = None,
+        target_logits_processor: Optional[LogitsProcessor] = None,
     ) -> None:
         self.target_worker = target_worker
+        self._target_logits_processor = target_logits_processor
         # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
         self._target_is_dsv41 = target_model_type(target_worker) == "deepseek_v41"
         self._fused_argmax = target_uses_fused_argmax(target_worker)
@@ -304,6 +308,7 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        keep_vocab_shard: bool = False,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -336,6 +341,8 @@ class TargetVerifyExecutor:
             seq_lens_sum_backup=seq_lens_sum_backup,
         )
 
+        if self._drop_or_gather_vocab_shard(result, keep=keep_vocab_shard):
+            return result
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
@@ -344,6 +351,25 @@ class TargetVerifyExecutor:
             )
 
         return result
+
+    def _drop_or_gather_vocab_shard(
+        self, result: TargetVerifyResult, *, keep: bool
+    ) -> bool:
+        """Gathers deferred vocab-shard logits into the full ones; returns True,
+        dropping them instead, when a replay's folded accept was their only reader."""
+        processor = self._target_logits_processor
+        logits_output = result.logits_output
+        if processor is None or not processor.is_deferred_shard(
+            logits_output.next_token_logits
+        ):
+            return False
+        if keep and result.can_run_cuda_graph:
+            logits_output.next_token_logits = None
+            return True
+        logits_output.next_token_logits = processor.finish_deferred_gather(
+            logits_output.next_token_logits
+        )
+        return False
 
     def _forward_prepared_verify(
         self,
@@ -578,6 +604,10 @@ class StaticVerifyIO(msgspec.Struct, frozen=True):
 
 
 class DsparkVerifyEpilogue:
+    # Set before capture when the target defers its verify gather: the logits
+    # here are vocab shards, argmaxed by the target's deferred_argmax.
+    vocab_shard_argmax: Optional[Callable] = None
+
     def __init__(
         self,
         *,
@@ -867,7 +897,11 @@ class DsparkVerifyEpilogue:
         bs = candidates.shape[0]
         target_predict = bonus_in = bonus_parts = None
         if not self.simulate_fold:
-            target_predict = _row_argmax(logits, fused=self._fused_argmax).view(-1)
+            target_predict = (
+                _row_argmax(logits, fused=self._fused_argmax)
+                if self.vocab_shard_argmax is None
+                else self.vocab_shard_argmax(logits)
+            ).view(-1)
         elif self._tail_broadcasts:
             bonus_in = self._sim_bonus(logits, bs)
             # Rank 0's length and draw, as build_accept_outs broadcasts them.
@@ -1076,6 +1110,7 @@ class DsparkVerifyEpilogue:
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=self._fused_argmax,
+            row_argmax=self.vocab_shard_argmax,
         )
         if self.simulate_fold:
             # Before the TP broadcast in build_accept_outs: every rank commits rank 0's draw.

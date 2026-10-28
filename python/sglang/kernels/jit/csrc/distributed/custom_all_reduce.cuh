@@ -11,6 +11,11 @@
 //   - 2shot_pull: reduce-scatter fused with all-gather; each rank reduces its
 //     shard in place so every workspace ends up holding the full result.
 //
+// `PullCollectiveKernel` splits 2shot_pull into its halves over the same pull
+// data sources: a reduce-scatter that reduces this rank's shard exactly as
+// 2shot_pull does (same loads, same rank-ordered sum) but keeps it local, and
+// an all-gather that copies every rank's input into a local output.
+//
 // Unlike the previous implementation, the kernels carry no storage or IPC
 // logic: all pointers arrive via the communication planes (owned by Python)
 // and the per-call params. The push and pull families take disjoint params,
@@ -104,6 +109,13 @@ struct LoadStoreImpl {
 #pragma unroll
     for (uint32_t i = 0; i < kWorldSize; ++i) {
       val.store(m_data[i], vid);
+    }
+  }
+
+  SGL_DEVICE void load_all(V (&vecs)[kWorldSize], uint32_t vid) const {
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      vecs[i].load(m_data[i], vid);
     }
   }
 
@@ -382,6 +394,77 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
   barrier.arrive_rel_acq(/*n=*/1);
 }
 
+/// `num_vecs` counts the whole input; this rank reduces the shard 2shot_pull
+/// gives it, with the same loads and sum order, into a shard-sized output.
+template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
+ALL_REDUCE_KERNEL void reduce_scatter_pull_kernel(const __grid_constant__ AllReducePullParams<kWorldSize> params) {
+  using namespace device;
+  constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
+  using vec_t = AlignedVector<packed_t<T>, kVecSize>;
+  const auto num_total_vecs = params.num_vecs;
+  const auto avg_vecs = num_total_vecs / kWorldSize;
+  const auto rem_vecs = num_total_vecs % kWorldSize;
+  const auto num_vecs = avg_vecs + (params.rank < rem_vecs ? 1 : 0);
+  const auto vec_offset = params.rank * avg_vecs + min(params.rank, rem_vecs);
+  const auto impl = Impl{params, vec_offset};
+  PDLWaitPrimary<kUsePDL>();
+  const auto barrier = distributed::Barrier<kWorldSize>{
+      params.ws.semaphores.data(),
+      params.rank,
+      /*num_arrives=*/2,
+  };
+  barrier.arrive_relaxed(/*n=*/0);
+  __syncthreads();
+
+  const auto num_threads = blockDim.x * gridDim.x;
+  const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
+    vec_t vec;
+    impl.load_reduce(vec, vid);
+    vec.store(params.output, vid);
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+  __syncthreads();
+  // Only local stores: the second phase just keeps peers from overwriting
+  // their input while this rank still loads it.
+  barrier.arrive_relaxed(/*n=*/1);
+}
+
+/// `num_vecs` counts one rank's input; the output holds every rank's input,
+/// rank-major.
+template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
+ALL_REDUCE_KERNEL void all_gather_pull_kernel(const __grid_constant__ AllReducePullParams<kWorldSize> params) {
+  using namespace device;
+  constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
+  using vec_t = AlignedVector<packed_t<T>, kVecSize>;
+  const auto num_vecs = params.num_vecs;
+  const auto impl = Impl{params};
+  PDLWaitPrimary<kUsePDL>();
+  const auto barrier = distributed::Barrier<kWorldSize>{
+      params.ws.semaphores.data(),
+      params.rank,
+      /*num_arrives=*/2,
+  };
+  barrier.arrive_relaxed(/*n=*/0);
+  __syncthreads();
+
+  const auto num_threads = blockDim.x * gridDim.x;
+  const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
+    vec_t vecs[kWorldSize];
+    impl.load_all(vecs, vid);
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      vecs[i].store(params.output, i * num_vecs + vid);
+    }
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+  __syncthreads();
+  barrier.arrive_relaxed(/*n=*/1);
+}
+
 template <uint32_t N>
 __global__ void memcpy_kernel(void* __restrict__ dst, const void* __restrict__ src, uint32_t num_vecs) {
   static_assert(N % 4 == 0, "at least 4-bytes aligned for uint32_t load/store");
@@ -394,6 +477,26 @@ __global__ void memcpy_kernel(void* __restrict__ dst, const void* __restrict__ s
     vec.load(src, tid);
     vec.store(dst, tid);
   }
+}
+
+/// Device-to-device copy that stages a plain tensor through a pull workspace.
+template <bool kUsePDL>
+inline void stage_memcpy(void* dst, const void* src, int64_t nbytes, cudaStream_t stream) {
+  using namespace host;
+  if constexpr (SGL_ARCH_HOPPER_OR_GREATER) {  // PDL memcpy is faster
+    // based on micro benchmark, only enable when batch size is small + aligned
+    constexpr int64_t threshold_MB = SGL_ARCH_BLACKWELL_OR_GREATER ? 1024 : 8;
+    if (nbytes % device::kMaxVecBytes == 0 && nbytes <= threshold_MB * 1024 * 1024) {
+      const auto copy_kernel = memcpy_kernel<device::kMaxVecBytes>;
+      const uint32_t num_copy_vecs = nbytes / device::kMaxVecBytes;
+      const uint32_t num_copy_threads = 128u;
+      const uint32_t num_copy_blocks = div_ceil(num_copy_vecs, num_copy_threads);
+      LaunchKernel(num_copy_blocks, num_copy_threads, stream).enable_pdl(kUsePDL)(copy_kernel, dst, src, num_copy_vecs);
+      return;
+    }
+  }
+  // safe fallback to cudaMemcpyAsync for large size or older architecture
+  CHECK_CUDA(cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDeviceToDevice, stream));
 }
 
 inline auto choose_block_size(uint32_t num_threads) -> uint32_t {
@@ -481,23 +584,7 @@ struct AllReduceKernel {
     const auto& ws = params.ws;
     CHECK_HOST(!use_multicast || ws.mc_workspace != nullptr) << "multicast needs a plane with an mc workspace";
 
-    const auto cuda_memcpy = [&](void* dst, const void* src) {
-      if constexpr (SGL_ARCH_HOPPER_OR_GREATER) {  // PDL memcpy is faster
-        // based on micro benchmark, only enable when batch size is small + aligned
-        constexpr int64_t threshold_MB = SGL_ARCH_BLACKWELL_OR_GREATER ? 1024 : 8;
-        if (nbytes % device::kMaxVecBytes == 0 && nbytes <= threshold_MB * 1024 * 1024) {
-          const auto copy_kernel = memcpy_kernel<device::kMaxVecBytes>;
-          const uint32_t num_copy_vecs = nbytes / device::kMaxVecBytes;
-          const uint32_t num_copy_threads = 128u;
-          const uint32_t num_copy_blocks = div_ceil(num_copy_vecs, num_copy_threads);
-          LaunchKernel(num_copy_blocks, num_copy_threads, stream)
-              .enable_pdl(kUsePDL)(copy_kernel, dst, src, num_copy_vecs);
-          return;
-        }
-      }
-      // safe fallback to cudaMemcpyAsync for large size or older architecture
-      CHECK_CUDA(cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDeviceToDevice, stream));
-    };
+    const auto cuda_memcpy = [&](void* dst, const void* src) { stage_memcpy<kUsePDL>(dst, src, nbytes, stream); };
     const uint32_t num_blocks = comm.get_pull_blocks();
     const auto local_workspace = ws.workspaces[pull.rank];
 
@@ -538,6 +625,109 @@ struct AllReduceKernel {
       if (!use_graph) cuda_memcpy(out.data_ptr(), local_workspace);
     }
     return out;
+  }
+};
+
+template <typename T, uint32_t kWorldSize, bool kUsePDL>
+struct PullCollectiveKernel {
+ private:
+  using TensorView = tvm::ffi::TensorView;
+  using PullParams = AllReducePullParams<kWorldSize>;
+  using vec_t = device::AlignedVector<packed_t<T>, 16 / (sizeof(T) * 2)>;
+  using LS = LoadStoreImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;
+  using LS_GRAPH = LoadStoreImpl<vec_t, kWorldSize, /*kUseGraph=*/true>;
+
+  /// Bytes of a contiguous CUDA tensor of `T`, 16-byte aligned in size and address.
+  static int64_t check_tensor(const TensorView t) {
+    using namespace host;
+    CHECK_HOST(t.IsContiguous() && is_type<T>(t.dtype()) && t.device().device_type == kDLCUDA);
+    const auto nbytes = static_cast<int64_t>(t.numel() * sizeof(T));
+    CHECK_HOST(reinterpret_cast<intptr_t>(t.data_ptr()) % 16 == 0 && nbytes % 16 == 0) << nbytes;
+    CHECK_HOST(nbytes / 16 < (int64_t{1} << 31)) << nbytes;
+    return nbytes;
+  }
+
+  /// `in` is staged through this rank's pull workspace unless `graph_params`
+  /// holds the peers' mappings of `in` itself.
+  template <typename KernelLS, typename KernelGraph>
+  static void launch(
+      KernelLS kernel_ls,
+      KernelGraph kernel_graph,
+      const host::distributed::CommunicatorObj& comm,
+      const TensorView in,
+      const TensorView out,
+      const tvm::ffi::Optional<TensorView>& graph_params_opt,
+      uint32_t num_vecs,
+      uint32_t work_vecs) {
+    using namespace host;
+    CHECK_HOST(comm.get_world_size() == kWorldSize) << comm.get_world_size();
+    const auto& pull = comm.get_pull_obj();
+    const auto in_bytes = static_cast<int64_t>(in.numel() * sizeof(T));
+    const auto use_graph = graph_params_opt.has_value();
+    const auto stream = LaunchKernel::resolve_device(in.device());
+    const auto params = PullParams{
+        .output = out.data_ptr(),
+        .num_vecs = num_vecs,
+        .rank = pull.rank,
+        .graph_params = use_graph ? static_cast<void* const*>(graph_params_opt.value().data_ptr()) : nullptr,
+        .ws = pull.get_workspace<kWorldSize>(use_graph ? 0 : in_bytes),
+    };
+    if (!use_graph) stage_memcpy<kUsePDL>(params.ws.workspaces[pull.rank], in.data_ptr(), in_bytes, stream);
+    LaunchKernel(comm.get_pull_blocks(), choose_block_size(work_vecs), stream)  //
+        .enable_pdl(kUsePDL)(use_graph ? kernel_graph : kernel_ls, params);
+  }
+
+ public:
+  /// \brief Sum `in` over the ranks and keep this rank's equal shard.
+  /// \param in `[world_size * n]` elements, the same shape on every rank.
+  /// \param out `[n]` elements: the shard 2shot_pull gives this rank, bitwise.
+  /// \param graph_params Peer mappings of `in` (CUDA-graph mode), or none to
+  ///        stage `in` through the pull workspace.
+  static void reduce_scatter(
+      const CommunicatorRef comm,
+      const TensorView in,
+      const TensorView out,
+      const tvm::ffi::Optional<TensorView> graph_params) {
+    using namespace host;
+    const auto in_bytes = check_tensor(in);
+    const auto out_bytes = check_tensor(out);
+    CHECK_HOST(in_bytes == out_bytes * kWorldSize) << in_bytes << " vs " << out_bytes << " x " << kWorldSize;
+    const auto num_vecs = static_cast<uint32_t>(in_bytes / 16);
+    launch(
+        reduce_scatter_pull_kernel<LS, T, kWorldSize, kUsePDL>,
+        reduce_scatter_pull_kernel<LS_GRAPH, T, kWorldSize, kUsePDL>,
+        *comm.get(),
+        in,
+        out,
+        graph_params,
+        num_vecs,
+        num_vecs / kWorldSize);
+  }
+
+  /// \brief Concatenate every rank's `in` along the flat axis, rank-major.
+  /// \param in `[n]` elements, the same shape on every rank.
+  /// \param out `[world_size * n]` elements.
+  /// \param graph_params Peer mappings of `in` (CUDA-graph mode), or none to
+  ///        stage `in` through the pull workspace.
+  static void all_gather(
+      const CommunicatorRef comm,
+      const TensorView in,
+      const TensorView out,
+      const tvm::ffi::Optional<TensorView> graph_params) {
+    using namespace host;
+    const auto in_bytes = check_tensor(in);
+    const auto out_bytes = check_tensor(out);
+    CHECK_HOST(out_bytes == in_bytes * kWorldSize) << out_bytes << " vs " << in_bytes << " x " << kWorldSize;
+    const auto num_vecs = static_cast<uint32_t>(in_bytes / 16);
+    launch(
+        all_gather_pull_kernel<LS, T, kWorldSize, kUsePDL>,
+        all_gather_pull_kernel<LS_GRAPH, T, kWorldSize, kUsePDL>,
+        *comm.get(),
+        in,
+        out,
+        graph_params,
+        num_vecs,
+        num_vecs);
   }
 };
 

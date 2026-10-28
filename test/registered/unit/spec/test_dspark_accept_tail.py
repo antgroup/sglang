@@ -4,13 +4,19 @@ from types import SimpleNamespace
 import msgspec
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    TargetVerifyResult,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -205,6 +211,186 @@ class TestFusedStaticAcceptTail(CustomTestCase):
         self.assertEqual(
             [site for site, _ in sync.calls], [SpecTpSyncSite.DSPARK_ACCEPT_GRAPH] * 3
         )
+
+
+def _devices():
+    return ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",)
+
+
+class TestVocabShardVerify(CustomTestCase):
+    """A target that defers its verify gather hands the step vocab shards: only a
+    replayed fold may skip the gather, and the fold argmaxes through the target."""
+
+    def test_only_a_replayed_fold_skips_the_gather(self):
+        shard = torch.randn(BS * STRIDE, VOCAB // 2)
+        full = torch.randn(BS * STRIDE, VOCAB)
+        processor = SimpleNamespace(
+            is_deferred_shard=lambda logits: logits.shape[-1] < VOCAB,
+            finish_deferred_gather=lambda logits: full,
+        )
+        target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(model_type="test")
+                )
+            )
+        )
+        for deferring in (processor, None):
+            executor = TargetVerifyExecutor(
+                target_worker=target_worker,
+                gamma=STRIDE - 1,
+                verify_num_draft_tokens=STRIDE,
+                model_runner=None,
+                kv_injector=None,
+                tp_sync=_RecordingTpSync(),
+                target_logits_processor=deferring,
+            )
+            for keep in (False, True):
+                for replayed in (False, True):
+                    out = SimpleNamespace(next_token_logits=shard)
+                    dropped = executor._drop_or_gather_vocab_shard(
+                        TargetVerifyResult(
+                            logits_output=out, can_run_cuda_graph=replayed
+                        ),
+                        keep=keep,
+                    )
+                    with self.subTest(
+                        deferring=deferring is not None, keep=keep, replayed=replayed
+                    ):
+                        if deferring is None:
+                            self.assertFalse(dropped)
+                            self.assertIs(out.next_token_logits, shard)
+                        elif keep and replayed:
+                            self.assertTrue(dropped)
+                            self.assertIsNone(out.next_token_logits)
+                        else:
+                            self.assertFalse(dropped)
+                            self.assertIs(out.next_token_logits, full)
+
+    def test_fold_argmaxes_the_shard_through_the_target(self):
+        # Rank 1's slice: its local argmax is not the vocab's.
+        for device in _devices():
+            candidates, logits, prefix_lens = (t.to(device) for t in _greedy_inputs())
+            shard = logits[:, VOCAB // 2 :].contiguous()
+            seen = []
+
+            def shard_argmax(local):
+                seen.append(local)
+                return logits.argmax(dim=-1)
+
+            for fused in (False, True):
+                with self.subTest(device=device, fused=fused):
+                    accepts = []
+                    for step_logits, argmax in ((logits, None), (shard, shard_argmax)):
+                        epilogue = DsparkVerifyEpilogue(
+                            max_bs=BS + 1,
+                            verify_num_draft_tokens=STRIDE,
+                            device=device,
+                            tp_sync=_NoSiteTpSync(),
+                            fused_accept_tail=fused,
+                        )
+                        epilogue.vocab_shard_argmax = argmax
+                        epilogue._static_epilogue(
+                            _verify_out(step_logits),
+                            _verify_batch(candidates, prefix_lens),
+                        )
+                        accepts.append(epilogue.read_accept(BS))
+                    self.assertIs(seen[-1], shard)
+                    ref, got = (msgspec.structs.asdict(a) for a in accepts)
+                    for field, value in ref.items():
+                        self.assertTrue(torch.equal(got[field], value), field)
+
+
+class TestPlainVerifyGatherDeferral(CustomTestCase):
+    """LogitsProcessor.defer_plain_verify_gather: only a plain TP vocab split
+    defers, and an unfolded step's gather returns what the forward would have."""
+
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="test")
+
+    def _processor(self, **overrides):
+        processor = LogitsProcessor(SimpleNamespace(vocab_size=VOCAB))
+        # A TP vocab split; the test context has one rank, so force the gather.
+        processor.do_tensor_parallel_all_gather = True
+        for name, value in overrides.items():
+            setattr(processor, name, value)
+        return processor
+
+    def test_only_a_plain_tp_split_defers(self):
+        lm_head = SimpleNamespace(
+            tp_size=get_parallel().tp_size, num_embeddings_per_partition=32
+        )
+        other_group = SimpleNamespace(
+            tp_size=lm_head.tp_size + 1, num_embeddings_per_partition=32
+        )
+        refusals = {
+            "no tp gather": (dict(do_tensor_parallel_all_gather=False), lm_head),
+            "dp attention": (dict(do_tensor_parallel_all_gather_dp_attn=True), lm_head),
+            "attn-tp lm head": (dict(use_attn_tp_group=True), lm_head),
+            "lm-head all-to-all": (dict(use_tp_lm_head_all_to_all=True), lm_head),
+            "softcapping": (dict(final_logit_softcapping=30.0), lm_head),
+            "lm head on another group": ({}, other_group),
+        }
+        for name, (overrides, head) in refusals.items():
+            with self.subTest(name):
+                processor = self._processor(**overrides)
+                self.assertFalse(
+                    processor.defer_plain_verify_gather(head, prefer_nvlink=False)
+                )
+                self.assertFalse(processor.defer_verify_gather)
+        processor = self._processor()
+        self.assertTrue(
+            processor.defer_plain_verify_gather(lm_head, prefer_nvlink=False)
+        )
+        self.assertTrue(processor.defer_verify_gather)
+
+    def test_unfolded_gather_matches_the_undeferred_forward(self):
+        rows, hidden_size, partition = BS * STRIDE, 16, 32
+        for device in _devices():
+            gen = torch.Generator(device=device).manual_seed(0)
+            lm_head = torch.nn.Linear(
+                hidden_size, partition, bias=False, device=device, dtype=torch.bfloat16
+            )
+            lm_head.tp_size = get_parallel().tp_size
+            lm_head.num_embeddings_per_partition = partition
+            hidden = torch.randn(rows, hidden_size, generator=gen, device=device).to(
+                torch.bfloat16
+            )
+            # Rank 0's view; the other rank's slice ends in vocab padding.
+            other = torch.randn(rows, partition, generator=gen, device=device).to(
+                torch.bfloat16
+            )
+
+            def gather(local):
+                return torch.cat([local, other], dim=-1)
+
+            plain, deferring = self._processor(), self._processor()
+            self.assertTrue(
+                deferring.defer_plain_verify_gather(lm_head, prefer_nvlink=False)
+            )
+            for processor in (plain, deferring):
+                processor._logits_gatherer = gather
+            for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DECODE):
+                with self.subTest(device=device, mode=mode):
+                    # The graph runner's FP32 buffer, which the forward casts into.
+                    metadata = SimpleNamespace(
+                        forward_mode=mode,
+                        next_token_logits_buffer=torch.empty(
+                            rows, VOCAB, device=device
+                        ),
+                    )
+                    with torch.no_grad():
+                        ref = plain._get_logits(hidden, lm_head, metadata).clone()
+                        got = deferring._get_logits(hidden, lm_head, metadata)
+                    if mode.is_target_verify():
+                        self.assertEqual(got.shape, (rows, partition))
+                        self.assertTrue(deferring.is_deferred_shard(got))
+                        got = deferring.finish_deferred_gather(got)
+                    self.assertEqual(got.dtype, torch.float32)
+                    self.assertTrue(torch.equal(got, ref))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")

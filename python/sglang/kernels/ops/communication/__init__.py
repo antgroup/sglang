@@ -52,6 +52,15 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="communication.segment_a2a",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.communication.segment_a2a:segment_a2a",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="communication.beam_all_reduce_norm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.communication.beam_all_reduce:beam_all_reduce_norm",

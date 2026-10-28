@@ -133,6 +133,14 @@ class CpDecodeAttnTpContext:
         else:
             setattr(obj, attr_name, cache[1])
 
+    def unsliced(self, obj, attr_name: str) -> Optional[torch.Tensor]:
+        """The replicated tensor behind ``obj.attr_name`` while decode attention TP
+        has it sliced, else None."""
+        cache = self._slice_cache.get((id(obj), attr_name))
+        if cache is None or not self.use_decode_attn_tp:
+            return None
+        return cache[0]
+
     def _restore(self, obj, attr_name: str):
         cache = self._slice_cache.get((id(obj), attr_name))
         if cache is None:

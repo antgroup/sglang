@@ -76,6 +76,13 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     maybe_copy_inplace,
 )
 from sglang.srt.layers.attention.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.srt.layers.attention.dsv4.sm90_decode import (
+    PackedDraftSwa,
+    fill_flashmla_sched_meta,
+    flashmla_sched_tuned,
+    forward_packed_draft,
+    packed_draft_rows_per_req,
+)
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillKVBuffer,
@@ -458,6 +465,10 @@ class DSV4AttnMetadata:
     )
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c128_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
+    # The packed DSpark draft attention's per-request tables (dsv41_sm90 "decode").
+    dspark_packed_draft: Optional[PackedDraftSwa] = field(
+        init=False, default=None, repr=False
+    )
 
     @property
     def positions(self) -> torch.Tensor:
@@ -675,6 +686,7 @@ class DSV4AttnMetadata:
                 "c2_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
+                "dspark_packed_draft",
                 # Eager-only lazy caches are assigned, not content-copied.
                 "trtllm_prefill_qmeta",
                 "trtllm_prefill_swa_lens",
@@ -723,6 +735,7 @@ class DSV4AttnMetadata:
             "c2_flashmla_metadata",
             "c4_flashmla_metadata",
             "c128_flashmla_metadata",
+            "dspark_packed_draft",
             # Reset eager-only caches so a replay cannot reuse another shape.
             "trtllm_prefill_qmeta",
             "trtllm_prefill_swa_lens",
@@ -1485,6 +1498,16 @@ class DeepseekV4AttnBackend(
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
+        # The legacy (block-split) FlashMLA kernels: the only SM90 ones.
+        self.sm90_decode = (
+            dsv41_sm90_on("decode")
+            and _is_cuda
+            and get_platform().is_sm90
+            and not self._swa_interleaved
+        )
+        self._tuned_flashmla_sched = self.sm90_decode and flashmla_sched_tuned(
+            self.device
+        )
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
         # Once a draft runner glues this prep (glue_draft_metadata): the draft
@@ -1642,6 +1665,7 @@ class DeepseekV4AttnBackend(
                 full_page_size=self.page_size,
                 compress_ratio=compress_ratio,
                 index_page_size=index_page_size,
+                one_launch=self.sm90_decode,
             )
         else:
             raise ValueError(f"Unsupported indexer {compress_ratio = }")
@@ -2462,10 +2486,15 @@ class DeepseekV4AttnBackend(
         block_size: int,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4Metadata:
-        if seq_lens_cpu is None:
-            seq_lens_cpu_list = seq_lens.tolist()
-        else:
+        if seq_lens_cpu is not None:
             seq_lens_cpu_list = [int(x) for x in seq_lens_cpu.tolist()]
+        elif self.sm90_decode:
+            # On CUDA the block prep reads only the device lengths (the host ones feed
+            # the torch expand fallback): no copy that waits on the last verify. The
+            # metadata glue that avoids it otherwise is off under prefill CP.
+            seq_lens_cpu_list = None
+        else:
+            seq_lens_cpu_list = seq_lens.tolist()
         lengths = compute_uniform_extend_lengths(
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu_list,
@@ -3681,10 +3710,14 @@ class DeepseekV4AttnBackend(
         run_compressor: bool = True,
         run_indexer: bool = True,
         cp_projected: Optional[Tuple[Optional[torch.Tensor], ...]] = None,
+        row_slice: Optional[Tuple[int, int, int]] = None,
     ) -> None:
         """Runs on every ratio 1/2 layer before its attention. ``cp_projected``:
         the compressor projections of every CP row in global token order, when the
-        caller gathered them (see cp_low_ratio_compressor_runs)."""
+        caller gathered them (see cp_low_ratio_compressor_runs). ``row_slice``, as
+        in forward(): this rank attends rows [start, end) of the num_rows-row
+        decode / verify batch, so the index top-k is selected for its real rows
+        only; the compressor writes every row's KV either way."""
         if forward_batch.forward_mode.is_idle():
             return
         if forward_batch.encoder_swa_replay:
@@ -3776,7 +3809,24 @@ class DeepseekV4AttnBackend(
         if run_compressor and layer.compressor is not None:
             self._low_ratio_compress(layer, x, req, pos, forward_batch)
         if run_indexer and layer.indexer is not None:
-            self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
+            if row_slice is None:
+                self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
+            else:
+                # DeepGEMM's decode (SM100) plans the whole batch; the others are per row.
+                assert not self.full_topk_indexer.use_deep_gemm_decode
+                start, end, num_rows = row_slice
+                assert x.shape[0] == num_rows, f"{x.shape=} {row_slice=}"
+                # Pad rows take dummy indices in forward(); a slice may be empty.
+                rows = slice(min(start, num_rows), min(end, num_rows))
+                self._low_ratio_index_topk(
+                    layer,
+                    x[rows],
+                    q_lora[rows],
+                    req[rows],
+                    pos[rows],
+                    forward_batch,
+                    row_offset=rows.start,
+                )
 
     def cp_low_ratio_compressor_runs(self, layer, forward_batch: ForwardBatch) -> bool:
         """Whether forward_low_ratio_sources runs ``layer``'s compressor on the CP
@@ -3862,6 +3912,10 @@ class DeepseekV4AttnBackend(
     def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
         if forward_batch.forward_mode.is_decode():
             self._low_ratio_compress_decode(layer, x, req, pos)
+        elif self._c2_verify_pools_in_batch(layer, forward_batch):
+            self._low_ratio_compress_decode(
+                layer, x, req, pos, in_batch_predecessor=True
+            )
         elif (
             forward_batch.forward_mode.is_target_verify()
             and not self.is_dspark_draft
@@ -3919,7 +3973,23 @@ class DeepseekV4AttnBackend(
             and not in_replay_tail_graph()
         )
 
-    def _low_ratio_compress_decode(self, layer, x, req, pos) -> None:
+    def _c2_verify_pools_in_batch(self, layer, forward_batch) -> bool:
+        """Target verify through the ratio-2 decode pooling, a request's rows reading
+        their predecessor from the batch; the window must stay inside the ring."""
+        if not (
+            self.sm90_decode
+            and forward_batch.forward_mode.is_target_verify()
+            and layer.compress_ratio == 2
+            and not layer.compressor.use_fused_compress
+            and self.speculative_num_draft_tokens is not None
+        ):
+            return False
+        state = self.token_to_kv_pool.get_attention_compress_states(layer.layer_id)
+        return 0 < self.speculative_num_draft_tokens < state.ring_size
+
+    def _low_ratio_compress_decode(
+        self, layer, x, req, pos, *, in_batch_predecessor=False
+    ) -> None:
         # Projection layout and fused-write support are fixed together at load time.
         if layer.compressor.use_fused_compress:
             self._low_ratio_compress_fused(layer, x, req, pos)
@@ -3960,6 +4030,7 @@ class DeepseekV4AttnBackend(
             state.kv_score_buffer.score,
             state.kv_score_buffer.shape[0] - 1,
             ring_size=state.ring_size,
+            in_batch_predecessor=in_batch_predecessor,
         )
         self._low_ratio_write_group(
             layer,
@@ -3967,6 +4038,7 @@ class DeepseekV4AttnBackend(
             slots,
             group_pos,
             fuse_index_store=is_sm100_or_newer(),
+            fuse_main_store=self.sm90_decode,
         )
 
     def _low_ratio_compress_fused(
@@ -4152,10 +4224,19 @@ class DeepseekV4AttnBackend(
         group_pos,
         *,
         fuse_index_store=False,
+        fuse_main_store=False,
     ) -> None:
         pool = self.token_to_kv_pool
-        latent = layer.compressor.finish(pooled)
-        freqs = layer.freqs_cis[group_pos]
+        main_stored = (
+            self._c2_epilogue_store(layer, pooled, slots, group_pos)
+            if fuse_main_store
+            else None
+        )
+        if main_stored is None:
+            latent = layer.compressor.finish(pooled)
+            freqs = layer.freqs_cis[group_pos]
+        else:
+            latent, freqs = main_stored
         # Index keys come from the pre-RoPE latent, so publish them first. Stored
         # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.
         if layer.indexer is not None and layer.indexer.owns_k:
@@ -4185,6 +4266,8 @@ class DeepseekV4AttnBackend(
                     loc=slots,
                     cache_k=layer.indexer.index_keys(latent, freqs),
                 )
+        if main_stored is not None:
+            return
         if pool.get_extra_key_layout(layer.layer_id).is_fp4:
             # The fp4 cache stores e2m1 codes: the kernel rotates the tail and
             # rounds once, with no fake quantization in between.
@@ -4198,6 +4281,41 @@ class DeepseekV4AttnBackend(
             layer_id=layer.layer_id, loc=slots, cache_k=latent
         )
 
+    def _c2_epilogue_store(
+        self, layer, pooled, slots, group_pos
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """The ratio-2 latent's RMSNorm, RoPE, fake FP4 and V4 FlashMLA store in one
+        launch, bitwise the unfused write; (pre-RoPE latent, freqs), or None."""
+        pool = self.token_to_kv_pool
+        if (
+            layer.compress_ratio != 2
+            or layer.rope_head_dim != 64
+            or pool.get_extra_key_layout(layer.layer_id) is not KVLayout.V4
+        ):
+            return None
+        from sglang.kernels.ops.attention.dsv4.c2_epilogue_sm90 import (
+            c2_epilogue_sm90,
+            can_use_c2_epilogue,
+        )
+
+        cache = pool.get_extra_key_buffer(layer.layer_id)
+        page_size = pool.get_extra_key_page_size(layer.layer_id)
+        weight = layer.compressor.norm.weight
+        if not can_use_c2_epilogue(
+            pooled, weight, layer.freqs_cis, slots, group_pos, cache, page_size
+        ):
+            return None
+        return c2_epilogue_sm90(
+            pooled,
+            weight,
+            layer.compressor.norm.eps,
+            layer.freqs_cis,
+            slots,
+            group_pos,
+            cache,
+            page_size,
+        )
+
     def _low_ratio_index_topk(
         self,
         layer,
@@ -4208,7 +4326,10 @@ class DeepseekV4AttnBackend(
         forward_batch,
         *,
         rows_per_request=None,  # NOTE: only used in CP
+        row_offset: Optional[int] = None,
     ) -> None:
+        """``row_offset``: the rows are rows [row_offset, row_offset + len) of a
+        decode / verify batch, and only those rows of the top-k are written."""
         is_source = layer.indexer.is_candidate_source
         is_consumer = layer.indexer.uses_candidates
         ratio = layer.compress_ratio
@@ -4226,7 +4347,7 @@ class DeepseekV4AttnBackend(
                 is_source = is_consumer = False
 
             inputs = self._make_low_ratio_decode_indexer_inputs(
-                layer, x, q_lora, req, pos, mode
+                layer, x, q_lora, req, pos, mode, row_offset
             )
             if is_source:
                 published = self.decode_candidates.publish_decode(inputs)
@@ -4236,6 +4357,7 @@ class DeepseekV4AttnBackend(
             else:
                 self.full_topk_indexer.topk_decode(inputs)
         else:
+            assert row_offset is None, "row-sliced top-k is decode / verify only"
             inputs = self._make_low_ratio_prefill_indexer_inputs(
                 layer, x, q_lora, req, pos, forward_batch, rows_per_request
             )
@@ -4265,7 +4387,9 @@ class DeepseekV4AttnBackend(
             inputs, self.forward_metadata.candidate_metadata
         )
 
-    def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
+    def _make_low_ratio_decode_indexer_inputs(
+        self, layer, x, q_lora, req, pos, mode, row_offset=None
+    ):
         ratio = layer.compress_ratio
         metadata = (
             self.forward_metadata.c1_indexer_metadata
@@ -4273,6 +4397,15 @@ class DeepseekV4AttnBackend(
             else self.forward_metadata.c2_indexer_metadata
         )
         assert metadata is not None, f"no decode indexer metadata for {ratio = }"
+        out_page_indices = self.forward_metadata.core_metadata.sparse_page_indices(
+            ratio
+        )
+        if row_offset is not None:
+            # A view: the selection lands in the batch rows it was made for.
+            out_page_indices = out_page_indices[row_offset : row_offset + x.shape[0]]
+            assert out_page_indices.shape[0] == x.shape[0], (
+                f"{row_offset=} {x.shape[0]=} past the top-k buffer"
+            )
         return DecodeInputs(
             indexer=layer.indexer,
             layer_id=layer.layer_id,
@@ -4284,9 +4417,8 @@ class DeepseekV4AttnBackend(
             req_rows=req,
             paged_metadata=metadata,
             is_verify=mode.is_target_verify(),
-            out_page_indices=self.forward_metadata.core_metadata.sparse_page_indices(
-                ratio
-            ),
+            out_page_indices=out_page_indices,
+            row_offset=row_offset,
         )
 
     def _make_low_ratio_prefill_indexer_inputs(
@@ -4443,6 +4575,26 @@ class DeepseekV4AttnBackend(
             cache_k=swa_k,
         )
 
+    def dspark_draft_rows_per_req(
+        self, *, forward_batch: ForwardBatch, num_heads: int
+    ) -> int:
+        """Draft rows per FlashMLA row when the DSpark draft attention runs packed,
+        else 0; the caller then passes q unpadded with ``pack_draft_rows=True``."""
+        if not (
+            self.sm90_decode
+            and self.is_dspark_draft
+            and not self.trtllm_attn
+            and forward_batch.forward_mode.is_target_verify()
+            # Only get_dspark_swa_page_indices gives the draft rows of a request one
+            # window; the request-window pool lays them out per row.
+            and self.token_to_kv_pool.request_window is None
+        ):
+            return 0
+        return packed_draft_rows_per_req(
+            rows_per_req=int(forward_batch.spec_info.draft_token_num),
+            num_heads=num_heads,
+        )
+
     def forward(self, q, k, v, layer, forward_batch, *args, **kwargs):
         result = self._forward_attention(q, k, v, layer, forward_batch, *args, **kwargs)
         window = self.token_to_kv_pool.request_window
@@ -4465,8 +4617,13 @@ class DeepseekV4AttnBackend(
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
         cos_sin_cache: Optional[torch.Tensor] = None,
+        pack_draft_rows: bool = False,
+        row_slice: Optional[Tuple[int, int, int]] = None,
         **_,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """``row_slice=(start, end, num_rows)``: q holds only rows [start, end) of a
+        num_rows-row decode / verify batch, padded past num_rows (the SM90
+        head<->row all-to-all), so the per-row metadata is sliced to match."""
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(
                 (q.shape[0], q.shape[1], layer.v_head_dim),
@@ -4521,6 +4678,8 @@ class DeepseekV4AttnBackend(
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
 
             def match_num_queries(x, value):
+                if x is not None and row_slice is not None:
+                    return _slice_query_rows(x, row_slice, value=value)
                 if x is None or x.shape[0] == q.shape[0]:
                     return x
                 if x.shape[0] > q.shape[0]:
@@ -4554,6 +4713,23 @@ class DeepseekV4AttnBackend(
                 extra_indices = extra_indices.unsqueeze(1)
 
             assert attn_sink is not None
+
+            if pack_draft_rows:
+                o, core_attn_metadata.dspark_packed_draft = forward_packed_draft(
+                    flash_mla_with_kvcache=self._flash_mla_with_kvcache,
+                    q=q,
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    rows_per_req=int(forward_batch.spec_info.draft_token_num),
+                    cached=core_attn_metadata.dspark_packed_draft,
+                    source=core_attn_metadata.swa_page_indices,
+                    head_dim_v=self.head_dim_v,
+                    softmax_scale=self.softmax_scale,
+                    tuned_sched=self._tuned_flashmla_sched,
+                )
+                return o
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 
@@ -4679,7 +4855,19 @@ class DeepseekV4AttnBackend(
                 else:
                     flash_mla_with_kvcache = self._flash_mla_with_kvcache
 
-                if self.is_dsv41 and (
+                if (
+                    self._tuned_flashmla_sched
+                    and not forward_batch.forward_mode.is_extend_without_speculative()
+                ):
+                    fill_flashmla_sched_meta(
+                        flashmla_metadata,
+                        q=q,
+                        indices=swa_page_indices,
+                        topk_length=swa_topk_lengths,
+                        extra_indices=extra_indices,
+                        extra_topk_length=extra_topk_lengths,
+                    )
+                elif self.is_dsv41 and (
                     not self._swa_interleaved
                     or _flashmla_v41_splits_kv(
                         swa_page_indices,
@@ -5401,3 +5589,15 @@ def _pad_tensor_to_size(tensor: torch.Tensor, size: int, *, value: int = 0):
             ],
             dim=0,
         )
+
+
+def _slice_query_rows(
+    tensor: torch.Tensor, row_slice: Tuple[int, int, int], *, value: int
+) -> torch.Tensor:
+    """Rows [start, end) of per-query-row metadata for a num_rows-row batch; rows
+    from num_rows on (padding) take ``value``, as in match_num_queries."""
+    start, end, num_rows = row_slice
+    tensor = tensor[:num_rows]
+    if tensor.shape[0] < end:
+        tensor = _pad_tensor_to_size(tensor, end, value=value)
+    return tensor[start:end]

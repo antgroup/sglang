@@ -98,17 +98,30 @@ def resolve_dsv41_sm90(
     )
 
 
-def initialize_dsv41_sm90(*, model_config) -> None:
-    """Materialize ``flags.dsv41_sm90``; runs once per worker at layer-runtime init."""
+def resolve_dsv41_sm90_from_env(
+    *, model_config, disaggregation_mode: str, encoder_only: bool
+) -> Dsv41Sm90Selection:
+    """The selection the switch envs give this model and device. Server-arg
+    resolution asks it before any worker has materialized the flags."""
     enabled = envs.SGLANG_OPT_DSV41_SM90.get()
-    disagg = get_disagg()
-    selection = resolve_dsv41_sm90(
+    if not enabled:
+        return Dsv41Sm90Selection()
+    return resolve_dsv41_sm90(
         enabled=enabled,
-        # Probed only when on: with the switch off, startup reads nothing new.
-        model_type=model_config.hf_config.model_type if enabled else "",
-        sm90=enabled and is_sm90_supported(),
+        model_type=model_config.hf_config.model_type,
+        sm90=is_sm90_supported(),
         disable=envs.SGLANG_OPT_DSV41_SM90_DISABLE.get(),
         lossy=envs.SGLANG_OPT_DSV41_SM90_LOSSY.get(),
+        disaggregation_mode=disaggregation_mode,
+        encoder_only=encoder_only,
+    )
+
+
+def initialize_dsv41_sm90(*, model_config) -> None:
+    """Materialize ``flags.dsv41_sm90``; runs once per worker at layer-runtime init."""
+    disagg = get_disagg()
+    selection = resolve_dsv41_sm90_from_env(
+        model_config=model_config,
         disaggregation_mode=disagg.disaggregation_mode,
         encoder_only=disagg.encoder_only,
     )

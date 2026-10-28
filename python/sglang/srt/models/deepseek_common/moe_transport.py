@@ -23,6 +23,7 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer_len,
     get_tbo_persistent_buffer,
     is_dp_gatherv_active,
+    use_nvlink_dp_reduce_scatter,
 )
 from sglang.srt.layers.layer_boundary.ops import attn_cp_interleave_reduce_scatter
 from sglang.srt.layers.layer_boundary.output import DeferredFinalize
@@ -140,7 +141,7 @@ class MoeRowTransport(ComputeTransport):
         # Equal-chunk combine requires MAX_LEN padding and one attention rank
         # per DP shard; the variable-length path takes precedence.
         _use_reduce_scatter = (
-            envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
+            (envs.SGLANG_DP_USE_REDUCE_SCATTER.get() or use_nvlink_dp_reduce_scatter())
             and _use_tp_moe_gather
             and not _use_reduce_scatterv
             and not should_use_dp_reduce_scatterv()

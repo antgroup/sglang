@@ -15,6 +15,7 @@ import mmap
 import os
 import re
 import time
+from enum import IntEnum
 from typing import Optional
 
 import msgspec
@@ -23,7 +24,12 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.communication.cp_prefill_symm import engram_owner_scatter
-from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
+from sglang.kernels.ops.embeddings.engram_gate import (
+    engram_gate_pack_width,
+    fused_engram_gate,
+    fused_engram_gate_apply,
+    fused_engram_gate_pack,
+)
 from sglang.kernels.ops.embeddings.engram_gather import (
     engram_gather,
     engram_gather_peer,
@@ -56,7 +62,7 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
-from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on, dsv41_sm90_role
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
@@ -658,6 +664,14 @@ def _hip_runtime() -> ctypes.CDLL:
     return lib
 
 
+# DeepSeek-V4.1 SM90 decode: below this many ids a host-table lookup reads its rows
+# unsorted. Measured on H20-3e with a per-rank shard of the V4.1 table (48M rows,
+# 11.4 GiB pinned): the torch.sort costs 25-80 us up to 37K ids (decode and verify:
+# 24 ids per token) and the address-order reads pay it back only from about 147K
+# (147K ids 714 -> 692 us; a 16K-token prefill chunk, 393K ids: 1898 -> 1471 us).
+_SORTED_READ_MIN_IDS = 1 << 17
+
+
 @functools.cache
 def _sorted_host_reads(device: int) -> bool:
     """Whether host-table rows are read in address order. Without ATS (no
@@ -1034,6 +1048,10 @@ class EngramEmbedding(nn.Module):
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
         self._sort_host_reads = False
+        # Fewer ids read faster unsorted than the sort costs (_SORTED_READ_MIN_IDS).
+        self._sorted_read_min_ids = (
+            _SORTED_READ_MIN_IDS if dsv41_sm90_on("decode") else 0
+        )
         # The prefill CP lookup written by each row's owner (_cp_scatter_owned_rows).
         self._cp_owner_scatter = is_cuda() and dsv41_sm90_on("cp")
         self._ids_fit_int32 = num_embeddings < 2**31
@@ -1111,6 +1129,9 @@ class EngramEmbedding(nn.Module):
         assert self.shared_host_table_without_ats
         self.staged_by_scheduler = True
 
+    def _sorted_reads(self, indices: torch.Tensor) -> bool:
+        return self._sort_host_reads and indices.numel() >= self._sorted_read_min_ids
+
     def _table_ptrs(self) -> tuple[int, int]:
         if self.host_table is None:
             return self.weight.data_ptr(), self.scale.data_ptr()
@@ -1155,7 +1176,7 @@ class EngramEmbedding(nn.Module):
                 out.view(-1, self.dim),
                 self.dim,
                 FP8_BLOCK_SIZE,
-                sort_ids=self._sort_host_reads,
+                sort_ids=self._sorted_reads(indices),
             )
             return out
         if cp_all_tokens and self.tp_size > 1:
@@ -1250,6 +1271,21 @@ class EngramEmbedding(nn.Module):
             values = self._reduce_owned_rows(values)
         return values
 
+    def lookup_row_slice(
+        self, indices: torch.Tensor, *, chunk: int, start: int, world: int
+    ) -> torch.Tensor:
+        """Rows [start, start + chunk) of the lookup of ``indices`` [rows, cols], which
+        every one of the ``world`` TP ranks holds whole; rows past ``rows`` come back
+        unspecified. A collective over the TP group unless every row is mapped here."""
+        indices = _pad_rows(indices, chunk * world)
+        if self.peer is not None or self._shared:
+            return self(indices[start : start + chunk])
+        out = self.new_rows(indices[:chunk])
+        # Every id has exactly one owning rank and the others add zeros, so the
+        # reduce-scatter is exact like the all-reduce of _lookup.
+        get_parallel().tp_group.reduce_scatter_tensor(out, self._owned_rows(indices))
+        return out
+
     def _reduce_owned_rows(self, values: torch.Tensor) -> torch.Tensor:
         if _is_hip and values.is_cuda:
             # Integer addition preserves all BF16 bits because exactly one shard owns each row.
@@ -1285,7 +1321,7 @@ class EngramEmbedding(nn.Module):
             FP8_BLOCK_SIZE,
             row_lo=self.row_start,
             row_hi=self.row_start + self.rows,
-            sort_ids=self._sort_host_reads,
+            sort_ids=self._sorted_reads(indices),
         )
         return out
 
@@ -1371,6 +1407,101 @@ def engram_gate(
     return out
 
 
+class _EngramSplit(IntEnum):
+    ROW = 0
+    COL_GATHER = 1
+    COL_A2A = 2
+
+
+# Measured on H20-3e TP4 with CUDA graphs, one Engram call: the replicated wkv
+# (N 25600, K 6144) costs ~105 us at any M <= 64, so the row split pays from 65 rows.
+_ROW_SPLIT_MIN_ROWS = 65
+# Same setup: the column modes beat the row split at 6-384 rows, and the all-to-all
+# variant beats the all-gather one from 66 rows (not at 48).
+_COL_SPLIT_A2A_MIN_ROWS = 64
+# Largest row count measured: 384.
+_COL_SPLIT_MAX_ROWS = 512
+
+
+def _pad_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
+    if t.shape[0] == rows:
+        return t
+    return torch.cat([t, t.new_zeros(rows - t.shape[0], *t.shape[1:])])
+
+
+@functools.cache
+def _warn_split_off(reason: str) -> None:
+    logger.warning("Engram TP split off: %s", reason)
+
+
+def _tp_split_on(*, tp_size: int, attn_dp_size: int) -> bool:
+    """DeepSeek-V4.1 SM90 mix decode: TP ranks that hold the same decode/verify rows
+    split the Engram lookup, wkv and gate over rows or wkv columns."""
+    if not (dsv41_sm90_on("mix_decode") and dsv41_sm90_role() == "mix"):
+        return False
+    if tp_size == 1 or attn_dp_size > 1:
+        return False
+    from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
+        all_m_precompile_enabled,
+    )
+
+    if all_m_precompile_enabled():
+        # The all-M precompile holds a cross-rank compile lock while a split rank
+        # can already wait in a collective that the compiling rank never reaches.
+        if get_parallel().tp_rank == 0:
+            _warn_split_off("the all-M DeepGEMM precompile is on")
+        return False
+    return True
+
+
+def _wkv_splits_bitwise(wkv: ReplicatedLinear, world: int) -> bool:
+    """Whether every wkv output element depends only on its row and its column at
+    every row count, for the full weight and for each N / world row slice of the
+    weight and its scales: SM90 block32 DeepGEMM, or a route with its bits."""
+    from sglang.srt.layers import deep_gemm_wrapper
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+    from sglang.srt.layers.quantization.fp8_block32_sm90 import keeps_deepgemm_bits
+    from sglang.srt.layers.quantization.fp8_utils import (
+        deepgemm_w8a8_block_fp8_linear_with_fallback,
+    )
+
+    method = wkv.quant_method
+    if not (
+        isinstance(method, Fp8LinearMethod)
+        and method.block_quant
+        and method.weight_block_size == [32, 32]
+        and not (method.use_marlin or method.use_mxfp8 or method.block_fp8_as_mxfp8)
+        and wkv.bias is None
+    ):
+        return False
+    linear = method.w8a8_block_fp8_linear
+    if not (
+        isinstance(linear, functools.partial)
+        and linear.func is deepgemm_w8a8_block_fp8_linear_with_fallback
+    ):
+        return False
+    weight, scale = wkv.weight, wkv.weight_scale_inv
+    n, k = weight.shape
+    if not (
+        n % (32 * world) == 0
+        and k % 32 == 0
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.is_contiguous()
+        # 32x32 blocks: row-major [N / 32, K / 32] fp32 scales.
+        and scale.dtype == torch.float32
+        and tuple(scale.shape) == (n // 32, k // 32)
+        and scale.is_contiguous()
+    ):
+        return False
+    routes = linear.keywords.get("block32_routes")
+    if routes is None:
+        # UE8M0 DeepGEMM moves non-power-of-two block32 scales to Triton.
+        return not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+    return all(
+        keeps_deepgemm_bits(routes=routes, n=cols, k=k) for cols in {n, n // world}
+    )
+
+
 class Engram(nn.Module):
     def __init__(
         self,
@@ -1404,6 +1535,12 @@ class Engram(nn.Module):
         )
         self.q_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
         self.k_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
+        self.tp_split = _tp_split_on(
+            tp_size=get_parallel().tp_size, attn_dp_size=get_parallel().attn_dp_size
+        )
+        # Resolved on first use, once wkv is loaded and processed.
+        self._row_split_ok: Optional[bool] = None
+        self._col_split_ok: Optional[bool] = None
 
     def forward(
         self,
@@ -1416,6 +1553,10 @@ class Engram(nn.Module):
     ) -> torch.Tensor:
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] and input_ids [T] for this
         layer."""
+        if self.tp_split and not cp_all_tokens:
+            mode = self._split_mode(x, forward_batch)
+            if mode is not None:
+                return self._forward_split(x, hash_ids, input_ids=input_ids, mode=mode)
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
         if (
@@ -1459,6 +1600,189 @@ class Engram(nn.Module):
                 *staged[self.layer_hash_index], hash_ids.shape
             )
         return self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
+
+    def forward_row_slice(
+        self,
+        x: torch.Tensor,
+        hash_ids: torch.Tensor,
+        *,
+        start: int,
+        chunk: int,
+        world: int,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """x [chunk, hc_mult, dim] is rows [start, start + chunk) of a TP decode/verify
+        batch whose hash_ids [rows, cols] and input_ids [rows] every TP rank holds (no
+        DP attention); rows past the batch are padding, returned unchanged. Bitwise
+        forward() on those rows; a collective over the TP group."""
+        rows = hash_ids.shape[0]
+        local_rows = max(0, min(chunk, rows - start))
+        if self._wkv_split_ok(columns=False):
+            emb = self.embed.lookup_row_slice(
+                hash_ids, chunk=chunk, start=start, world=world
+            )
+            kv = self.wkv(emb[:local_rows].flatten(-2))[0] if local_rows else None
+        else:
+            # wkv may round a row differently at another M: project every row.
+            kv, _ = self.wkv(self.embed(hash_ids).flatten(-2))
+            kv = kv[start : start + local_rows]
+        if local_rows == 0:
+            return x
+        image_ids = None
+        if self.image_token_id is not None:
+            image_ids = input_ids[start : start + local_rows]
+        gated = engram_gate(
+            x[:local_rows],
+            kv,
+            self.q_weight,
+            self.k_weight,
+            self.eps,
+            self.clamp_value,
+            image_ids,
+            self.image_token_id,
+        )
+        if local_rows == chunk:
+            return gated
+        return torch.cat([gated, x[local_rows:]])
+
+    def _wkv_split_ok(self, *, columns: bool) -> bool:
+        if self._row_split_ok is None:
+            # Also the fused gate kernels' conditions, so both paths run them.
+            gate_ok = all(
+                w.dtype in (torch.bfloat16, torch.float32) and w.is_contiguous()
+                for w in (self.q_weight, self.k_weight)
+            )
+            tp_size = self.embed.tp_size
+            self._row_split_ok = gate_ok and _wkv_splits_bitwise(self.wkv, 1)
+            self._col_split_ok = gate_ok and _wkv_splits_bitwise(self.wkv, tp_size)
+            if not self._col_split_ok and get_parallel().tp_rank == 0:
+                _warn_split_off(
+                    f"wkv is not a column-splittable SM90 block32 linear over {tp_size} "
+                    f"ranks (row split: {self._row_split_ok})"
+                )
+        return self._col_split_ok if columns else self._row_split_ok
+
+    def _split_mode(
+        self, x: torch.Tensor, forward_batch: Optional[ForwardBatch]
+    ) -> Optional[_EngramSplit]:
+        """Decode/verify rows (every TP rank holds them all) the fused gate kernels
+        take; None keeps the replicated path."""
+        rows = x.shape[0]
+        if not (
+            forward_batch is not None
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and rows > 0
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+        ):
+            return None
+        if rows <= _COL_SPLIT_MAX_ROWS and self._wkv_split_ok(columns=True):
+            if rows < _COL_SPLIT_A2A_MIN_ROWS:
+                return _EngramSplit.COL_GATHER
+            return _EngramSplit.COL_A2A
+        if rows >= _ROW_SPLIT_MIN_ROWS and self._wkv_split_ok(columns=False):
+            return _EngramSplit.ROW
+        return None
+
+    def _forward_split(
+        self,
+        x: torch.Tensor,
+        hash_ids: torch.Tensor,
+        *,
+        input_ids: torch.Tensor,
+        mode: _EngramSplit,
+    ) -> torch.Tensor:
+        """Bitwise forward() with the lookup, wkv and gate split over the TP group.
+
+        ROW: rank r looks up and projects rows [r * chunk, +chunk) with all wkv
+        columns. COL_*: every rank looks up all rows and projects them with its
+        N / tp wkv columns; COL_GATHER all-gathers those columns, COL_A2A trades
+        them for this rank's rows. ROW and COL_A2A gate their rows and one
+        all-gather of [value | fp32 gates] rows lets every rank gate all rows.
+        """
+        tp = get_parallel().tp_group
+        rows = x.shape[0]
+        world, rank = tp.world_size, tp.rank_in_group
+        image_ids = input_ids if self.image_token_id is not None else None
+        if mode == _EngramSplit.COL_GATHER:
+            cols = self._wkv_columns(
+                self.embed(hash_ids).flatten(-2), rank=rank, world=world
+            )
+            kv = cols.new_empty(world, rows, cols.shape[1])
+            tp.all_gather_into_tensor(kv.view(world * rows, -1), cols)
+            packed = self._pack(x, kv, start=0, rows=rows, chunk=rows)
+        else:
+            chunk = -(-rows // world)
+            start = rank * chunk
+            local_rows = max(0, min(chunk, rows - start))
+            if mode == _EngramSplit.ROW:
+                emb = self.embed.lookup_row_slice(
+                    hash_ids, chunk=chunk, start=start, world=world
+                )
+                kv = self.wkv(emb[:local_rows].flatten(-2))[0] if local_rows else None
+            else:
+                emb = self.embed(_pad_rows(hash_ids, chunk * world))
+                cols = self._wkv_columns(emb.flatten(-2), rank=rank, world=world)
+                kv = cols.new_empty(world, chunk, cols.shape[1])
+                tp.all_to_all_single(kv.view(-1), cols.view(-1))
+            local = self._pack(x, kv, start=start, rows=local_rows, chunk=chunk)
+            packed = x.new_empty(chunk * world, local.shape[1])
+            tp.all_gather_into_tensor(packed, local)
+            packed = packed[:rows]
+        return fused_engram_gate_apply(
+            x=x, packed=packed, input_ids=image_ids, image_token_id=self.image_token_id
+        )
+
+    def _pack(
+        self,
+        x: torch.Tensor,
+        kv: Optional[torch.Tensor],
+        *,
+        start: int,
+        rows: int,
+        chunk: int,
+    ) -> torch.Tensor:
+        """Packed [value | fp32 gates] rows for x rows [start, start + rows) from kv's
+        first ``rows`` rows, padded to ``chunk`` rows."""
+        hc, dim = x.shape[1:]
+        # The lookup and wkv are bf16 like x, so the fp32 gates ride in x's dtype.
+        packed = x.new_empty(
+            chunk, engram_gate_pack_width(hc=hc, dim=dim, dtype=x.dtype)
+        )
+        if rows:
+            fused_engram_gate_pack(
+                x=x[start : start + rows],
+                kv=kv,
+                q_weight=self.q_weight,
+                k_weight=self.k_weight,
+                eps=self.eps,
+                clamp_value=self.clamp_value,
+                out=packed[:rows],
+            )
+        return packed
+
+    def _wkv_columns(
+        self, emb_flat: torch.Tensor, *, rank: int, world: int
+    ) -> torch.Tensor:
+        """wkv output columns [rank * N / world, +N / world) for every row: the same
+        block32 linear on the matching rows of the weight and its scales."""
+        method = self.wkv.quant_method
+        cols = self.wkv.weight.shape[0] // world
+        block_n = method.weight_block_size[0]
+        return method.w8a8_block_fp8_linear(
+            input=emb_flat,
+            weight=self.wkv.weight.narrow(0, rank * cols, cols),
+            block_size=method.weight_block_size,
+            weight_scale=self.wkv.weight_scale_inv.narrow(
+                0, rank * cols // block_n, cols // block_n
+            ),
+            input_scale=None,
+            bias=None,
+        )
 
 
 @eager_on_graph

@@ -21,6 +21,31 @@ import torch
 from sglang.srt.runtime_context import get_parallel
 
 
+def decode_graphs_cp_aligned() -> bool:
+    """Whether decode / verify / draft CUDA graph batch sizes keep the CP-size
+    alignment of ``get_cuda_graph_batch_size_alignment``.
+
+    Under CP decode attention TP (interleave prefill CP, attention TP 1, no DP
+    attention) every CP rank holds every decode row and slices the attention
+    weights instead, so outside a CP prefill the alignment only adds dummy rows: a
+    single DSpark request on V4.1 (TP8 + prefill CP8) ran the bs=4 graph, 24 verify
+    rows instead of 6. With ``dsv41_sm90_on("mix_decode")`` on the mix role the
+    graphs keep logical sizes."""
+    from sglang.srt.layers.cp.base import is_interleave
+    from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on, dsv41_sm90_role
+
+    parallel = get_parallel()
+    return not (
+        dsv41_sm90_on("mix_decode")
+        and dsv41_sm90_role() == "mix"
+        and parallel.enable_cp_decode_attn_tp
+        and parallel.attn_cp_size > 1
+        and parallel.attn_tp_size == 1
+        and parallel.attn_dp_size == 1
+        and is_interleave()
+    )
+
+
 def get_cp_padding_align_size() -> int:
     """Return the token-count alignment required by the active CP strategy."""
     from sglang.srt.layers.cp.base import is_zigzag

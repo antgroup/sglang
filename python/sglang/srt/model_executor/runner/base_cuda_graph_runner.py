@@ -80,8 +80,11 @@ def get_batch_sizes_to_capture(
     if dllm_config is not None and dllm_config.requires_separate_context_encoding:
         num_max_requests = min(num_max_requests, dllm_config.max_running_requests)
 
+    from sglang.srt.layers.cp.padding import decode_graphs_cp_aligned
+
     mul_base = get_cuda_graph_batch_size_alignment(
-        gathered_buffer_required=gathered_buffer_required
+        gathered_buffer_required=gathered_buffer_required,
+        cp_aligned=decode_graphs_cp_aligned(),
     )
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.

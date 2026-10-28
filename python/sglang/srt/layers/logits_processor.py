@@ -34,8 +34,16 @@ from sglang.kernels.ops.activation.softcap import (
     softcap_to_float32_logits,
 )
 from sglang.kernels.ops.sampling.softcap_row_argmax import softcap_row_argmax
+from sglang.kernels.ops.speculative.dspark.markov_sample import (
+    argmax_packet_width,
+    sharded_row_argmax,
+)
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.distributed.device_communicators.vocab_gather import (
+    VocabGather,
+    make_vocab_gather,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStates, pack_aux_hidden_states
@@ -494,6 +502,9 @@ class LogitsProcessor(nn.Module):
         # Set before graph capture by a speculative worker that finishes the TP
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
+        # deferred_argmax's (value, index) packet gather; set only when
+        # defer_plain_verify_gather defers logits that nothing softcaps.
+        self._plain_verify_argmax_gather: Optional[VocabGather] = None
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -1023,6 +1034,11 @@ class LogitsProcessor(nn.Module):
             return self._gather_softcap_fused(
                 logits, logits_metadata, use_logits_buffer
             )
+        if (
+            self._plain_verify_argmax_gather is not None
+            and logits_metadata.forward_mode.is_target_verify()
+        ):
+            return logits
 
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
@@ -1097,21 +1113,59 @@ class LogitsProcessor(nn.Module):
             )
         )
 
+    def defer_plain_verify_gather(
+        self, lm_head: VocabParallelEmbedding, *, prefer_nvlink: bool
+    ) -> bool:
+        """Before graph capture: target-verify logits stay this rank's lm_head
+        slice, as with softcapping. False, deferring nothing, unless they are a
+        plain TP split of the vocab that nothing softcaps."""
+        if (
+            not self.do_tensor_parallel_all_gather
+            or self.do_tensor_parallel_all_gather_dp_attn
+            or self.use_attn_tp_group
+            or self.use_tp_lm_head_all_to_all
+            or self.final_logit_softcapping
+            or lm_head.tp_size != get_parallel().tp_size
+        ):
+            return False
+        self._plain_verify_argmax_gather = make_vocab_gather(
+            get_parallel().tp_group,
+            local_width=argmax_packet_width(lm_head.num_embeddings_per_partition),
+            dtype=torch.float32,
+            prefer_nvlink=prefer_nvlink,
+            symm_rows=0,
+        )
+        self.defer_verify_gather = True
+        return True
+
     def is_deferred_shard(self, logits: torch.Tensor) -> bool:
         return self.defer_verify_gather and logits.shape[-1] < self.vocab_size
 
     def finish_deferred_gather(self, logits: torch.Tensor) -> torch.Tensor:
-        """Full softcapped logits from a target-verify vocab shard."""
+        """Full (softcapped) logits from a target-verify vocab shard, as the
+        forward without the deferral returns them."""
+        if self._plain_verify_argmax_gather is not None:
+            return self._copy_logits_to_buffer(
+                self._logits_gatherer(logits), None, use_buffer=False
+            )
         return self._gather_softcap_fused(logits, None, use_buffer=False)
 
     def deferred_argmax(self, logits: torch.Tensor) -> torch.Tensor:
-        """``argmax`` of the full softcapped logits from a target-verify vocab
-        shard, gathering only each rank's row maxima. Ties resolve to the lowest
-        vocab index, as ``torch.argmax`` over the gathered row does."""
+        """``argmax`` of the full (softcapped) logits from a target-verify vocab
+        shard, gathering only (value, index) maxima. Ties resolve to the lowest
+        vocab index, as ``torch.argmax`` over the gathered row does; without
+        softcapping the lowest NaN wins, also as there."""
         group = get_parallel().tp_group
         num_tokens, shard_width = logits.shape
         col_offset = group.rank_in_group * shard_width
         valid_width = max(0, min(shard_width, self.vocab_size - col_offset))
+        if self._plain_verify_argmax_gather is not None:
+            return sharded_row_argmax(
+                logits,
+                valid_width=valid_width,
+                vocab_start=col_offset,
+                gather=self._plain_verify_argmax_gather.gather_stacked,
+            )
         local = softcap_row_argmax(
             logits, self.final_logit_softcapping, valid_width, col_offset
         )

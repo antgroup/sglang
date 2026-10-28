@@ -92,6 +92,20 @@ def _prefers_triton(*, routes: Block32Routes, m: int, n: int, k: int) -> bool:
     return torch._dynamo.is_compiling() or lookup_swapab(routes.swapab, n, k, m) is None
 
 
+def keeps_deepgemm_bits(*, routes: Block32Routes, n: int, k: int) -> bool:
+    """Whether an (n, k) linear gets DeepGEMM's bits at every row count on these
+    routes: no Triton row and no swap-AB row with split > 1 (split 1 is bitwise
+    DeepGEMM)."""
+    if any(
+        _prefers_triton(routes=routes, m=m, n=n, k=k)
+        for m in range(1, routes.triton_max_m + 1)
+    ):
+        return False
+    return all(
+        cfg is None or cfg.split == 1 for _, cfg in routes.swapab.get((n, k), ())
+    )
+
+
 def _triton_config(*, routes: Block32Routes, m: int, n: int, k: int) -> dict:
     configs = routes.triton_small_m.get((n, k))
     if not configs:

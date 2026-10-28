@@ -89,7 +89,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on, dsv41_sm90_role
 from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
 from sglang.srt.layers.layer_boundary import append_stages, get_attn_tp_context
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -159,8 +159,10 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models import deepseek_v4_attn_proj as dsv41_attn_proj
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
+from sglang.srt.models import deepseek_v4_head_a2a as head_a2a
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models import deepseek_v4_prefill_graph as prefill_graph
+from sglang.srt.models import deepseek_v4_tp_sp as tp_sp
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     is_cross_layer_mhc_fusion_enabled,
@@ -1396,6 +1398,7 @@ class MQALayer(MqaAttentionBase):
     is_dsv41: bool = False
     use_mega_attention: bool = False
     cp_prefill_symm: bool = False
+    head_a2a: bool = False
 
     def __init__(
         self,
@@ -1572,6 +1575,15 @@ class MQALayer(MqaAttentionBase):
             and self.wo_a.weight.dtype == torch.bfloat16
             and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
             and can_use_fused_wo_a(self.n_local_groups, self.o_lora_rank)
+        )
+        # Decode attention TP exchanges q / o head <-> row (deepseek_v4_head_a2a).
+        self.head_a2a = (
+            _is_cuda
+            and get_platform().is_sm90
+            and self.is_dsv41
+            and dsv41_sm90_on("mix_decode")
+            and dsv41_sm90_role() == "mix"
+            and not get_exec().deterministic.enable_deterministic_inference
         )
         if _is_hip:
             _hip.init_mqa_layer(self, quant_config)
@@ -1822,9 +1834,17 @@ class MQALayer(MqaAttentionBase):
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
         defer_rope: bool = False,
+        *,
+        row_plan: Optional[head_a2a.HeadA2APlan] = None,
     ) -> torch.Tensor:
-        q, _ = self.wq_b(q)
-        q = q.view(-1, self.n_local_heads, self.head_dim)
+        """With ``row_plan.row_q`` the result is this rank's row slice with all heads."""
+        if row_plan is not None and row_plan.row_q:
+            q, positions = head_a2a.project_row_q(
+                layer=self, q_lora=q, positions=positions, plan=row_plan
+            )
+        else:
+            q, _ = self.wq_b(q)
+            q = q.view(-1, self.n_local_heads, self.head_dim)
         if self.use_mega_attention:
             return q
         if not self.q_head_norm:
@@ -2312,10 +2332,19 @@ class MQALayer(MqaAttentionBase):
         k_nope_out: Optional[torch.Tensor] = None,
         k_rope_out: Optional[torch.Tensor] = None,
         defer_cp_attention: bool = False,
+        row_plan: Optional[head_a2a.HeadA2APlan] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """``row_plan``: attention runs head<->row exchanged (deepseek_v4_head_a2a);
+        q_out then holds what ``head_a2a.new_q_buffer`` allocated."""
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x_linear)
+            qkv_a = (
+                head_a2a.wqkv_a_row_q(layer=self, x=x, plan=row_plan)
+                if row_plan is not None and x_quant is None
+                else None
+            )
+            if qkv_a is None:
+                qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
         else:
             q_lora, _ = self.wq_a(x_linear)
@@ -2569,7 +2598,11 @@ class MQALayer(MqaAttentionBase):
                     and not in_replay_tail_graph()
                 )
                 q = self._compute_q_b(
-                    q_for_wqb, positions, q_out, defer_rope=fuse_q_rope
+                    q_for_wqb,
+                    positions,
+                    q_out,
+                    defer_rope=fuse_q_rope,
+                    row_plan=row_plan,
                 )
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
@@ -2664,6 +2697,7 @@ class MQALayer(MqaAttentionBase):
                         if finish_cp_projected is not None
                         else None
                     ),
+                    row_slice=None if row_plan is None else row_plan.row_slice,
                 )
         else:
             use_npu_cp_full_metadata = use_cp and _is_npu
@@ -2817,6 +2851,7 @@ class MQALayer(MqaAttentionBase):
             raise RuntimeError("prefill graph: unsupported CP attention path")
         tp_slice, q_padded, q_out, q_rope = slice(None), None, None, None
         k_nope, k_rope = None, None
+        row_plan = None
         if self.use_mega_attention:
             kernel_num_heads = 64 if self.n_local_heads <= 64 else 128
         elif (
@@ -2847,6 +2882,23 @@ class MQALayer(MqaAttentionBase):
                 k_nope = nope_pool.new_empty((x.shape[0], nope_pool.shape[-1]))
                 k_rope = rope_pool.new_empty((x.shape[0], rope_pool.shape[-1]))
             kernel_num_heads = self.n_local_heads
+        elif (
+            self.head_a2a
+            and not unified
+            and not enable_multi_stream
+            and not is_in_breakable_cuda_graph()
+            and (
+                row_plan := head_a2a.plan_head_a2a(
+                    layer=self, num_rows=x.shape[0], forward_batch=forward_batch
+                )
+            )
+            is not None
+        ):
+            # Attention takes every head of a row slice (attend_rows), not this
+            # rank's heads padded to the kernel's.
+            kernel_num_heads = self.n_local_heads
+            q_a2a = head_a2a.new_q_buffer(layer=self, x=x, plan=row_plan)
+            q_out = q_a2a if row_plan.row_q else q_a2a[: x.shape[0]]
         else:
             kernel_num_heads = (
                 self.n_local_heads
@@ -2923,6 +2975,7 @@ class MQALayer(MqaAttentionBase):
                 k_nope_out=k_nope,
                 k_rope_out=k_rope,
                 defer_cp_attention=cp_capture,
+                row_plan=row_plan,
             )
 
         if unified_fp8_prefill and is_cp_active(forward_batch):
@@ -3011,6 +3064,14 @@ class MQALayer(MqaAttentionBase):
                     self.compress_ratio,
                     attn_sink,
                     save_kv_cache,
+                )
+            elif row_plan is not None:
+                o = head_a2a.attend_rows(
+                    layer=self,
+                    q=q_a2a,
+                    plan=row_plan,
+                    attn_backend=attn_backend,
+                    forward_batch=forward_batch,
                 )
             else:
                 o = attn_backend.forward(
@@ -4058,6 +4119,19 @@ class DeepseekV4Model(nn.Module):
             )
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
+        # Decode / verify mHC rows split over TP (deepseek_v4_tp_sp).
+        self.decode_tp_sp = (
+            _is_cuda
+            and dsv41_sm90_on("mix_decode")
+            and dsv41_sm90_role() == "mix"
+            and self.hc_pre_from_prev_sublayer
+            and self.pp_group.world_size == 1
+            and not get_exec().deterministic.enable_deterministic_inference
+            and all(
+                tp_sp.decode_tp_sp_supported(self.layers[i])
+                for i in range(self.start_layer, self.end_layer)
+            )
+        )
 
         # Decoder SWA bounded replay: layers from late_layer_start on run over each
         # request's last SWA_WINDOW extend tokens only.
@@ -4773,7 +4847,25 @@ class DeepseekV4Model(nn.Module):
             )
         last_pre = None
         tail = None
-        if self.hc_pre_from_prev_sublayer:
+        row_plan = (
+            tp_sp.plan_decode_tp_sp(
+                forward_batch=forward_batch, rows=hidden_states.shape[0]
+            )
+            if self.decode_tp_sp
+            else None
+        )
+        if row_plan is not None:
+            hidden_states, last_pre = tp_sp.forward_layers(
+                self,
+                row_plan,
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                dspark_aux_hidden_states=dspark_aux_hidden_states,
+            )
+        elif self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
             # Hand the layer input over without keeping a reference here, so the
             # layer loop can free it once the first residual replaces it.
@@ -4873,6 +4965,17 @@ class DeepseekV4Model(nn.Module):
                 hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
             )
         hidden_states = self.norm(hidden_states)
+        if row_plan is not None:
+            hidden_states, pre_hc_head, aux = tp_sp.gather_outputs(
+                row_plan,
+                hidden_states=hidden_states,
+                pre_hc_head=pre_hc_head,
+                dspark_aux_hidden_states=dspark_aux_hidden_states,
+                forward_batch=forward_batch,
+            )
+            if capture_dspark:
+                return (hidden_states, pre_hc_head), aux
+            return hidden_states, pre_hc_head
 
         if tail is not None and not capture_dspark:
             # The logits processor indexes rows by the full extend layout.

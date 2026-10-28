@@ -62,6 +62,17 @@ register_kernel(
     )
 )
 
+for _op in ("fused_engram_gate_pack", "fused_engram_gate_apply"):
+    register_kernel(
+        KernelSpec(
+            op=f"embeddings.{_op}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.embeddings.engram_gate:{_op}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _op
+
 __all__ = []
 
 

@@ -92,9 +92,19 @@ class DecodeInputs(msgspec.Struct, frozen=True, kw_only=True):
 
     # [rows, topk] int32 index-K pool slots of the selection, unordered, -1 padded.
     out_page_indices: torch.Tensor
+    # Set when the rows are rows [row_offset, row_offset + rows) of the batch, the
+    # ones this rank attends under the SM90 head<->row all-to-all; the per-row
+    # tables of paged_metadata still cover the whole batch.
+    row_offset: Optional[int] = None
 
     def reset_outputs(self) -> None:
         self.out_page_indices.fill_(-1)
+
+    def batch_rows(self, table: torch.Tensor, rows: int) -> torch.Tensor:
+        """The rows of a per-batch-row table that the first ``rows`` of these
+        inputs are."""
+        start = self.row_offset or 0
+        return table[start : start + rows]
 
 
 class CapturedPrefillInputs(msgspec.Struct, frozen=True, kw_only=True):

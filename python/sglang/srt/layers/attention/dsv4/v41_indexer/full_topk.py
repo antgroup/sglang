@@ -141,7 +141,7 @@ class FullTopKIndexer:
             topk_page_transform(
                 d.scores,
                 inputs.indexer.index_topk,
-                page_table=metadata.page_table[: d.bs],
+                page_table=inputs.batch_rows(metadata.page_table, d.bs),
                 page_size=metadata.compressed_page_size,
                 end=d.lens.to(torch.int32),
                 sorted_index=False,

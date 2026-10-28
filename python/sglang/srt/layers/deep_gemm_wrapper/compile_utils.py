@@ -57,6 +57,11 @@ os.environ["DG_JIT_CACHE_DIR"] = envs.SGLANG_DG_CACHE_DIR.get()
 os.environ["DG_JIT_USE_NVRTC"] = "1" if envs.SGLANG_DG_USE_NVRTC.get() else "0"
 
 
+def all_m_precompile_enabled() -> bool:
+    """The all-M JIT precompile in effect, as update_deep_gemm_config resolved it."""
+    return _ENABLE_JIT_DEEPGEMM_PRECOMPILE
+
+
 def update_deep_gemm_config(gpu_id: int):
     global _BUILTIN_M_LIST
     global _DO_COMPILE_ALL

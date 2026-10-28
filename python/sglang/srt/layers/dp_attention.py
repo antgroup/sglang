@@ -713,6 +713,49 @@ def _dp_gather_via_all_reduce(
             global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
+def _nvlink_dp_comm():
+    """The TP group's custom all-reduce v2 when the DeepSeek-V4.1 decode role
+    carries the DP MoE gather / combine over its NVLink pull plane (one NVLink
+    clique, tp_size == attn_dp_size), else None. Rank-uniform."""
+    from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on, dsv41_sm90_role
+    from sglang.srt.layers.moe.utils import is_tbo_enabled
+
+    if not (dsv41_sm90_on("decode") and dsv41_sm90_role() == "decode"):
+        return None
+    # TBO issues these collectives on its own comm stream, concurrently with the
+    # compute stream's all-reduces on the same pull-plane semaphores.
+    if torch.compiler.is_compiling() or world_dp_gather_enabled() or is_tbo_enabled():
+        return None
+    parallel = get_parallel()
+    if parallel.tp_size != parallel.attn_dp_size:
+        return None
+    ca_comm = parallel.tp_group.ca_comm
+    if not isinstance(ca_comm, CustomAllReduceV2) or ca_comm.disabled:
+        return None
+    return ca_comm
+
+
+def use_nvlink_dp_reduce_scatter() -> bool:
+    """Whether ``dp_reduce_scatter_tensor`` reduce-scatters a combine input shaped
+    like this forward's global DP buffer over NVLink. Rank-uniform (shape, dtype
+    and capture state only), so callers may skip the MoE all-reduce on it."""
+    ca_comm = _nvlink_dp_comm()
+    return ca_comm is not None and ca_comm.can_reduce_scatter_input(
+        numel=get_global_dp_buffer_len() * get_dp_hidden_size(), dtype=get_dp_dtype()
+    )
+
+
+def _try_nvlink_dp_all_gather(
+    global_tokens: torch.Tensor, local_tokens: torch.Tensor
+) -> bool:
+    # One kernel pulls every rank's rows over NVLink; bitwise the NCCL gather.
+    ca_comm = _nvlink_dp_comm()
+    if ca_comm is None or not ca_comm.can_all_gather(local_tokens, global_tokens):
+        return False
+    ca_comm.all_gather(local_tokens, global_tokens)
+    return True
+
+
 def _dp_gather_via_all_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -728,7 +771,7 @@ def _dp_gather_via_all_gather(
                 local_tokens,
                 group=torch.distributed.group.WORLD,
             )
-        else:
+        elif not _try_nvlink_dp_all_gather(global_tokens, local_tokens):
             get_parallel().tp_group.all_gather_into_tensor(global_tokens, local_tokens)
         return
 
@@ -1137,7 +1180,13 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
             get_parallel().tp_group.reduce_scatterv(input, output=output, sizes=sizes)
             return
     if get_parallel().tp_size == get_parallel().attn_dp_size:
-        get_parallel().tp_group.reduce_scatter_tensor(output, input)
+        # The reduce half of 2shot_pull (rank-ordered fp32 sum) over NVLink,
+        # bitwise the 2shot_pull all-reduce + slice; else NCCL.
+        ca_comm = _nvlink_dp_comm()
+        if ca_comm is not None and ca_comm.can_reduce_scatter(input, output):
+            ca_comm.reduce_scatter(input, output)
+        else:
+            get_parallel().tp_group.reduce_scatter_tensor(output, input)
     else:
         scattered_local_tokens = input.tensor_split(get_parallel().tp_size)[
             get_parallel().tp_rank

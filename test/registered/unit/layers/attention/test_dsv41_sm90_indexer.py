@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
@@ -466,6 +467,58 @@ class TestSm90DecodeIndexer(CustomTestCase):
                     )
 
                 self._check_pages(batch, consumer.out_page_indices, among_blocks)
+
+    def test_head_a2a_row_slices_match_the_whole_batch(self):
+        """Under the head<->row all-to-all (mix_decode) rank r scores rows
+        [r * chunk, (r + 1) * chunk) of the verify batch, which cut requests'
+        DSpark rows apart. Each slice's top-k, published blocks and consumer
+        top-k are the whole batch's on those rows, and land in those rows of the
+        shared buffers only."""
+        batch = _DecodeBatch(ratio=1, lmax=2048, group=6, seed=2)
+        rows = batch.req.shape[0]
+        backend = _backend(
+            Sm90DenseBlocksBackend, batch.table, batch.req_to_token, DECODE_BLOCKS
+        )
+        whole_source, whole_consumer = batch.inputs(), batch.inputs()
+        whole_published = backend.publish_decode(whole_source)
+        backend.consume_decode(whole_consumer, whole_published)
+        source_out = torch.full_like(whole_source.out_page_indices, 7)
+        consumer_out = torch.full_like(whole_consumer.out_page_indices, 7)
+        # 30 rows over 4 ranks: chunks of 8 start inside requests 1, 2 and 4.
+        world = 4
+        chunk = -(-rows // world)
+        for rank in range(world):
+            start = rank * chunk
+            end = min(start + chunk, rows)
+
+            def row_slice(out):
+                whole = batch.inputs()
+                return msgspec.structs.replace(
+                    whole,
+                    x=whole.x[start:end],
+                    q_lora=whole.q_lora[start:end],
+                    positions=whole.positions[start:end],
+                    req_rows=whole.req_rows[start:end],
+                    out_page_indices=out[start:end],
+                    row_offset=start,
+                )
+
+            consumer = row_slice(consumer_out)
+            published = backend.publish_decode(row_slice(source_out))
+            backend.consume_decode(consumer, published)
+            with self.subTest(rank=rank):
+                self.assertTrue(
+                    torch.equal(published.blocks, whole_published.blocks[start:end])
+                )
+                self.assertTrue(
+                    torch.equal(published.counts, whole_published.counts[start:end])
+                )
+        for out, whole in (
+            (source_out, whole_source.out_page_indices),
+            (consumer_out, whole_consumer.out_page_indices),
+        ):
+            self.assertTrue(torch.equal(out[:rows], whole[:rows]))
+            self.assertTrue((out[rows:] == 7).all())
 
     def test_planned_long_rows_take_the_cluster_top_k(self):
         """Batches large enough for a written top-k v2 plan with rows long enough

@@ -211,6 +211,7 @@ def _draft_step(
     noise: DraftNoise,
     step: int,
     logits_out: Optional[torch.Tensor],
+    keep_local_logits: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     if logits_out is None and len(prev_tokens) == 1:
         # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
@@ -233,7 +234,7 @@ def _draft_step(
         else dict(
             vocab_start=shard.start,
             gather=shard.gather.gather_stacked,
-            gather_logits=shard.gather,
+            gather_logits=None if keep_local_logits else shard.gather,
         )
     )
     tokens = MarkovSampleStep.execute(
@@ -263,9 +264,12 @@ def draft_markov_block(
     tp_sync: SpecTpSync,
     logits_out: Optional[torch.Tensor] = None,
     greedy_draft: bool = False,
+    keep_local_logits: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Returns the drafted tokens and the [bs, gamma, vocab] step logits,
-    written to ``logits_out`` or allocated here; a greedy draft keeps none."""
+    written to ``logits_out`` or allocated here; a greedy draft keeps none.
+    ``keep_local_logits`` (a vocab-sharded head) writes this rank's
+    [bs, gamma, partition] slice to ``logits_out`` instead of gathering it."""
     bs, gamma = base_logits.shape[:2]
     if not greedy_draft and logits_out is None:
         logits_out = torch.empty(
@@ -287,6 +291,7 @@ def draft_markov_block(
             noise=noise,
             step=step,
             logits_out=None if greedy_draft else logits_out[:, step],
+            keep_local_logits=keep_local_logits,
         )
         prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
@@ -471,6 +476,8 @@ class DraftBlockProposer:
             and fwd.can_run_graph
         ):
             folded = True
+            if sampling_info is not None and not sampling_info.is_all_greedy:
+                draft_sampler.gather_step_logits(bs)
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
                 corrected_logits=(

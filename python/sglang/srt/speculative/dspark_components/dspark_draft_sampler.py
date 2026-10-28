@@ -11,6 +11,8 @@ from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_draft_sampler,
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
@@ -92,6 +94,19 @@ class DsparkDraftSampler:
         # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
         # the first call; a greedy draft keeps none.
         self.step_logits: Optional[torch.Tensor] = None
+        # DeepSeek-V4.1 SM90 decode: a vocab-sharded draft keeps the step logits
+        # TP-local in the graph ([max_bs, gamma, partition]) and gathers them into
+        # step_logits only for a batch whose accept samples (gather_step_logits).
+        # Without DP attention every rank of the gather holds the same batch, so
+        # all of them take that decision alike.
+        self._keeps_local_logits = (
+            dsv41_sm90_on("decode")
+            and get_parallel().attn_dp_size == 1
+            and not greedy_draft
+            and megakernel_sampler is None
+            and self.markov_head.vocab_shard is not None
+        )
+        self._local_step_logits: Optional[torch.Tensor] = None
         self._megakernel_steps = None
         if megakernel_sampler is not None:
             self._megakernel_steps = self._build_megakernel_steps(megakernel_sampler)
@@ -132,12 +147,33 @@ class DsparkDraftSampler:
                 else torch.cuda.is_current_stream_capturing()
             )
             assert not capturing
+            dtype = self.markov_head.step_logits_dtype(base_logits.dtype)
             self.step_logits = torch.empty(
                 (self.max_bs, self.gamma, _step_logits_width(self.model)),
-                dtype=self.markov_head.step_logits_dtype(base_logits.dtype),
+                dtype=dtype,
                 device=base_logits.device,
             )
+            if self._keeps_local_logits:
+                self._local_step_logits = torch.empty(
+                    (self.max_bs, self.gamma, base_logits.shape[-1]),
+                    dtype=dtype,
+                    device=base_logits.device,
+                )
+        if self._keeps_local_logits:
+            return self._local_step_logits
         return self.step_logits
+
+    def gather_step_logits(self, bs: int) -> None:
+        """Fill ``step_logits[:bs]`` from the TP-local step logits of the last
+        replay; a collective, so every rank of the vocab group calls it for the
+        same batches. A no-op unless the graph kept them local."""
+        if not self._keeps_local_logits:
+            return
+        gather = self.markov_head.vocab_shard.gather
+        width = self.step_logits.shape[-1]
+        for step in range(self.gamma):
+            local = self._local_step_logits[:bs, step].contiguous()
+            self.step_logits[:bs, step].copy_(gather(local)[:, :width])
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Must run before the draft graph replay that reads these buffers."""
@@ -192,6 +228,7 @@ class DsparkDraftSampler:
             if self.greedy_draft
             else self._step_logits(base_logits)[:bs],
             greedy_draft=self.greedy_draft,
+            keep_local_logits=self._keeps_local_logits,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         return draft_tokens, confidence_features

@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
     is_unified_kv_triton,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -142,6 +143,9 @@ class DSparkAttention(MqaAttentionBase):
         )
 
         self._use_fast_kernel = envs.SGLANG_DSPARK_FAST_KERNEL.get()
+        # The draft rows' TP-local heads (8 at TP8) run as one FlashMLA row per
+        # request instead of every row padded to 64 heads.
+        self._pack_draft_heads = dsv41_sm90_on("decode") and get_platform().is_sm90
         self.alt_streams = alt_streams
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
         if _is_npu:
@@ -292,6 +296,13 @@ class DSparkAttention(MqaAttentionBase):
             and hidden_states.shape[0] <= self._multi_stream_bs_limit
         )
 
+        pack_draft_rows = (
+            self._pack_draft_heads
+            and attn_backend.dspark_draft_rows_per_req(
+                forward_batch=forward_batch, num_heads=self.n_local_heads
+            )
+            > 0
+        )
         q_padded: Optional[torch.Tensor] = None
         q_out: Optional[torch.Tensor] = None
         if (
@@ -304,7 +315,7 @@ class DSparkAttention(MqaAttentionBase):
                 dtype=torch.float8_e4m3fn,
                 device=hidden_states.device,
             )
-        elif self.n_local_heads < _PAD_NUM_HEADS:
+        elif self.n_local_heads < _PAD_NUM_HEADS and not pack_draft_rows:
             q_padded = hidden_states.new_empty(
                 hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
@@ -349,6 +360,7 @@ class DSparkAttention(MqaAttentionBase):
             compress_ratio=0,
             attn_sink=attn_sink,
             save_kv_cache=False,
+            **({"pack_draft_rows": True} if pack_draft_rows else {}),
         )
 
         if o.shape[1] != self.n_local_heads:

@@ -140,6 +140,7 @@ def _backend(fx):
     backend.encoder_replay = False
     backend.encoder_row_floor = fx.folded.row_floor
     backend.skip_unread_late_layer_tail = False
+    backend.sm90_decode = False
     backend.req_to_token = fx.req_to_token
     backend.page_size = 256
     backend.index_topk = 512

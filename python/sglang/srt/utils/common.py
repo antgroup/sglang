@@ -4165,7 +4165,7 @@ def require_mlp_sync():
 
 
 def get_cuda_graph_batch_size_alignment(
-    *, gathered_buffer_required: Optional[bool] = None
+    *, gathered_buffer_required: Optional[bool] = None, cp_aligned: bool = True
 ) -> int:
     if gathered_buffer_required is None:
         gathered_buffer_required = require_gathered_buffer()
@@ -4175,7 +4175,7 @@ def get_cuda_graph_batch_size_alignment(
     if gathered_buffer_required:
         alignment *= get_parallel().attn_tp_size
     # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
-    if not is_hip() and alignment % get_parallel().attn_cp_size != 0:
+    if cp_aligned and not is_hip() and alignment % get_parallel().attn_cp_size != 0:
         alignment *= get_parallel().attn_cp_size
     return alignment
 

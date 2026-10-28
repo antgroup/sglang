@@ -39,7 +39,9 @@ from sglang.kernels.ops.communication.all_reduce import (
     IPCManager,
     PullPlane,
     PushPlane,
+    custom_all_gather,
     custom_all_reduce,
+    custom_reduce_scatter,
     get_all_reduce_module,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
@@ -70,6 +72,7 @@ MB = 1024 * 1024
 _ALIGN_BYTES = 1024
 _SEMAPHORE_BYTES = 128
 _MAX_GRAPH_INPUTS = 131072
+_PULL_COLLECTIVE_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 # resolved once at import time; explicit constructor sizes take precedence
 _DEFAULT_MAX_SIZE = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.get() * 1024
 # forced per-direction workspace sizes; highest priority, override both the
@@ -482,6 +485,97 @@ class CustomAllReduceV2:
             graph_params=graph_params,
             use_multicast=use_multicast,
         )
+
+    # ------------------------------------------------------------------
+    # Reduce-scatter / all-gather: the two halves of 2shot_pull
+    # ------------------------------------------------------------------
+
+    def can_reduce_scatter(self, input: torch.Tensor, output: torch.Tensor) -> bool:
+        """Whether ``reduce_scatter`` takes this pair. Depends only on shapes,
+        dtype and the capture state, so every rank of a collective agrees."""
+        return (
+            input.is_contiguous()
+            and output.is_contiguous()
+            and output.dtype == input.dtype
+            and output.numel() * self.world_size == input.numel()
+            and self.can_reduce_scatter_input(numel=input.numel(), dtype=input.dtype)
+        )
+
+    def can_reduce_scatter_input(self, *, numel: int, dtype: torch.dtype) -> bool:
+        """``can_reduce_scatter`` for a contiguous input of ``numel`` elements and
+        a shard-sized output, decided before either exists (a caller that skips
+        an all-reduce for it must know up front)."""
+        return self._fits_pull_collective(
+            full_numel=numel, dtype=dtype, staged_bytes=numel * dtype.itemsize
+        )
+
+    def all_reduce_sums_in_rank_order(self, *, numel: int, dtype: torch.dtype) -> bool:
+        """Whether the all-reduce of a contiguous ``numel``-element input runs a
+        pull kernel here (1shot_pull, or 2shot_pull without multicast), whose
+        rank-ordered fp32 sum ``reduce_scatter`` repeats bit for bit.
+
+        Not NCCL, not the NVLS multicast reduction, and not the push kernels:
+        their lamport marker remap stores a +0.0 pair as (-0.0, +0.0), so a
+        zero sum can come out as -0.0 where the pull sum gives +0.0.
+        Rank-uniform like ``can_reduce_scatter``."""
+        nbytes = numel * dtype.itemsize
+        if self.disabled or nbytes % 16 != 0:
+            return False
+        if self.override_algo is not None:
+            return nbytes <= self.max_size and not self.override_algo.is_push()
+        config = self._pick_config(nbytes, self._can_use_graph())
+        return (
+            config is not None
+            and not config.algo.is_push()
+            and not config.use_multicast
+        )
+
+    def can_all_gather(self, input: torch.Tensor, output: torch.Tensor) -> bool:
+        """Whether ``all_gather`` takes this pair; rank-uniform as above."""
+        return (
+            input.is_contiguous()
+            and output.is_contiguous()
+            and output.dtype == input.dtype
+            and input.numel() * self.world_size == output.numel()
+            and self._fits_pull_collective(
+                full_numel=output.numel(),
+                dtype=input.dtype,
+                staged_bytes=input.numel() * input.element_size(),
+            )
+        )
+
+    def reduce_scatter(self, input: torch.Tensor, output: torch.Tensor) -> None:
+        """``output`` = this rank's equal flat shard of the sum of ``input``,
+        bitwise the shard the graph-mode ``2shot_pull`` all-reduce produces."""
+        custom_reduce_scatter(
+            self.obj, input, output, graph_params=self._pull_graph_row(input)
+        )
+
+    def all_gather(self, input: torch.Tensor, output: torch.Tensor) -> None:
+        """``output`` = every rank's ``input``, rank-major along the flat axis."""
+        custom_all_gather(
+            self.obj, input, output, graph_params=self._pull_graph_row(input)
+        )
+
+    def _fits_pull_collective(
+        self, *, full_numel: int, dtype: torch.dtype, staged_bytes: int
+    ) -> bool:
+        if self.disabled or not self.pull_enabled:
+            return False
+        if dtype not in _PULL_COLLECTIVE_DTYPES:
+            return False
+        # Equal shards of whole 16-byte vectors.
+        shard_bytes, rem = divmod(full_numel * dtype.itemsize, self.world_size)
+        if rem != 0 or shard_bytes == 0 or shard_bytes % 16 != 0:
+            return False
+        # Graph mode reads the peers' registered tensors; eager stages through
+        # the pull workspace.
+        return self._can_use_graph() or staged_bytes <= self.max_pull_size
+
+    def _pull_graph_row(self, input: torch.Tensor) -> Optional[torch.Tensor]:
+        if not self._can_use_graph():
+            return None
+        return self._allocate_graph_row(input, input.numel() * input.element_size())
 
     def _allocate_graph_row(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:
         index = self._graph_counter + len(self._graph_inputs)
