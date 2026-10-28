@@ -618,6 +618,18 @@ class SpFlags(_FlagGroupBase):
     enabled: bool = False
 
 
+class Dsv41Sm90Flags(_FlagGroupBase):
+    """DeepSeek-V4.1 SM90 optimization set, materialized by
+    ``initialize_dsv41_sm90`` (scheduler init; reads the model config). Empty
+    unless SGLANG_OPT_DSV41_SM90 is on for DeepSeek-V4.1 on SM90. See
+    ``layers.dsv41_sm90``."""
+
+    subsystems: frozenset[str] = frozenset()
+    lossy: frozenset[str] = frozenset()
+    # "mix", "prefill", "decode" or "encoder"; "" while the set is empty.
+    role: str = ""
+
+
 class Flags(_FlagGroupBase):
     """Mutable runtime state; resolved configuration lives in the config bags."""
 
@@ -625,6 +637,7 @@ class Flags(_FlagGroupBase):
     moe: MoeFlags = msgspec.field(default_factory=MoeFlags)
     dp: DpFlags = msgspec.field(default_factory=DpFlags)
     sp: SpFlags = msgspec.field(default_factory=SpFlags)
+    dsv41_sm90: Dsv41Sm90Flags = msgspec.field(default_factory=Dsv41Sm90Flags)
 
 
 class Resources(_FlagGroupBase):

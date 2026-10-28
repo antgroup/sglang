@@ -121,6 +121,10 @@ import { agentx } from "/src/snippets/agentx/deepseek-ai/deepseek-v4_1.jsx";
 
 Overriding them is the most common cause of a disappointing measurement: it leaves the 32-wide ue8m0 blocks on the Triton `_w8a8_block_fp8_matmul` fallback, which dominates the decode step and costs most of the model's bs=1 throughput. If your decode rate looks like a small fraction of what you expected, check the resolved backends first.
 
+### H20 / SM90
+
+On eight H20 or H20-3e GPUs, add `SGLANG_OPT_DSV41_SM90=1` to the environment of the launch command. The switch only takes effect for DeepSeek-V4.1 on SM90; it was tuned and validated on H20 and H20-3e, and other SM90 GPUs (H100, H200) are untested. A PD decode server can also set `SGLANG_OPT_DSV41_SM90_LOSSY=fp8_lm_head_target`, which runs the target LM head in FP8: it is not bitwise identical to the BF16 head and can change outputs and logprobs. See the [environment variable reference](/docs/references/environment_variables#model-specific-options) for the subsystem controls.
+
 ## 3. Advanced Usage
 
 ### 3.1 Reasoning

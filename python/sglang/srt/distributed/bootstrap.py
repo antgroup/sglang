@@ -28,6 +28,7 @@ from sglang.srt.layers.dp_attention import (
     init_dp_gathered_buffer,
     initialize_dp_attention,
 )
+from sglang.srt.layers.dsv41_sm90 import initialize_dsv41_sm90
 from sglang.srt.layers.layernorm_sp import initialize_layernorm_sp
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -346,9 +347,11 @@ def _init_parallel_groups(
 
 
 def init_layer_runtime(*, model_config: ModelConfig) -> None:
-    """Size the DP gathered buffer and resolve layernorm SP from the model."""
+    """Size the DP gathered buffer and resolve layernorm SP and the
+    DeepSeek-V4.1 SM90 set from the model."""
     init_dp_gathered_buffer(model_config)
     initialize_layernorm_sp(model_config=model_config)
+    initialize_dsv41_sm90(model_config=model_config)
 
 
 def _prewarm_nccl() -> None:

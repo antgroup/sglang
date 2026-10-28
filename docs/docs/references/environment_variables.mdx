@@ -751,6 +751,21 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_DSV41_SM90</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the DeepSeek-V4.1 optimizations for SM90 GPUs, tuned and validated on H20 and H20-3e (other SM90 GPUs are untested). Has no effect for other models or GPU architectures. Set to <code>1</code> to enable; when disabled, retain upstream behavior.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_DSV41_SM90_DISABLE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated subsystems to disable when <code>SGLANG_OPT_DSV41_SM90=1</code> on DeepSeek-V4.1 + SM90: <code>startup</code>, <code>moe</code>, <code>fp8_gemm</code>, <code>indexer</code>, <code>cp</code>, <code>mhc</code>, <code>attn_proj</code>, <code>prefill_graph</code>, <code>mix_decode</code>, <code>decode</code>, <code>lm_head</code>, <code>runtime</code>, <code>pd</code>, <code>epd</code>. Has no effect otherwise.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Empty list</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_DSV41_SM90_LOSSY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated opt-in lossy options when <code>SGLANG_OPT_DSV41_SM90=1</code> on DeepSeek-V4.1 + SM90. The only option is <code>fp8_lm_head_target</code>: use an FP8 target LM head, which is not bitwise identical to the BF16 head and can change outputs and logprobs. Subject to FP8 LM head eligibility; disabled with LoRA. Has no effect for other models or GPU architectures.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Empty list</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV4_FP4_EXPERTS</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Whether DeepSeek V4 experts use FP4. Set to <code>false</code> when using an FP4-to-FP8 converted DeepSeek V4 checkpoint.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>

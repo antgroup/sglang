@@ -1794,6 +1794,13 @@ class Envs:
     SGLANG_DSV4_FP8_HCA_PERSIST = EnvBool(True)
     SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
+    # DeepSeek-V4.1 on SM90: one switch for the H20-tuned paths (layers/dsv41_sm90.py);
+    # off, or on another model or architecture, every caller keeps the upstream path.
+    # DISABLE drops subsystems by name; LOSSY opts into the paths that are not bitwise.
+    SGLANG_OPT_DSV41_SM90 = EnvBool(False)
+    SGLANG_OPT_DSV41_SM90_DISABLE = EnvTuple(())
+    SGLANG_OPT_DSV41_SM90_LOSSY = EnvTuple(())
+
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
