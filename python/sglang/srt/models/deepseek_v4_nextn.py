@@ -36,6 +36,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.models import deepseek_v4_attn_proj as dsv41_attn_proj
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
@@ -267,6 +268,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
+        self.wo_a_fp8_block32 = dsv41_attn_proj.wo_a_fp8_block32_enabled(quant_config)
         self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         self.model = DeepseekV4ModelNextN(

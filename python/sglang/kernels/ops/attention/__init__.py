@@ -358,6 +358,23 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+# DeepSeek-V4.1 SM90 row-tiled RoPE and the wo_a input's RoPE + FP8 rounding.
+for _mod, _fn in [
+    ("dsv4.q_rope_rows", "q_rope_rows_inplace"),
+    ("dsv4.wo_a_rope_quant", "wo_a_rope_qdq"),
+    ("dsv4.wo_a_rope_quant", "wo_a_rope_qdq_rows"),
+    ("dsv4.wo_a_rope_quant", "wo_a_rope_quant_block32"),
+    ("dsv4.wo_a_rope_quant", "wo_a_rope_quant_block32_rows"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _mod, _fn
 register_kernel(
     KernelSpec(
         op="attention.fused_rope_wo_a_bf16",

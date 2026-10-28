@@ -497,6 +497,30 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.block32_swapab_gemm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.fp8_block32_swapab:block32_swapab_gemm",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.lm_head_swapab_gemm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.fp8_lm_head_swapab:lm_head_swapab_gemm",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.wo_a_block32_small_gemm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.dsv41_wo_a_fp8:wo_a_block32_small_gemm",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.w8a8_mxfp8_matmul_deepgemm",
         backend=KernelBackend.DEEPGEMM,
         target="sglang.kernels.ops.gemm.fp8_kernel:w8a8_mxfp8_matmul_deepgemm",

@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
+from sglang.kernels.ops.quantization.fp8_block32_qdq import fp8_block32_quant_dequant
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
@@ -27,6 +28,10 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_lm_head import (
+    attach_fp8_lm_head,
+    resolve_fp8_lm_head_use,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -37,6 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models import deepseek_v4_attn_proj as dsv41_attn_proj
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.dbrx import ReplicatedLinear
@@ -197,12 +203,22 @@ class DSparkAttention(MqaAttentionBase):
                 fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
                 return q_out
             if self._use_fast_kernel and not _is_npu:
-                fused_rope_inplace(
-                    q[..., -self.rope_head_dim :],
-                    None,
-                    self.freqs_cis,
-                    positions=positions,
-                )
+                if not (
+                    self.attn_proj is not None
+                    and dsv41_attn_proj.q_rope_rows(
+                        self.attn_proj,
+                        q=q,
+                        freqs_cis=self.freqs_cis,
+                        positions=positions,
+                        draft=True,
+                    )
+                ):
+                    fused_rope_inplace(
+                        q[..., -self.rope_head_dim :],
+                        None,
+                        self.freqs_cis,
+                        positions=positions,
+                    )
             else:
                 apply_rotary_emb(
                     q[..., -self.rope_head_dim :], self.freqs_cis[positions]
@@ -269,7 +285,6 @@ class DSparkAttention(MqaAttentionBase):
 
         pool = _resolve_dspark_pool()
         attn_backend = get_attn_backend()
-        rd = self.rope_head_dim
 
         enable_multi_stream = (
             self.alt_streams is not None
@@ -339,6 +354,39 @@ class DSparkAttention(MqaAttentionBase):
         if o.shape[1] != self.n_local_heads:
             o = o[:, : self.n_local_heads, :]
 
+        o = self._wo_a_input(o, positions)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        if self._use_fast_kernel:
+            o = _apply_wo_a_bf16_matmul(
+                o,
+                wo_a,
+                is_decode=forward_batch.forward_mode.is_decode(),
+                is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                fast_path=self.is_dsv41,
+            )
+        else:
+            o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
+        value = o.reshape(o.shape[0], o.shape[1] * o.shape[2])
+        out, _ = self.wo_b(value, skip_all_reduce=defer_all_reduce)
+        return (
+            mhc.AttnOutput(out)
+            if _is_cuda and defer_all_reduce and self.attn_tp_size > 1
+            else out
+        )
+
+    def _wo_a_input(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """o [T, H, Dh] -> the [T, G, H * Dh / G] wo_a input."""
+        rd = self.rope_head_dim
+        if self._use_fast_kernel and self.attn_proj is not None:
+            rows = dsv41_attn_proj.draft_wo_a_rope_qdq(
+                self.attn_proj,
+                o=o,
+                freqs_cis=self.freqs_cis,
+                positions=positions,
+                num_groups=self.n_local_groups,
+            )
+            if rows is not None:
+                return rows
         if self._use_fast_kernel:
             fused_rope_inplace(
                 o[..., -rd:], None, self.freqs_cis, positions=positions, inverse=True
@@ -369,24 +417,10 @@ class DSparkAttention(MqaAttentionBase):
             self.n_local_groups,
             o.shape[1] * o.shape[2] // self.n_local_groups,
         )
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        if self._use_fast_kernel:
-            o = _apply_wo_a_bf16_matmul(
-                o,
-                wo_a,
-                is_decode=forward_batch.forward_mode.is_decode(),
-                is_target_verify=forward_batch.forward_mode.is_target_verify(),
-                fast_path=self.is_dsv41,
-            )
-        else:
-            o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
-        value = o.reshape(o.shape[0], o.shape[1] * o.shape[2])
-        out, _ = self.wo_b(value, skip_all_reduce=defer_all_reduce)
-        return (
-            mhc.AttnOutput(out)
-            if _is_cuda and defer_all_reduce and self.attn_tp_size > 1
-            else out
-        )
+        if self.attn_proj is not None:
+            # The V4.1 reference rounds the draft's wo_a input too.
+            o = fp8_block32_quant_dequant(o)
+        return o
 
     @staticmethod
     def accepts_mxfp8_swizzled_input():
@@ -829,6 +863,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             self.embed_tokens: Optional[nn.Module] = None
             self.lm_head: Optional[nn.Module] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
+        self._fp8_lm_head_use = resolve_fp8_lm_head_use()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
         if self.lm_head is not None:
             self.markov_head.configure_tp_shard(lm_head=self.lm_head)
@@ -844,6 +879,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             self.embed_tokens = embed_tokens
             self.lm_head = lm_head
         self.markov_head.configure_tp_shard(lm_head=self.lm_head)
+        if self._fp8_lm_head_use.draft and self.lm_head.fp8_head is None:
+            attach_fp8_lm_head(self.lm_head, use=self._fp8_lm_head_use)
 
     def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
         stage0 = self.stages[0]
@@ -993,7 +1030,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         last = self.stages[-1]
         x = last.norm(x_post_hc)
         weight = self.lm_head.weight
-        if self._use_fp32_lm_head and weight.is_floating_point():
+        if self._fp8_lm_head_use.draft:
+            local_logits = self.lm_head.fp8_head(x)
+        elif self._use_fp32_lm_head and weight.is_floating_point():
             local_logits = F.linear(x.float(), weight.float())
         else:
             local_logits = project_through_lm_head(x, self.lm_head)

@@ -587,6 +587,9 @@ class ParallelLMHead(VocabParallelEmbedding):
             use_presharded_weights=use_presharded_weights,
         )
         self.quant_config = quant_config
+        # FP8 copy of the bf16 weight (layers/quantization/fp8_lm_head.py), built
+        # after weight loading and shared by every caller of this head.
+        self.fp8_head: Optional[torch.nn.Module] = None
 
         # We only support pack LMHead if it's not quantized.
         if _is_cpu and _is_cpu_amx_available:

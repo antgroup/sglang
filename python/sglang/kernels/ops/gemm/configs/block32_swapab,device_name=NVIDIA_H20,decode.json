@@ -1,0 +1,46 @@
+{
+  "N=32768,K=1280": {
+    "12": {"bt1": 16, "bt2": 0, "stages": 3, "split": 1, "maxnreg": 64},
+    "24": {"bt1": 32, "bt2": 0, "stages": 3, "split": 1, "maxnreg": 64},
+    "36": {"bt1": 32, "bt2": 16, "stages": 2, "split": 1, "maxnreg": 64},
+    "48": {"bt1": 32, "bt2": 16, "stages": 2, "split": 1, "maxnreg": 64},
+    "72": {"bt1": 32, "bt2": 16, "stages": 2, "split": 1, "maxnreg": 64},
+    "96": {"bt1": 32, "bt2": 16, "stages": 2, "split": 1, "maxnreg": 64},
+    "128": {"bt1": 64, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 72},
+    "144": {"bt1": 32, "bt2": 16, "stages": 2, "split": 1, "maxnreg": 64},
+    "160": {"bt1": 32, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 64},
+    "192": {"bt1": 64, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 80}
+  },
+  "N=5120,K=8192": {
+    "12": {"bt1": 16, "bt2": 0, "stages": 4, "split": 1, "maxnreg": 64},
+    "24": {"bt1": 16, "bt2": 0, "stages": 4, "split": 1, "maxnreg": 64},
+    "32": {"bt1": 16, "bt2": 0, "stages": 3, "split": 1, "maxnreg": 64},
+    "36": null,
+    "48": null,
+    "64": null,
+    "72": {"bt1": 32, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 64},
+    "96": {"bt1": 32, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 64},
+    "128": null,
+    "160": {"bt1": 32, "bt2": 0, "stages": 4, "split": 1, "maxnreg": 64},
+    "192": {"bt1": 32, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 64}
+  },
+  "N=1792,K=5120": {
+    "6": {"bt1": 8, "bt2": 0, "stages": 2, "split": 10, "maxnreg": 64},
+    "16": {"bt1": 16, "bt2": 0, "stages": 3, "split": 5, "maxnreg": 80},
+    "24": null,
+    "48": null,
+    "72": {"bt1": 16, "bt2": 0, "stages": 4, "split": 1, "maxnreg": 64},
+    "96": null
+  },
+  "N=5120,K=288": {
+    "6": {"bt1": 8, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 64},
+    "16": {"bt1": 16, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 64},
+    "96": {"bt1": 32, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 64},
+    "192": {"bt1": 64, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 80},
+    "288": {"bt1": 64, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 80},
+    "320": {"bt1": 64, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 72},
+    "384": {"bt1": 64, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 80},
+    "576": {"bt1": 64, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 80},
+    "768": {"bt1": 64, "bt2": 0, "stages": 2, "split": 1, "maxnreg": 80}
+  }
+}

@@ -28,6 +28,7 @@ from sglang.srt.layers.amx_utils import (
     _amx_process_weight_after_loading,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dsv41_sm90 import dsv41_sm90_on, dsv41_sm90_role
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -121,6 +122,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+    from sglang.srt.layers.quantization.fp8_block32_sm90 import Block32Routes
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
     from sglang.srt.models.utils import WeightsMapper
 
@@ -485,6 +487,20 @@ class Fp8Config(QuantizationConfig):
             )
 
 
+def _dsv41_block32_routes(
+    *, weight_block_size: Optional[List[int]], act_scale_ue8m0: bool
+) -> Optional[Block32Routes]:
+    if not (
+        weight_block_size == [32, 32] and act_scale_ue8m0 and dsv41_sm90_on("fp8_gemm")
+    ):
+        return None
+    from sglang.srt.layers.quantization.fp8_block32_sm90 import load_block32_routes
+
+    return load_block32_routes(
+        device_name=torch.cuda.get_device_name(), role=dsv41_sm90_role()
+    )
+
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
 
@@ -545,10 +561,17 @@ class Fp8LinearMethod(LinearMethodBase):
             effective_block_size = (
                 [128, 128] if self.convert_mxfp8_to_block else self.weight_block_size
             )
+            act_scale_ue8m0 = (
+                isinstance(self.quant_config, Fp8Config)
+                and self.quant_config.scale_fmt == "ue8m0"
+            )
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear(
                 weight_block_size=effective_block_size,
-                act_scale_ue8m0=isinstance(self.quant_config, Fp8Config)
-                and self.quant_config.scale_fmt == "ue8m0",
+                act_scale_ue8m0=act_scale_ue8m0,
+                block32_routes=_dsv41_block32_routes(
+                    weight_block_size=effective_block_size,
+                    act_scale_ue8m0=act_scale_ue8m0,
+                ),
             )
         # Method-wide gate; a layer that cannot take the MXFP8 view stays on the
         # block kernel (see _prepare_block_fp8_as_mxfp8).

@@ -479,6 +479,92 @@ class TestSm90Block32Linear(_LinearBackendCheck):
             torch.testing.assert_close(plain, quantized, rtol=0, atol=0)
 
 
+@unittest.skipUnless(get_device_sm() == 90, "SM90 block32 routes")
+class TestDsv41Block32Routes(_LinearBackendCheck):
+    """The H20-measured DeepSeek-V4.1 routes (``fp8_gemm``) against upstream's."""
+
+    def _layers(self, n: int, k: int):
+        from sglang.srt.layers.quantization.fp8_block32_sm90 import (
+            load_block32_routes,
+        )
+        from sglang.srt.runtime_context import get_flags
+
+        layers = []
+        for subsystems in (frozenset(), frozenset({"fp8_gemm"})):
+            torch.manual_seed(7)
+            with (
+                get_flags().dsv41_sm90.override(subsystems=subsystems, role="mix"),
+                mock.patch("torch.cuda.get_device_name", return_value="NVIDIA H20-3e"),
+            ):
+                layer, _ = _build_block32_layer(n, k)
+            layer.quant_method.process_weights_after_loading(layer)
+            layers.append(layer)
+        routes = load_block32_routes(device_name="NVIDIA H20-3e", role="mix")
+        linear = layers[1].quant_method.w8a8_block_fp8_linear
+        self.assertIs(linear.keywords["block32_routes"], routes)
+        return layers[0], layers[1], routes
+
+    def test_bitwise_upstream_except_split_k_and_triton_rows(self):
+        from sglang.kernels.ops.gemm.fp8_block32_swapab import lookup_swapab
+        from sglang.srt.layers.quantization.fp8_block32_sm90 import _prefers_triton
+
+        bitwise_swapab = 0
+        for n, k in ((576, 5120), (5120, 1024), (1536, 5120), (4096, 1280)):
+            upstream, routed, routes = self._layers(n, k)
+            for m in (1, 6, 7, 16, 17, 24, 48, 96, 192, 193, 320, 1024):
+                with self.subTest(n=n, k=k, m=m):
+                    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+                    ref = upstream.quant_method.apply(upstream, x)
+                    out = routed.quant_method.apply(routed, x)
+                    cfg = lookup_swapab(routes.swapab, n, k, m)
+                    if _prefers_triton(routes=routes, m=m, n=n, k=k) or (
+                        cfg is not None and cfg.split > 1
+                    ):
+                        assert_output_close(
+                            self, out, ref.float(), rtol=1e-2, atol=1e-2
+                        )
+                    else:
+                        bitwise_swapab += cfg is not None
+                        self.assertTrue(torch.equal(out, ref))
+        self.assertGreater(bitwise_swapab, 3)
+
+    def test_prequantized_input_out_slice_and_graph_replay(self):
+        from sglang.kernels.ops.quantization.fp8_block32_act_quant import (
+            block32_act_quant_ue8m0_mn_major,
+        )
+
+        n, k = 576, 5120
+        _, layer, _ = self._layers(n, k)
+        linear = layer.quant_method.w8a8_block_fp8_linear
+        weights = dict(weight=layer.weight, block_size=[32, 32])
+        weights["weight_scale"] = layer.weight_scale_inv
+        for m in (6, 24, 192, 1024):
+            with self.subTest(m=m):
+                x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+                plain = linear(input=x, **weights)
+                # MN-major pre-quantized rows take the same GEMM as the bf16 rows.
+                q, scale = block32_act_quant_ue8m0_mn_major(x)
+                self.assertTrue(
+                    torch.equal(linear(input=q, input_scale=scale, **weights), plain)
+                )
+                buf = torch.zeros((m, n + 64), device="cuda", dtype=torch.bfloat16)
+                linear(input=x, out=buf[:, 32 : 32 + n], **weights)
+                self.assertTrue(torch.equal(buf[:, 32 : 32 + n], plain))
+                self.assertEqual(int(buf[:, :32].count_nonzero()), 0)
+                self.assertEqual(int(buf[:, 32 + n :].count_nonzero()), 0)
+        # A split-K row inside a graph: its tile counters must exist before capture
+        # and be zero again after every replay.
+        x = torch.randn((6, k), device="cuda", dtype=torch.bfloat16)
+        linear(input=x, **weights)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = linear(input=x, **weights)
+        for scale in (0.5, 4.0):
+            x.mul_(scale)
+            graph.replay()
+            self.assertTrue(torch.equal(captured, linear(input=x, **weights)))
+
+
 @unittest.skipUnless(
     "flashinfer_cutedsl" in _block32_backends(),
     "block-fp8-as-MXFP8 prefill tuning needs the FlashInfer CuTe-DSL kernel",

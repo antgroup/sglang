@@ -278,13 +278,61 @@ struct FusedKNormRopeFlashMLAParams {
   int64_t kv_stride_batch;
   uint32_t batch_size;
   float eps;
-  // kRopeQ (ROCm): (B, num_q_heads, kHeadDim) DType; the trailing kRopeDim of every head
+  // kRopeQ: (B, num_q_heads, kHeadDim) DType; the trailing kRopeDim of every head
   // are rotated in place with this token's frequencies by the same launch.
   void* __restrict__ q = nullptr;
   int64_t q_stride_batch = 0;
   int64_t q_stride_head = 0;
   uint32_t num_q_heads = 0;
 };
+
+#ifdef USE_ROCM
+// ROCm ropes a token's query heads inside its K block.
+constexpr bool kFusedKRopeQInBlock = true;
+#else
+// CUDA ropes them in blocks batch_size .. 2 * batch_size - 1 (fused_k_norm_rope_flashmla_q_rope).
+constexpr bool kFusedKRopeQInBlock = false;
+#endif
+
+// The query rope of one token on CUDA: every thread keeps one rope pair (one frequency) and
+// rotates it for kUnroll heads at a time, keeping the loads in flight; heads are kHeadDim apart
+// (a runtime head stride costs ~1.5 us at 512 rows x 64 heads on H20). deepseek_rope_kernel's
+// forward with NVCC's contraction (first product fused, second rounded): bitwise fused_rope_inplace.
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL>
+SGL_DEVICE void fused_k_norm_rope_flashmla_q_rope(const FusedKNormRopeFlashMLAParams& params, uint32_t token) {
+  using namespace device;
+  using DType2 = packed_t<DType>;
+  constexpr uint32_t kPairs = kRopeDim / 2;
+  constexpr uint32_t kUnroll = 8;
+  constexpr uint32_t kHeadsPerStep = kFusedKBlockSize / kPairs;
+  static_assert(kFusedKBlockSize % kPairs == 0);
+  const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[token]);
+  const auto freqs = reinterpret_cast<const fp32x2_t*>(params.freqs_cis + position * kRopeDim);
+  const auto row = static_cast<DType*>(params.q) + token * params.q_stride_batch + (kHeadDim - kRopeDim);
+  const uint32_t pair = threadIdx.x % kPairs;
+  const auto [f_real, f_imag] = freqs[pair];
+  PDLWaitPrimary<kUsePDL>();
+  for (uint32_t h0 = threadIdx.x / kPairs; h0 < params.num_q_heads; h0 += kHeadsPerStep * kUnroll) {
+    DType2 data[kUnroll];
+#pragma unroll
+    for (uint32_t u = 0; u < kUnroll; ++u) {
+      const uint32_t head = h0 + u * kHeadsPerStep;
+      if (head < params.num_q_heads) data[u] = reinterpret_cast<const DType2*>(row + head * kHeadDim)[pair];
+    }
+#pragma unroll
+    for (uint32_t u = 0; u < kUnroll; ++u) {
+      const uint32_t head = h0 + u * kHeadsPerStep;
+      if (head >= params.num_q_heads) break;
+      const auto [x_real, x_imag] = cast<fp32x2_t>(data[u]);
+      const fp32x2_t out = {
+          __fmaf_rn(x_real, f_real, -__fmul_rn(x_imag, f_imag)),
+          __fmaf_rn(x_real, f_imag, __fmul_rn(x_imag, f_real)),
+      };
+      reinterpret_cast<DType2*>(row + head * kHeadDim)[pair] = cast<DType2>(out);
+    }
+  }
+  PDLTriggerSecondary<kUsePDL>();
+}
 
 // The V4.1 K RoPE with its fma pinned, so the two K kernels below round it the same way.
 SGL_DEVICE fp32x2_t v41_rope_pair(float x_real, float x_imag, float freq_real, float freq_imag) {
@@ -316,6 +364,12 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
   const auto warp_id = tx / kWarpThreads;
   const auto lane_id = tx % kWarpThreads;
   const auto work_id = blockIdx.x;
+  if constexpr (kRopeQ && !kFusedKRopeQInBlock) {
+    if (work_id >= params.batch_size) {
+      return fused_k_norm_rope_flashmla_q_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL>(
+          params, work_id - params.batch_size);
+    }
+  }
   if (work_id >= params.batch_size) return;
 
   const auto input_ptr = static_cast<const DType*>(params.kv) + work_id * params.kv_stride_batch;
@@ -360,7 +414,7 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
   }
 
   // Before the out_loc check: a row without a KV slot still ropes its query heads.
-  if constexpr (kRopeQ) {
+  if constexpr (kRopeQ && kFusedKRopeQInBlock) {
     // Query rope, pair j of head h at q[h * stride + kHeadDim - kRopeDim + 2j]: the cross product
     // is rounded, then one fma with the cosine, so the bf16 result is bitwise the Triton flat
     // rope kernel's on gfx950.
@@ -595,7 +649,7 @@ struct FusedKNormRopeFlashMLAKernel {
     forward_impl<false>(kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, nullptr);
   }
 
-  /// `forward` with the same tokens' query heads `q` (B, H, kHeadDim) roped in place (ROCm).
+  /// `forward` with the same tokens' query heads `q` (B, H, kHeadDim) roped in place.
   static void forward_with_q(
       const tvm::ffi::TensorView kv,
       const tvm::ffi::TensorView kv_weight,
@@ -676,6 +730,7 @@ struct FusedKNormRopeFlashMLAKernel {
           .verify(*q);
       // The rope pairs are read and written as 4-byte packs.
       RuntimeCheck(q->stride(1) % 2 == 0 && q->stride(0) % 2 == 0, "q strides must be even");
+      RuntimeCheck(kFusedKRopeQInBlock || q->stride(1) == kHeadDim, "q heads must be contiguous");
       params.q = q->data_ptr();
       params.q_stride_batch = q->stride(0);
       params.q_stride_head = q->stride(1);
@@ -693,7 +748,8 @@ struct FusedKNormRopeFlashMLAKernel {
     const auto k_int32 = kernel<int32_t, kRopeQ>;
     const auto k_int64 = kernel<int64_t, kRopeQ>;
     const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
-    LaunchKernel(batch_size, kFusedKBlockSize, device_.unwrap())  //
+    const auto num_blocks = kRopeQ && !kFusedKRopeQInBlock ? 2 * batch_size : batch_size;
+    LaunchKernel(num_blocks, kFusedKBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(k, params);
   }
 };

@@ -98,7 +98,7 @@ def _jit_main_k_norm_rope_q_flashmla_module(
     page_size: int,
     layout: KVLayout,
 ):
-    """ROCm only: the K kernel above with the in-place query rope in the same launch."""
+    """The K kernel above with the in-place query rope in the same launch."""
     args = make_cpp_args(
         dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl()
     )
@@ -326,7 +326,6 @@ def fused_k_norm_rope_flashmla(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size
         )
     elif q is not None:
-        assert _is_hip, "only the ROCm K launch ropes q"
         module = _jit_main_k_norm_rope_q_flashmla_module(
             kv.dtype, head_dim, rope_dim, page_size, layout
         )

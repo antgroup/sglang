@@ -461,6 +461,7 @@ class LogitsProcessor(nn.Module):
         skip_all_gather: bool = False,
         logit_scale: Optional[float] = None,
         return_full_logits: bool = False,
+        use_fp8_lm_head: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -471,6 +472,9 @@ class LogitsProcessor(nn.Module):
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head or getattr(
             config, "enable_lm_head_fp32", False
         )
+        # Logits come from lm_head.fp8_head, which the model builds after loading;
+        # an FP32 head that was asked for stays FP32.
+        self.use_fp8_lm_head = use_fp8_lm_head and not self.use_fp32_lm_head
         self.use_fp32_lm_head_output = getattr(
             config, "enable_lm_head_output_fp32", False
         )
@@ -1149,6 +1153,9 @@ class LogitsProcessor(nn.Module):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.use_fp8_lm_head:
+            assert embedding_bias is None
+            return lm_head.fp8_head(hidden_states)
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method

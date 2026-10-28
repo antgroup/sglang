@@ -150,3 +150,24 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+for _fn in ("fp8_block32_quant_dequant", "fp8_block32_quant_mn_major"):
+    register_kernel(
+        KernelSpec(
+            op=f"quantization.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.quantization.fp8_block32_qdq:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn
+register_kernel(
+    KernelSpec(
+        op="quantization.block32_act_quant_ue8m0_mn_major",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.quantization.fp8_block32_act_quant"
+            ":block32_act_quant_ue8m0_mn_major"
+        ),
+        capabilities=CUDA_ONLY,
+    )
+)

@@ -270,6 +270,22 @@ def _reduce_block_fp8_split_k(
 
 
 @triton.jit
+def _reduce_block_fp8_split_k_fixed_order(
+    Parts, Out, ELEMENTS, SPLITS: tl.constexpr, BLOCK: tl.constexpr
+):
+    # (p0 + p2 + ...) + (p1 + p3 + ...), each half summed in split order: the
+    # order Triton 3.7.1 lowers the tl.sum above to for 8 splits; 3.8 differs.
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < ELEMENTS
+    even = tl.load(Parts + offsets, mask, 0.0)
+    odd = tl.load(Parts + ELEMENTS + offsets, mask, 0.0)
+    for split in tl.static_range(2, SPLITS, 2):
+        even += tl.load(Parts + split * ELEMENTS + offsets, mask, 0.0)
+        odd += tl.load(Parts + (split + 1) * ELEMENTS + offsets, mask, 0.0)
+    tl.store(Out + offsets, even + odd, mask)
+
+
+@triton.jit
 def _w8a8_block_fp8_matmul_gfx1250(
     # Pointers to inputs and output
     A,
@@ -615,6 +631,47 @@ def get_w8a8_block_fp8_configs(
     return None
 
 
+# H20 reads the H20-3e tables: the same 78-SM die, and every SM90 block32 table
+# measured on both was byte-identical. A file named for the device itself wins.
+_TUNED_TABLE_DEVICE_ALIASES = {"NVIDIA H20": "NVIDIA H20-3e"}
+
+
+def find_tuned_config(stem: str, device_name: str, suffix: str = "") -> Optional[str]:
+    """Path of ``configs/<stem>,device_name=<GPU><suffix>.json`` for this device or
+    its alias, or None when neither was measured."""
+    for name in (device_name, _TUNED_TABLE_DEVICE_ALIASES.get(device_name)):
+        if name is None:
+            continue
+        path = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)),
+            "configs",
+            f"{stem},device_name={name.replace(' ', '_')}{suffix}.json",
+        )
+        if os.path.exists(path):
+            return path
+    return None
+
+
+@functools.lru_cache
+def get_w8a8_block32_small_m_configs(
+    device_name: str,
+) -> Dict[Tuple[int, int], Dict[int, Dict[str, Any]]]:
+    """Measured Triton configs of the SM90 block-[32, 32] GEMM at decode-sized M,
+    {(N, K): {M: config}}; the nearest listed M serves a row count, as in
+    get_w8a8_block_fp8_configs. Empty when the device has no table."""
+    path = find_tuned_config("block32_triton_small_m", device_name)
+    if path is None:
+        return {}
+    with open(path) as f:
+        raw = json.load(f)
+    configs = {}
+    for shape, rows in raw.items():
+        n_part, k_part = shape.split(",")
+        key = (int(n_part.removeprefix("N=")), int(k_part.removeprefix("K=")))
+        configs[key] = {int(m): cfg for m, cfg in rows.items()}
+    return configs
+
+
 @functools.lru_cache
 def get_w8a8_channelwise_fp8_configs(N: int, K: int) -> Optional[Dict[int, Any]]:
     """
@@ -743,8 +800,15 @@ def w8a8_block_fp8_matmul_deepgemm(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
+    if out is not None:
+        # DeepGEMM stores D through a TMA descriptor built from out's strides, so
+        # a row-major slice of a wider buffer (16B-aligned base and row pitch) works.
+        assert out.shape == C.shape and out.dtype == C.dtype and out.stride(-1) == 1
+        assert out.data_ptr() % 16 == 0 and out.stride(0) * out.element_size() % 16 == 0
+        C = out
 
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -780,6 +844,8 @@ def w8a8_block_fp8_matmul_triton(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
+    config: Optional[Dict[str, Any]] = None,
+    fixed_order_split_k: bool = False,
 ) -> torch.Tensor:
     """This function performs matrix multiplication with block-wise quantization.
 
@@ -793,6 +859,9 @@ def w8a8_block_fp8_matmul_triton(
         Bs: The per-block quantization scale for `B`.
         block_size: The block size for per-block quantization. It should be 2-dim, e.g., [128, 128].
         output_dytpe: The dtype of the returned tensor.
+        config: Launch config to use instead of the tuned-table lookup.
+        fixed_order_split_k: Sum the SPLIT_K partials in a fixed order that does
+            not depend on the Triton version (an even SPLIT_K).
 
     Returns:
         torch.Tensor: The result of matmul.
@@ -802,22 +871,23 @@ def w8a8_block_fp8_matmul_triton(
 
     block_n, block_k = block_size
 
-    configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
-    if configs:
-        # If an optimal configuration map has been found, look up the
-        # optimal config
-        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
-    else:
-        # Default config
-        # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
-        config = {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": block_size[0],
-            "BLOCK_SIZE_K": block_size[1],
-            "GROUP_SIZE_M": 32,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
+    if config is None:
+        configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
+        if configs:
+            # If an optimal configuration map has been found, look up the
+            # optimal config
+            config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+        else:
+            # Default config
+            # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
+            config = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": block_size[0],
+                "BLOCK_SIZE_K": block_size[1],
+                "GROUP_SIZE_M": 32,
+                "num_warps": 4,
+                "num_stages": 3,
+            }
 
     # Split-K accumulates K in SPLIT_K separate fp32 partials, so its results
     # do not match the single-accumulator kernels bit-for-bit.
@@ -872,7 +942,12 @@ def w8a8_block_fp8_matmul_triton(
         needs_masking=needs_masking,
     )
 
-    if split_k > 1:
+    if split_k > 1 and fixed_order_split_k:
+        assert split_k % 2 == 0
+        _reduce_block_fp8_split_k_fixed_order[(triton.cdiv(M * N, 256),)](
+            partials, C, M * N, split_k, 256
+        )
+    elif split_k > 1:
         _reduce_block_fp8_split_k[(triton.cdiv(M * N, 256),)](
             partials, C, M * N, split_k, 256
         )
