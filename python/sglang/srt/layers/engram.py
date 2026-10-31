@@ -1792,3 +1792,9 @@ def _bcg_engram_embed(
     # A replay builds a fresh batch; the capture-time one stages no rows.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     out.copy_(engram.embed_rows(hash_ids, forward_batch, cp_all_tokens))
+
+# Opt-in external shared-Engram adapter; native table behavior stays the default.
+if __import__("os").environ.get("SGLANG_EXPERIMENTAL_REMOTE_ENGRAM") == "1":
+    from shared_model_adapter import install as _install_shared_engram
+
+    _install_shared_engram()

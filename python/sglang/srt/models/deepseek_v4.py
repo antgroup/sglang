@@ -4301,6 +4301,14 @@ class DeepseekV4Model(nn.Module):
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
+        remote_prefetch = (
+            __import__("os").environ.get("SGLANG_EXPERIMENTAL_REMOTE_ENGRAM") == "1"
+            and __import__("os").environ.get("ENGRAM_SHARED_PREFETCH") == "1"
+        )
+        if self.engram_hasher is not None and remote_prefetch:
+            from sglang.srt.layers.remote_engram import prepare_forward
+
+            prepare_forward(cp_extend)
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
@@ -4310,6 +4318,12 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                 )
                 parallel = get_parallel()
+                if remote_prefetch:
+                    from sglang.srt.layers.remote_engram import prefetch_full_hash
+
+                    prefetch_full_hash(
+                        hash_ids, hidden_states.shape[0], parallel.attn_cp_size
+                    )
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
                 if pad_rows > 0:
