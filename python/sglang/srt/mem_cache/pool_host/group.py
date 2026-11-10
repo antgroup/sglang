@@ -8,8 +8,9 @@ from typing import Any
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
-    PoolName,
+    HostPoolName,
     PoolTransfer,
+    host_pool_name,
     merge_source_transfers,
 )
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView
@@ -18,7 +19,7 @@ from sglang.srt.mem_cache.pool_host.base import HostKVCache, shared_host_layout_
 
 @dataclass
 class PoolEntry:
-    name: PoolName
+    name: HostPoolName
     host_pool: Any
     device_pool: Any
     layer_mapper: Callable[[int], int | None]
@@ -36,6 +37,9 @@ class PoolEntry:
     # Stage-local transfer IDs -> physical host layer slots. Storage uses the
     # inverse mapping to give sparse and packed-draft layers stable identities.
     transfer_layer_mapping: dict[int, int] | None = None
+
+    def __post_init__(self):
+        self.name = host_pool_name(self.name)
 
 
 class HostPoolGroup:
@@ -78,10 +82,12 @@ class HostPoolGroup:
         self.entry_map[entry.name] = entry
         self._refresh_transfer_capabilities()
 
-    def get_entry(self, name: PoolName | None = None) -> PoolEntry:
-        return self.anchor_entry if name is None else self.entry_map[name]
+    def get_entry(self, name: HostPoolName | None = None) -> PoolEntry:
+        return (
+            self.anchor_entry if name is None else self.entry_map[host_pool_name(name)]
+        )
 
-    def get_pool(self, name: PoolName):
+    def get_pool(self, name: HostPoolName):
         return self.get_entry(name).host_pool
 
     @contextmanager
@@ -111,7 +117,7 @@ class HostPoolGroup:
             element_sizes.add(element_size)
         return element_sizes.pop() if len(element_sizes) == 1 else None
 
-    def get_contiguous_buf_infos(self, pool_names: set[PoolName] | None = None):
+    def get_contiguous_buf_infos(self, pool_names: set[HostPoolName] | None = None):
         """Return (device_buffers, host_buffers), each (ptrs, sizes, item_sizes)."""
         host_by_device_ptr = {}
         device_infos = ([], [], [])
@@ -216,7 +222,7 @@ class HostPoolGroup:
         self,
         need_size: int,
         *,
-        pool: PoolName | None = None,
+        pool: HostPoolName | None = None,
         reclaim: Callable[[int], Any] | None = None,
         start_owner: int | None = None,
     ) -> torch.Tensor | None:
@@ -230,7 +236,7 @@ class HostPoolGroup:
             indices = host_pool.alloc(need_size, **kwargs)
         return indices
 
-    def free(self, indices: torch.Tensor, *, pool: PoolName | None = None) -> int:
+    def free(self, indices: torch.Tensor, *, pool: HostPoolName | None = None) -> int:
         return self.get_entry(pool).host_pool.free(indices)
 
     def resolve_host_transfers(
@@ -366,5 +372,5 @@ class HostPoolGroup:
         for entry in self.entries:
             entry.host_pool.destroy()
 
-    def available_size(self, pool: PoolName | None = None):
+    def available_size(self, pool: HostPoolName | None = None):
         return self.get_entry(pool).host_pool.available_size()

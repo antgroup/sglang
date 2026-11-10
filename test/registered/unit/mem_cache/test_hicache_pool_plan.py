@@ -170,21 +170,42 @@ class TestPoolComponentPlans(CustomTestCase):
         cfg.is_hybrid_swa = cfg.is_hybrid_swa_compress = False
         cfg.sliding_window_size = None
         cfg.kv_cache_dtype = torch.bfloat16
-        for blackwell, quantization in (
-            (False, None),
-            (True, None),
-            (True, "fp8"),
-            (False, "minimax_m3_nvfp4"),
-            (True, "minimax_m3_nvfp4"),
+        # SM11x/SM12x are Blackwell too, but only SM10x uses the CUDA
+        # native stack. On gfx950, the pool also depends on the spec algorithm
+        # and the requested AMD KV format.
+        for sm100, blackwell, hip, quantization, spec, kv_format, packed in (
+            (False, False, False, None, None, "auto", False),
+            (True, True, False, None, None, "auto", False),
+            (True, True, False, "fp8", None, "auto", False),
+            (False, False, False, "minimax_m3_nvfp4", None, "auto", False),
+            (False, True, False, "minimax_m3_nvfp4", None, "auto", False),
+            (True, True, False, "minimax_m3_nvfp4", None, "auto", True),
+            (False, False, True, "minimax_m3_nvfp4", "DSPARK", "auto", True),
+            (False, False, True, "minimax_m3_nvfp4", "DSPARK", "fp8", False),
+            (False, False, True, "minimax_m3_nvfp4", None, "auto", False),
         ):
             with (
-                self.subTest(blackwell=blackwell, quantization=quantization),
+                self.subTest(
+                    sm100=sm100,
+                    blackwell=blackwell,
+                    hip=hip,
+                    quantization=quantization,
+                    spec=spec,
+                    kv_format=kv_format,
+                ),
                 get_context().override_server_args(
                     enable_hierarchical_cache=True,
                     hicache_mem_layout="page_unified",
                     enable_unified_memory=False,
+                    speculative_algorithm=spec,
                 ),
-                override_platform(is_blackwell=blackwell),
+                override_platform(
+                    is_sm100=sm100,
+                    is_blackwell=blackwell,
+                    is_hip=hip,
+                    is_gfx95=hip,
+                ),
+                envs.SGLANG_MINIMAX_M3_AMD_KV_FORMAT.override(kv_format),
                 _cp_topology(1),
             ):
                 cfg.model_config = SimpleNamespace(
@@ -193,7 +214,7 @@ class TestPoolComponentPlans(CustomTestCase):
                     ),
                     quantization=quantization,
                 )
-                if blackwell and quantization == "minimax_m3_nvfp4":
+                if packed:
                     with self.assertRaisesRegex(NotImplementedError, "minimax_nvfp4"):
                         cfg._validate_hicache_cp_pools()
                 else:
@@ -211,6 +232,8 @@ class TestPoolComponentPlans(CustomTestCase):
             MLAGeometry,
             kv_layer_decls,
         )
+        from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+        from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
         from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
@@ -227,6 +250,7 @@ class TestPoolComponentPlans(CustomTestCase):
                         hicache_storage_head_partition=1,
                         hicache_ratio=2,
                         hicache_size=0,
+                        page_size=4,
                     ),
                     _cp_topology(
                         2,
@@ -268,9 +292,11 @@ class TestPoolComponentPlans(CustomTestCase):
                     cfg = KVCacheConfigurator.__new__(KVCacheConfigurator)
                     cfg.page_size, cfg.device = 4, "cpu"
                     cfg.is_draft_worker, cfg.post_capture_kv_active = False, False
+                    cfg.mambaish_config, cfg.is_hybrid_swa = None, True
                     cfg.forward_stream = None
                     cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=3)
                     cfg.model_config = SimpleNamespace(
+                        hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
                         context_len=32,
                         sliding_window_size=8,
                         head_dim=16,
@@ -280,47 +306,39 @@ class TestPoolComponentPlans(CustomTestCase):
                     )
                     # A valid arena needs two lifetimes. Only the full view is
                     # exercised here; hybrid/CP admission is tested separately.
-                    sizes = SimpleNamespace(
-                        unified_memory_pool_bytes=8192,
-                        unified_total_bytes=None,
-                        full_max_total_num_tokens=64,
-                        swa_max_total_num_tokens=16,
-                        max_running_requests=2,
-                    )
-                    with (
-                        patch.object(
-                            KVCacheConfigurator,
-                            "_kv_layer_decls",
-                            return_value=kv_layer_decls(
-                                full_layer_ids=(0, 1),
-                                full_geometry=geometry,
-                                window_layer_ids=(2,),
-                                window_geometry=MHAGeometry(
-                                    head_num=1,
-                                    head_dim=16,
-                                    v_head_dim=16,
-                                    kv_cache_dtype=torch.bfloat16,
-                                ),
-                                window=8,
+                    cfg._unified_plan = plan_kv_storage(
+                        kv_layer_decls(
+                            full_layer_ids=(0, 1),
+                            full_geometry=geometry,
+                            window_layer_ids=(2,),
+                            window_geometry=MHAGeometry(
+                                head_num=1,
+                                head_dim=16,
+                                v_head_dim=16,
+                                kv_cache_dtype=torch.bfloat16,
                             ),
+                            window=8,
                         ),
-                        patch.object(
-                            KVCacheConfigurator,
-                            "_unified_window_and_state",
-                            return_value=(True, False),
+                        page_size=cfg.page_size,
+                    )
+                    extra_context_len, pre_alloc_rows = cfg._unified_request_rows(
+                        has_state=False
+                    )
+                    cfg._unified_sized = size_plan(
+                        cfg._unified_plan,
+                        KVSizingInputs(
+                            full_tokens=64,
+                            window_tokens=16,
+                            max_running_requests=2,
+                            context_len=cfg.model_config.context_len,
+                            extra_context_len=extra_context_len,
+                            pre_alloc_rows=pre_alloc_rows,
+                            alignment=1,
                         ),
-                        patch.object(
-                            KVCacheConfigurator,
-                            "_fused_draft_for_swa_factory",
-                            return_value=None,
-                        ),
-                        patch.object(
-                            KVCacheConfigurator,
-                            "_unified_request_rows",
-                            return_value=(0, 0),
-                        ),
-                    ):
-                        storage = cfg._init_unified_pools(sizes=sizes)
+                    )
+                    storage = cfg._init_unified_pools(
+                        sizes=SimpleNamespace(max_running_requests=2)
+                    )
                     view = storage.view("full")
                     info = view.get_device_pool_infos()[0].buffer_info
                     owner = cp_rank == 0 and (tp_rank == 0 if mla else tp_rank % 2 == 0)
@@ -330,7 +348,7 @@ class TestPoolComponentPlans(CustomTestCase):
                             (info.global_head_start, info.global_head_num),
                             (tp_rank // 2, 2),
                         )
-                    host = build_kv_host_pool(kv_pool=view, page_size=4, use_mla=mla)
+                    host = build_kv_host_pool(kv_pool=view, page_size=4)
                     try:
                         records = host.storage_component_metadata
                         self.assertTrue(records)
