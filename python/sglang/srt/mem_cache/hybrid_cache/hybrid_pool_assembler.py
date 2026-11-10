@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.device_pool_info import (
     MLABufferInfo,
     PageRowBufferInfo,
 )
+from sglang.srt.mem_cache.hicache_key_scheme import resolve_head_group_num
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -262,6 +263,7 @@ def build_pool_entry(
         device_free_fn=device_free_fn,
         packed_draft_device_pools=packed_draft_device_pools,
         device_translate=device_translate,
+        transfer_layer_mapping=dict(layer_mapping),
     )
 
 
@@ -582,6 +584,15 @@ def _dsv4_region_page_aligned_only(region: DSV4PagedBufferInfo) -> bool:
     return region.layout not in ("v4", "index_fused", "pa_nd")
 
 
+def _dsv4_native_page_formats(region, device_pool):
+    packing = (
+        f"{region.layout}:slots={region.page_slots}"
+        f":fp4={int(bool(getattr(device_pool, 'use_fp4_indexer', False)))}"
+        f":page8={int(bool(getattr(device_pool, 'index_k_page8', False)))}"
+    )
+    return (packing,) * len(region.buffers)
+
+
 def _dsv4_pool_infos(kvcache: Any) -> dict[PoolName, DevicePoolInfo]:
     return {info.pool_name: info for info in kvcache.get_device_pool_infos()}
 
@@ -678,6 +689,9 @@ def _dsv4_low_ratio_entries(
                     layout=get_memory().hicache_mem_layout,
                     allocator_type=_get_allocator_type(),
                     page_aligned_only=True,
+                    native_page_formats=_dsv4_native_page_formats(
+                        infos[name].buffer_info, device_pool
+                    ),
                 ),
                 device_pool=device_pool,
                 layer_mapping=layer_mapping,
@@ -736,6 +750,10 @@ def _extra_host_region_entries(
                     layout=get_memory().hicache_mem_layout,
                     allocator_type=_get_allocator_type(),
                     page_aligned_only=True,
+                    native_page_formats=(
+                        f"extra:{getattr(kvcache, 'kv_layout', 'unknown')}:{region.pool_name}",
+                    )
+                    * (len(region.device_buffers) + len(drafts)),
                 ),
                 device_pool=region.device_pool,
                 layer_mapping=with_packed_draft_layer_mapping(
@@ -775,6 +793,7 @@ def _build_dsv4_rope_entry(
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
             page_aligned_only=True,
+            native_page_formats=_dsv4_native_page_formats(region, device_pool),
         ),
         device_pool=device_pool,
         layer_mapping=layer_mapping,
@@ -797,6 +816,12 @@ def build_deepseek_v4_hicache_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
+    if get_memory().hicache_mem_layout == "page_unified" and (
+        params.attn_cp_size > 1 or params.mtp_draft_device_pools
+    ):
+        raise NotImplementedError(
+            "Unified DSV4 supports TP/PP without CP or packed drafts."
+        )
     page_size = params.page_size
     infos = _dsv4_pool_infos(kvcache)
     transfer_layer_id_max = len(kvcache.stage_layer_ids)
@@ -881,6 +906,9 @@ def build_deepseek_v4_hicache_stack(
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
             page_aligned_only=_dsv4_region_page_aligned_only(swa_info),
+            native_page_formats=_dsv4_native_page_formats(
+                swa_info, kvcache.swa_kv_pool
+            ),
         )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
         entries.append(
@@ -913,6 +941,7 @@ def build_deepseek_v4_hicache_stack(
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
             page_aligned_only=_dsv4_region_page_aligned_only(c4_info),
+            native_page_formats=_dsv4_native_page_formats(c4_info, kvcache.c4_kv_pool),
         )
         entries.append(
             build_pool_entry(
@@ -946,6 +975,9 @@ def build_deepseek_v4_hicache_stack(
                         layout=get_memory().hicache_mem_layout,
                         allocator_type=_get_allocator_type(),
                         page_aligned_only=_dsv4_region_page_aligned_only(region),
+                        native_page_formats=_dsv4_native_page_formats(
+                            region, kvcache.c4_indexer_kv_pool
+                        ),
                     ),
                     device_pool=kvcache.c4_indexer_kv_pool,
                     layer_mapping=c4_layer_mapping,
@@ -1019,6 +1051,9 @@ def build_deepseek_v4_hicache_stack(
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
             page_aligned_only=_dsv4_region_page_aligned_only(c128_info),
+            native_page_formats=_dsv4_native_page_formats(
+                c128_info, kvcache.c128_kv_pool
+            ),
         )
         # C128 state pool is intentionally not registered with hicache.
         # page_size=256 % 128 == 0, so state pool is not consumed on load.
@@ -1580,6 +1615,10 @@ def _build_sidecar_host_pool(
     *, config: HostPoolConfig, root: Any, root_host_pool: Any
 ) -> DSAIndexerPoolHost | QSAIndexerPoolHost:
     if config.buffer_info.key_layout is IndexKeyLayout.KEY_ROWS:
+        if root_host_pool.layout == "page_unified":
+            raise NotImplementedError(
+                "Unified QSA requires the recurrent-state extension."
+            )
         return _build_qsa_indexer_host_pool(
             config=config, root_host_pool=root_host_pool
         )
@@ -2717,6 +2756,7 @@ def build_minimax_sparse_hicache_stack(
             device_capacity_tokens=main_pool.size,
             start_layer=main_pool.start_layer,
             end_layer=main_pool.end_layer,
+            head_group_num=resolve_head_group_num(main_pool.head_num),
         )
     else:
         kv_host_pool = build_kv_host_pool(kv_pool=main_pool, page_size=params.page_size)

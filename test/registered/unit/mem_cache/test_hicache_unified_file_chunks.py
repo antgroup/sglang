@@ -10,14 +10,20 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.hicache_key_scheme import plan_unified_kv
+from sglang.srt.mem_cache.hicache_key_scheme import (
+    plan_unified_kv,
+    plan_unified_pool_components,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+from sglang.srt.mem_cache.pool_host.page_unified import (
+    PageStorageComponent,
+    PageUnifiedLayout,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -120,6 +126,168 @@ class TestUnifiedFileChunks(unittest.TestCase):
 
     def _path(self, backend, key, suffix):
         return Path(backend.file_path) / f"{key}_{suffix}.bin"
+
+    def test_specialized_main_and_replicated_indexer_reshard_together(self):
+        # Distinct global head/layer/token bytes expose misplaced spans. The
+        # replicated indexer elects a writer independently of the sharded KV.
+        full = torch.arange(4 * 4 * 4 * 8).reshape(4, 4, 4, 8).to(torch.uint8)
+        index = (torch.arange(4 * 4 * 132).reshape(4, 4, 132) % 251).to(torch.uint8)
+
+        def rank(tp, pp, tr, pr):
+            heads, layers = 4 // tp, 4 // pp
+            start = pr * layers
+            pages = {
+                PoolName.KV: full[
+                    tr * heads : (tr + 1) * heads, start : start + layers
+                ].contiguous(),
+                PoolName.INDEXER: index[start : start + layers].contiguous(),
+            }
+            components = {
+                PoolName.KV: tuple(
+                    PageStorageComponent(
+                        name="packed-kv",
+                        shape=(layers, 4, 8),
+                        dtype="uint8",
+                        byte_offset=group * layers * 32,
+                        byte_length=layers * 32,
+                        shard_coordinate=f"H{tr * heads + group}-{tr * heads + group + 1}",
+                    )
+                    for group in range(heads)
+                ),
+                PoolName.INDEXER: (
+                    PageStorageComponent(
+                        name="index-k-with-scale",
+                        shape=(layers, 4, 132),
+                        dtype="uint8",
+                        byte_offset=0,
+                        byte_length=layers * 4 * 132,
+                    ),
+                ),
+            }
+            plans = {
+                name: plan_unified_pool_components(
+                    model_id="specialized/model",
+                    pool_name=name,
+                    object_layout="codec-v1",
+                    page_size=4,
+                    components=records,
+                    layer_ids=tuple(range(start, start + layers)),
+                    attn_tp_rank=tr,
+                    attn_tp_size=tp,
+                    layer_partition=2,
+                    is_final_stage=pr == pp - 1,
+                    stage_end_layer=4,
+                )
+                for name, records in components.items()
+            }
+            config, _, _ = _rank()
+            config = replace(
+                config,
+                tp_rank=tr,
+                tp_size=tp,
+                pp_rank=pr,
+                pp_size=pp,
+                unified_suffixes=list(plans[PoolName.KV].suffixes),
+                unified_chunk_spans=list(plans[PoolName.KV].chunk_spans),
+                unified_pool_plans=plans,
+            )
+            backend = self._backend(config)
+            pools = {}
+            for name, page in pages.items():
+                host = _HostPool.__new__(_HostPool)
+                host.page_unified_layout = None
+                host.page_size, host.page = 4, page.clone()
+                pools[name] = host
+                if name == PoolName.KV:
+                    backend.register_mem_pool_host(host)
+                backend.register_mem_host_pool_v2(host, name)
+            return backend, pools, plans
+
+        for writer, reader in (((2, 1), (1, 2)), ((1, 2), (2, 1))):
+            key = f"specialized-{writer}"
+            written = set()
+            for pr in range(writer[1]):
+                for tr in range(writer[0]):
+                    backend, pools, plans = rank(*writer, tr, pr)
+                    transfers = [
+                        PoolTransfer(
+                            name=name, keys=[key], host_indices=torch.arange(4)
+                        )
+                        for name, plan in plans.items()
+                        if plan.is_storage_writer
+                    ]
+                    self.assertTrue(
+                        all(
+                            all(result)
+                            for result in backend.batch_set_v2(transfers).values()
+                        )
+                    )
+                    written.update(
+                        suffix
+                        for plan in plans.values()
+                        for suffix in plan.owned_suffixes
+                    )
+            restored = set()
+            for pr in range(reader[1]):
+                for tr in range(reader[0]):
+                    backend, pools, plans = rank(*reader, tr, pr)
+                    expected = {name: pool.page.clone() for name, pool in pools.items()}
+                    for pool in pools.values():
+                        pool.page.zero_()
+                    transfers = [
+                        PoolTransfer(
+                            name=name, keys=[key], host_indices=torch.arange(4)
+                        )
+                        for name in pools
+                    ]
+                    self.assertTrue(
+                        all(
+                            all(result)
+                            for result in backend.batch_get_v2(transfers).values()
+                        )
+                    )
+                    for name, pool in pools.items():
+                        self.assertTrue(torch.equal(pool.page, expected[name]))
+                    restored.update(
+                        suffix
+                        for plan in plans.values()
+                        for suffix in plan.owned_suffixes
+                    )
+            self.assertEqual(written, restored)
+
+    def test_specialized_namespace_separates_schema_pool_and_dtype(self):
+        component = PageStorageComponent(
+            name="row", shape=(2, 4, 8), dtype="uint8", byte_offset=0, byte_length=64
+        )
+
+        def plan(**overrides):
+            args = dict(
+                model_id="model",
+                pool_name="indexer",
+                object_layout="fp8-k128-scale4",
+                page_size=4,
+                components=(component,),
+                layer_ids=(0, 1),
+                stage_end_layer=2,
+            )
+            args.update(overrides)
+            return plan_unified_pool_components(**args)
+
+        reference = plan()
+        for override in (
+            dict(pool_name="deepseek_v4_c4_indexer"),
+            dict(object_layout="fp4-k64-scale4"),
+            dict(components=(replace(component, dtype="float8_e4m3fn"),)),
+        ):
+            self.assertTrue(
+                set(reference.suffixes).isdisjoint(plan(**override).suffixes)
+            )
+        self.assertFalse(plan(attn_tp_rank=1, attn_tp_size=2).is_storage_writer)
+        self.assertFalse(plan(attn_cp_rank=1, attn_cp_size=2).is_storage_writer)
+        with self.assertRaisesRegex(ValueError, "identity"):
+            plan(model_id="")
+        with self.assertRaisesRegex(NotImplementedError, "head ownership"):
+            plan(components=(replace(component, shard_coordinate=None),))
 
     def test_reshard_tp_and_pp_in_both_directions(self):
         for writer, reader in (((2, 1), (1, 2)), ((1, 2), (2, 1))):

@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from dataclasses import dataclass
 
 import msgspec
 
@@ -365,3 +366,141 @@ def _layer_chunks(
         [f"L{a}-{b}" for a, b in bounds],
         [(a - start_layer, b - start_layer) for a, b in bounds],
     )
+
+
+@dataclass(frozen=True)
+class UnifiedPoolStoragePlan:
+    suffixes: tuple[str, ...]
+    chunk_spans: tuple[tuple[int, int], ...]
+    is_storage_writer: bool = True
+    writer_mask: tuple[bool, ...] = ()
+
+    @property
+    def chunk_writers(self):
+        return self.writer_mask or (self.is_storage_writer,) * len(self.suffixes)
+
+    @property
+    def owned_suffixes(self):
+        return tuple(s for s, owned in zip(self.suffixes, self.chunk_writers) if owned)
+
+    @property
+    def page_bytes(self):
+        return sum(length for _, length in self.chunk_spans)
+
+    def validate(self):
+        if len(self.suffixes) != len(self.chunk_spans) or len(
+            set(self.suffixes)
+        ) != len(self.suffixes):
+            raise ValueError("Unified pool keys and spans must pair uniquely.")
+        if self.writer_mask and len(self.writer_mask) != len(self.suffixes):
+            raise ValueError("Unified pool keys require matching writer ownership.")
+        end = 0
+        for offset, length in sorted(self.chunk_spans):
+            if offset != end or length <= 0:
+                raise ValueError("Unified pool spans must cover one page without gaps.")
+            end += length
+
+
+def plan_unified_pool_components(
+    *,
+    model_id,
+    pool_name,
+    object_layout,
+    page_size,
+    components,
+    layer_ids,
+    attn_tp_rank=0,
+    attn_tp_size=1,
+    attn_cp_rank=0,
+    attn_cp_size=1,
+    layer_partition=None,
+    is_final_stage=True,
+    stage_end_layer=None,
+):
+    """Apply the canonical layer grid to specialized, layer-major byte runs.
+
+    Dense ordinary KV retains its existing planner and namespace. Specialized
+    formats add their pool, byte schema and explicit head range to model
+    identity, then reuse the same layer-grid validation and coordinates.
+    """
+    if (
+        not model_id
+        or not 0 <= attn_tp_rank < attn_tp_size
+        or not 0 <= attn_cp_rank < attn_cp_size
+    ):
+        raise ValueError("Invalid unified pool model identity or topology.")
+    if layer_partition is not None and (
+        type(layer_partition) is not int or layer_partition < 1
+    ):
+        raise ValueError("layer_partition must be a positive integer.")
+    groups = {}
+    for component in components:
+        if component.shard_coordinate is None:
+            raise NotImplementedError(
+                "Unified specialized KV requires explicit global head ownership."
+            )
+        count = component.shape[0]
+        if count <= 0 or component.byte_length % count:
+            raise ValueError("Unified components must contain complete layer records.")
+        ids = layer_ids[component.layer_offset : component.layer_offset + count]
+        if component.layer_offset < 0 or len(ids) != count:
+            raise ValueError("Unified component is missing model layer coordinates.")
+        identity = (
+            pool_name,
+            object_layout,
+            component.name,
+            component.dtype,
+            component.shape[1:],
+            component.byte_length // count,
+            component.shard_coordinate,
+        )
+        schema = hashlib.sha256(msgspec.msgpack.encode(identity)).hexdigest()[:24]
+        writer = (
+            component.is_storage_writer
+            and attn_cp_rank == 0
+            and (bool(component.shard_coordinate) or attn_tp_rank == 0)
+        )
+        length = component.byte_length // count
+        for index, layer in enumerate(ids):
+            groups.setdefault((schema, writer), []).append(
+                (layer, component.byte_offset + index * length, length)
+            )
+    suffixes, spans, writers = [], [], []
+    for (schema, writer), rows in groups.items():
+        rows.sort()
+        if len({layer for layer, _, _ in rows}) != len(rows):
+            raise ValueError("Unified components repeat a model layer.")
+        runs = []
+        for row in rows:
+            if (
+                not runs
+                or row[0] != runs[-1][-1][0] + 1
+                or row[1] != runs[-1][-1][1] + runs[-1][-1][2]
+            ):
+                runs.append([])
+            runs[-1].append(row)
+        for run in runs:
+            start, end = run[0][0], run[-1][0] + 1
+            plan = plan_unified_kv(
+                model_id=f"{model_id}|{schema}",
+                dtype="uint8",
+                page_size=page_size,
+                rank_replicated=True,
+                local_kv_heads=0,
+                attn_tp_rank=attn_tp_rank,
+                attn_tp_size=attn_tp_size,
+                attn_cp_size=attn_cp_size,
+                start_layer=start,
+                end_layer=end,
+                is_final_stage=is_final_stage and end == stage_end_layer,
+                layer_partition=layer_partition or 1,
+            )
+            for suffix, (lo, hi) in zip(plan.suffixes, plan.layer_ranges):
+                suffixes.append(suffix)
+                spans.append((run[lo][1], sum(row[2] for row in run[lo:hi])))
+                writers.append(writer)
+    result = UnifiedPoolStoragePlan(
+        tuple(suffixes), tuple(spans), any(writers), tuple(writers)
+    )
+    result.validate()
+    return result

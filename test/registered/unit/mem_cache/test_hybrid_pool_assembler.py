@@ -1218,6 +1218,61 @@ class TestKvHostPoolRow(CustomTestCase):
             )
         return seen
 
+    def test_canonical_unified_mla_rejects_split_or_scaled_buffers_before_allocation(
+        self,
+    ):
+        from sglang.srt.mem_cache.device_pool_info import MLABufferInfo, MLASplitBuffers
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        latent = torch.zeros((8, 1, 32), dtype=torch.uint8)
+        split = MLASplitBuffers(
+            k=torch.zeros((1, 2, 4, 24), dtype=torch.uint8),
+            v=torch.zeros((1, 2, 4, 8), dtype=torch.uint8),
+            index_k=None,
+            index_scales=None,
+            index_layer_indices=(),
+            k_width=24,
+            v_width=8,
+            index_width=0,
+        )
+        for buffers, scales in (
+            (split, None),
+            ((latent,), (torch.zeros((8, 1, 2), dtype=torch.uint8),)),
+        ):
+            info = MLABufferInfo(
+                buffers=buffers,
+                scales=scales,
+                data_ptrs=None,
+                layer_indices=(0,),
+                device_layer_num=1,
+                page_size=4,
+                kv_lora_rank=24,
+                qk_rope_head_dim=8,
+                kv_cache_dim=32,
+                dtype=torch.uint8,
+                device=torch.device("cpu"),
+            )
+            with (
+                self.subTest(split=isinstance(buffers, MLASplitBuffers)),
+                patch(
+                    "sglang.srt.mem_cache.pool_host.mla.HostKVCache.__init__"
+                ) as allocation,
+            ):
+                with self.assertRaisesRegex(NotImplementedError, "native codec"):
+                    MLATokenToKVPoolHost(
+                        info,
+                        1,
+                        0,
+                        4,
+                        "page_unified",
+                        pin_memory=False,
+                        device_capacity_tokens=8,
+                        start_layer=0,
+                        end_layer=1,
+                        target_layer_num=1,
+                    )
+                allocation.assert_not_called()
+
     def test_mla_row_width_comes_from_the_device_pool(self):
         pool = _dsa_pool_stub(layer_num=2)
         pool.kv_cache_dim = 656  # fp8 DSA store: 576 + fp32 scales

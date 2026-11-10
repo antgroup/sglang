@@ -5553,6 +5553,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     if self.use_fp4_indexer
                     else IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES
                 ),
+                key_shuffle_tile=(
+                    16
+                    if not self.use_fp4_indexer and aiter_can_use_preshuffle_paged_mqa()
+                    else 0
+                ),
             ),
         )
         return (*kv_infos, index_info)

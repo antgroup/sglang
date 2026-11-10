@@ -11,7 +11,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
-from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo
+from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo, IndexKeyLayout
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
     MLA_KVCACHEIO_OPS,
     require_kvcacheio_ops,
@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
+from sglang.srt.mem_cache.pool_host.page_unified import PageStorageComponent
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -116,6 +117,24 @@ class DSAIndexerPoolHost(HostKVCache):
         self.dcp_size = dcp_size
         self.dcp_rank = dcp_rank
         self.layout = layout
+        if (
+            layout == "page_unified"
+            and buffer_info.key_layout is not IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES
+        ):
+            raise NotImplementedError(
+                "Unified DSA indexer requires FP8 keys with per-token scales."
+            )
+        self._index_key_info = buffer_info
+        self._kernel_page_size = buffer_info.kernel_page_size or (
+            buffer_info.page_size // buffer_info.compress_ratio
+        )
+        self._key_count = transfer_page_size // buffer_info.compress_ratio
+        self.storage_format_tag = (
+            f"dsa-index-token-v2:{buffer_info.key_layout.value}:"
+            f"compression={buffer_info.compress_ratio}"
+            if layout == "page_unified"
+            else None
+        )
         self.dtype = dtype
         self.indexer_dtype = torch.uint8
         self.layer_num = len(buffers)
@@ -129,12 +148,21 @@ class DSAIndexerPoolHost(HostKVCache):
             layer for layer in layer_mapping if layer >= target_device_layer_num
         ]
         self.target_layer_num = len(self._live_target_layers)
+        self.is_storage_writer = buffer_info.is_storage_writer
+        self._layer_storage_writers = buffer_info.layer_storage_writers or (
+            self.is_storage_writer,
+        ) * len(buffers)
         self.packed_device_index_buffers = list(buffers)
         self.page_num = num_host_pages
         self.size = num_host_pages * self.page_size
         self.indexer_page_stride_size = (
-            buffer_info.kernel_page_bytes // buffer_info.page_size
-        ) * transfer_page_size
+            self._key_count * 132
+            if layout == "page_unified"
+            else (buffer_info.kernel_page_bytes // buffer_info.page_size)
+            * transfer_page_size
+        )
+        if layout == "page_unified" and self._key_count % self._kernel_page_size:
+            raise ValueError("Unified DSA pages require complete native kernel pages")
         self._initialize_host_buffers()
 
     def _initialize_host_buffers(self):
@@ -245,13 +273,17 @@ class DSAIndexerPoolHost(HostKVCache):
                 self._buffer_device,
                 host_memory_registered=self.pin_memory,
             )
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout in ["page_first", "page_first_direct", "page_unified"]:
+            token_shape = (
+                (self._key_count, 132)
+                if self.layout == "page_unified"
+                else (1, self.indexer_page_stride_size)
+            )
             self.index_k_with_scale_buffer = alloc_func(
                 (
                     self.indexer_page_num,
                     self.layer_num,
-                    1,
-                    self.indexer_page_stride_size,
+                    *token_shape,
                 ),
                 dtype=self.indexer_dtype,
                 device=self.device,
@@ -289,6 +321,79 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def get_hybrid_pool_buffer(self):
         return [self.index_k_with_scale_buffer]
+
+    @property
+    def storage_component_metadata(self) -> tuple[PageStorageComponent, ...]:
+        """Replicated MQA keys in logical-token order, with each token's scale."""
+        return tuple(
+            PageStorageComponent(
+                name="index_k_with_scale",
+                shape=(1, self._key_count, 132),
+                dtype="uint8",
+                byte_offset=layer * self.indexer_page_stride_size,
+                byte_length=self.indexer_page_stride_size,
+                layer_offset=layer,
+                shard_coordinate="",
+                is_storage_writer=self._layer_storage_writers[layer],
+            )
+            for layer in range(self.layer_num)
+        )
+
+    def _canonical_index_rows(self, rows: torch.Tensor, *, load: bool):
+        """Transpose native [kernel-page K][kernel-page S] without requantizing."""
+        count = rows.shape[0]
+        kernel_slots = self._kernel_page_size
+        kernel_pages = self._key_count // kernel_slots
+        tile = self._index_key_info.key_shuffle_tile
+        if load:
+            tokens = rows.reshape(count, kernel_pages, kernel_slots, 132)
+            keys = tokens[..., :128]
+            scales = tokens[..., 128:]
+            if tile:
+                keys = keys.reshape(
+                    count * kernel_pages, kernel_slots // tile, tile, 128 // tile, tile
+                )
+                keys = keys.permute(0, 1, 3, 2, 4)
+            return torch.cat(
+                (
+                    keys.reshape(count, kernel_pages, -1),
+                    scales.reshape(count, kernel_pages, -1),
+                ),
+                dim=-1,
+            ).reshape(count, -1)
+        native = rows.reshape(count, kernel_pages, kernel_slots * 132)
+        keys = native[..., : kernel_slots * 128]
+        scales = native[..., kernel_slots * 128 :]
+        if tile:
+            keys = keys.reshape(
+                count * kernel_pages, kernel_slots // tile, 128 // tile, tile, tile
+            )
+            keys = keys.permute(0, 1, 3, 2, 4)
+        return torch.cat(
+            (
+                keys.reshape(count, self._key_count, 128),
+                scales.reshape(count, self._key_count, 4),
+            ),
+            dim=-1,
+        )
+
+    def _copy_unified_layer(self, host_layer, host_pages, device_pages, *, load):
+        if host_pages.numel() == 0:
+            return
+        device = self.packed_device_index_buffers[host_layer]
+        native = device.view(-1, self.indexer_page_stride_size)
+        hp = host_pages.to(device="cpu", dtype=torch.int64)
+        dp = device_pages.to(device=device.device, dtype=torch.int64)
+        if load:
+            rows = self.index_k_with_scale_buffer[hp, host_layer]
+            native.index_copy_(
+                0, dp, self._canonical_index_rows(rows, load=True).to(device.device)
+            )
+        else:
+            rows = native.index_select(0, dp).to("cpu")
+            self.index_k_with_scale_buffer[hp, host_layer] = self._canonical_index_rows(
+                rows, load=False
+            )
 
     def _get_indexer_page_indices(self, host_indices, device_indices):
         if host_indices.numel() == 0:
@@ -332,6 +437,11 @@ class DSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
+        if self.layout == "page_unified":
+            self._copy_unified_layer(
+                host_layer_id, host_page_indices, device_page_indices, load=True
+            )
+            return
         use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
         if use_kernel:
             if self.layout == "layer_first":
@@ -400,6 +510,11 @@ class DSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
+        if self.layout == "page_unified":
+            self._copy_unified_layer(
+                host_layer_id, host_page_indices, device_page_indices, load=False
+            )
+            return
         use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
         if use_kernel:
             if self.layout == "layer_first":
@@ -440,6 +555,11 @@ class DSAIndexerPoolHost(HostKVCache):
         assert not getattr(self, "_is_dummy", False), (
             "backup on a dummy (non-src DSA) host pool"
         )
+        if self.layout == "page_unified":
+            hp, dp = self._get_indexer_page_indices(host_indices, device_indices)
+            for layer in range(self.layer_num):
+                self._copy_unified_layer(layer, hp, dp, load=False)
+            return
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
@@ -524,7 +644,7 @@ class DSAIndexerPoolHost(HostKVCache):
         page_idx = self._storage_page_number(index)
         if self.layout == "layer_first":
             data_page = self.index_k_with_scale_buffer[:, page_idx : page_idx + 1, :]
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout in ["page_first", "page_first_direct", "page_unified"]:
             data_page = self.index_k_with_scale_buffer[page_idx : page_idx + 1, :, :, :]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -542,6 +662,11 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         page_idx = self._storage_page_number(index)
+        if self.layout == "page_unified":
+            self.index_k_with_scale_buffer[page_idx].copy_(
+                data_page.reshape_as(self.index_k_with_scale_buffer[page_idx])
+            )
+            return
         if self.layout == "layer_first":
             self.index_k_with_scale_buffer[:, page_idx : page_idx + 1, :] = (
                 data_page.reshape(
@@ -565,7 +690,7 @@ class DSAIndexerPoolHost(HostKVCache):
     def get_page_buffer_meta(self, indices):
         """Meta data for zero-copy storage I/O."""
         assert len(indices) % self.logical_page_size == 0
-        if self.layout not in ["page_first", "page_first_direct"]:
+        if self.layout not in ["page_first", "page_first_direct", "page_unified"]:
             raise ValueError(f"Unsupported layout: {self.layout}")
         ptr_list = []
         indices = indices.tolist()
@@ -579,7 +704,7 @@ class DSAIndexerPoolHost(HostKVCache):
         return ptr_list, [page_stride_bytes] * len(ptr_list)
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
-        if self.layout not in ["page_first", "page_first_direct"]:
+        if self.layout not in ["page_first", "page_first_direct", "page_unified"]:
             return False
         page_stride_bytes = (
             self.layer_num * self.indexer_page_stride_size * self.indexer_dtype.itemsize

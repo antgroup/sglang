@@ -35,6 +35,8 @@ class PoolEntry:
     # through its allocator (`KVStorage.host_ids`); None when they index it.
     device_translate: Callable[[torch.Tensor], torch.Tensor] | None = None
 
+    transfer_layer_mapping: dict[int, int] | None = None
+
     def __post_init__(self):
         self.name = host_pool_name(self.name)
 

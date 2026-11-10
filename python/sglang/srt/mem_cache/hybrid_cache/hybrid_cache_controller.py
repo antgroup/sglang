@@ -517,6 +517,10 @@ class HybridCacheController(BaseHiCacheController):
             # Sidecars added after attach (e.g. the DFLASH draft) miss the
             # attach-time DCP check.
             check_dcp_l3_extra_pool(entry, self.storage_host_pool)
+        if self.mem_pool_host.layout == "page_unified":
+            raise NotImplementedError(
+                "Dynamic sidecars are not supported with unified storage."
+            )
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
@@ -1989,6 +1993,9 @@ class HybridCacheController(BaseHiCacheController):
             _finish_op_trace(operation)
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
+        plans = getattr(self.storage_config, "unified_pool_plans", None)
+        if plans is not None:
+            return plans[transfer.name].is_storage_writer
         if not self.backup_skip:
             return True
 

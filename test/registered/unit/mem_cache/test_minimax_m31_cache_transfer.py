@@ -308,7 +308,9 @@ def test_retraction_round_trip_preserves_unaligned_rows_and_scales(start_layer):
                 assert torch.equal(left.view(torch.uint8), right.view(torch.uint8))
 
 
-@pytest.mark.parametrize("layout", ["layer_first", "page_first", "page_first_direct"])
+@pytest.mark.parametrize(
+    "layout", ["layer_first", "page_first", "page_first_direct", "page_unified"]
+)
 @pytest.mark.parametrize("backend", ["kernel", "direct"])
 def test_host_round_trip_preserves_pages_and_other_layers(layout, backend):
     pool = make_pool()
@@ -340,6 +342,76 @@ def test_host_round_trip_preserves_pages_and_other_layers(layout, backend):
     finally:
         index.destroy()
         main.destroy()
+
+
+def test_unified_dsa_and_bf16_index_keys_restore_only_the_requested_layer():
+    from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo, IndexKeyLayout
+    from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+    from sglang.srt.mem_cache.pool_host.mha import MHATokenToKOnlyPoolHost
+
+    for paged in (False, True):
+        buffers = tuple(
+            torch.randint(0, 256, (4, 528), dtype=torch.uint8)
+            if paged
+            else torch.randn(16, 1, 8, dtype=torch.bfloat16)
+            for _ in range(2)
+        )
+        originals = [buffer.clone() for buffer in buffers]
+        info = IndexKeyBufferInfo(
+            page_size=4,
+            buffers=buffers,
+            compress_ratio=1,
+            key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES
+            if paged
+            else IndexKeyLayout.KEY_ROWS,
+        )
+        if paged:
+            host = DSAIndexerPoolHost(
+                info,
+                layer_mapping={0: 0, 1: 1},
+                target_device_layer_num=2,
+                num_host_pages=4,
+                transfer_page_size=4,
+                layout="page_unified",
+                buffer_device="cpu",
+                dtype=torch.bfloat16,
+                pin_memory=False,
+            )
+        else:
+            host = MHATokenToKOnlyPoolHost(
+                info,
+                SimpleNamespace(page_size=4, page_num=4, size=16),
+                "page_unified",
+                pin_memory=False,
+            )
+        try:
+            host.backup_from_device_all_layer(
+                None, torch.arange(8, 12), torch.arange(4, 8), "kernel"
+            )
+            if paged:
+                expected = torch.cat(
+                    (
+                        buffers[0][1, :512].reshape(4, 128),
+                        buffers[0][1, 512:].reshape(4, 4),
+                    ),
+                    dim=-1,
+                )
+                assert torch.equal(host.index_k_with_scale_buffer[2, 0], expected)
+            for buffer in buffers:
+                buffer.zero_()
+            host.load_to_device_per_layer(
+                None, torch.arange(8, 12), torch.arange(12, 16), 1, "kernel"
+            )
+            assert torch.count_nonzero(buffers[0]) == 0
+            for layer in (0, 1):
+                host.load_to_device_per_layer(
+                    None, torch.arange(8, 12), torch.arange(12, 16), layer, "kernel"
+                )
+                expected = originals[layer][1] if paged else originals[layer][4:8]
+                actual = buffers[layer][3] if paged else buffers[layer][12:16]
+                assert torch.equal(expected, actual)
+        finally:
+            host.destroy()
 
 
 def test_invalid_host_pages_fail_before_writing():
@@ -380,7 +452,9 @@ def storage_config(model_name="m31-nvfp4"):
     )
 
 
-@pytest.mark.parametrize("layout", ["layer_first", "page_first", "page_first_direct"])
+@pytest.mark.parametrize(
+    "layout", ["layer_first", "page_first", "page_first_direct", "page_unified"]
+)
 def test_file_storage_round_trip_restores_main_and_index_rows(layout, tmp_path):
     pool = make_pool()
     fill_pool(pool)

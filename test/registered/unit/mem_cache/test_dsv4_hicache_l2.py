@@ -93,7 +93,12 @@ class TestDSV4HostViews(CustomTestCase):
         return pool
 
     def test_state_binding_preserves_storage_and_per_layer_dtype(self):
-        for layout in ("layer_first", "page_first", "page_first_direct"):
+        for layout in (
+            "layer_first",
+            "page_first",
+            "page_first_direct",
+            "page_unified",
+        ):
             with self.subTest(layout=layout):
                 pools = [
                     self._state_pool(torch.float16, 4),
@@ -159,7 +164,12 @@ class TestDSV4HostViews(CustomTestCase):
             pages * layers * state_page_bytes, dtype=torch.uint8
         ).reshape(pages, layers, state_page_bytes)
 
-        for layout in ("layer_first", "page_first", "page_first_direct"):
+        for layout in (
+            "layer_first",
+            "page_first",
+            "page_first_direct",
+            "page_unified",
+        ):
             with self.subTest(pool="paged", layout=layout):
                 host = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
                 host.pool_name = "c4"

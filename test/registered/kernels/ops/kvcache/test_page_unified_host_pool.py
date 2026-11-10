@@ -281,5 +281,281 @@ def test_mla_page_unified(kv_lora_rank, qk_rope_head_dim, dtype, preallocate):
         ), f"latent KV mismatch at layer {layer}"
 
 
+def _expected_serialized_page(host, native_layers):
+    """Reference byte addresses from the native format, independent of its codec."""
+    from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+    from sglang.srt.mem_cache.pool_host.minimax_m3_nvfp4 import (
+        MiniMaxM3Nvfp4IndexKPoolHost,
+        MiniMaxM3Nvfp4MainKVPoolHost,
+    )
+
+    pieces = []
+    if isinstance(host, DSAIndexerPoolHost):
+        info = host._index_key_info
+        slots = host.page_size // info.compress_ratio
+        native_slots = info.kernel_page_size or slots
+        tile = info.key_shuffle_tile
+        for row in native_layers:
+            for token in range(slots):
+                page, offset = divmod(token, native_slots)
+                base = page * native_slots * 132
+                if tile:
+                    # HIP's native cache tiles token/channel coordinates.
+                    key = row[
+                        torch.tensor(
+                            [
+                                base
+                                + (
+                                    ((offset // tile) * (128 // tile) + channel // tile)
+                                    * tile
+                                    + offset % tile
+                                )
+                                * tile
+                                + channel % tile
+                                for channel in range(128)
+                            ]
+                        )
+                    ]
+                else:
+                    key = row[base + offset * 128 : base + (offset + 1) * 128]
+                scale = base + native_slots * 128 + offset * 4
+                pieces.extend((key, row[scale : scale + 4]))
+    elif isinstance(host, MiniMaxM3Nvfp4MainKVPoolHost):
+        slots, heads = host.page_size, host.head_num
+        group_heads = heads // host.head_group_num
+        payload_bytes = heads * slots * 64
+        scale_bytes = heads * slots * 8
+        for group in range(host.head_group_num):
+            for row in native_layers:
+                for kv in range(2):
+                    base = kv * (payload_bytes + scale_bytes)
+                    for token in range(slots):
+                        for head in range(
+                            group * group_heads, (group + 1) * group_heads
+                        ):
+                            payload = base + (head * slots + token) * 64
+                            scale = base + payload_bytes + (head * slots + token) * 8
+                            pieces.extend(
+                                (row[payload : payload + 64], row[scale : scale + 8])
+                            )
+    elif isinstance(host, MiniMaxM3Nvfp4IndexKPoolHost):
+        slots = host.page_size
+        for row in native_layers:
+            for token in range(slots):
+                scale = slots * 64 + token * 8
+                pieces.extend(
+                    (row[token * 64 : (token + 1) * 64], row[scale : scale + 8])
+                )
+    else:
+        pieces = native_layers
+    return torch.cat(pieces)
+
+
+def _specialized_round_trip(host, buffers, backend, layer_ids=None):
+    """Move real CUDA bytes through relocated host pages and serialized pages."""
+    page_size = host.page_size
+    source_pages, host_pages, restored_pages = [3, 1, 4], [0, 4, 2], [5, 1, 3]
+    host_indices = _page_indices(host_pages, page_size)
+    restored_indices = _page_indices(restored_pages, page_size)
+    if backend == "kernel":
+        host_indices, restored_indices = host_indices.cuda(), restored_indices.cuda()
+    device_indices = _page_indices(source_pages, page_size).cuda()
+    expected = []
+    for layer, buffer in enumerate(buffers):
+        rows = buffer.view(torch.uint8).reshape(6, -1)
+        rows.copy_(
+            (torch.arange(rows.numel(), device=DEVICE, dtype=torch.int32) + layer * 43)
+            .remainder(251)
+            .to(torch.uint8)
+            .reshape_as(rows)
+        )
+        expected.append(rows[source_pages].cpu())
+    backing = host.get_hybrid_pool_buffer()[0]
+    assert backing.is_pinned()
+    backing.fill_(239)
+    host.backup_from_device_all_layer(None, host_indices, device_indices, backend)
+    torch.cuda.synchronize()
+    serialized = [host.get_data_page(page * page_size).clone() for page in host_pages]
+    for index, page in enumerate(serialized):
+        assert torch.equal(
+            page.view(torch.uint8).flatten(),
+            _expected_serialized_page(host, [layer[index] for layer in expected]),
+        )
+    assert torch.all(backing[6] == 239)
+    backing.zero_()
+    for page, data in zip(restored_pages, serialized):
+        host.set_from_flat_data_page(page * page_size, data)
+    assert torch.all(backing[0] == 0)
+    for buffer in buffers:
+        buffer.zero_()
+    for layer in range(len(buffers)) if layer_ids is None else layer_ids:
+        host.load_to_device_per_layer(
+            None, restored_indices, device_indices, layer, backend
+        )
+    torch.cuda.synchronize()
+    for buffer, original in zip(buffers, expected):
+        rows = buffer.view(torch.uint8).reshape(6, -1)
+        assert torch.equal(rows[source_pages].cpu(), original)
+        assert torch.count_nonzero(rows[[0, 2, 5]]) == 0
+
+
+@pytest.mark.parametrize("backend", ["kernel", "direct"])
+@pytest.mark.parametrize(
+    "kind,dtype",
+    [
+        ("dsa", torch.uint8),
+        ("dsa_shuffled", torch.uint8),
+        ("k_only", torch.bfloat16),
+        ("dsv4", torch.uint8),
+        ("dsv4", torch.float16),
+        ("dsv4", torch.float32),
+        ("dsv4_state", torch.uint8),
+        ("minimax_nvfp4", torch.uint8),
+    ],
+)
+def test_specialized_page_unified_cuda(kind, dtype, backend):
+    from types import SimpleNamespace
+
+    from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
+    from sglang.srt.mem_cache.device_pool_info import (
+        IndexKeyBufferInfo,
+        IndexKeyLayout,
+        PageRowBufferInfo,
+    )
+    from sglang.srt.mem_cache.memory_pool_host import (
+        DeepSeekV4PagedHostPool,
+        DeepSeekV4StateHostPool,
+    )
+    from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
+    from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+    from sglang.srt.mem_cache.pool_host.mha import MHATokenToKOnlyPoolHost
+    from sglang.srt.mem_cache.pool_host.minimax_m3_nvfp4 import (
+        MiniMaxM3Nvfp4IndexKPoolHost,
+        MiniMaxM3Nvfp4MainKVPoolHost,
+    )
+
+    def buffers(shape, dtype=dtype):
+        return tuple(torch.empty(shape, dtype=dtype, device=DEVICE) for _ in range(2))
+
+    hosts = []
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    try:
+        with host_memory_budget_scope(4 << 20), torch.cuda.stream(stream):
+            if kind.startswith("dsa"):
+                device = buffers((6, PAGE_SIZE * 132))
+                info = IndexKeyBufferInfo(
+                    page_size=PAGE_SIZE,
+                    buffers=device,
+                    compress_ratio=1,
+                    key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES,
+                    key_shuffle_tile=16 if kind == "dsa_shuffled" else 0,
+                )
+                host = DSAIndexerPoolHost(
+                    info,
+                    layer_mapping={1: 0, 3: 1},
+                    target_device_layer_num=4,
+                    num_host_pages=8,
+                    transfer_page_size=PAGE_SIZE,
+                    layout="page_unified",
+                    buffer_device=DEVICE,
+                    dtype=torch.bfloat16,
+                )
+                hosts.append(host)
+                _specialized_round_trip(host, device, backend, layer_ids=[1, 3])
+            elif kind == "k_only":
+                device = buffers((6 * PAGE_SIZE, 1, HEAD_DIM))
+                info = IndexKeyBufferInfo(
+                    page_size=PAGE_SIZE,
+                    buffers=device,
+                    compress_ratio=1,
+                    key_layout=IndexKeyLayout.KEY_ROWS,
+                )
+                host = MHATokenToKOnlyPoolHost(
+                    info,
+                    SimpleNamespace(
+                        page_size=PAGE_SIZE, page_num=8, size=8 * PAGE_SIZE
+                    ),
+                    "page_unified",
+                )
+                hosts.append(host)
+                _specialized_round_trip(host, device, backend)
+            elif kind == "dsv4":
+                device = buffers((6, 4, 1, 32 // dtype.itemsize))
+                host = DeepSeekV4PagedHostPool(
+                    "c4",
+                    device,
+                    item_bytes=128,
+                    num_host_pages=8,
+                    slot_page_size=PAGE_SIZE,
+                    layout="page_unified",
+                    page_aligned_only=True,
+                )
+                hosts.append(host)
+                _specialized_round_trip(host, device, backend)
+            elif kind == "dsv4_state":
+                infos = [
+                    DSV4StateBufferInfo(
+                        pages=torch.empty((6, 128), dtype=torch.uint8, device=DEVICE),
+                        ring_size=4,
+                        dtype=state_dtype,
+                    )
+                    for state_dtype in (torch.bfloat16, torch.float32)
+                ]
+                host = DeepSeekV4StateHostPool(
+                    "c4_state",
+                    infos,
+                    num_host_pages=8,
+                    swa_page_size=PAGE_SIZE,
+                    layout="page_unified",
+                )
+                hosts.append(host)
+                _specialized_round_trip(host, [info.pages for info in infos], backend)
+            else:
+                # Transfer packed payload/scales directly: no FP4 quantizer or
+                # SM100 arithmetic kernel participates in this byte codec test.
+                def info(heads, components):
+                    slab = torch.empty(
+                        (2, 6, components * heads * 128 * 72),
+                        dtype=torch.uint8,
+                        device=DEVICE,
+                    )
+                    return PageRowBufferInfo(
+                        slab=slab,
+                        rows=tuple(slab),
+                        row_bytes=slab.shape[-1],
+                        page_size=128,
+                        num_pages=6,
+                        head_num=heads,
+                        global_head_start=0,
+                        global_head_num=heads,
+                    )
+
+                main_info, index_info = info(2, 2), info(1, 1)
+                main = MiniMaxM3Nvfp4MainKVPoolHost(
+                    main_info,
+                    2,
+                    0,
+                    128,
+                    "page_unified",
+                    device_capacity_tokens=5 * 128,
+                    start_layer=0,
+                    end_layer=2,
+                    head_group_num=2,
+                )
+                hosts.append(main)
+                index = MiniMaxM3Nvfp4IndexKPoolHost(
+                    index_info, main, "page_unified", start_layer=0, end_layer=2
+                )
+                hosts.append(index)
+                _specialized_round_trip(main, main_info.rows, backend)
+                _specialized_round_trip(index, index_info.rows, backend)
+        stream.synchronize()
+    finally:
+        stream.synchronize()
+        for host in reversed(hosts):
+            host.destroy()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

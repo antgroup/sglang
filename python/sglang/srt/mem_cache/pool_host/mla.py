@@ -128,6 +128,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         host_token_capacity: int | None = None,
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
+        if layout == "page_unified" and not self._is_dummy:
+            for info in (buffer_info, *draft_buffer_infos):
+                if info.scales is not None or isinstance(info.buffers, MLASplitBuffers):
+                    raise NotImplementedError(
+                        "Canonical MLA page_unified requires one latent tensor "
+                        "without separate scales; split/scaled buffers need the native codec."
+                    )
         self.override_kv_cache_dim = override_kv_cache_dim
         if _is_xpu and not self._is_dummy:
             require_kvcacheio_ops(

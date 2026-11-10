@@ -118,6 +118,11 @@ def _page_row_device_pool_info(pool, pool_name) -> DevicePoolInfo:
             row_bytes=pool.row_bytes,
             page_size=pool.page_size,
             num_pages=pool.num_pages,
+            head_num=pool.head_num,
+            head_dim=pool.head_dim,
+            global_head_start=getattr(pool, "global_head_start", None),
+            global_head_num=getattr(pool, "global_head_num", None),
+            is_storage_writer=getattr(pool, "is_storage_writer", True),
         ),
     )
 

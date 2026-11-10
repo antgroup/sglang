@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """HiCache host mirrors of the MiniMax M3.1 NVFP4 main and index page rows.
 
-Each device sub-pool stores one ``row_bytes`` row per (layer, page); its host
-mirror keeps rows of the same width, so one page of one layer is a single
-contiguous copy on both sides. Main and index share host page indices.
+Each device sub-pool stores one ``row_bytes`` row per (layer, page). Legacy
+host layouts mirror those rows. ``page_unified`` instead orders main KV by
+global head group, layer, K/V, token, and head, with each 64-byte FP4 payload
+followed by its eight scale bytes. The replicated index uses layer/token order.
+Main and index share host page indices; packing changes never requantize data.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
+from sglang.srt.mem_cache.pool_host.page_unified import PageStorageComponent
 from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
@@ -32,7 +35,7 @@ if _is_cuda:
 
 logger = logging.getLogger(__name__)
 
-_LAYOUTS = ("layer_first", "page_first", "page_first_direct")
+_LAYOUTS = ("layer_first", "page_first", "page_first_direct", "page_unified")
 # Bounded batches let the copy engine start while later ones are built.
 _DIRECT_BATCH_ENTRIES = 4096
 
@@ -51,6 +54,7 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
     """HiCache sidecar mirroring the packed index K page rows."""
 
     storage_objects_per_page = 1
+    _is_main_kv = False
 
     def __init__(
         self,
@@ -67,7 +71,7 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
         if layout not in _LAYOUTS:
             raise ValueError(
                 "MiniMax NVFP4 HiCache supports layer_first, page_first, "
-                f"and page_first_direct layouts, got {layout!r}."
+                f"page_first_direct, and page_unified layouts, got {layout!r}."
             )
         self.page_size = anchor_host.page_size
         if self.page_size != buffer_info.page_size:
@@ -76,6 +80,8 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
                 f"{self.page_size} and {buffer_info.page_size}."
             )
         self.layout = layout
+        if layout == "page_unified":
+            self.storage_format_tag = "page-unified-minimax-m3-nvfp4-index-token-v2"
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
@@ -119,9 +125,12 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
         self.device_slab = buffer_info.slab
         self.device_num_pages = buffer_info.num_pages
         self.device_slots = buffer_info.num_pages * buffer_info.page_size
-        # The slab's device picks the ALLOC_MEMORY_FUNCS dispatch, so it is the
-        # device the host-memory budget and hugetlb credit key on.
         self._transfer_device = self.device_slab.device
+        self.head_num = buffer_info.head_num
+        self.head_dim = buffer_info.head_dim
+        self.global_head_start = buffer_info.global_head_start
+        self.global_head_num = buffer_info.global_head_num
+        self.is_storage_writer = buffer_info.is_storage_writer
 
     @property
     def page_bytes(self) -> int:
@@ -134,9 +143,66 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
+    @property
+    def storage_component_metadata(self):
+        if self.layout == "page_unified":
+            if self._is_main_kv:
+                heads = self.head_num // self.head_group_num
+                group_bytes = self.layer_num * 2 * self.page_size * heads * 72
+                return tuple(
+                    PageStorageComponent(
+                        name="nvfp4-kv-token-payload64-scale8",
+                        shape=(self.layer_num, 2, self.page_size, heads, 72),
+                        dtype="uint8",
+                        byte_offset=group * group_bytes,
+                        byte_length=group_bytes,
+                        shard_coordinate=(
+                            f"H{self.global_head_start + group * heads}-{self.global_head_start + (group + 1) * heads}"
+                            if self.global_head_start is not None
+                            else None
+                        ),
+                        is_storage_writer=self.is_storage_writer,
+                    )
+                    for group in range(self.head_group_num)
+                )
+            return (
+                PageStorageComponent(
+                    name="nvfp4-index-token-payload64-scale8",
+                    shape=(self.layer_num, self.page_size, 72),
+                    dtype="uint8",
+                    byte_offset=0,
+                    byte_length=self.page_bytes,
+                    shard_coordinate="",
+                    is_storage_writer=self.is_storage_writer,
+                ),
+            )
+        return (
+            PageStorageComponent(
+                name="native_page_rows",
+                shape=(self.layer_num, self.row_bytes),
+                dtype="uint8",
+                byte_offset=0,
+                byte_length=self.page_bytes,
+            ),
+        )
+
     def init_kv_buffer(self):
         if self.layout == "layer_first":
             dims = (self.layer_num, self.page_num, self.row_bytes)
+        elif self.layout == "page_unified":
+            dims = (
+                (
+                    self.page_num,
+                    self.head_group_num,
+                    self.layer_num,
+                    2,
+                    self.page_size,
+                    self.head_num // self.head_group_num,
+                    72,
+                )
+                if self._is_main_kv
+                else (self.page_num, self.layer_num, self.page_size, 72)
+            )
         else:
             dims = (self.page_num, self.layer_num, 1, self.row_bytes)
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_slab.device.type]
@@ -168,6 +234,8 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
 
     def _init_page_row_transfer(self) -> None:
         self._page_row_tables = None
+        if self.layout == "page_unified":
+            return  # Canonical host rows require head/token and scale reordering.
         device = self.device_rows[0].device
         if not (_is_cuda or _is_hip) or device.type != "cuda" or not self.pin_memory:
             return
@@ -263,6 +331,9 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
         if host_pages.numel() == 0:
             return
+        if self.layout == "page_unified":
+            self._copy_unified_layer(layer_id, host_pages, device_pages, load=load)
+            return
         device = self.device_rows[layer_id]
         if device.is_cuda:
             if not self.pin_memory:
@@ -285,6 +356,77 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
         )
         rows = src.index_select(0, src_pages.to(src.device)).to(dst.device)
         dst.index_copy_(0, dst_pages.to(dst.device), rows)
+
+    def _canonical_page_rows(self, rows: torch.Tensor, *, load: bool):
+        """Losslessly exchange native head-major planes and canonical token rows."""
+        count = rows.shape[0]
+        if not self._is_main_kv:
+            if load:
+                return torch.cat(
+                    (
+                        rows[..., :64].reshape(count, -1),
+                        rows[..., 64:].reshape(count, -1),
+                    ),
+                    dim=-1,
+                )
+            payload_bytes = self.page_size * 64
+            return torch.cat(
+                (
+                    rows[:, :payload_bytes].reshape(count, self.page_size, 64),
+                    rows[:, payload_bytes:].reshape(count, self.page_size, 8),
+                ),
+                dim=-1,
+            )
+        heads = self.head_num // self.head_group_num
+        if load:
+            pairs = rows.permute(0, 2, 1, 4, 3, 5).reshape(
+                count, 2, self.head_num, self.page_size, 72
+            )
+            return torch.cat(
+                (
+                    pairs[..., :64].reshape(count, 2, -1),
+                    pairs[..., 64:].reshape(count, 2, -1),
+                ),
+                dim=-1,
+            ).reshape(count, -1)
+        tokens = self.head_num * self.page_size
+        payload, scales = rows.reshape(count, 2, -1).split(
+            (tokens * 64, tokens * 8), dim=-1
+        )
+        pairs = torch.cat(
+            (
+                payload.reshape(count, 2, self.head_num, self.page_size, 64),
+                scales.reshape(count, 2, self.head_num, self.page_size, 8),
+            ),
+            dim=-1,
+        )
+        return (
+            pairs.reshape(count, 2, self.head_group_num, heads, self.page_size, 72)
+            .permute(0, 2, 1, 4, 3, 5)
+            .contiguous()
+        )
+
+    def _copy_unified_layer(self, layer, host_pages, device_pages, *, load):
+        device = self.device_rows[layer]
+        hp = host_pages.to(device="cpu", dtype=torch.int64)
+        dp = device_pages.to(device=device.device, dtype=torch.int64)
+        if load:
+            rows = (
+                self.kv_buffer[hp, :, layer]
+                if self._is_main_kv
+                else self.kv_buffer[hp, layer]
+            )
+            device.index_copy_(
+                0, dp, self._canonical_page_rows(rows, load=True).to(device.device)
+            )
+        else:
+            rows = self._canonical_page_rows(
+                device.index_select(0, dp).to("cpu"), load=False
+            )
+            if self._is_main_kv:
+                self.kv_buffer[hp, :, layer] = rows
+            else:
+                self.kv_buffer[hp, layer] = rows
 
     def _copy_layer_pages_direct(self, layer_id, host_pages, device_pages, *, load):
         hp, dp = host_pages.numpy(), device_pages.numpy()
@@ -389,6 +531,10 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
         host_pages, device_pages = host_indices, device_indices
         if host_pages.numel() == 0:
             return
+        if self.layout == "page_unified":
+            for layer_id in range(self.layer_num):
+                self._copy_unified_layer(layer_id, host_pages, device_pages, load=False)
+            return
         if self.device_rows[0].is_cuda:
             if not self.pin_memory:
                 raise ValueError("MiniMax NVFP4 HiCache requires pinned host memory.")
@@ -426,6 +572,8 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
         page_idx = int(index) // self.page_size
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, page_idx]
+        elif self.layout == "page_unified":
+            data_page = self.kv_buffer[page_idx]
         else:
             data_page = self.kv_buffer[page_idx, :, 0]
         return data_page.flatten() if flat else data_page
@@ -440,6 +588,11 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         page_idx = int(index) // self.page_size
+        if self.layout == "page_unified":
+            self.kv_buffer[page_idx].copy_(
+                data_page.reshape_as(self.kv_buffer[page_idx])
+            )
+            return
         rows = data_page.reshape(self.layer_num, self.row_bytes)
         if self.layout == "layer_first":
             self.kv_buffer[:, page_idx] = rows
@@ -447,7 +600,7 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
             self.kv_buffer[page_idx, :, 0] = rows
 
     def get_page_buffer_meta(self, indices):
-        if self.layout not in ("page_first", "page_first_direct"):
+        if self.layout not in ("page_first", "page_first_direct", "page_unified"):
             raise ValueError(f"Unsupported zero-copy layout: {self.layout}")
         if len(indices) % self.page_size != 0:
             raise ValueError("MiniMax NVFP4 page metadata requires full pages.")
@@ -468,7 +621,7 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
         return ptrs, sizes
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
-        if self.layout not in ("page_first", "page_first_direct"):
+        if self.layout not in ("page_first", "page_first_direct", "page_unified"):
             return False
         return (
             self.kv_buffer.data_ptr() % page_size_bytes == 0
@@ -480,6 +633,7 @@ class MiniMaxM3Nvfp4MainKVPoolHost(MiniMaxM3Nvfp4IndexKPoolHost):
     """HiCache host mirror of the MSA-v1 main K/V page rows."""
 
     storage_objects_per_page = 2
+    _is_main_kv = True
 
     def __init__(
         self,
@@ -496,6 +650,7 @@ class MiniMaxM3Nvfp4MainKVPoolHost(MiniMaxM3Nvfp4IndexKPoolHost):
         start_layer: int,
         end_layer: int,
         pool_label: str = "kv",
+        head_group_num: int = 1,
     ):
         if layout not in _LAYOUTS:
             raise ValueError(f"Unsupported MiniMax NVFP4 host layout: {layout}")
@@ -505,6 +660,11 @@ class MiniMaxM3Nvfp4MainKVPoolHost(MiniMaxM3Nvfp4IndexKPoolHost):
                 f"{page_size} and {buffer_info.page_size}."
             )
         self._configure_device_rows(buffer_info)
+        if self.head_num % head_group_num:
+            raise ValueError("MiniMax KV heads must tile the unified head groups")
+        self.head_group_num = head_group_num
+        if layout == "page_unified":
+            self.storage_format_tag = "page-unified-minimax-m3-nvfp4-main-token-v2"
         HostKVCache.__init__(
             self,
             dtype=torch.uint8,

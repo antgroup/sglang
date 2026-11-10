@@ -53,7 +53,10 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
-from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+from sglang.srt.mem_cache.pool_host.page_unified import (
+    PageStorageComponent,
+    PageUnifiedLayout,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -982,9 +985,13 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
                 pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
             )
         self.device_k_buffers = buffer_info.buffers
+        self.is_storage_writer = buffer_info.is_storage_writer
         self._transfer_device = first.device
         self.page_size = anchor_host.page_size
         self.layout = layout
+        self.storage_format_tag = (
+            "page-unified-index-k-v1" if layout == "page_unified" else None
+        )
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
@@ -1064,7 +1071,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             dims = (self.layer_num, self.size, self.head_num, self.head_dim)
         elif self.layout == "page_first":
             dims = (self.size, self.layer_num, self.head_num, self.head_dim)
-        elif self.layout == "page_first_direct":
+        elif self.layout in ("page_first_direct", "page_unified"):
             dims = (
                 self.page_num,
                 self.layer_num,
@@ -1083,13 +1090,44 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             allocator=self.allocator,
             registration_granularity_bytes=(
                 self.page_size * self.layout_dim
-                if self.layout in ("page_first", "page_first_direct")
+                if self.layout in ("page_first", "page_first_direct", "page_unified")
                 else None
             ),
         )
 
     def get_hybrid_pool_buffer(self):
         return [self.k_buffer]
+
+    @property
+    def storage_component_metadata(self) -> tuple[PageStorageComponent, ...]:
+        return (
+            PageStorageComponent(
+                name="index-k",
+                shape=(self.layer_num, self.page_size, self.head_num, self.head_dim),
+                dtype=str(self.dtype),
+                byte_offset=0,
+                byte_length=self.page_size * self.size_per_token,
+                shard_coordinate="" if self.head_num == 1 else None,
+                is_storage_writer=self.is_storage_writer,
+            ),
+        )
+
+    def _copy_page_unified(self, host_indices, device_indices, layer, *, to_device):
+        host_indices = host_indices.to(device="cpu", dtype=torch.int64)
+        page_ids = host_indices // self.page_size
+        offsets = host_indices % self.page_size
+        buffer = self.device_k_buffers[layer]
+        device_indices = device_indices.to(device=buffer.device, dtype=torch.int64)
+        if host_indices.numel() != device_indices.numel():
+            raise ValueError("K-only transfer index lengths differ.")
+        if to_device:
+            rows = self.k_buffer.view(torch.uint8)[page_ids, layer, offsets].to(
+                buffer.device
+            )
+            buffer.view(torch.uint8).index_copy_(0, device_indices, rows)
+        else:
+            rows = buffer.view(torch.uint8).index_select(0, device_indices).to("cpu")
+            self.k_buffer.view(torch.uint8)[page_ids, layer, offsets] = rows
 
     if _is_xpu:
         # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
@@ -1122,6 +1160,11 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
+        if self.layout == "page_unified":
+            self._copy_page_unified(
+                host_indices, device_indices, layer_id, to_device=True
+            )
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1189,6 +1232,12 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if self.layout == "page_unified":
+            for layer in range(self.layer_num):
+                self._copy_page_unified(
+                    host_indices, device_indices, layer, to_device=False
+                )
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1261,7 +1310,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             data_page = self.k_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
             data_page = self.k_buffer[index : index + self.page_size, :, :, :]
-        elif self.layout == "page_first_direct":
+        elif self.layout in ("page_first_direct", "page_unified"):
             real_index = index // self.page_size
             data_page = self.k_buffer[real_index : real_index + 1, :, :, :, :]
         else:
@@ -1287,7 +1336,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             self.k_buffer[index : index + self.page_size, :, :, :] = data_page.reshape(
                 self.page_size, self.layer_num, self.head_num, self.head_dim
             )
-        elif self.layout == "page_first_direct":
+        elif self.layout in ("page_first_direct", "page_unified"):
             real_index = index // self.page_size
             self.k_buffer[real_index : real_index + 1, :, :, :, :] = data_page.reshape(
                 1, self.layer_num, self.page_size, self.head_num, self.head_dim
@@ -1298,7 +1347,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
     def get_page_buffer_meta(self, indices):
         """Meta data for zero-copy storage I/O."""
         assert len(indices) % self.page_size == 0
-        if self.layout not in ["page_first", "page_first_direct"]:
+        if self.layout not in ["page_first", "page_first_direct", "page_unified"]:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
         ptr_list = []

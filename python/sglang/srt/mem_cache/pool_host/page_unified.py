@@ -36,6 +36,7 @@ L3, and neither side has to ask which.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import msgspec
@@ -43,6 +44,21 @@ import msgspec
 # Byte order identity, recorded in the L3 namespace digest. Bump when the axis
 # order changes, so old objects miss instead of deserializing permuted.
 PAGE_UNIFIED_OBJECT_LAYOUT = "page-unified-v1"
+
+
+@dataclass(frozen=True)
+class PageStorageComponent:
+    """A layer-major typed byte run used by specialized page codecs."""
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: str
+    byte_offset: int
+    byte_length: int
+    layer_offset: int = 0
+    # Empty means replicated; nonempty coordinates name actual global heads.
+    shard_coordinate: str | None = ""
+    is_storage_writer: bool = True
 
 
 class PageUnifiedLayout(msgspec.Struct, frozen=True, kw_only=True):

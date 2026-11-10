@@ -2561,6 +2561,28 @@ class KVCacheConfigurator:
             enable_hisparse=enable_hisparse,
             **hisparse_kwargs,
         )
+        if (
+            get_memory().hicache_mem_layout == "page_unified"
+            and pool_cls is not MiniMaxSparseKVPool
+        ):
+            # PageRow metadata must describe real heads when GQA replicates KV.
+            parallel = get_parallel()
+            total = self.model_config.get_total_num_kv_heads()
+            width, rank = parallel.attn_tp_size, parallel.attn_tp_rank
+            if total >= width:
+                if total % width:
+                    raise ValueError("Unified KV heads must tile attention TP.")
+                start, writer = rank * (total // width), True
+            else:
+                if width % total:
+                    raise ValueError("Unified KV replicas must tile attention TP.")
+                replicas = width // total
+                start, writer = rank // replicas, rank % replicas == 0
+            token_to_kv_pool.main_pool.global_head_start = start
+            token_to_kv_pool.main_pool.global_head_num = total
+            token_to_kv_pool.main_pool.is_storage_writer = (
+                writer and parallel.attn_cp_rank == 0
+            )
         return token_to_kv_pool
 
     def _build_unlimited_ocr_v2_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:

@@ -90,6 +90,9 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     key_layout: IndexKeyLayout
     # Replicated DCP stores multiple kernel pages in each allocation row.
     kernel_page_size: int | None = None
+    key_shuffle_tile: int = 0
+    is_storage_writer: bool = True
+    layer_storage_writers: tuple[bool, ...] = ()
 
     @property
     def page_bytes(self) -> int:
@@ -109,6 +112,20 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
 
     def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
         buffers = self.buffers
+        if self.layer_storage_writers and len(self.layer_storage_writers) != len(
+            buffers
+        ):
+            raise ValueError("Index keys require one writer flag per layer.")
+        if self.key_shuffle_tile and (
+            self.key_shuffle_tile < 0
+            or self.key_layout is not IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES
+            or 128 % self.key_shuffle_tile
+            or (self.kernel_page_size or self.page_size // self.compress_ratio)
+            % self.key_shuffle_tile
+        ):
+            raise ValueError(
+                "Index key shuffle must tile the native token and channel axes."
+            )
         if layer_ids is not None and len(layer_ids) != len(buffers):
             raise ValueError(
                 f"{len(layer_ids)} model layers must match {len(buffers)} buffers"
@@ -376,6 +393,11 @@ class PageRowBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     row_bytes: int
     page_size: int
     num_pages: int
+    head_num: int = 1
+    head_dim: int = 128
+    global_head_start: int | None = None
+    global_head_num: int | None = None
+    is_storage_writer: bool = True
 
     def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
         layers = len(self.rows)

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Copyright 2023-2025 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,6 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from __future__ import annotations
 
 import logging
 import threading
@@ -43,9 +42,11 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.hicache_key_scheme import (
     UnifiedKVPlan,
+    UnifiedPoolStoragePlan,
     namespace_digest,
     normalize_dtype,
     plan_unified_kv,
+    plan_unified_pool_components,
 )
 from sglang.srt.mem_cache.kv.memory.views import KVLayoutView, MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
@@ -370,6 +371,8 @@ class HiCacheController:
         self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
+        self.storage_start_layer = mem_pool_device.start_layer
+        self.storage_end_layer = mem_pool_device.start_layer + mem_pool_device.layer_num
         # A pool wrapping one token KV view transfers that view's KV.
         inner = mem_pool_device.layer_router.wrapped_view()
         if inner is not None:
@@ -853,8 +856,17 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         dcp_size = get_parallel().attn_dcp_size
+        if not model_name and get_memory().hicache_storage_key_scheme == "unified":
+            raise ValueError("Unified storage requires a non-empty model_id.")
+        pool_plans = self._build_unified_pool_plans(
+            model_name, attn_cp_size, attn_cp_rank
+        )
         model_name = storage_model_name(model_name, self.storage_host_pool)
-        unified_plan = self._build_unified_plan(model_name, attn_cp_size)
+        unified_plan = (
+            None
+            if pool_plans is not None
+            else self._build_unified_plan(model_name, attn_cp_size)
+        )
         unified_chunk_spans = None
         if unified_plan is not None:
             # Keys are layer-major/head-minor; the physical page is head-major.
@@ -866,6 +878,9 @@ class HiCacheController:
                 for layer_range in unified_plan.layer_ranges
                 for head_group in range(unified_plan.head_group_num)
             ]
+
+        if pool_plans is not None:
+            unified_chunk_spans = list(pool_plans[PoolName.KV].chunk_spans)
 
         return HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -883,15 +898,26 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=dp_rank,
             extra_config=storage_backend_extra_config,
-            unified_suffixes=(unified_plan.suffixes if unified_plan else None),
+            unified_suffixes=(
+                list(pool_plans[PoolName.KV].suffixes)
+                if pool_plans is not None
+                else unified_plan.suffixes
+                if unified_plan
+                else None
+            ),
             unified_chunk_spans=unified_chunk_spans,
+            unified_pool_plans=pool_plans,
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
         )
 
     def _build_unified_plan(
-        self, model_name: Optional[str], attn_cp_size: int
+        self,
+        model_name: Optional[str],
+        attn_cp_size: int,
+        *,
+        allow_sidecars: bool = False,
     ) -> Optional[UnifiedKVPlan]:
         """Pair topology-free chunk coordinates with local page ranges."""
         memory = get_memory()
@@ -900,9 +926,8 @@ class HiCacheController:
         parallel = get_parallel()
         host_pool = self.storage_host_pool
         if (
-            len(getattr(self.mem_pool_host, "entries", [])) > 1
-            or getattr(host_pool, "page_unified_layout", None) is None
-        ):
+            len(getattr(self.mem_pool_host, "entries", [])) > 1 and not allow_sidecars
+        ) or getattr(host_pool, "page_unified_layout", None) is None:
             raise NotImplementedError(
                 "The unified key scheme requires a single page_unified KV pool; "
                 "composite and sidecar pools are not supported."
@@ -956,6 +981,108 @@ class HiCacheController:
             plan.suffixes,
         )
         return plan
+
+    def _build_unified_pool_plans(self, model_name, cp_size, cp_rank=0):
+        entries = getattr(self.mem_pool_host, "entries", ())
+        if (
+            len(entries) <= 1
+            and getattr(self.storage_host_pool, "page_unified_layout", None) is not None
+        ):
+            return None  # Keep ordinary dense KV's namespace and defaults unchanged.
+        memory, parallel = get_memory(), get_parallel()
+        if memory.hicache_storage_key_scheme != "unified":
+            return None
+        if parallel.attn_dcp_size > 1:
+            raise NotImplementedError(
+                "Unified storage requires complete pages without DCP."
+            )
+        if not entries:
+            raise NotImplementedError(
+                "Specialized unified storage requires declared pools."
+            )
+        from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKOnlyPoolHost
+
+        plans = {}
+        stage_start = getattr(
+            self, "storage_start_layer", self.mem_pool_device.start_layer
+        )
+        stage_end = getattr(self, "storage_end_layer", self.mem_pool_device.end_layer)
+        for entry in entries:
+            host = entry.host_pool
+            if entry.packed_draft_device_pools:
+                raise NotImplementedError(
+                    "Unified specialized storage does not support packed drafts."
+                )
+            if getattr(entry.device_pool, "layer_shard_enabled", False):
+                raise NotImplementedError(
+                    "Unified specialized storage does not support CP layer splitting."
+                )
+            if cp_size > 1 and (
+                entry.name != PoolName.KV
+                and not isinstance(host, (DSAIndexerPoolHost, MHATokenToKOnlyPoolHost))
+            ):
+                raise NotImplementedError(
+                    "Unified CP supports full KV and its uncompressed indexer only."
+                )
+            layout = getattr(host, "page_unified_layout", None)
+            if entry.name == PoolName.KV and layout is not None:
+                canonical = self._build_unified_plan(
+                    storage_model_name(model_name, host), cp_size, allow_sidecars=True
+                )
+                plans[entry.name] = UnifiedPoolStoragePlan(
+                    tuple(canonical.suffixes),
+                    tuple(
+                        layout.chunk_span(layers, group)
+                        for layers in canonical.layer_ranges
+                        for group in range(canonical.head_group_num)
+                    ),
+                    cp_rank == 0
+                    and (
+                        not canonical.namespace.rank_replicated
+                        or parallel.attn_tp_rank == 0
+                    ),
+                )
+                continue
+            components = getattr(host, "storage_component_metadata", None)
+            if components is None:
+                if host.get_dummy_flat_data_page().numel() == 0:
+                    plans[entry.name] = UnifiedPoolStoragePlan(
+                        (), (), parallel.attn_tp_rank == 0 and cp_rank == 0
+                    )
+                    continue
+                raise NotImplementedError(
+                    f"{entry.name} has no specialized unified byte schema."
+                )
+            mapping = entry.transfer_layer_mapping
+            if mapping is None:
+                raise ValueError(f"{entry.name} is missing model layer coordinates.")
+            compact = getattr(host, "_device_to_host_layer", None)
+            layer_ids = [None] * host.layer_num
+            for transfer, local in mapping.items():
+                local = compact.get(local, -1) if compact is not None else local
+                if 0 <= local < len(layer_ids):
+                    layer_ids[local] = stage_start + transfer
+            if any(layer is None for layer in layer_ids):
+                raise ValueError(
+                    f"{entry.name} has incomplete model layer coordinates."
+                )
+            plans[entry.name] = plan_unified_pool_components(
+                model_id=model_name,
+                pool_name=entry.name,
+                object_layout=getattr(host, "storage_format_tag", None),
+                page_size=host.page_size,
+                components=components,
+                layer_ids=tuple(layer_ids),
+                attn_tp_rank=parallel.attn_tp_rank,
+                attn_tp_size=parallel.attn_tp_size,
+                attn_cp_rank=cp_rank,
+                attn_cp_size=cp_size,
+                layer_partition=memory.hicache_storage_layer_partition,
+                is_final_stage=parallel.pp_rank == parallel.pp_size - 1,
+                stage_end_layer=stage_end,
+            )
+        return plans
 
     def reset(self):
         # Reuse detach's queue wakeups and bounded joins, and fail if any
@@ -1118,7 +1245,7 @@ class HiCacheController:
                 return host_indices, device_indices
             return host_indices, device_indices.cpu()
         else:
-            raise ValueError(f"Unsupported io backend")
+            raise ValueError("Unsupported io backend")
 
     def _move_write_operation(
         self, op: CacheOperation
