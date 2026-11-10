@@ -37,11 +37,16 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import (
+    get_mla_host_pool_cls,
+)
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
 )
-from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
+from sglang.srt.mem_cache.pool_host.page_unified import (
+    resolve_kv_host_geometry,
+    validate_page_unified_pool_names,
+)
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -120,8 +125,9 @@ def _dsv4_transfer_layer_mapping(
 
 
 def _mha_host_inputs(pool, info, drafts=()):
+    host_cls = get_mha_host_pool_cls(info, layout=get_memory().hicache_mem_layout)
     return (
-        get_mha_host_pool_cls(info),
+        host_cls,
         info,
         dict(
             device_capacity_tokens=(
@@ -151,9 +157,37 @@ def build_kv_host_pool(
 ):
     if use_mla is None:
         use_mla = is_mla_pool(kv_pool)
-    if use_mla:
-        kv_host_pool_cls = MLATokenToKVPoolHost
+    host_input = None
+    empty = kv_pool.layer_num == 0
+    if use_mla and not empty:
         host_input = kv_pool.get_device_pool_infos()[0].buffer_info
+        empty = not host_input.buffers
+    if (
+        get_memory().hicache_mem_layout == "page_unified"
+        and empty
+        and not mtp_draft_device_pools
+    ):
+        # A PP stage can contain only FULL or only SWA layers. Its empty peer
+        # still owns token indices, but has no physical page geometry or byte
+        # budget. Preserve that peer's independent ratio-based slot capacity.
+        capacity = (
+            kv_pool.size
+            if kv_pool.host_capacity_tokens is None
+            else kv_pool.host_capacity_tokens
+        )
+        page_num = int(capacity * get_memory().hicache_ratio) // page_size + 1
+        host_pool = LogicalHostPool(page_num * page_size, page_size, "page_unified")
+        host_pool.start_layer = kv_pool.start_layer
+        host_pool.end_layer = kv_pool.end_layer
+        if isinstance(kv_pool, PageInterleaveKVPoolMixin):
+            return PageInterleaveHostPool(host_pool, kv_pool.placement)
+        return host_pool
+    if use_mla:
+        if host_input is None:
+            host_input = kv_pool.get_device_pool_infos()[0].buffer_info
+        kv_host_pool_cls = get_mla_host_pool_cls(
+            host_input, layout=get_memory().hicache_mem_layout
+        )
         mha_kwargs = {}
     else:
         kv_host_pool_cls, host_input, mha_kwargs = _mha_host_inputs(
@@ -172,9 +206,11 @@ def build_kv_host_pool(
     parallel = get_parallel()
     geometry = resolve_kv_host_geometry(
         kv_pool,
-        page_size=page_size // parallel.attn_dcp_size
-        if use_mla and parallel.dcp_enabled
-        else page_size,
+        page_size=(
+            page_size // parallel.attn_dcp_size
+            if use_mla and parallel.dcp_enabled
+            else page_size
+        ),
         layout=get_memory().hicache_mem_layout,
         use_mla=use_mla,
         draft_layer_num=len(mtp_draft_device_pools),
@@ -189,9 +225,11 @@ def build_kv_host_pool(
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla:
         kwargs.update(
-            device_capacity_tokens=kv_pool.size
-            if kv_pool.host_capacity_tokens is None
-            else kv_pool.host_capacity_tokens,
+            device_capacity_tokens=(
+                kv_pool.size
+                if kv_pool.host_capacity_tokens is None
+                else kv_pool.host_capacity_tokens
+            ),
             start_layer=kv_pool.start_layer,
             end_layer=kv_pool.end_layer,
             draft_buffer_infos=tuple(
@@ -259,6 +297,12 @@ def build_pool_entry(
     packed_draft_device_pools: tuple[Any, ...] = (),
     device_translate: Optional[Callable[[Any], Any]] = None,
 ) -> PoolEntry:
+    if getattr(host_pool, "layout", None) == "page_unified":
+        validate_page_unified_pool_names((name,))
+    if hasattr(host_pool, "is_storage_writer") and device_pool is not None:
+        host_pool.is_storage_writer = getattr(
+            device_pool, "is_storage_writer", host_pool.is_storage_writer
+        )
     return PoolEntry(
         name=name,
         host_pool=host_pool,
@@ -271,6 +315,7 @@ def build_pool_entry(
         device_free_fn=device_free_fn,
         packed_draft_device_pools=packed_draft_device_pools,
         device_translate=device_translate,
+        transfer_layer_mapping=dict(layer_mapping),
     )
 
 
@@ -1434,7 +1479,8 @@ def build_unified_host_stack(
             owner_id_drafts += by_owner_ids
     envelope = storage.page_envelope_pair()
     if envelope is not None and (
-        any(token_drafts.values())
+        memory.hicache_mem_layout == "page_unified"
+        or any(token_drafts.values())
         or owner_id_drafts
         or not HybridCacheController.supports_page_envelope_host(
             memory.hicache_storage_backend
@@ -1612,6 +1658,10 @@ def _build_sidecar_host_pool(
     *, config: HostPoolConfig, root: Any, root_host_pool: Any
 ) -> DSAIndexerPoolHost | QSAIndexerPoolHost:
     if config.buffer_info.key_layout is IndexKeyLayout.KEY_ROWS:
+        if get_memory().hicache_mem_layout == "page_unified":
+            raise NotImplementedError(
+                "page_unified QSA indexer support is not enabled yet."
+            )
         return _build_qsa_indexer_host_pool(
             config=config, root_host_pool=root_host_pool
         )
@@ -1739,11 +1789,13 @@ def _build_mha_mla_host_pool(
     if isinstance(pool, MHAKVView):
         host_cls, host_input, host_kwargs = _mha_host_inputs(pool, buffer_info)
         return host_cls(host_input, **host_kwargs, **kwargs)
-    return MLATokenToKVPoolHost(
+    return get_mla_host_pool_cls(buffer_info, layout=layout)(
         buffer_info,
-        device_capacity_tokens=pool.size
-        if pool.host_capacity_tokens is None
-        else pool.host_capacity_tokens,
+        device_capacity_tokens=(
+            pool.size
+            if pool.host_capacity_tokens is None
+            else pool.host_capacity_tokens
+        ),
         start_layer=pool.start_layer,
         end_layer=pool.end_layer,
         target_layer_num=pool.layer_num,

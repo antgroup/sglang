@@ -19,7 +19,7 @@ import torch
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=55, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -42,7 +42,7 @@ def _page_indices(pages, page_size):
     ).flatten()
 
 
-def _pinned_host_pool(host_pool_cls, device_pool, **kwargs):
+def _pinned_host_pool(host_pool_cls, device_pool, *, page_size=PAGE_SIZE, **kwargs):
     """Allocate the host pool with pin_memory rather than cudaHostRegister.
 
     Registering is what the runtime does, but it is process-global: a second
@@ -72,7 +72,7 @@ def _pinned_host_pool(host_pool_cls, device_pool, **kwargs):
             end_layer=device_pool.end_layer,
             host_to_device_ratio=2.0,
             host_size=0,
-            page_size=PAGE_SIZE,
+            page_size=page_size,
             layout="page_unified",
             pin_memory=True,
             device="cpu",
@@ -84,21 +84,28 @@ def _pinned_host_pool(host_pool_cls, device_pool, **kwargs):
 
 def _restore_storage_pages(host_pool, host_indices):
     """Exercise the flat page API used by generic file storage at new offsets."""
+    from sglang.srt.mem_cache.hicache_key_scheme import host_page_components
+
+    page_size = host_pool.page_size
     stored_pages = [
         host_pool.get_data_page(int(index)).clone()
-        for index in host_indices[::PAGE_SIZE]
+        for index in host_indices[::page_size]
     ]
     dummy_page = host_pool.get_dummy_flat_data_page()
     assert all(page.shape == dummy_page.shape for page in stored_pages)
-    assert dummy_page.nbytes == host_pool.page_unified_layout.bytes_per_page
+    assert dummy_page.nbytes == sum(
+        component.byte_length for component in host_page_components(host_pool)
+    )
 
     host_pool.kv_buffer.zero_()
-    restored_indices = _page_indices([7, 3, 5, 1], PAGE_SIZE)
-    for index, page in zip(restored_indices[::PAGE_SIZE], stored_pages):
+    restored_indices = _page_indices([7, 3, 5, 1], page_size)
+    for index, page in zip(restored_indices[::page_size], stored_pages):
         host_pool.set_from_flat_data_page(int(index), page)
         restored_page = host_pool.get_data_page(int(index), flat=False)
         assert restored_page.is_contiguous()
-        assert torch.equal(restored_page.flatten(), page)
+        assert torch.equal(
+            restored_page.flatten().view(torch.uint8), page.view(torch.uint8)
+        )
     return restored_indices
 
 

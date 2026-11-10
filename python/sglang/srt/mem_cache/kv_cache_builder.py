@@ -49,7 +49,14 @@ from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     prepare_page_unified_write_back_staging,
 )
-from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
+from sglang.srt.mem_cache.pool_host.mha import (
+    get_mha_host_pool_cls,
+    prepare_mha_write_back_staging,
+    use_page_unified_reference,
+)
+from sglang.srt.mem_cache.pool_host.mla import (
+    get_mla_host_pool_cls,
+)
 from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -115,6 +122,20 @@ def prepare_hicache_staging(
                     int(capacity_tokens * memory.hicache_ratio) // page_size + 1
                 )
             info = pool.get_device_pool_infos()[0].buffer_info
+            # Fail before preparing a dense staging buffer for a native format.
+            factory = get_mla_host_pool_cls if is_mla else get_mha_host_pool_cls
+            factory(info, layout=memory.hicache_mem_layout)
+            if (
+                memory.hicache_mem_layout == "page_unified"
+                and use_page_unified_reference(
+                    device=info.device,
+                    buffers=info.buffers
+                    if is_mla
+                    else (*info.buffers.k, *info.buffers.v),
+                    layer_shard_enabled=is_mla and pool.layer_shard_enabled,
+                )
+            ):
+                return
             if memory.hicache_mem_layout == "page_unified":
                 geometry = resolve_kv_host_geometry(
                     pool,

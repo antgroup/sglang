@@ -6,14 +6,23 @@ coordinate. They share a file because they have to agree on the grid.
 """
 
 import unittest
+from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
 from sglang.srt.mem_cache.hicache_key_scheme import (
     derive_namespace,
     namespace_digest,
     normalize_dtype,
+    plan_pool_components,
     plan_unified_kv,
+)
+from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
+from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
+from sglang.srt.mem_cache.pool_host.mla import (
+    MLATokenToKVPoolHost,
+    get_mla_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -94,6 +103,328 @@ class TestPageUnifiedLayout(CustomTestCase):
             layout.chunk_span((3, 3))
         with self.assertRaisesRegex(ValueError, "head group"):
             layout.chunk_span((0, 1), layout.head_group_num)
+
+
+class TestPageUnifiedMLATransfer(CustomTestCase):
+    def test_page_unified_rejects_split_or_scaled_mla(self):
+        from sglang.srt.mem_cache.device_pool_info import MLASplitBuffers
+
+        latent = torch.zeros(12, 1, 16)
+        split = MLASplitBuffers(
+            k=latent.reshape(3, 4, 1, 16),
+            v=None,
+            index_k=None,
+            index_scales=None,
+            index_layer_indices=(),
+            k_width=16,
+            v_width=0,
+            index_width=0,
+        )
+        for buffers, scales in (((latent,), (latent,)), (split, None)):
+            with self.subTest(split=isinstance(buffers, MLASplitBuffers)):
+                info = MLABufferInfo(
+                    buffers=buffers,
+                    data_ptrs=None,
+                    layer_indices=(0,),
+                    device_layer_num=1,
+                    page_size=4,
+                    kv_lora_rank=8,
+                    qk_rope_head_dim=8,
+                    kv_cache_dim=16,
+                    dtype=latent.dtype,
+                    device=latent.device,
+                    scales=scales,
+                )
+                with self.assertRaisesRegex(NotImplementedError, "page_unified"):
+                    get_mla_host_pool_cls(info, layout="page_unified")
+                with self.assertRaisesRegex(NotImplementedError, "page_unified"):
+                    MLATokenToKVPoolHost(
+                        info,
+                        2,
+                        0,
+                        4,
+                        "page_unified",
+                        pin_memory=False,
+                        device_capacity_tokens=8,
+                        start_layer=0,
+                        end_layer=1,
+                        target_layer_num=1,
+                    )
+
+    @mock.patch.dict(
+        ALLOC_MEMORY_FUNCS,
+        {"cpu": lambda dims, **kw: torch.empty(dims, dtype=kw["dtype"])},
+    )
+    def test_replicated_mla_objects_restore_across_tp_and_sparse_pp(self):
+        """A stage without index rows reuses the same latent objects as PP1."""
+        for writer_tp, reader_tp in ((2, 4), (4, 2)):
+            with self.subTest(mode="canonical", writer_tp=writer_tp):
+                size, tokens = (4, 16)
+
+                def logical(layer, width, component):
+                    return (
+                        (
+                            torch.arange(tokens * width).reshape(tokens, 1, width)
+                            + layer * 53
+                            + component * 79
+                        )
+                        .remainder(251)
+                        .to(torch.uint8)
+                    )
+
+                def make(layers, rank, tp, *, empty):
+
+                    def rows(width, component, *, paged=False, indices=None):
+                        indices = range(len(layers)) if indices is None else indices
+                        data = tuple(
+                            (logical(layers[i], width, component) for i in indices)
+                        )
+                        if paged:
+                            data = tuple((x.reshape(4, size, 1, width) for x in data))
+                        return data
+
+                    buffers = rows(32, 0)
+                    scales = None
+                    observed_rows = [*buffers, *(scales or ())]
+                    observable = [
+                        (row, row.clone(), "canonical" == "split")
+                        for row in observed_rows
+                    ]
+                    if empty:
+                        for row in observed_rows:
+                            row.fill_(173)
+                    info = MLABufferInfo(
+                        buffers=buffers,
+                        data_ptrs=torch.tensor(
+                            [x.data_ptr() for x in buffers], dtype=torch.uint64
+                        ),
+                        layer_indices=tuple(range(len(layers))),
+                        device_layer_num=len(layers),
+                        page_size=size,
+                        kv_lora_rank=24,
+                        qk_rope_head_dim=8,
+                        kv_cache_dim=32,
+                        dtype=torch.uint8,
+                        device=torch.device("cpu"),
+                        scales=scales,
+                    )
+                    cls = get_mla_host_pool_cls(info, layout="page_unified")
+                    with host_memory_budget_scope(1 << 20):
+                        host = cls(
+                            info,
+                            2,
+                            0,
+                            size,
+                            "page_unified",
+                            pin_memory=False,
+                            device_capacity_tokens=tokens - size,
+                            start_layer=layers[0],
+                            end_layer=layers[-1] + 1,
+                            target_layer_num=len(layers),
+                        )
+                    plan = plan_pool_components(
+                        model_id=f"replicated-mla-{'canonical'}",
+                        pool_name="kv",
+                        object_layout=getattr(host, "storage_format_tag", None)
+                        or "page-unified-v1",
+                        page_size=size,
+                        components=host.storage_component_metadata,
+                        layer_ids=tuple((f"L{layer}" for layer in layers)),
+                        tp_rank=rank,
+                        tp_size=tp,
+                    )
+                    return (host, plan, observable)
+
+                source, host_indices, target = (
+                    torch.arange(4, 8),
+                    torch.arange(4),
+                    torch.arange(8, 12),
+                )
+                writer, plan, _ = make((0, 1, 2), 0, writer_tp, empty=False)
+                try:
+                    writer.backup_from_device_all_layer(
+                        None, host_indices, source, "kernel"
+                    )
+                    page = writer.get_data_page(0).view(torch.uint8)
+                    for component in writer.storage_component_metadata:
+                        layer = component.layer_offset
+                        fields = ((32, 0),)
+                        reference = torch.cat(
+                            [
+                                logical(layer, width, field)[source, 0]
+                                for width, field in fields
+                            ],
+                            dim=-1,
+                        ).flatten()
+                        self.assertTrue(
+                            torch.equal(
+                                page[
+                                    component.byte_offset : component.byte_offset
+                                    + component.byte_length
+                                ],
+                                reference,
+                            )
+                        )
+                    objects = {
+                        key: page[offset : offset + length].clone()
+                        for key, (offset, length) in zip(
+                            plan.suffixes, plan.chunk_spans
+                        )
+                    }
+                finally:
+                    writer.destroy()
+                consumed = set()
+                for layers in ((0,), (1, 2)):
+                    for rank in range(reader_tp):
+                        reader, plan, observable = make(
+                            layers, rank, reader_tp, empty=True
+                        )
+                        try:
+                            page = reader.get_dummy_flat_data_page().view(torch.uint8)
+                            for key, (offset, length) in zip(
+                                plan.suffixes, plan.chunk_spans
+                            ):
+                                page[offset : offset + length].copy_(objects[key])
+                                consumed.add(key)
+                            reader.set_from_flat_data_page(0, page)
+                            for layer in range(len(layers)):
+                                reader.load_to_device_per_layer(
+                                    None, host_indices, target, layer, "kernel"
+                                )
+                            for actual, saved, paged in observable:
+                                self.assertTrue(
+                                    torch.equal(
+                                        actual[2] if paged else actual[target],
+                                        saved[1] if paged else saved[source],
+                                    )
+                                )
+                                guard = torch.ones(actual.shape[0], dtype=torch.bool)
+                                guard[2 if paged else target] = False
+                                self.assertTrue(torch.all(actual[guard] == 173))
+                        finally:
+                            reader.destroy()
+                self.assertEqual(consumed, objects.keys())
+
+    @mock.patch.dict(
+        ALLOC_MEMORY_FUNCS,
+        {
+            "cpu": lambda dims, **kw: torch.empty(
+                dims, dtype=kw["dtype"], device=kw["device"]
+            )
+        },
+    )
+    def test_mla_pages_preserve_owned_layers_and_drafts(self):
+        """A page restores only its owned MLA layers, with all packed scales.
+
+        CP layer holes and reserved host rows cannot shift draft layers, and
+        sparse split index components cannot be inferred from latent width.
+        """
+        with self.subTest(native_format="canonical"):
+            infos, observable = ([], [])
+            for layer_ids in ((2, 4), (0,)):
+                count = len(layer_ids)
+                dtype = torch.float16
+                width = 8
+                backing = torch.empty(12, count + 1, 1, width, dtype=dtype)
+                backing.view(torch.uint8).random_(0, 256)
+                buffers = tuple((backing[:, layer] for layer in range(count)))
+                observable.extend(((row, False) for row in buffers))
+                scales = None
+                infos.append(
+                    MLABufferInfo(
+                        buffers=buffers,
+                        data_ptrs=torch.tensor(
+                            [b.data_ptr() for b in buffers], dtype=torch.uint64
+                        ),
+                        layer_indices=layer_ids,
+                        device_layer_num=5 if count == 2 else 1,
+                        page_size=2,
+                        kv_lora_rank=4,
+                        qk_rope_head_dim=4,
+                        kv_cache_dim=8,
+                        dtype=dtype,
+                        device=torch.device("cpu"),
+                        scales=scales,
+                    )
+                )
+            host_cls = get_mla_host_pool_cls(infos[0], layout="page_unified")
+            self.assertIs(host_cls, MLATokenToKVPoolHost)
+            with host_memory_budget_scope(1 << 20):
+                writer, reader = [
+                    host_cls(
+                        infos[0],
+                        2,
+                        0,
+                        2,
+                        "page_unified",
+                        pin_memory=False,
+                        device_capacity_tokens=8,
+                        start_layer=0,
+                        end_layer=5,
+                        target_layer_num=3,
+                        layer_shard_enabled=True,
+                        draft_buffer_infos=(infos[1],),
+                    )
+                    for _ in range(2)
+                ]
+            try:
+                host_indices, source_indices = (
+                    torch.tensor([6, 7, 0, 1]),
+                    torch.tensor([4, 5, 8, 9]),
+                )
+                writer.backup_from_device_all_layer(
+                    None, host_indices, source_indices, "kernel"
+                )
+                for source, target in ((6, 4), (0, 2)):
+                    reader.set_from_flat_data_page(
+                        target, writer.get_data_page(source).clone()
+                    )
+                saved = []
+                for buffer, paged in observable:
+                    source_rows = torch.tensor([2, 4]) if paged else source_indices
+                    saved.append(
+                        buffer.view(torch.uint8).index_select(0, source_rows).clone()
+                    )
+                    buffer.view(torch.uint8).fill_(173)
+                reader_indices, restore_indices = (
+                    torch.tensor([4, 5, 2, 3]),
+                    torch.tensor([0, 1, 6, 7]),
+                )
+                reader.load_to_device_per_layer(
+                    None, reader_indices, restore_indices, 3, "kernel"
+                )
+                self.assertTrue(
+                    all(
+                        (
+                            torch.all(buffer.view(torch.uint8) == 173)
+                            for buffer, _ in observable
+                        )
+                    )
+                )
+                for layer in (2, 4, 5):
+                    reader.load_to_device_per_layer(
+                        None,
+                        reader_indices,
+                        restore_indices,
+                        layer,
+                        "kernel",
+                        is_draft=layer == 5,
+                    )
+                for (buffer, paged), expected in zip(observable, saved):
+                    rows = torch.tensor([0, 3]) if paged else restore_indices
+                    self.assertTrue(
+                        torch.equal(
+                            buffer.view(torch.uint8).index_select(0, rows), expected
+                        )
+                    )
+                    unselected = torch.ones(buffer.shape[0], dtype=torch.bool)
+                    unselected[rows] = False
+                    self.assertTrue(
+                        torch.all(buffer.view(torch.uint8)[unselected] == 173)
+                    )
+            finally:
+                writer.destroy()
+                reader.destroy()
 
 
 # GQA-70B shape: 8 kv heads, 80 layers.

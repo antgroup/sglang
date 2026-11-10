@@ -33,6 +33,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
     is_unlimited_ocr_v2,
+    uses_minimax_m3_nvfp4_native_stack,
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
@@ -92,6 +93,10 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveKVPoolMixin,
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
+)
+from sglang.srt.mem_cache.pool_host.page_unified import (
+    validate_page_unified_cp_pool_names,
+    validate_page_unified_pool_names,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -660,6 +665,35 @@ class KVCacheConfigurator:
             unified_total_bytes=config.unified_total_bytes,
         )
 
+    def _validate_hicache_cp_pools(self) -> None:
+        memory = get_memory()
+        if (
+            not memory.enable_hierarchical_cache
+            or memory.hicache_mem_layout != "page_unified"
+        ):
+            return
+        cp_size = get_parallel().attn_cp_size
+        # A pure sliding-window model can use a plain MHA view and KV anchor.
+        # Resolve the model's semantics before those physical views erase them.
+        unsupported = []
+        if self.mambaish_config is not None:
+            unsupported.append("mamba")
+        if self.is_hybrid_swa or (
+            self.sliding_window_size is not None and self.sliding_window_size > 0
+        ):
+            unsupported.append("swa")
+        if self.is_hybrid_swa_compress:
+            unsupported.append("compressed")
+        hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
+        if (
+            hf_config is not None
+            and is_minimax_sparse(hf_config)
+            and uses_minimax_m3_nvfp4_native_stack(self.model_config.quantization)
+        ):
+            unsupported.append("minimax_nvfp4")
+        validate_page_unified_pool_names(unsupported)
+        validate_page_unified_cp_pool_names(unsupported, cp_size)
+
     def _init_pools(
         self,
         *,
@@ -668,6 +702,7 @@ class KVCacheConfigurator:
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
     ) -> _InitializedPools:
         """Initialize the memory pools."""
+        self._validate_hicache_cp_pools()
         token_to_kv_pool = None
 
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
@@ -823,6 +858,7 @@ class KVCacheConfigurator:
             req_to_token_pool=req_to_token_pool,
             state=state,
         )
+        self._bind_hicache_head_coordinates(token_to_kv_pool)
 
         if self.kv_shard_rank is not None:
             if not isinstance(token_to_kv_pool, PageInterleaveKVPoolMixin):
@@ -1097,6 +1133,12 @@ class KVCacheConfigurator:
                 mamba_full_memory_ratio=get_schedule().mamba_full_memory_ratio,
             ),
         )
+        for sub_pool in storage.sub_pools():
+            if not sub_pool.holds_state:
+                self._bind_hicache_head_coordinates(
+                    storage.view(sub_pool.name),
+                    is_swa=sub_pool.external.host_pool == "swa",
+                )
         return storage
 
     def _unified_request_rows(self, *, has_state: bool) -> Tuple[int, int]:
@@ -1791,6 +1833,66 @@ class KVCacheConfigurator:
                     quant_method=quant_method,
                 )
         return token_to_kv_pool
+
+    def _bind_hicache_head_coordinates(self, pool, *, is_swa: bool = False) -> None:
+        """Publish actual model head ownership, including replicated GQA heads.
+
+        Physical local head counts alone cannot distinguish sharding from
+        replication when attention TP exceeds the number of KV heads.
+        """
+        if get_memory().hicache_mem_layout != "page_unified":
+            return
+        from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
+
+        parallel = get_parallel()
+        if isinstance(pool, MHAKVView):
+            # Pure state-space models retain an empty attention anchor for
+            # allocator indices; it owns neither heads nor stored KV bytes.
+            if getattr(pool, "layer_num", None) == 0:
+                return
+            total = (
+                self.model_config.get_swa_num_kv_heads(1)
+                if is_swa
+                else self.model_config.get_total_num_kv_heads()
+            )
+            width = (
+                self.draft_attn_tp_size
+                if self.is_draft_worker
+                else parallel.attn_tp_size
+            )
+            rank = parallel.attn_tp_rank % width
+            if total >= width:
+                if total % width:
+                    raise ValueError("Unified KV heads must tile attention TP.")
+                start, writer = rank * (total // width), True
+            else:
+                if width % total:
+                    raise ValueError("Unified KV replicas must tile attention TP.")
+                replicas = width // total
+                start, writer = rank // replicas, rank % replicas == 0
+            pool.global_head_num = total
+            pool.global_head_start = start
+            pool.is_storage_writer = writer and parallel.attn_cp_rank == 0
+        elif isinstance(pool, MLAKVView):
+            pool.is_storage_writer = parallel.attn_tp_rank == 0 and (
+                getattr(pool, "layer_shard_enabled", False)
+                or parallel.attn_cp_rank == 0
+            )
+        for name, child_is_swa in (
+            ("full_kv_pool", False),
+            ("full_pool", False),
+            ("swa_kv_pool", True),
+            ("swa_pool", True),
+            ("main_pool", False),
+        ):
+            child = getattr(pool, name, None)
+            if child is not None and child is not pool:
+                self._bind_hicache_head_coordinates(child, is_swa=child_is_swa)
+        index_pool = getattr(pool, "index_k_pool", None)
+        if index_pool is not None:
+            index_pool.is_storage_writer = (
+                parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0
+            )
 
     def _build_mtp_kv_shard_pool(
         self, *, sizes: _PoolSizes, is_dsa_model: bool, is_dsv4_model: bool

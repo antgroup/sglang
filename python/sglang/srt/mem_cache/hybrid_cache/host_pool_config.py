@@ -131,6 +131,7 @@ def _prepare_sidecar(
         if start <= model_to_device[layer] < end
     ]
     packed_buffers = [buffer for _, buffer in owned]
+    packed_writers = [buffers.is_storage_writer] * len(owned)
     device_to_host = {layer: i for i, (layer, _) in enumerate(owned)}
     transfer_layers = {model_to_device[layer] for layer in target.layer_ids}
     for depth, draft in enumerate(drafts):
@@ -148,11 +149,13 @@ def _prepare_sidecar(
             draft_buffers.compress_ratio,
             draft_buffers.key_layout,
             draft_buffers.kernel_page_bytes,
+            draft_buffers.key_shuffle_tile,
         ) != (
             buffers.page_size,
             buffers.compress_ratio,
             buffers.key_layout,
             buffers.kernel_page_bytes,
+            buffers.key_shuffle_tile,
         ):
             raise ValueError(
                 f"{target.pool_name}: draft[{depth}] index key layout differs from target"
@@ -160,7 +163,12 @@ def _prepare_sidecar(
         device_to_host[len(model_layer_ids) + depth] = len(packed_buffers)
         transfer_layers.add(len(model_layer_ids) + depth)
         packed_buffers.extend(draft_buffers.buffers)
-    packed = msgspec.structs.replace(buffers, buffers=tuple(packed_buffers))
+        packed_writers.append(draft_buffers.is_storage_writer)
+    packed = msgspec.structs.replace(
+        buffers,
+        buffers=tuple(packed_buffers),
+        layer_storage_writers=tuple(packed_writers),
+    )
     # The DSA indexer host copies kernel_page_bytes / page_size bytes per token.
     if (
         packed.key_layout is IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES

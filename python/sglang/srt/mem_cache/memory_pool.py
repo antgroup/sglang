@@ -2176,6 +2176,9 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         quant_method=None,
         post_capture_active: bool = False,
         allocation_label: Optional[str] = None,
+        global_head_start: Optional[int] = None,
+        global_head_num: Optional[int] = None,
+        is_storage_writer: bool = True,
     ):
         self.k_buffer = None
         self.v_buffer = None
@@ -2202,6 +2205,9 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         self.post_capture_active = post_capture_active
         self._post_capture_owner = None
         self.head_num = swa_head_num if swa_head_num is not None else head_num
+        self.global_head_start = global_head_start
+        self.global_head_num = global_head_num
+        self.is_storage_writer = is_storage_writer
         self.head_dim = swa_head_dim if swa_head_dim is not None else head_dim
         self.v_head_dim = (
             swa_v_head_dim
@@ -2340,6 +2346,9 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             dtype=self.store_dtype,
             device=buffers.k[0].device if len(buffers.k) else torch.device(self.device),
             scales=self._mha_scale_buffers(),
+            global_head_start=self.global_head_start,
+            global_head_num=self.global_head_num,
+            is_storage_writer=self.is_storage_writer,
         )
 
     def _init_kv_copy_and_warmup(self):
@@ -4744,6 +4753,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             scales=None
             if self.kv_scale_buffer is None
             else tuple(self.kv_scale_buffer[start:end]),
+            is_storage_writer=getattr(self, "is_storage_writer", True),
         )
 
     def _create_buffers(self):
@@ -5329,9 +5339,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         kv_infos = super().get_device_pool_infos()
         # Local buffer positions, translated to model layer IDs below.
+        owned_start, owned_end = (
+            self._owned_local_layer_range()
+            if self.layer_shard_enabled
+            else (0, self.layer_num)
+        )
         index_buffer_layer_ids = tuple(
             layer
-            for layer in range(self.layer_num)
+            for layer in range(owned_start, owned_end)
             if self._should_allocate_index_layer(layer)
         )
         if not index_buffer_layer_ids or not self.index_key_cache.buffer:
@@ -5350,6 +5365,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     self.index_key_cache.buffer[i] for i in index_buffer_layer_ids
                 ),
                 key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES,
+                key_shuffle_tile=16 if aiter_can_use_preshuffle_paged_mqa() else 0,
+                is_storage_writer=getattr(self, "is_storage_writer", True),
             ),
         )
         return (*kv_infos, index_info)
@@ -5708,6 +5725,7 @@ class MHATokenToKOnlyPool(KVCache):
                         buffer.view(-1, self.head_num, self.head_dim)
                         for buffer in self.k_buffer
                     ),
+                    is_storage_writer=getattr(self, "is_storage_writer", True),
                 ),
             ),
         )

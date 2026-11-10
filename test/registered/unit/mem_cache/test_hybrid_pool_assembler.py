@@ -362,6 +362,7 @@ class TestMambaInfoRouting(CustomTestCase):
                             hicache_size=0,
                             hicache_ratio=2,
                             hicache_mem_layout="page_first_direct",
+                            hicache_storage_head_partition=1,
                             hicache_write_policy="write_through",
                             hicache_io_backend="direct",
                             hicache_host_memory_mode="cache",
@@ -989,7 +990,14 @@ class TestDeclaredStackStructure(CustomTestCase):
             _entry_shape(stack.host_pool_group, 3),
             [
                 (PoolName.KV, True, id(pool), (), mapper, _kv_shape(2)),
-                (PoolName.INDEXER, False, id(pool), (), mapper, _indexer_shape(2)),
+                (
+                    PoolName.INDEXER,
+                    False,
+                    id(pool),
+                    (),
+                    (None, 1, None, 0, None, None),
+                    _indexer_shape(2),
+                ),
             ],
         )
 
@@ -1118,7 +1126,9 @@ class TestKvHostPoolRow(CustomTestCase):
             return SimpleNamespace(layer_num=kwargs["target_layer_num"])
 
         with (
-            patch.object(hybrid_pool_assembler, "MLATokenToKVPoolHost", fake_host),
+            patch.object(
+                hybrid_pool_assembler, "get_mla_host_pool_cls", return_value=fake_host
+            ),
             patch.object(
                 hybrid_pool_assembler,
                 "get_parallel",

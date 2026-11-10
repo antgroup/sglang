@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.storage import StorageBackendFactory
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -225,7 +226,10 @@ class TestRegistrationBurstOrder(CustomTestCase):
         backend = RecordingBackend(order)
 
         _attach(controller, backend, order, host_pools=group.entries)
-        controller.register_host_pool_entry(_entry(PoolName.SWA, _fake_pool("swa")))
+        with get_context().override_server_args(
+            hicache_storage_key_scheme="rank-suffix"
+        ):
+            controller.register_host_pool_entry(_entry(PoolName.SWA, _fake_pool("swa")))
 
         self.assertEqual(
             order,

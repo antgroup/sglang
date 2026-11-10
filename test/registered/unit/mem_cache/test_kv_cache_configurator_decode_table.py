@@ -49,7 +49,9 @@ class TestDecodeTableInitPools(CustomTestCase):
             patch.object(
                 kcc,
                 "get_memory",
-                return_value=SimpleNamespace(enable_unified_memory=False),
+                return_value=SimpleNamespace(
+                    enable_unified_memory=False, enable_hierarchical_cache=False
+                ),
             ),
             patch.object(kcc, "get_disagg", return_value=disagg),
             patch.object(

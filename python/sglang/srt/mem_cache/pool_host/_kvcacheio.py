@@ -46,12 +46,20 @@ MLA_KVCACHEIO_OPS = MappingProxyType(
                     "transfer_kv_per_layer_mla_pf_lf",
                     "transfer_kv_all_layer_mla_lf_pf",
                 ),
+                "page_unified": (
+                    "transfer_kv_per_layer_mla_pf_lf",
+                    "transfer_kv_all_layer_mla_lf_pf",
+                ),
             }
         ),
         "direct": MappingProxyType(
             {
                 "layer_first": ("transfer_kv_direct",),
                 "page_first_direct": (
+                    "transfer_kv_per_layer_direct_pf_lf",
+                    "transfer_kv_all_layer_direct_lf_pf",
+                ),
+                "page_unified": (
                     "transfer_kv_per_layer_direct_pf_lf",
                     "transfer_kv_all_layer_direct_lf_pf",
                 ),

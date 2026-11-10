@@ -295,7 +295,9 @@ class TestDraftBindingDispatch(CustomTestCase):
             patch.object(
                 kcc,
                 "get_memory",
-                return_value=SimpleNamespace(enable_unified_memory=True),
+                return_value=SimpleNamespace(
+                    enable_unified_memory=True, enable_hierarchical_cache=False
+                ),
             ),
             patch.object(
                 kcc,

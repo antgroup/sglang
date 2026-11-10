@@ -502,6 +502,9 @@ class MHAView(MHAKVView):
                     ),
                     scales=None,
                     page_envelope=self._page_envelope_info(),
+                    global_head_start=getattr(self, "global_head_start", None),
+                    global_head_num=getattr(self, "global_head_num", None),
+                    is_storage_writer=getattr(self, "is_storage_writer", True),
                 ),
             ),
         )

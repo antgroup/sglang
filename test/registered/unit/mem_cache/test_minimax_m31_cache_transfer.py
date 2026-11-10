@@ -535,6 +535,9 @@ def cpu_host_allocation(monkeypatch):
     monkeypatch.setattr(
         "sglang.srt.mem_cache.pool_host.base._cuda_host_unregister", lambda buffer: None
     )
+    monkeypatch.setattr(
+        "sglang.srt.mem_cache.pool_host.mha._cuda_host_unregister", lambda buffer: None
+    )
     monkeypatch.setitem(
         ALLOC_MEMORY_FUNCS,
         "cpu",
@@ -551,6 +554,101 @@ def cpu_host_allocation(monkeypatch):
             transfer_layer_id_max=kwargs["transfer_layer_id_max"],
         ),
     )
+
+
+def test_bfloat16_minimax_page_unified_stack(cpu_host_allocation):
+    """The complete BF16 stack restores both main KV and sparse index K."""
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+    from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+    from sglang.srt.runtime_context import get_parallel
+
+    with (
+        get_context().override_server_args(
+            hicache_mem_layout="page_unified",
+            hicache_storage_key_scheme="unified",
+            hicache_storage_head_partition=1,
+            hicache_io_backend="direct",
+            hicache_ratio=2,
+            hicache_size=0,
+        ),
+        get_parallel().override(
+            tp_size=4,
+            moe_tp_size=4,
+            attn_tp_size=4,
+            tp_rank=2,
+            attn_tp_rank=2,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+        ),
+        host_memory_budget_scope(1 << 24),
+    ):
+        target = MiniMaxSparseKVPool(
+            size=768,
+            page_size=128,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=128,
+            idx_head_dim=128,
+            dense_layer_ids=[0],
+            sparse_layer_ids=[1],
+            disable_value_sparse_layer_ids=[1],
+            device="cpu",
+            start_layer=0,
+            end_layer=2,
+        )
+        cfg = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        cfg.model_config = SimpleNamespace(get_total_num_kv_heads=lambda: 8)
+        cfg.is_draft_worker = False
+        cfg._bind_hicache_head_coordinates(target)
+        params = CacheInitParams(
+            False,
+            SimpleNamespace(holds_state_slots=False),
+            SimpleNamespace(get_kvcache=lambda: target, storage=None),
+            128,
+        )
+        group, _ = build_stack(params, target)
+        try:
+            assert {entry.name for entry in group.entries} == {
+                PoolName.KV,
+                PoolName.INDEXER,
+            }
+            source = torch.arange(128, 256)
+            host_ids = torch.arange(256, 384)
+            destination = torch.arange(128)
+            main = target.main_pool
+            buffers = [*main.k_buffer, *main.v_buffer, *target.index_k_pool.k_buffer]
+            for index, buffer in enumerate(buffers):
+                buffer.fill_(index + 1)
+            expected = [buffer.index_select(0, source).clone() for buffer in buffers]
+            for entry in group.entries:
+                entry.host_pool.backup_from_device_all_layer(
+                    entry.device_pool, host_ids, source, "direct"
+                )
+            for buffer in buffers:
+                buffer.zero_()
+            for entry in group.entries:
+                for layer in range(2):
+                    mapped = entry.layer_mapper(layer)
+                    if mapped is not None:
+                        entry.host_pool.load_to_device_per_layer(
+                            entry.device_pool, host_ids, destination, mapped, "direct"
+                        )
+            for buffer, saved in zip(buffers, expected):
+                assert torch.equal(buffer.index_select(0, destination), saved)
+                assert torch.count_nonzero(buffer[128:]) == 0
+            coordinates = {
+                record.shard_coordinate
+                for record in group.anchor_entry.host_pool.storage_component_metadata
+            }
+            assert coordinates == {"H4-5", "H5-6"}
+            index = group.entry_map[PoolName.INDEXER].host_pool
+            assert all(
+                not record.is_storage_writer
+                for record in index.storage_component_metadata
+            )
+        finally:
+            for entry in group.entries:
+                entry.host_pool.destroy()
 
 
 @pytest.mark.parametrize(

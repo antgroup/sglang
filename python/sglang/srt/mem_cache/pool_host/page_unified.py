@@ -36,6 +36,8 @@ L3, and neither side has to ask which.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import msgspec
@@ -43,6 +45,62 @@ import msgspec
 # Byte order identity, recorded in the L3 namespace digest. Bump when the axis
 # order changes, so old objects miss instead of deserializing permuted.
 PAGE_UNIFIED_OBJECT_LAYOUT = "page-unified-v1"
+
+
+def validate_page_unified_pool_names(pool_names: Iterable[str]) -> None:
+    """Reject pool formats that have not adopted the canonical page protocol."""
+    unsupported = sorted({str(name) for name in pool_names} - {"kv", "indexer"})
+    if unsupported:
+        raise NotImplementedError(
+            "page_unified currently supports only full MHA/MLA KV and its "
+            "DSA or K-only indexer pools; unsupported pools: " + ", ".join(unsupported)
+        )
+
+
+def validate_page_unified_cp_pool_names(
+    pool_names: Iterable[str], attn_cp_size: int
+) -> None:
+    """Limit CP to full attention KV and the indexers attached to that KV.
+
+    Other pools retain their TP/PP layouts, but have no supported CP restore
+    path yet. Check names before registering a pool or publishing storage keys.
+    """
+    if attn_cp_size <= 1:
+        return
+    supported = {"kv", "indexer", "draft", "draft_indexer"}
+    unsupported = sorted({str(name) for name in pool_names} - supported)
+    if unsupported:
+        raise NotImplementedError(
+            "page_unified with CP>1 supports only full MHA/MLA KV and its "
+            "associated indexer pools; "
+            f"{', '.join(unsupported)} supports TP/PP only."
+        )
+
+
+@dataclass(frozen=True)
+class PageStorageComponent:
+    """One contiguous typed component of a serialized host page.
+
+    Layer-major components can be stored independently for each model layer.
+    Slot-wide side state has no layer axis. Offsets always address the flat
+    uint8 page returned by the host pool, including heterogeneous dtypes.
+    """
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: str
+    byte_offset: int
+    byte_length: int
+    layer_axis: int | None = 0
+    layer_offset: int = 0
+    # None is an opaque legacy shard. An empty coordinate explicitly means
+    # replicated data; other values name global head/channel ranges. Neither
+    # explicit form depends on the TP/CP rank that owns the bytes.
+    shard_coordinate: str | None = None
+    is_storage_writer: bool = True
+    # Slot-wide side state can belong to a global layer or to the request.
+    # Its identity must not depend on the local pipeline stage's layer set.
+    layer_coordinate: str | None = None
 
 
 class PageUnifiedLayout(msgspec.Struct, frozen=True, kw_only=True):
@@ -170,8 +228,8 @@ def resolve_kv_host_geometry(
 ) -> KVHostGeometry:
     """Resolve physical host/staging dimensions, independent of capacity and keys.
 
-    ``page_size`` is physical, including under DCP. Uneven MLA layer shards
-    reserve the largest shard's layer count; packed drafts follow that reserve.
+    ``page_size`` is physical, including under DCP. Unified MLA pages contain
+    only owned layers; other layouts retain their existing CP reserve policy.
     """
     target_layer_num = kv_pool.layer_num
     if use_mla and kv_pool.layer_shard_enabled:
@@ -184,6 +242,8 @@ def resolve_kv_host_geometry(
     from sglang.srt.mem_cache.hicache_key_scheme import resolve_head_group_num
 
     info = kv_pool.get_device_pool_infos()[0].buffer_info
+    if use_mla and kv_pool.layer_shard_enabled:
+        target_layer_num = len(info.layer_indices)
     return KVHostGeometry(
         target_layer_num,
         PageUnifiedLayout(

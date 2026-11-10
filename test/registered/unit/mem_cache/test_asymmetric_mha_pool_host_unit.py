@@ -6,8 +6,19 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.device_pool_info import (
+    IndexKeyBufferInfo,
+    IndexKeyLayout,
+    KVBufferLayout,
+    KVBuffers,
+    MHABufferInfo,
+)
+from sglang.srt.mem_cache.hicache_key_scheme import plan_pool_components
+from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
+from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.mha import (
     AsymmetricMHATokenToKVPoolHost,
+    MHATokenToKOnlyPoolHost,
     MHATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
@@ -16,6 +27,48 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _cpu_host_allocation(test):
+    return mock.patch.dict(
+        ALLOC_MEMORY_FUNCS,
+        {"cpu": lambda dims, **kw: torch.empty(dims, dtype=kw["dtype"])},
+    )(test)
+
+
+def _mha_info(k, v, *, page_size, head_num, head_dim, layout=KVBufferLayout.NHD, **kw):
+    return MHABufferInfo(
+        buffers=KVBuffers(
+            k=k,
+            v=v,
+            layout=layout,
+            k_data_ptrs=torch.tensor([b.data_ptr() for b in k], dtype=torch.uint64),
+            v_data_ptrs=torch.tensor([b.data_ptr() for b in v], dtype=torch.uint64),
+        ),
+        page_size=page_size,
+        head_num=head_num,
+        head_dim=head_dim,
+        v_head_dim=kw.pop("v_head_dim", head_dim),
+        dtype=kw.pop("dtype", torch.uint8),
+        device=torch.device("cpu"),
+        **kw,
+    )
+
+
+def _unified_host(info, *, end_layer, start_layer=0, capacity=8, budget=1 << 20, **kw):
+    with host_memory_budget_scope(budget):
+        return get_mha_host_pool_cls(info, layout="page_unified")(
+            info,
+            2,
+            0,
+            info.page_size,
+            "page_unified",
+            pin_memory=False,
+            device_capacity_tokens=capacity,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            **kw,
+        )
 
 
 def _make_host(layout: str) -> AsymmetricMHATokenToKVPoolHost:
@@ -85,6 +138,380 @@ def _make_device_pool(host: AsymmetricMHATokenToKVPoolHost) -> SimpleNamespace:
 
 
 class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
+    def test_page_unified_rejects_unadapted_mha_formats(self):
+        from sglang.srt.mem_cache.device_pool_info import KVScaleBuffers, KVScaleLayout
+
+        rows = (torch.zeros(12, 1, 32, dtype=torch.uint8),)
+        scales = KVScaleBuffers(k=rows, v=rows, layout=KVScaleLayout.TOKEN)
+        for overrides in (
+            {"scales": scales},
+            {"v_head_dim": 16},
+            {"layout": KVBufferLayout.HND},
+        ):
+            with self.subTest(overrides=overrides):
+                info = _mha_info(
+                    rows, rows, page_size=4, head_num=1, head_dim=32, **overrides
+                )
+                with self.assertRaisesRegex(NotImplementedError, "page_unified"):
+                    get_mha_host_pool_cls(info, layout="page_unified")
+                with self.assertRaisesRegex(NotImplementedError, "page_unified"):
+                    MHATokenToKVPoolHost(
+                        info,
+                        2,
+                        0,
+                        4,
+                        "page_unified",
+                        pin_memory=False,
+                        device_capacity_tokens=8,
+                        start_layer=0,
+                        end_layer=1,
+                    )
+
+    @_cpu_host_allocation
+    def test_packed_draft_keeps_its_own_global_heads_and_cp_writer(self):
+        """Equal local shapes can represent replicated target and sharded draft heads."""
+        published = set()
+        for cp_rank in range(2):
+            for rank in range(4):
+                with self.subTest(fp4=False, rank=rank, cp_rank=cp_rank):
+
+                    def info(layers, *, draft):
+                        k = tuple(
+                            (
+                                torch.empty(12, 1, 32, dtype=torch.uint8)
+                                for _ in range(layers)
+                            )
+                        )
+                        v = tuple((torch.empty_like(row) for row in k))
+                        scales = None
+                        return _mha_info(
+                            k,
+                            v,
+                            page_size=4,
+                            head_num=1,
+                            head_dim=32,
+                            scales=scales,
+                            global_head_start=rank if draft else rank // 2,
+                            global_head_num=4 if draft else 2,
+                            is_storage_writer=cp_rank == 0
+                            if draft
+                            else cp_rank == 1 and rank % 2 == 0,
+                        )
+
+                    target, draft = (info(2, draft=False), info(1, draft=True))
+                    host = _unified_host(
+                        target,
+                        start_layer=10,
+                        end_layer=12,
+                        draft_buffer_infos=(draft,),
+                    )
+                    target_only = _unified_host(target, start_layer=10, end_layer=12)
+                    try:
+                        metadata = host.storage_component_metadata
+                        self.assertEqual(
+                            [component.shard_coordinate for component in metadata],
+                            [f"H{rank // 2}-{rank // 2 + 1}"] * 2
+                            + [f"H{rank}-{rank + 1}"],
+                        )
+                        self.assertEqual(
+                            [component.is_storage_writer for component in metadata],
+                            [target.is_storage_writer] * 2 + [draft.is_storage_writer],
+                        )
+
+                        def plan(pool, layers):
+                            return plan_pool_components(
+                                model_id=f"target-with-different-draft-heads-{False}",
+                                pool_name="kv",
+                                object_layout=getattr(pool, "storage_format_tag", None)
+                                or "page-unified-v1",
+                                page_size=4,
+                                components=pool.storage_component_metadata,
+                                layer_ids=layers,
+                                tp_rank=rank,
+                                tp_size=4,
+                                attn_cp_rank=cp_rank,
+                                attn_cp_size=2,
+                            )
+
+                        combined = plan(host, ("L10", "L11", "Dtest0"))
+                        standalone = plan(target_only, ("L10", "L11"))
+                        self.assertEqual(combined.suffixes[:2], standalone.suffixes)
+                        for key, writer in zip(combined.suffixes, combined.writer_mask):
+                            if writer:
+                                self.assertNotIn(key, published)
+                                published.add(key)
+                    finally:
+                        host.destroy()
+                        target_only.destroy()
+        self.assertEqual(len(published), 8)
+
+    @_cpu_host_allocation
+    def test_unified_objects_restore_global_heads_across_tp_and_uneven_pp(self):
+        """A different rank/stage grid consumes the same independently named bytes."""
+        for writer_tp, reader_tp, total_heads in (
+            (2, 4, 8),
+            (4, 2, 8),
+            (8, 4, 4),
+            (4, 8, 4),
+        ):
+            with self.subTest(mode="dense", writer_tp=writer_tp):
+                size = 4
+                tokens = size * 4
+                payload_width = 32
+                v_width = payload_width
+                layout = KVBufferLayout.NHD
+
+                def logical(width, layer, component):
+                    return (
+                        torch.arange(tokens * total_heads * width, dtype=torch.int64)
+                        .reshape(tokens, total_heads, width)
+                        .add(layer * 53 + component * 79)
+                        .remainder(251)
+                        .to(torch.uint8)
+                    )
+
+                def physical(data, name):
+                    return data.contiguous()
+
+                def make(rank, tp, layers, *, empty):
+                    heads = max(1, total_heads // tp)
+                    replicas = max(1, tp // total_heads)
+                    start = rank // replicas * heads
+                    sources = {}
+                    for name, width, component in (
+                        ("k", payload_width, 0),
+                        ("v", v_width, 1),
+                        *(),
+                    ):
+                        sources[name] = tuple(
+                            (
+                                physical(
+                                    logical(width, layer, component)[
+                                        :, start : start + heads
+                                    ],
+                                    name,
+                                )
+                                for layer in layers
+                            )
+                        )
+                    expected = {
+                        name: tuple((x.clone() for x in rows))
+                        for name, rows in sources.items()
+                    }
+                    if empty:
+                        for rows in sources.values():
+                            for row in rows:
+                                row.fill_(173)
+                    scales = None
+                    info = _mha_info(
+                        sources["k"],
+                        sources["v"],
+                        layout=layout,
+                        page_size=size,
+                        head_num=heads,
+                        head_dim=32,
+                        v_head_dim=32,
+                        scales=scales,
+                        global_head_start=start,
+                        global_head_num=total_heads,
+                        is_storage_writer=rank % replicas == 0,
+                    )
+                    host = _unified_host(
+                        info,
+                        capacity=tokens - size,
+                        start_layer=layers[0],
+                        end_layer=layers[-1] + 1,
+                        head_group_num=max(1, heads // 2),
+                        budget=1 << 24,
+                    )
+                    plan = plan_pool_components(
+                        model_id=f"global-head-pattern-{'dense'}",
+                        pool_name="kv",
+                        object_layout=getattr(host, "storage_format_tag", None)
+                        or "page-unified-v1",
+                        page_size=size,
+                        components=host.storage_component_metadata,
+                        layer_ids=tuple((f"L{layer}" for layer in layers)),
+                        tp_rank=rank,
+                        tp_size=tp,
+                    )
+                    return (host, plan, sources, expected)
+
+                objects = {}
+                source = torch.arange(size, 2 * size)
+                host_indices = torch.arange(size)
+                for rank in range(writer_tp):
+                    writer, plan, _, _ = make(rank, writer_tp, range(3), empty=False)
+                    try:
+                        writer.backup_from_device_all_layer(
+                            None, host_indices, source, "kernel"
+                        )
+                        page = writer.get_data_page(0).view(torch.uint8)
+                        for component in writer.storage_component_metadata:
+                            start, end = map(
+                                int, component.shard_coordinate[1:].split("-")
+                            )
+                            width = getattr(writer, "record_bytes", 32)
+                            reference = torch.zeros(
+                                (component.shape[0], 2, size, end - start, width),
+                                dtype=torch.uint8,
+                            )
+                            for local_layer in range(component.shape[0]):
+                                layer = component.layer_offset + local_layer
+                                reference[local_layer, 0, ..., :payload_width] = (
+                                    logical(payload_width, layer, 0)[source, start:end]
+                                )
+                                reference[local_layer, 1, ..., :v_width] = logical(
+                                    v_width, layer, 1
+                                )[source, start:end]
+                            self.assertTrue(
+                                torch.equal(
+                                    page[
+                                        component.byte_offset : component.byte_offset
+                                        + component.byte_length
+                                    ],
+                                    reference.flatten(),
+                                )
+                            )
+                        for key, (offset, length), owns_object in zip(
+                            plan.suffixes, plan.chunk_spans, plan.writer_mask
+                        ):
+                            if not owns_object:
+                                continue
+                            self.assertNotIn(key, objects)
+                            objects[key] = page[offset : offset + length].clone()
+                    finally:
+                        writer.destroy()
+                consumed = set()
+                for layers in (range(1), range(1, 3)):
+                    for rank in range(reader_tp):
+                        reader, plan, sources, expected = make(
+                            rank, reader_tp, layers, empty=True
+                        )
+                        try:
+                            page = reader.get_dummy_flat_data_page().view(torch.uint8)
+                            for key, (offset, length) in zip(
+                                plan.suffixes, plan.chunk_spans
+                            ):
+                                page[offset : offset + length].copy_(objects[key])
+                                consumed.add(key)
+                            reader.set_from_flat_data_page(0, page)
+                            target = torch.arange(2 * size, 3 * size)
+                            for layer in range(len(layers)):
+                                reader.load_to_device_per_layer(
+                                    None, host_indices, target, layer, "kernel"
+                                )
+                            for name, rows in sources.items():
+                                paged = layout != KVBufferLayout.NHD or (
+                                    name.endswith("scale") and "dense" == "mxfp8"
+                                )
+                                if name.endswith("scale") and "dense" != "mxfp8":
+                                    paged = False
+                                for actual, original in zip(rows, expected[name]):
+                                    self.assertTrue(
+                                        torch.equal(
+                                            actual[2] if paged else actual[target],
+                                            original[1] if paged else original[source],
+                                        ),
+                                        name,
+                                    )
+                                    guard = torch.ones(
+                                        actual.shape[0], dtype=torch.bool
+                                    )
+                                    guard[2 if paged else target] = False
+                                    self.assertTrue(
+                                        torch.all(actual[guard] == 173), name
+                                    )
+                        finally:
+                            reader.destroy()
+                self.assertEqual(consumed, objects.keys())
+
+    @_cpu_host_allocation
+    def test_canonical_unified_strided_rows_keep_the_existing_byte_order(self):
+        """Strided K/V rows must serialize exactly like packed canonical MHA."""
+        layers, page_size, heads, width, token_count = 3, 2, 4, 8, 12
+        k_backing = torch.empty(token_count, layers, heads, width, dtype=torch.float16)
+        v_backing = torch.empty(
+            token_count, layers * 2, heads, width, dtype=torch.float16
+        )
+        k_backing.view(torch.uint8).random_(0, 256)
+        v_backing.view(torch.uint8).random_(0, 256)
+        k = tuple(k_backing[:, layer] for layer in range(layers))
+        v = tuple(v_backing[:, layer * 2] for layer in range(layers))
+        info = _mha_info(
+            k,
+            v,
+            page_size=page_size,
+            head_num=heads,
+            head_dim=width,
+            dtype=torch.float16,
+        )
+        self.assertIs(
+            get_mha_host_pool_cls(info, layout="page_unified"), MHATokenToKVPoolHost
+        )
+        host = _unified_host(info, end_layer=layers, head_group_num=2)
+        try:
+            host_indices = torch.tensor([6, 7, 0, 1])
+            device_indices = torch.tensor([4, 5, 8, 9])
+            host.backup_from_device_all_layer(
+                None, host_indices, device_indices, "kernel"
+            )
+            for host_page, device_page in ((3, 2), (0, 4)):
+                # The canonical byte protocol is head-group, layer, K/V, token,
+                # head-in-group, width, independent of the device row strides.
+                expected = torch.stack(
+                    [
+                        torch.stack(
+                            [
+                                torch.stack(
+                                    [
+                                        buffers[layer][
+                                            device_page * page_size : (device_page + 1)
+                                            * page_size,
+                                            group * 2 : (group + 1) * 2,
+                                        ]
+                                        for buffers in (k, v)
+                                    ]
+                                )
+                                for layer in range(layers)
+                            ]
+                        )
+                        for group in range(2)
+                    ]
+                )
+                self.assertTrue(
+                    torch.equal(
+                        host.get_data_page(host_page * page_size).view(torch.uint8),
+                        expected.flatten().view(torch.uint8),
+                    )
+                )
+            originals = [
+                [
+                    b.view(torch.uint8).index_select(0, device_indices).clone()
+                    for b in component
+                ]
+                for component in (k, v)
+            ]
+            for component in (k, v):
+                for buffer in component:
+                    buffer.view(torch.uint8).fill_(173)
+            target_indices = torch.tensor([0, 1, 6, 7])
+            for layer in range(layers):
+                host.load_to_device_per_layer(
+                    None, host_indices, target_indices, layer, "direct"
+                )
+            for component, expected_layers in zip((k, v), originals):
+                for actual, expected in zip(component, expected_layers):
+                    self.assertTrue(
+                        torch.equal(
+                            actual.view(torch.uint8).index_select(0, target_indices),
+                            expected,
+                        )
+                    )
+                    self.assertTrue(torch.all(actual.view(torch.uint8)[2:6] == 173))
+        finally:
+            host.destroy()
+
     def test_factory_selects_asymmetric_pool_for_mismatched_kv_dims(self):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
@@ -138,9 +565,11 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
             pin_memory=False,
             device="cpu",
             allocator_type="default",
-            device_capacity_tokens=device.size
-            if device.host_capacity_tokens is None
-            else device.host_capacity_tokens,
+            device_capacity_tokens=(
+                device.size
+                if device.host_capacity_tokens is None
+                else device.host_capacity_tokens
+            ),
             start_layer=device.start_layer,
             end_layer=device.end_layer,
             write_back_staging=device.hicache_write_back_staging,
@@ -429,6 +858,92 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
                 device_indices,
                 layer_id=2,
                 io_backend="direct",
+            )
+
+
+class TestPageUnifiedKOnly(CustomTestCase):
+    @mock.patch.dict(
+        ALLOC_MEMORY_FUNCS,
+        {"cpu": lambda dims, **kw: torch.zeros(dims, dtype=kw["dtype"])},
+    )
+    def test_replicated_index_writer_survives_device_descriptor_and_host(self):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool
+
+        device = MHATokenToKOnlyPool.__new__(MHATokenToKOnlyPool)
+        device.page_size = 2
+        device.head_num = 1
+        device.head_dim = 4
+        device.model_layer_ids = (3, 7)
+        device.k_buffer = [torch.zeros(10, 1, 4) for _ in range(2)]
+        for writer in (False, True):
+            with self.subTest(writer=writer):
+                device.is_storage_writer = writer
+                info = device.get_device_pool_infos()[0].buffer_info
+                with host_memory_budget_scope(1 << 20):
+                    host = MHATokenToKOnlyPoolHost(
+                        info,
+                        SimpleNamespace(size=8, page_num=4, page_size=2),
+                        "page_unified",
+                        pin_memory=False,
+                    )
+                try:
+                    plan = plan_pool_components(
+                        model_id="replicated-index",
+                        pool_name="indexer",
+                        object_layout=host.storage_format_tag,
+                        page_size=host.page_size,
+                        components=host.storage_component_metadata,
+                        layer_ids=("L3", "L7"),
+                        tp_rank=0,
+                        tp_size=1,
+                    )
+                    self.assertEqual(plan.chunk_writers, (writer, writer))
+                    self.assertEqual(plan.is_storage_writer, writer)
+                    self.assertEqual(
+                        host.storage_component_metadata[0].shard_coordinate, ""
+                    )
+                finally:
+                    host.destroy()
+
+    @mock.patch.dict(
+        ALLOC_MEMORY_FUNCS,
+        {"cpu": lambda dims, **kw: torch.zeros(dims, dtype=kw["dtype"])},
+    )
+    def test_sparse_index_pages_restore_only_selected_rows_and_layers(self):
+        backing = torch.arange(10 * 2 * 2 * 3, dtype=torch.float32).reshape(10, 2, 2, 3)
+        buffers = tuple(backing[:, layer].contiguous() for layer in range(2))
+        info = IndexKeyBufferInfo(
+            page_size=2,
+            buffers=buffers,
+            compress_ratio=1,
+            key_layout=IndexKeyLayout.KEY_ROWS,
+        )
+        with host_memory_budget_scope(1 << 20):
+            host = MHATokenToKOnlyPoolHost(
+                info,
+                SimpleNamespace(size=8, page_num=4, page_size=2),
+                "page_unified",
+                pin_memory=False,
+            )
+        self.addCleanup(host.destroy)
+        host_ids = torch.tensor([0, 1, 4, 5])
+        device_ids = torch.tensor([2, 3, 6, 7])
+        expected = backing[device_ids].clone()
+        host.backup_from_device_all_layer(None, host_ids, device_ids, "kernel")
+        for start in (0, 4):
+            page = host.get_data_page(start).clone()
+            self.assertEqual(
+                page.nbytes, host.storage_component_metadata[0].byte_length
+            )
+            host.k_buffer[start // 2].zero_()
+            host.set_from_flat_data_page(start, page)
+        for buffer in buffers:
+            buffer.zero_()
+        for layer in range(2):
+            host.load_to_device_per_layer(None, host_ids, device_ids, layer, "kernel")
+            torch.testing.assert_close(buffers[layer][device_ids], expected[:, layer])
+            self.assertEqual(
+                buffers[layer][[0, 1, 4, 5, 8, 9]].count_nonzero().item(), 0
             )
 
 

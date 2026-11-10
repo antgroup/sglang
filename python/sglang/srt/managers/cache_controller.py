@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Copyright 2023-2025 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,11 +11,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from __future__ import annotations
 
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
@@ -42,12 +41,19 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.hicache_key_scheme import (
     UnifiedKVPlan,
+    UnifiedPoolStoragePlan,
+    host_page_components,
     namespace_digest,
     normalize_dtype,
+    plan_pool_components,
     plan_unified_kv,
 )
 from sglang.srt.mem_cache.kv.memory.views import MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.pool_host.page_unified import (
+    validate_page_unified_cp_pool_names,
+    validate_page_unified_pool_names,
+)
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
@@ -327,6 +333,15 @@ class HiCacheController:
         self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
+        # Hybrid wrappers can expose compact children whose start_layer is 0.
+        # Storage coordinates must retain the original model stage origin.
+        self.storage_start_layer = mem_pool_device.start_layer
+        stage_layers = getattr(mem_pool_device, "layer_num", None)
+        self.storage_end_layer = (
+            self.storage_start_layer + stage_layers
+            if stage_layers is not None
+            else None
+        )
         # A pool wrapping one token KV view transfers that view's KV.
         inner = mem_pool_device.layer_router.wrapped_view()
         if inner is not None:
@@ -805,20 +820,12 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         dcp_size = get_parallel().attn_dcp_size
-        model_name = storage_model_name(model_name, self.storage_host_pool)
-        unified_plan = self._build_unified_plan(model_name, attn_cp_size)
-        unified_chunk_spans = None
-        if unified_plan is not None:
-            # Keys are layer-major/head-minor; the physical page is head-major.
-            # Keep each key paired with its byte span instead of slicing pages
-            # consecutively in key order.
-            layout = self.storage_host_pool.page_unified_layout
-            unified_chunk_spans = [
-                layout.chunk_span(layer_range, head_group)
-                for layer_range in unified_plan.layer_ranges
-                for head_group in range(unified_plan.head_group_num)
-            ]
-
+        if get_memory().hicache_storage_key_scheme != "unified":
+            model_name = storage_model_name(model_name, self.storage_host_pool)
+        pool_plans = self._build_unified_pool_plans(
+            model_name, attn_cp_size, attn_cp_rank=attn_cp_rank
+        )
+        unified_plan = pool_plans.get(PoolName.KV) if pool_plans else None
         return HiCacheStorageConfig(
             tp_rank=tp_rank,
             tp_size=tp_size,
@@ -835,8 +842,11 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=dp_rank,
             extra_config=storage_backend_extra_config,
-            unified_suffixes=(unified_plan.suffixes if unified_plan else None),
-            unified_chunk_spans=unified_chunk_spans,
+            unified_suffixes=(list(unified_plan.suffixes) if unified_plan else None),
+            unified_chunk_spans=(
+                list(unified_plan.chunk_spans) if unified_plan else None
+            ),
+            unified_pool_plans=pool_plans,
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
@@ -908,6 +918,128 @@ class HiCacheController:
             plan.suffixes,
         )
         return plan
+
+    def _build_unified_pool_plans(
+        self, model_name: Optional[str], attn_cp_size: int, *, attn_cp_rank: int = 0
+    ) -> Optional[dict[str, UnifiedPoolStoragePlan]]:
+        memory = get_memory()
+        if memory.hicache_storage_key_scheme != "unified":
+            return None
+        parallel = get_parallel()
+        if parallel.attn_dcp_size > 1:
+            raise NotImplementedError(
+                "Unified storage requires complete pages without DCP."
+            )
+        entries = getattr(self.mem_pool_host, "entries", ()) or (None,)
+        validate_page_unified_pool_names(
+            getattr(entry, "name", PoolName.KV) for entry in entries
+        )
+        validate_page_unified_cp_pool_names(
+            (getattr(entry, "name", PoolName.KV) for entry in entries),
+            max(attn_cp_size, parallel.attn_cp_size),
+        )
+        stage_start = getattr(
+            self,
+            "storage_start_layer",
+            getattr(self.mem_pool_device, "start_layer", 0),
+        )
+        plans = {}
+        for entry in entries:
+            host = entry.host_pool if entry is not None else self.storage_host_pool
+            name = getattr(entry, "name", PoolName.KV)
+            device = entry.device_pool if entry is not None else self.mem_pool_device
+            mapping = getattr(entry, "transfer_layer_mapping", None)
+            components = host_page_components(host)
+            layer_count = max(
+                (c.layer_offset + c.shape[0] for c in components if c.layer_axis == 0),
+                default=0,
+            )
+            coordinates = [None] * layer_count
+            if mapping is not None:
+                drafts = getattr(entry, "packed_draft_device_pools", ())
+                target_layers = layer_count - len(drafts)
+                compact = getattr(host, "_device_to_host_layer", None)
+                if compact is None:
+                    compact = getattr(host, "_host_layer_by_controller", None)
+                for transfer_layer, local_layer in mapping.items():
+                    if compact is not None:
+                        local_layer = compact.get(local_layer, -1)
+                    if 0 <= local_layer < target_layers:
+                        coordinates[local_layer] = f"L{stage_start + transfer_layer}"
+                for depth in range(len(drafts)):
+                    coordinates[target_layers + depth] = self._draft_storage_coordinate(
+                        depth
+                    )
+                owned = getattr(host, "_target_layer_indices", None)
+                reserve = getattr(host, "target_layer_num", 0)
+                if owned is not None:
+                    for index in range(len(owned), reserve):
+                        if coordinates[index] is None:
+                            coordinates[index] = f"P{stage_start}-{reserve}-{index}"
+            else:
+                start = getattr(host, "start_layer", stage_start)
+                coordinates = [f"L{start + i}" for i in range(layer_count)]
+            if name in (PoolName.DRAFT, PoolName.DRAFT_INDEXER, PoolName.DRAFT_SWA):
+                coordinates = [
+                    self._draft_storage_coordinate(i) for i in range(layer_count)
+                ]
+            if any(coordinate is None for coordinate in coordinates):
+                raise ValueError(f"{name}: incomplete unified storage layer mapping.")
+            resolved_components = []
+            for component in components:
+                coordinate = component.layer_coordinate
+                if coordinate is not None and coordinate.startswith("@layer:"):
+                    local_layer = int(coordinate.removeprefix("@layer:"))
+                    if not 0 <= local_layer < len(coordinates):
+                        raise ValueError(f"{name}: invalid side-state layer slot.")
+                    component = replace(
+                        component, layer_coordinate=coordinates[local_layer]
+                    )
+                resolved_components.append(component)
+            plan = plan_pool_components(
+                model_id=model_name or "",
+                pool_name=str(name),
+                object_layout=getattr(host, "storage_format_tag", None)
+                or "page-unified-v1",
+                page_size=host.page_size,
+                components=tuple(resolved_components),
+                layer_ids=tuple(coordinates),
+                tp_rank=parallel.tp_rank,
+                tp_size=parallel.tp_size,
+                attn_tp_rank=parallel.attn_tp_rank,
+                attn_tp_size=parallel.attn_tp_size,
+                attn_cp_rank=attn_cp_rank,
+                attn_cp_size=attn_cp_size,
+                layer_partition=memory.hicache_storage_layer_partition,
+                is_final_stage=(
+                    memory.hicache_storage_layer_partition in (None, 1)
+                    or parallel.pp_rank == parallel.pp_size - 1
+                ),
+                stage_end_layer=getattr(self, "storage_end_layer", None),
+                # Opaque objects retain global TP identity, including CP
+                # replicas. Every such rank publishes its own objects.
+                is_storage_writer=True,
+                logical_dtype=normalize_dtype(getattr(device, "dtype", host.dtype)),
+            )
+            plans[name] = plan
+            if host is self.storage_host_pool:
+                plans[PoolName.KV] = plan
+        return plans
+
+    @staticmethod
+    def _draft_storage_coordinate(depth: int) -> str:
+        import hashlib
+
+        from sglang.srt.runtime_context import get_spec
+
+        spec = get_spec()
+        identity = (
+            spec.speculative_algorithm,
+            spec.speculative_draft_model_path,
+            spec.speculative_draft_model_revision,
+        )
+        digest = hashlib.sha256(repr(identity).encode()).hexdigest()[:16]
+        return f"D{digest}-{depth}"
 
     def reset(self):
         # Reuse detach's queue wakeups and bounded joins, and fail if any
@@ -1079,7 +1211,7 @@ class HiCacheController:
                 return host_indices, device_indices
             return host_indices, device_indices.cpu()
         else:
-            raise ValueError(f"Unsupported io backend")
+            raise ValueError("Unsupported io backend")
 
     def _move_write_operation(
         self, op: CacheOperation

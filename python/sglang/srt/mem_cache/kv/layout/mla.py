@@ -374,6 +374,7 @@ class MLAView(MLAKVView):
             device=self.data_ptrs.device,
             packed_fp8=False,
             scales=None,
+            is_storage_writer=getattr(self, "is_storage_writer", True),
         )
         return (
             DevicePoolInfo(

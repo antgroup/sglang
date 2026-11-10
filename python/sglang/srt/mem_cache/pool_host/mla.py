@@ -40,6 +40,11 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+from sglang.srt.mem_cache.pool_host.mha import (
+    _native_transfer_device,
+    _page_unified_transfer_pages,
+    use_page_unified_reference,
+)
 from sglang.srt.mem_cache.pool_host.npu_memfabric import (
     alloc_with_memfabric,
     ascendc_io_enabled,
@@ -48,7 +53,10 @@ from sglang.srt.mem_cache.pool_host.npu_memfabric import (
     to_device_no_sync,
     track_pinned_staging,
 )
-from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+from sglang.srt.mem_cache.pool_host.page_unified import (
+    PageStorageComponent,
+    PageUnifiedLayout,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -102,6 +110,27 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     the shared HostKVCache signature but use the captured tensors and slot map.
     """
 
+    _page_unified_reference = False
+
+    @property
+    def storage_component_metadata(self):
+        geometry = self.page_unified_layout
+        if geometry is None:
+            return ()
+        return tuple(
+            PageStorageComponent(
+                name="latent",
+                shape=(1, self.page_size, self.kv_cache_dim),
+                dtype=str(self.dtype),
+                byte_offset=layer * geometry.layer_bytes,
+                byte_length=geometry.layer_bytes,
+                layer_offset=layer,
+                shard_coordinate="",
+                is_storage_writer=self._storage_writer_by_layer[layer],
+            )
+            for layer in range(self.layer_num)
+        )
+
     def __init__(
         self,
         buffer_info: MLABufferInfo | MLAHostAllocation,
@@ -128,6 +157,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         host_token_capacity: int | None = None,
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
+        if layout == "page_unified" and not self._is_dummy and layer_shard_enabled:
+            target_layer_num = len(buffer_info.layer_indices)
+            page_unified_layout = None
         self.override_kv_cache_dim = override_kv_cache_dim
         if _is_xpu and not self._is_dummy:
             require_kvcacheio_ops(
@@ -149,6 +181,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.layer_num = target_layer_num + (
             buffer_info.draft_layer_num if self._is_dummy else len(draft_buffer_infos)
         )
+        self._storage_writer_by_layer = (
+            (True,) * self.layer_num
+            if self._is_dummy
+            else (buffer_info.is_storage_writer,) * target_layer_num
+            + tuple(info.is_storage_writer for info in draft_buffer_infos)
+        )
         self._layer_shard_enabled = layer_shard_enabled
         self._native_buffers = None
         if self._is_dummy:
@@ -160,6 +198,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             infos = (buffer_info, *draft_buffer_infos)
             for index, info in enumerate(infos):
+                if layout == "page_unified" and (
+                    info.scales is not None or isinstance(info.buffers, MLASplitBuffers)
+                ):
+                    raise NotImplementedError(
+                        "page_unified currently requires one MLA latent tensor without separate scales."
+                    )
                 info.validate()
                 if info.scales is not None:
                     role = "target" if index == 0 else f"draft[{index - 1}]"
@@ -221,6 +265,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self.device_kv_buffers = tuple(
                     tensor for info in infos for tensor in info.buffers
                 )
+                self._transfer_device = _native_transfer_device(
+                    infos, (("latent", self.device_kv_buffers, False),)
+                )
                 self.device_data_ptrs = (
                     torch.cat([info.data_ptrs for info in infos])
                     if draft_buffer_infos
@@ -266,13 +313,25 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self._initialize_transfer_views(write_back_staging)
 
     def _initialize_transfer_views(self, write_back_staging=None) -> None:
+        self._page_unified_reference = (
+            self.layout == "page_unified"
+            and use_page_unified_reference(
+                device=self._transfer_device,
+                buffers=self.device_kv_buffers,
+                layer_shard_enabled=self._layer_shard_enabled,
+            )
+        )
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
         # write-back kernel has a ROCm path, so enable them on HIP too. This
         # keeps the ROCm write-back path consistent with CUDA.
-        self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
-            page_size=self.page_size,
-            element_size=self.kv_cache_dim * self.dtype.itemsize,
+        self.can_use_jit = (
+            not self._page_unified_reference
+            and (_is_cuda or _is_hip)
+            and can_use_hicache_jit_kernel(
+                page_size=self.page_size,
+                element_size=self.kv_cache_dim * self.dtype.itemsize,
+            )
         )
 
         if self.layout == "page_unified":
@@ -295,7 +354,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if self.data_refs
             else None
         )
-        if self._native_buffers is None:
+        if self._native_buffers is None and not self._page_unified_reference:
             self._init_device_row_stride(self.device_kv_buffers)
         self._init_write_back_staging_buffers(write_back_staging)
 
@@ -473,6 +532,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.staging_token_capacity = 0
         self.staging_buffer = None
         self.can_use_write_back_jit = False
+        if self._page_unified_reference:
+            return
         if not current_platform.capabilities.hicache_device_kernels:
             return
         if self.layout == "page_unified":
@@ -742,6 +803,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # Draft transfer IDs follow all target device layers, while host rows
         # follow only this rank's target layers.
         host_layer_id = self._host_layer_by_controller[layer_id]
+        if self._page_unified_reference:
+            self._copy_reference_page_unified_layer(
+                host_indices, device_indices, layer_id, io_backend, load=True
+            )
+            return
         if io_backend != "kernel_ascend":
             device_buffer = self.device_kv_buffers[
                 self._buffer_index_by_layer[layer_id]
@@ -1038,6 +1104,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device_indices = maybe_dcp_kernel_indices(
             device_indices, self.dcp_size, self.dcp_rank
         )
+        if self._page_unified_reference:
+            pages = self._reference_page_unified_indices(
+                host_indices, device_indices, io_backend
+            )
+            for layer_id in self._host_layer_by_controller:
+                self._copy_reference_page_unified_layer(
+                    *pages, layer_id, io_backend, load=False, prepared=True
+                )
+            return
         if self._layer_shard_enabled:
             for layer_id in self._target_layer_indices:
                 self._backup_from_device_per_layer(
@@ -1184,6 +1259,53 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+    def _reference_page_unified_indices(self, host_indices, device_indices, io_backend):
+        return _page_unified_transfer_pages(
+            host_indices,
+            device_indices,
+            page_size=self.page_size,
+            host_capacity=self.size,
+            device_capacity=min(buffer.shape[0] for buffer in self.device_kv_buffers),
+            io_backend=io_backend,
+        )
+
+    def _copy_reference_page_unified_layer(
+        self,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        load,
+        prepared=False,
+    ):
+        host_pages, device_pages = (
+            (host_indices, device_indices)
+            if prepared
+            else self._reference_page_unified_indices(
+                host_indices, device_indices, io_backend
+            )
+        )
+        rows = (
+            device_pages[:, None] * self.page_size + torch.arange(self.page_size)
+        ).flatten()
+        device = self.device_kv_buffers[self._buffer_index_by_layer[layer_id]].view(
+            torch.uint8
+        )
+        host = self.kv_buffer[:, self._host_layer_by_controller[layer_id]].view(
+            torch.uint8
+        )
+        if load:
+            data = host.index_select(0, host_pages.to(host.device)).reshape(
+                -1, *device.shape[1:]
+            )
+            device.index_copy_(0, rows.to(device.device), data.to(device.device))
+        else:
+            data = device.index_select(0, rows.to(device.device)).reshape(
+                -1, self.page_size, host.shape[-1]
+            )
+            host.index_copy_(0, host_pages.to(host.device), data.to(host.device))
 
     def _storage_page_index(self, index: int) -> int:
         if self.dcp_size == 1:
@@ -1406,3 +1528,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
         return base_aligned and stride % page_size_bytes == 0
+
+
+def get_mla_host_pool_cls(
+    buffer_info: MLABufferInfo, *, layout: str | None = None
+) -> type:
+    if layout == "page_unified" and (
+        buffer_info.scales is not None
+        or isinstance(buffer_info.buffers, MLASplitBuffers)
+    ):
+        raise NotImplementedError(
+            "page_unified currently requires one MLA latent tensor without separate scales."
+        )
+    return MLATokenToKVPoolHost

@@ -43,6 +43,10 @@ from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
+from sglang.srt.mem_cache.pool_host.page_unified import (
+    validate_page_unified_cp_pool_names,
+    validate_page_unified_pool_names,
+)
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.observability.trace import (
@@ -57,6 +61,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import broadcast_pyobj
 
 logger = logging.getLogger(__name__)
@@ -502,10 +507,24 @@ class HybridCacheController(BaseHiCacheController):
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
+        if self.mem_pool_host.layout == "page_unified":
+            validate_page_unified_pool_names((entry.name,))
+            _, group_cp_size = self.get_attn_cp_rank_and_size()
+            validate_page_unified_cp_pool_names(
+                (entry.name,), max(group_cp_size, get_parallel().attn_cp_size)
+            )
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
         if self.enable_storage and self.storage_backend is not None:
+            if get_memory().hicache_storage_key_scheme == "unified":
+                cp_rank, cp_size = self.get_attn_cp_rank_and_size()
+                plans = self._build_unified_pool_plans(
+                    self.storage_config.model_name, cp_size, attn_cp_rank=cp_rank
+                )
+                plan = plans[entry.name]
+                self.storage_config.unified_pool_plans[entry.name] = plan
+                self.storage_backend.register_unified_pool_plan(entry.name, plan)
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     @staticmethod
@@ -1966,6 +1985,9 @@ class HybridCacheController(BaseHiCacheController):
             _finish_op_trace(operation)
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
+        plans = getattr(self.storage_config, "unified_pool_plans", None)
+        if plans is not None:
+            return plans[transfer.name].is_storage_writer
         if not self.backup_skip:
             return True
 

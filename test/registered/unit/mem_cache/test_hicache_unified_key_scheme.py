@@ -20,7 +20,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+from sglang.srt.mem_cache.pool_host.page_unified import (
+    PageStorageComponent,
+    PageUnifiedLayout,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -101,7 +104,6 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
                 _resolve(hicache_storage_backend=backend)
 
     def test_unified_refuses_speculative_decoding(self):
-        # Draft layers sit on the host pool's layer axis but outside the grid.
         with self.assertRaises(NotImplementedError):
             _resolve(speculative_algorithm="EAGLE")
 
@@ -130,6 +132,8 @@ class TestControllerUnifiedKeys(CustomTestCase):
         # Buffer-info host pools expose the physical dtype and no device_pool.
         host_pool = SimpleNamespace(
             dtype=torch.uint8,
+            page_size=16,
+            storage_format_tag=None,
             head_num=0 if mla else 4,
             head_group_num=1,
             start_layer=4,
@@ -342,12 +346,14 @@ class TestControllerUnifiedKeys(CustomTestCase):
                 return_value=True,
             ),
             patch.object(controller, "get_attn_cp_rank_and_size", return_value=(1, 2)),
+            patch(
+                "sglang.srt.managers.cache_controller.get_memory",
+                return_value=SimpleNamespace(hicache_storage_key_scheme="unified"),
+            ),
             patch.object(
                 controller,
-                "_build_unified_plan",
-                return_value=SimpleNamespace(
-                    suffixes=["shared"], layer_ranges=[(0, 4)], head_group_num=1
-                ),
+                "_build_unified_pool_plans",
+                return_value=None,
             ),
         ):
             config = controller._generate_storage_config("org/model")
@@ -356,17 +362,22 @@ class TestControllerUnifiedKeys(CustomTestCase):
         self.assertTrue(config.is_mla_model)
 
     def test_config_pairs_grid_keys_with_physical_page_spans(self):
-        # MHA key order alternates head groups, while each group's layers are
-        # contiguous in memory. Include a short final PP layer chunk.
+        # The configured global layer grid names contiguous physical spans.
+        # The final model remainder may be shorter than the agreed partition.
         cases = (
-            (False, 4, [(0, 16384), (32768, 16384), (16384, 16384), (49152, 16384)]),
-            (False, 3, [(0, 16384), (24576, 16384), (16384, 8192), (40960, 8192)]),
-            (True, 4, [(0, 4096), (4096, 4096)]),
-            (True, 3, [(0, 4096), (4096, 2048)]),
+            (False, 4, 1, [(i * 8192, 8192) for i in range(8)]),
+            (False, 3, 1, [(i * 8192, 8192) for i in range(6)]),
+            (True, 4, 1, [(i * 2048, 2048) for i in range(4)]),
+            (True, 3, 1, [(i * 2048, 2048) for i in range(3)]),
+            (False, 4, 2, [(i * 16384, 16384) for i in range(4)]),
+            (False, 3, 2, [(0, 16384), (16384, 8192), (24576, 16384), (40960, 8192)]),
+            (True, 4, 2, [(0, 4096), (4096, 4096)]),
+            (True, 3, 2, [(0, 4096), (4096, 2048)]),
         )
-        for mla, layer_num, expected_spans in cases:
-            with self.subTest(mla=mla, layer_num=layer_num):
+        for mla, layer_num, partition, expected_spans in cases:
+            with self.subTest(mla=mla, layer_num=layer_num, partition=partition):
                 controller = self._controller(mla=mla, grouped=False)
+                controller.storage_end_layer = 4 + layer_num
                 host_pool = controller.storage_host_pool
                 host_pool.layout = "page_unified"
                 host_pool.storage_format_tag = None
@@ -382,12 +393,29 @@ class TestControllerUnifiedKeys(CustomTestCase):
                     itemsize=1,
                     is_mla=mla,
                 )
+                geometry = host_pool.page_unified_layout
+                host_pool.storage_component_metadata = tuple(
+                    PageStorageComponent(
+                        name="latent" if mla else "kv",
+                        shape=(layer_num, 16, 128)
+                        if mla
+                        else (layer_num, 2, 16, 2, 128),
+                        dtype="uint8",
+                        byte_offset=group * geometry.head_group_bytes,
+                        byte_length=geometry.head_group_bytes,
+                        shard_coordinate=""
+                        if mla
+                        else f"H{4 + group * 2}-{6 + group * 2}",
+                    )
+                    for group in range(geometry.head_group_num)
+                )
                 controller.enable_storage_metrics = False
                 parallel = SimpleNamespace(
                     tp_rank=1,
                     tp_size=2,
                     attn_tp_rank=1,
                     attn_tp_size=2,
+                    attn_cp_size=1,
                     attn_dcp_size=1,
                     attn_dcp_rank=0,
                     pp_rank=1,
@@ -396,7 +424,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
                 memory = SimpleNamespace(
                     hicache_storage_key_scheme="unified",
                     hicache_storage_head_partition=2,
-                    hicache_storage_layer_partition=2,
+                    hicache_storage_layer_partition=partition,
                 )
                 with (
                     patch(
@@ -417,23 +445,17 @@ class TestControllerUnifiedKeys(CustomTestCase):
                 ):
                     config = controller._generate_storage_config("org/model")
 
-                namespace = derive_namespace(
-                    model_id="org/model",
-                    dtype="float8_e4m3fn",
-                    page_size=16,
-                    rank_replicated=mla,
-                    total_kv_heads=0 if mla else 8,
-                    head_group=0 if mla else 2,
-                    layer_partition=2,
-                )
-                digest = namespace_digest(namespace)
-                head_suffixes = ("",) if mla else ("_H2", "_H3")
+                head_suffixes = ("",) if mla else ("_H4-6", "_H6-8")
                 self.assertEqual(
-                    config.unified_suffixes,
+                    [suffix.split("_", 1)[1] for suffix in config.unified_suffixes],
                     [
-                        f"{digest}_{layers}{heads}"
-                        for layers in ("L4-6", f"L6-{4 + layer_num}")
+                        (
+                            f"L{layer}{heads}"
+                            if partition == 1
+                            else f"L{layer}-{min(layer + partition, 4 + layer_num)}{heads}"
+                        )
                         for heads in head_suffixes
+                        for layer in range(4, 4 + layer_num, partition)
                     ],
                 )
                 self.assertEqual(config.unified_chunk_spans, expected_spans)

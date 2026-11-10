@@ -86,6 +86,11 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     key_layout: IndexKeyLayout
     # Replicated DCP stores multiple kernel pages in each allocation row.
     kernel_page_size: int | None = None
+    # Native HIP cache keys can be tiled within a kernel page. Host storage
+    # restores logical token/channel order before writing topology-free objects.
+    key_shuffle_tile: int = 0
+    is_storage_writer: bool = True
+    layer_storage_writers: tuple[bool, ...] = ()
 
     @property
     def page_bytes(self) -> int:
@@ -105,6 +110,21 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
 
     def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
         buffers = self.buffers
+        if self.layer_storage_writers and len(self.layer_storage_writers) != len(
+            buffers
+        ):
+            raise ValueError("Index keys require one writer flag per captured layer")
+        if self.key_shuffle_tile and (
+            self.key_shuffle_tile < 0
+            or self.compress_ratio <= 0
+            or self.key_layout is not IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES
+            or 128 % self.key_shuffle_tile
+            or (self.kernel_page_size or self.page_size // self.compress_ratio)
+            % self.key_shuffle_tile
+        ):
+            raise ValueError(
+                "Index key shuffle must tile native token and channel axes"
+            )
         if layer_ids is not None and len(layer_ids) != len(buffers):
             raise ValueError(
                 f"{len(layer_ids)} model layers must match {len(buffers)} buffers"
@@ -257,9 +277,22 @@ class MHABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     page_envelope: PageEnvelopeBufferInfo | None = None
     # Resolve current contiguous backing at transfer time for relocatable pools.
     transfer_buffers: Callable[[], tuple[torch.Tensor, torch.Tensor]] | None = None
+    # Model-global KV ownership, including replicated GQA heads. Unknown
+    # descriptors stay topology-specific rather than inventing global heads.
+    global_head_start: int | None = None
+    global_head_num: int | None = None
+    is_storage_writer: bool = True
 
     def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
         layers = len(self.buffers.k)
+        if (self.global_head_start is None) != (self.global_head_num is None):
+            raise ValueError("Global KV head ownership needs both start and total.")
+        if self.global_head_start is not None and not (
+            self.global_head_start >= 0
+            and self.global_head_num > 0
+            and self.global_head_start + self.head_num <= self.global_head_num
+        ):
+            raise ValueError("Local KV heads fall outside the global head range.")
         if len(self.buffers.v) != layers or (
             layer_ids is not None and len(layer_ids) != layers
         ):
@@ -322,6 +355,7 @@ class MLABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     packed_fp8: bool = False
     scales: tuple[torch.Tensor, ...] | None = None
     native_buffers: Callable[[], MLASplitBuffers] | None = None
+    is_storage_writer: bool = True
 
     def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
         if layer_ids is not None and len(layer_ids) != len(self.layer_indices):

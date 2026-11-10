@@ -46,7 +46,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
+from sglang.srt.mem_cache.storage.file.lru_file_evictor import (
+    LRUFileEvictor,
+    _parse_size_to_bytes,
+)
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.test_utils import CustomTestCase
 
@@ -243,6 +246,33 @@ class TestCapBasedEviction(HiCacheFileLRUTestBase):
 
 
 class TestScanExistingFiles(HiCacheFileLRUTestBase):
+    def test_dynamic_pool_registration_accounts_existing_objects(self):
+        """Restarted draft files must count toward the cap before their first hit."""
+        directory = Path(self.tmpdir, "dynamic")
+        directory.mkdir()
+        (directory / "main_owned.bin").write_bytes(b"m" * 40)
+        (directory / "draft_attached.bin").write_bytes(b"d" * 80)
+        foreign = directory / "other_foreign.bin"
+        foreign.write_bytes(b"f" * 90)
+        evictor = LRUFileEvictor(
+            str(directory),
+            owned_suffixes=("_owned",),
+            tp_rank=0,
+            extra_config={"max_size": 100, "min_free_space": 0, "eviction_ratio": 1},
+        )
+        self.assertEqual(evictor._total_bytes, 40)
+        evictor.register_owned_suffixes(("_attached",))
+        actual_bytes = sum(
+            path.stat().st_size
+            for path in directory.glob("*.bin")
+            if path.stem.endswith(("_owned", "_attached"))
+        )
+        self.assertEqual(evictor._total_bytes, actual_bytes)
+        self.assertLessEqual(actual_bytes, 100)
+        self.assertEqual(foreign.read_bytes(), b"f" * 90)
+        evictor.register_owned_suffixes(("_attached",))
+        self.assertEqual(evictor._total_bytes, actual_bytes)
+
     def test_scan_seeds_lru_in_mtime_order(self):
         # Pre-create files, then check older mtimes land at the LRU front.
         d = tempfile.mkdtemp(prefix="hicache_seed_", dir=self.tmpdir)
@@ -251,7 +281,7 @@ class TestScanExistingFiles(HiCacheFileLRUTestBase):
             extra_config={"max_size": "1000", "min_free_space": "0"},
         )
         # Files must end with the expected suffix for the rank/model.
-        suffix = f"_seedmodel_0_1"
+        suffix = "_seedmodel_0_1"
         # Create older "old.bin" first, then newer "new.bin".
         old_path = os.path.join(d, f"old{suffix}.bin")
         new_path = os.path.join(d, f"new{suffix}.bin")
@@ -467,7 +497,7 @@ class TestHiCacheFileMetadataIntegration(HiCacheFileLRUTestBase):
             model="seedmodel",
             extra_config={"metadata_ttl": 5.0, "enable_metadata_cache": True},
         )
-        suffix = f"_seedmodel_0_1"
+        suffix = "_seedmodel_0_1"
 
         # Pre-create a suffixed bin file on disk
         with open(os.path.join(d, f"k1{suffix}.bin"), "wb") as f:
@@ -516,7 +546,6 @@ class TestHiCacheFileMetadataIntegration(HiCacheFileLRUTestBase):
 
     def test_batch_exists_bypass_scandir(self):
         b = self.make_backend(metadata_ttl=5.0, enable_metadata_cache=True)
-        suffix = b.config_suffix
 
         b.set("k1", _t(50))
         b.set("k2", _t(50))

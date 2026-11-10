@@ -145,6 +145,20 @@ class LRUFileEvictor:
     def _owns(self, suffixed_key: str) -> bool:
         return suffixed_key.endswith(self._owned_suffixes)
 
+    def register_owned_suffixes(self, suffixes: Tuple[str, ...]) -> None:
+        """Add a dynamically attached side pool to this rank's eviction domain."""
+        with self._lock:
+            added = tuple(s for s in suffixes if s not in self._owned_suffixes)
+            if not added:
+                return
+            self._owned_suffixes = tuple(dict.fromkeys((*self._owned_suffixes, *added)))
+            if self._eviction_enabled:
+                self._scan_existing_files()
+                if self.max_size_bytes > 0 and self._total_bytes > self.max_size_bytes:
+                    self._evict_locked(0)
+                if self.min_free_bytes > 0:
+                    self._enforce_free_space_locked(0)
+
     def reserve(self, suffixed_key: str, value_bytes: int, key: str = "") -> bool:
         """Admit a new write of ``value_bytes``, evicting LRU victims as needed.
 
@@ -290,7 +304,7 @@ class LRUFileEvictor:
                 continue
             stem = fn[:-4]
             # Only files belonging to this rank/model.
-            if not self._owns(stem):
+            if not self._owns(stem) or stem in self._lru:
                 continue
             fp = os.path.join(self.file_path, fn)
             try:
@@ -299,9 +313,12 @@ class LRUFileEvictor:
                 continue
             entries.append((st.st_mtime, stem, st.st_size))
         entries.sort(key=lambda e: e[0])  # oldest first
-        for _, stem, size in entries:
-            self._lru[stem] = size
-            self._total_bytes += size
+        discovered = OrderedDict((stem, size) for _, stem, size in entries)
+        # Newly discovered on-disk objects have not been used in this process;
+        # preserve the recency of already tracked/touched objects behind them.
+        discovered.update(self._lru)
+        self._lru = discovered
+        self._total_bytes += sum(size for _, _, size in entries)
 
     def _evict_one_lru_locked(self) -> Tuple[str, int]:
         """Evict the single oldest evictable LRU entry. Caller holds _lock.

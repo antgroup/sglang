@@ -74,6 +74,14 @@ def _cpu_staging_environment(*, dcp_size=1, **memory_overrides):
         return torch.zeros(dims, dtype=dtype, device=device)
 
     with ExitStack() as stack:
+        # These tests exercise the CUDA staging budget with CPU scratch tensors.
+        # The real CPU/strided fallback has separate byte round-trip coverage.
+        for module in (kv_cache_builder, mha, mla):
+            stack.enter_context(
+                mock.patch.object(
+                    module, "use_page_unified_reference", return_value=False
+                )
+            )
         for module in (runtime_context, kv_cache_builder, hybrid_pool_assembler):
             stack.enter_context(
                 mock.patch.object(module, "get_memory", return_value=memory)
@@ -270,7 +278,7 @@ class TestPageUnifiedStaging(CustomTestCase):
         for key_scheme, head_partition, head_group_num in (
             ("rank-suffix", None, 1),
             ("rank-suffix", 2, 1),
-            ("unified", None, 1),
+            ("unified", None, 4),
             ("unified", 1, 4),
             ("unified", 2, 2),
             ("unified", 4, 1),
@@ -298,8 +306,8 @@ class TestPageUnifiedStaging(CustomTestCase):
                 self.assertEqual(host.page_unified_layout, geometry)
                 self.assertEqual(host.staging_buffer.data_ptr(), prepared.data_ptr())
 
-    def test_uneven_mla_layer_shards_reserve_equal_host_geometry(self):
-        """The shorter shard retains the reserved target row before draft layers."""
+    def test_uneven_mla_layer_shards_store_only_owned_layers(self):
+        """CP owners store actual layers without topology-dependent padding."""
         for owned_range in ((0, 3), (3, 5)):
             for draft_layers in (0, 2):
                 with (
@@ -313,7 +321,8 @@ class TestPageUnifiedStaging(CustomTestCase):
                         _device_pool(is_mla=True, layer_num=1)
                         for _ in range(draft_layers)
                     )
-                    geometry = _geometry(True, layer_num=3 + draft_layers)
+                    owned_layers = owned_range[1] - owned_range[0]
+                    geometry = _geometry(True, layer_num=owned_layers + draft_layers)
                     with mock.patch.object(
                         pool,
                         "_owned_local_layer_range",
@@ -335,7 +344,7 @@ class TestPageUnifiedStaging(CustomTestCase):
                                 page_size=PAGE_SIZE,
                                 mtp_draft_device_pools=drafts,
                             )
-                    self.assertEqual(host.target_layer_num, 3)
+                    self.assertEqual(host.target_layer_num, owned_layers)
                     self.assertEqual(host.page_unified_layout, geometry)
                     self.assertEqual(
                         host.staging_buffer.data_ptr(), prepared.data_ptr()

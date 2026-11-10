@@ -33,6 +33,9 @@ class PoolEntry:
     # Controller ids -> the device pool's rows, for a sub-pool whose ids map
     # through its allocator (`KVStorage.host_ids`); None when they index it.
     device_translate: Callable[[torch.Tensor], torch.Tensor] | None = None
+    # Stage-local transfer IDs -> physical host layer slots. Storage uses the
+    # inverse mapping to give sparse and packed-draft layers stable identities.
+    transfer_layer_mapping: dict[int, int] | None = None
 
 
 class HostPoolGroup:
