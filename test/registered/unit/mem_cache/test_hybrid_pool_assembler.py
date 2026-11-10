@@ -1193,7 +1193,9 @@ class TestKvHostPoolRow(CustomTestCase):
 
         with (
             patch.object(
-                hybrid_pool_assembler, "MLATokenToKVPoolHost", host_cls or fake_host
+                hybrid_pool_assembler,
+                "get_mla_host_pool_cls",
+                return_value=host_cls or fake_host,
             ),
             patch.object(
                 hybrid_pool_assembler,

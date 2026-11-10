@@ -1,14 +1,29 @@
 """Unit tests for asymmetric MHA host KV pool transfer dispatch."""
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.srt.managers.cache_controller import storage_model_name
+from sglang.srt.mem_cache.device_pool_info import (
+    KVBufferLayout,
+    KVBuffers,
+    KVScaleBuffers,
+    KVScaleLayout,
+    MHABufferInfo,
+)
+from sglang.srt.mem_cache.hicache_key_scheme import plan_unified_kv
+from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
+from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.mha import (
     AsymmetricMHATokenToKVPoolHost,
     MHATokenToKVPoolHost,
+    NativePageUnifiedMHATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
 from sglang.srt.platforms.interface import PlatformCapabilities
@@ -16,6 +31,48 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _cpu_host_allocation(test):
+    return mock.patch.dict(
+        ALLOC_MEMORY_FUNCS,
+        {"cpu": lambda dims, **kw: torch.empty(dims, dtype=kw["dtype"])},
+    )(test)
+
+
+def _mha_info(k, v, *, page_size, head_num, head_dim, layout=KVBufferLayout.NHD, **kw):
+    return MHABufferInfo(
+        buffers=KVBuffers(
+            k=k,
+            v=v,
+            layout=layout,
+            k_data_ptrs=torch.tensor([b.data_ptr() for b in k], dtype=torch.uint64),
+            v_data_ptrs=torch.tensor([b.data_ptr() for b in v], dtype=torch.uint64),
+        ),
+        page_size=page_size,
+        head_num=head_num,
+        head_dim=head_dim,
+        v_head_dim=kw.pop("v_head_dim", head_dim),
+        dtype=kw.pop("dtype", torch.uint8),
+        device=torch.device("cpu"),
+        **kw,
+    )
+
+
+def _unified_host(info, *, end_layer, start_layer=0, capacity=8, budget=1 << 20, **kw):
+    with host_memory_budget_scope(budget):
+        return get_mha_host_pool_cls(info, layout="page_unified")(
+            info,
+            2,
+            0,
+            info.page_size,
+            "page_unified",
+            pin_memory=False,
+            device_capacity_tokens=capacity,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            **kw,
+        )
 
 
 def _make_host(layout: str) -> AsymmetricMHATokenToKVPoolHost:
@@ -85,6 +142,286 @@ def _make_device_pool(host: AsymmetricMHATokenToKVPoolHost) -> SimpleNamespace:
 
 
 class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
+    @_cpu_host_allocation
+    def test_native_unified_pages_preserve_all_components_and_strides(self):
+        """A stored native page must restore payloads and scales byte-for-byte.
+
+        K/V widths, scale dtype, physical page axes and row gaps cannot be
+        inferred from a logical head dimension. Dropping any of them corrupts
+        FP4/MXFP8 or restores a neighbouring layer in a strided device pool.
+        """
+        formats = (
+            (KVBufferLayout.NHD, None, False),
+            (KVBufferLayout.NHD, KVScaleLayout.TOKEN, True),
+            (KVBufferLayout.NHD, KVScaleLayout.MXFP8_INTERLEAVED, False),
+            (KVBufferLayout.HND, None, False),
+            (KVBufferLayout.PAGED_NHD, None, False),
+            (KVBufferLayout.VECTORIZED_5D, None, False),
+        )
+        for layout, scale_layout, packed_fp4 in formats:
+            with self.subTest(layout=layout, scale_layout=scale_layout):
+                layers, page_size, pages = 3, 2, 6
+
+                def buffers(width, *, scales=False):
+                    dtype = torch.float32 if scales else torch.uint8
+                    if scales and scale_layout == KVScaleLayout.MXFP8_INTERLEAVED:
+                        shape = (pages, 2, 1, page_size, width)
+                    elif layout == KVBufferLayout.NHD or scales:
+                        shape = (pages * page_size, 2, width)
+                    elif layout == KVBufferLayout.HND:
+                        shape = (pages, 2, page_size, width)
+                    elif layout == KVBufferLayout.PAGED_NHD:
+                        shape = (pages, page_size, 2, width)
+                    else:
+                        shape = (pages, 2, width // 2, page_size, 2)
+                    # Different component widths yield different row strides.
+                    backing = torch.empty((shape[0], layers, *shape[1:]), dtype=dtype)
+                    backing.view(torch.uint8).random_(0, 256)
+                    return tuple(backing[:, layer] for layer in range(layers))
+
+                k = buffers(2 if packed_fp4 else 4)
+                v = buffers(4 if packed_fp4 else 6)
+                scales = (
+                    None
+                    if scale_layout is None
+                    else KVScaleBuffers(
+                        k=buffers(1, scales=True),
+                        v=buffers(2, scales=True),
+                        layout=scale_layout,
+                    )
+                )
+                info = _mha_info(
+                    k,
+                    v,
+                    layout=layout,
+                    page_size=page_size,
+                    head_num=2,
+                    head_dim=4,
+                    v_head_dim=6,
+                    scales=scales,
+                )
+                host_cls = get_mha_host_pool_cls(info, layout="page_unified")
+                self.assertIs(host_cls, NativePageUnifiedMHATokenToKVPoolHost)
+                writer, reader = [
+                    _unified_host(info, start_layer=5, end_layer=8) for _ in range(2)
+                ]
+                try:
+                    host_indices = torch.tensor([6, 7, 2, 3])
+                    source_indices = torch.tensor([4, 5, 8, 9])
+                    restore_indices = torch.tensor([0, 1, 6, 7])
+                    writer.backup_from_device_all_layer(
+                        None, host_indices, source_indices, "kernel"
+                    )
+                    for source, target in ((6, 4), (2, 0)):
+                        reader.set_from_flat_data_page(
+                            target, writer.get_data_page(source).clone()
+                        )
+                    reader_indices = torch.tensor([4, 5, 0, 1])
+                    originals = []
+                    for component, paged, _ in writer._native_components:
+                        source_rows = torch.tensor([2, 4]) if paged else source_indices
+                        target_rows = torch.tensor([0, 3]) if paged else restore_indices
+                        originals.append(
+                            (
+                                component,
+                                target_rows,
+                                [
+                                    b.view(torch.uint8)
+                                    .index_select(0, source_rows)
+                                    .clone()
+                                    for b in component
+                                ],
+                            )
+                        )
+                        for buffer in component:
+                            buffer.view(torch.uint8).fill_(173)
+                    # Restoring one layer must leave the others untouched.
+                    reader.load_to_device_per_layer(
+                        None, reader_indices, restore_indices, 1, "direct"
+                    )
+                    for component, _, expected in originals:
+                        self.assertTrue(
+                            torch.all(component[0].view(torch.uint8) == 173)
+                        )
+                    for layer in (0, 2):
+                        reader.load_to_device_per_layer(
+                            None, reader_indices, restore_indices, layer, "kernel"
+                        )
+                    for component, target_rows, expected in originals:
+                        for actual, saved in zip(component, expected):
+                            self.assertTrue(
+                                torch.equal(
+                                    actual.view(torch.uint8).index_select(
+                                        0, target_rows
+                                    ),
+                                    saved,
+                                )
+                            )
+                            unselected = torch.ones(actual.shape[0], dtype=torch.bool)
+                            unselected[target_rows] = False
+                            self.assertTrue(
+                                torch.all(actual.view(torch.uint8)[unselected] == 173)
+                            )
+                    self.assertEqual(
+                        reader.page_unified_layout.bytes_per_page,
+                        reader.get_dummy_flat_data_page().numel(),
+                    )
+                finally:
+                    writer.destroy()
+                    reader.destroy()
+
+    @_cpu_host_allocation
+    def test_native_file_objects_restore_across_tp_and_uneven_pp(self):
+        """Payload and scales share global layer/head objects across deployments."""
+        layers, heads, tokens, page_size = 5, 4, 8, 2
+        originals = [
+            ((torch.arange(layers * tokens * heads * width) + offset) % 251)
+            .reshape(layers, tokens, heads, width)
+            .to(dtype)
+            for width, dtype, offset in (
+                (2, torch.uint8, 7),
+                (4, torch.uint8, 31),
+                (1, torch.float32, 57),
+                (2, torch.float32, 83),
+            )
+        ]
+
+        def make_host(start, end, first, last, *, source=False):
+            components = [
+                tuple(
+                    tensor[layer, :, first:last].clone()
+                    if source
+                    else torch.full_like(tensor[layer, :, first:last], 173)
+                    for layer in range(start, end)
+                )
+                for tensor in originals
+            ]
+            info = _mha_info(
+                components[0],
+                components[1],
+                page_size=page_size,
+                head_num=last - first,
+                head_dim=4,
+                v_head_dim=8,
+                scales=KVScaleBuffers(
+                    k=components[2], v=components[3], layout=KVScaleLayout.TOKEN
+                ),
+            )
+            host = _unified_host(
+                info, start_layer=start, end_layer=end, head_group_num=last - first
+            )
+            return host, components
+
+        def backend(host, directory, *, tp_rank=0, tp_size=1, pp_rank=0):
+            plan = plan_unified_kv(
+                model_id=storage_model_name("org/model", host),
+                dtype="uint8",
+                page_size=page_size,
+                rank_replicated=False,
+                local_kv_heads=host.head_num,
+                attn_tp_rank=tp_rank,
+                attn_tp_size=tp_size,
+                attn_cp_size=1,
+                start_layer=host.start_layer,
+                end_layer=host.end_layer,
+                is_final_stage=host.end_layer == layers,
+                head_group=1,
+                layer_partition=1,
+            )
+            spans = [
+                host.page_unified_layout.chunk_span(window, group)
+                for window in plan.layer_ranges
+                for group in range(plan.head_group_num)
+            ]
+            config = HiCacheStorageConfig(
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                pp_rank=pp_rank,
+                pp_size=2,
+                attn_cp_rank=0,
+                attn_cp_size=1,
+                is_mla_model=False,
+                enable_storage_metrics=False,
+                is_page_first_layout=False,
+                model_name="org/model",
+                unified_suffixes=plan.suffixes,
+                unified_chunk_spans=spans,
+                extra_config={"max_size": 0, "min_free_space": 0},
+            )
+            return HiCacheFile(config, file_path=directory)
+
+        hosts = []
+        try:
+            with TemporaryDirectory() as directory:
+                writer, _ = make_host(0, layers, 0, heads, source=True)
+                hosts.append(writer)
+                writer.backup_from_device_all_layer(
+                    None, torch.arange(2), torch.arange(2, 4), "kernel"
+                )
+                storage = backend(writer, directory)
+                self.assertTrue(storage.set("prefix", writer.get_data_page(0)))
+                self.assertEqual(
+                    len(list(Path(directory).glob("*.bin"))), layers * heads
+                )
+                for rank in range(2):
+                    for pp_rank, (start, end) in enumerate(((0, 3), (3, layers))):
+                        reader, components = make_host(
+                            start, end, rank * 2, rank * 2 + 2
+                        )
+                        hosts.append(reader)
+                        self.assertEqual(
+                            writer.storage_format_tag, reader.storage_format_tag
+                        )
+                        store = backend(
+                            reader, directory, tp_rank=rank, tp_size=2, pp_rank=pp_rank
+                        )
+                        data = reader.get_dummy_flat_data_page()
+                        self.assertIsNotNone(store.get("prefix", data))
+                        reader.set_from_flat_data_page(2, data)
+                        for layer in range(end - start):
+                            reader.load_to_device_per_layer(
+                                None,
+                                torch.arange(2, 4),
+                                torch.arange(4, 6),
+                                layer,
+                                "direct",
+                            )
+                        for actual, saved in zip(components, originals):
+                            for local, layer in enumerate(range(start, end)):
+                                self.assertTrue(
+                                    torch.equal(
+                                        actual[local][4:6],
+                                        saved[layer, 2:4, rank * 2 : rank * 2 + 2],
+                                    )
+                                )
+                                self.assertTrue(torch.all(actual[local][:4] == 173))
+                        # A missing scale-containing object may never partially publish a page.
+                        path = Path(directory) / (
+                            store._get_component_keys("prefix")[0] + ".bin"
+                        )
+                        original = path.read_bytes()
+                        path.write_bytes(original[:-1])
+                        data.fill_(199)
+                        self.assertIsNone(store.get("prefix", data))
+                        self.assertTrue(torch.all(data == 199))
+                        path.write_bytes(original)
+        finally:
+            for host in hosts:
+                host.destroy()
+
+    def test_native_fp4_scale_buffers_are_explicitly_rejected(self):
+        buffer = (torch.zeros(8, 2, 4, dtype=torch.uint8),)
+        info = _mha_info(
+            buffer,
+            buffer,
+            page_size=2,
+            head_num=2,
+            head_dim=8,
+            has_native_scale_buffers=True,
+        )
+        with self.assertRaisesRegex(NotImplementedError, "native NVFP4 scale"):
+            get_mha_host_pool_cls(info, layout="page_unified")
+
     def test_factory_selects_asymmetric_pool_for_mismatched_kv_dims(self):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 

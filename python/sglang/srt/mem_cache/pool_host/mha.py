@@ -37,6 +37,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyBufferInfo,
     IndexKeyLayout,
+    KVBufferLayout,
     KVScaleLayout,
     MHABufferInfo,
 )
@@ -56,6 +57,7 @@ from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.mem_cache.pool_host.page_unified import (
     PageStorageComponent,
     PageUnifiedLayout,
+    needs_native_page_unified,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
@@ -99,6 +101,69 @@ if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
 logger = logging.getLogger(__name__)
+
+
+def _native_transfer_device(infos, component_sets):
+    """Resolve unindexed empty descriptors against the live component device."""
+    device = next(
+        (
+            buffer.device
+            for _, buffers, _ in component_sets
+            for buffer in buffers
+            if buffer is not None and buffer.numel()
+        ),
+        infos[0].device,
+    )
+    for info in infos:
+        requested = info.device
+        if requested.type != device.type or (
+            requested.index is not None and requested.index != device.index
+        ):
+            raise ValueError(
+                f"Native host layers request device {requested}, but live components use {device}."
+            )
+    return device
+
+
+def _page_unified_transfer_pages(
+    host_indices,
+    device_indices,
+    *,
+    page_size,
+    host_capacity,
+    device_capacity,
+    io_backend,
+):
+    if io_backend not in ("kernel", "direct", "kernel_ascend"):
+        raise ValueError(f"Unsupported page_unified IO backend: {io_backend}")
+    if host_indices.numel() != device_indices.numel():
+        raise ValueError("page_unified transfers require equal full-page index lists.")
+    pages = []
+    for indices, capacity in (
+        (host_indices, host_capacity),
+        (device_indices, device_capacity),
+    ):
+        if (
+            indices.ndim != 1
+            or indices.dtype not in (torch.int32, torch.int64)
+            or indices.numel() % page_size
+        ):
+            raise ValueError(
+                "page_unified transfers require integer full-page index lists."
+            )
+        rows = indices.to(device="cpu", dtype=torch.int64).reshape(-1, page_size)
+        starts = rows[:, 0]
+        if not (
+            (starts % page_size == 0).all()
+            and (rows == starts[:, None] + torch.arange(page_size)).all()
+            and (rows >= 0).all()
+            and (rows < capacity).all()
+        ):
+            raise ValueError(
+                "page_unified transfers require aligned, ordered, in-range pages."
+            )
+        pages.append(starts // page_size)
+    return tuple(pages)
 
 
 def prepare_mha_write_back_staging(
@@ -1797,7 +1862,400 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         )
 
 
-def get_mha_host_pool_cls(buffer_info: MHABufferInfo) -> type:
+class NativePageUnifiedMHATokenToKVPoolHost(HostKVCache):
+    """Canonical head-group pages for native payload and scale encodings.
+
+    Bytes follow (page, group, layer, K/V, token, head, record). Each head
+    record contains its payload followed by its scales; unequal K/V records
+    use zero padding. Native HND/vectorized rows and scale swizzles are
+    normalized during transfer, without dequantizing any stored values.
+    """
+
+    def __init__(
+        self,
+        buffer_info: MHABufferInfo,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+        *,
+        device_capacity_tokens: int,
+        start_layer: int,
+        end_layer: int,
+        draft_buffer_infos: Sequence[MHABufferInfo] = (),
+        write_back_staging=None,
+        pool_label: str = "kv",
+        head_group_num: int = 1,
+        page_unified_layout: PageUnifiedLayout | None = None,
+        host_token_capacity: int | None = None,
+    ):
+        if layout != "page_unified":
+            raise ValueError("Native MHA host pages require layout='page_unified'.")
+        needs_native_page_unified(buffer_info)
+        infos = (buffer_info, *draft_buffer_infos)
+        for info in infos:
+            needs_native_page_unified(info)
+            info.validate()
+            if info.page_size != page_size:
+                raise ValueError("Native MHA host and device page sizes must match.")
+            if info.quantization != buffer_info.quantization:
+                raise ValueError("Packed MHA layers must share a quantization recipe.")
+            if (info.head_num, info.head_dim, info.v_head_dim, info.dtype) != (
+                buffer_info.head_num,
+                buffer_info.head_dim,
+                buffer_info.v_head_dim,
+                buffer_info.dtype,
+            ):
+                raise ValueError(
+                    "Packed MHA layers must share local head geometry and dtype."
+                )
+            if info.buffers.layout != buffer_info.buffers.layout or (
+                (info.scales is None) != (buffer_info.scales is None)
+                or (
+                    info.scales is not None
+                    and info.scales.layout != buffer_info.scales.layout
+                )
+            ):
+                raise ValueError("Packed MHA layers must share a native page format.")
+        self.target_layer_num = len(buffer_info.buffers.k)
+        if not self.target_layer_num and not draft_buffer_infos:
+            raise ValueError("Native MHA host pages require at least one layer.")
+        if any(len(info.buffers.k) != 1 for info in draft_buffer_infos):
+            raise ValueError("Each packed MHA draft must contain exactly one layer.")
+        self.layer_num = sum(len(info.buffers.k) for info in infos)
+        self.head_num = buffer_info.head_num
+        self.head_dim = buffer_info.head_dim
+        self.v_head_dim = buffer_info.v_head_dim
+        self._quantization = buffer_info.quantization
+        self._mha_buffer_layout = buffer_info.buffers.layout
+        self._mha_scale_layout = (
+            None if buffer_info.scales is None else buffer_info.scales.layout
+        )
+        self.head_group_num = head_group_num
+        if head_group_num <= 0 or self.head_num % self.head_group_num:
+            raise ValueError("Native MHA heads must tile complete head groups.")
+        self.heads_per_group = self.head_num // self.head_group_num
+        component_sets = [
+            (
+                name,
+                tuple(b for info in infos for b in getattr(info.buffers, name)),
+                buffer_info.buffers.layout != KVBufferLayout.NHD,
+            )
+            for name in ("k", "v")
+        ]
+        if buffer_info.scales is not None:
+            paged_scales = buffer_info.scales.layout == KVScaleLayout.MXFP8_INTERLEAVED
+            component_sets.extend(
+                (
+                    f"{name}_scale",
+                    tuple(b for info in infos for b in getattr(info.scales, name)),
+                    paged_scales,
+                )
+                for name in ("k", "v")
+            )
+        self._transfer_device = _native_transfer_device(infos, component_sets)
+        self._configure_mha_components(component_sets, page_size)
+        self.page_unified_layout = PageUnifiedLayout(
+            page_size=page_size,
+            layer_num=self.layer_num,
+            head_num=self.head_num,
+            head_group_num=self.head_group_num,
+            head_dim=self.record_bytes,
+            itemsize=1,
+        )
+        super().__init__(
+            dtype=torch.uint8,
+            device_capacity_tokens=device_capacity_tokens,
+            size_per_token=(self.layer_num * self.layer_page_bytes + page_size - 1)
+            // page_size,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=page_size,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator_type=allocator_type,
+            pool_label=pool_label,
+            host_token_capacity=host_token_capacity,
+        )
+        self.can_use_jit = False
+
+    def _configure_mha_components(self, component_sets, page_size):
+        self._mha_components = []
+        self._native_components = []
+        offsets = [0, 0]
+        capacities = []
+        schema = []
+        for name, buffers, paged in component_sets:
+            first = next((buffer for buffer in buffers if buffer is not None), None)
+            if first is None:
+                continue
+            page_bytes = first[0].nbytes * (1 if paged else page_size)
+            if page_bytes % (page_size * self.head_num):
+                raise ValueError("Native MHA components must contain whole head rows.")
+            width = page_bytes // (page_size * self.head_num)
+            for buffer in buffers:
+                if buffer is not None and (
+                    buffer.dtype != first.dtype
+                    or tuple(buffer.shape[1:]) != tuple(first.shape[1:])
+                    or buffer.device != self._transfer_device
+                    or buffer.stride(-1) != 1
+                ):
+                    raise ValueError(
+                        f"Native {name} layers have incompatible geometry."
+                    )
+                if buffer is not None:
+                    capacities.append(buffer.shape[0] * (page_size if paged else 1))
+            component = 0 if name.startswith("k") else 1
+            self._mha_components.append(
+                (name, buffers, paged, width, component, offsets[component])
+            )
+            self._native_components.append((buffers, paged, page_bytes))
+            offsets[component] += width
+            schema.append((name, str(first.dtype), width))
+        self.device_slots = min(capacities)
+        self.record_bytes = ((max(offsets) + 15) // 16) * 16
+        self.layer_page_bytes = 2 * page_size * self.head_num * self.record_bytes
+        self._page_shape = (
+            self.head_group_num,
+            self.layer_num,
+            2,
+            page_size,
+            self.heads_per_group,
+            self.record_bytes,
+        )
+        self.storage_format_tag = (
+            f"page-unified-mha-record-v3:{self.head_dim}:{self.v_head_dim}:"
+            f"{self._quantization}:{schema}"
+        )
+
+    def _mha_component_pages(self, buffer, pages, name, paged, width):
+        raw = buffer.view(torch.uint8)
+        rows = (
+            pages
+            if paged
+            else (
+                pages[:, None] * self.page_size + torch.arange(self.page_size)
+            ).flatten()
+        )
+        data = raw.index_select(0, rows.to(raw.device))
+        batch = pages.numel()
+        if (
+            name.endswith("scale")
+            and self._mha_scale_layout == KVScaleLayout.MXFP8_INTERLEAVED
+        ):
+            data = data.permute(0, 3, 2, 1, 4)
+        elif paged and self._mha_buffer_layout == KVBufferLayout.HND:
+            data = data.transpose(1, 2)
+        elif paged and self._mha_buffer_layout == KVBufferLayout.VECTORIZED_5D:
+            data = (
+                data.permute(0, 3, 1, 2, 4)
+                if name == "k"
+                else data.reshape(*data.shape[:-1], -1, buffer.element_size()).permute(
+                    0, 2, 4, 1, 3, 5
+                )
+            )
+        return data.reshape(batch, self.page_size, self.head_num, width)
+
+    def _set_mha_component_pages(self, buffer, pages, name, paged, data):
+        raw = buffer.view(torch.uint8)
+        if (
+            name.endswith("scale")
+            and self._mha_scale_layout == KVScaleLayout.MXFP8_INTERLEAVED
+        ):
+            data = data.reshape(
+                -1, raw.shape[3], raw.shape[2], self.head_num, raw.shape[-1]
+            ).permute(0, 3, 2, 1, 4)
+        elif paged and self._mha_buffer_layout == KVBufferLayout.HND:
+            data = data.transpose(1, 2)
+        elif paged and self._mha_buffer_layout == KVBufferLayout.VECTORIZED_5D:
+            shape = raw.shape[1:]
+            data = (
+                data.reshape(
+                    -1, self.page_size, self.head_num, shape[1], shape[-1]
+                ).permute(0, 2, 3, 1, 4)
+                if name == "k"
+                else data.reshape(
+                    -1,
+                    shape[1],
+                    shape[-1] // buffer.element_size(),
+                    self.head_num,
+                    shape[2],
+                    buffer.element_size(),
+                ).permute(0, 3, 1, 4, 2, 5)
+            )
+        rows = (
+            pages
+            if paged
+            else (
+                pages[:, None] * self.page_size + torch.arange(self.page_size)
+            ).flatten()
+        )
+        raw.index_copy_(
+            0, rows.to(raw.device), data.reshape(-1, *raw.shape[1:]).to(raw.device)
+        )
+
+    @property
+    def page_bytes(self):
+        return self.layer_num * self.layer_page_bytes
+
+    def get_size_per_token(self):
+        return (self.page_bytes + self.page_size - 1) // self.page_size
+
+    def get_ksize_per_token(self):
+        widths = [component[2] for component in self._native_components]
+        return self.layer_num * sum(widths[::2]) // self.page_size
+
+    def init_kv_buffer(self):
+        return ALLOC_MEMORY_FUNCS[self._transfer_device.type](
+            (self.page_num, *self._page_shape),
+            dtype=torch.uint8,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+            registration_granularity_bytes=self.page_bytes,
+        )
+
+    def get_hybrid_pool_buffer(self):
+        return [self.kv_buffer]
+
+    def prepare_transfer_indices(self, host_indices, device_indices, io_backend):
+        return _page_unified_transfer_pages(
+            host_indices,
+            device_indices,
+            page_size=self.page_size,
+            host_capacity=self.size,
+            device_capacity=self.device_slots,
+            io_backend=io_backend,
+        )
+
+    def _copy_layer_pages(self, host_pages, device_pages, layer_id, *, load):
+        if not 0 <= layer_id < self.layer_num:
+            return
+        if not load:
+            self.kv_buffer[:, :, layer_id].index_fill_(
+                0, host_pages.to(self.kv_buffer.device), 0
+            )
+        for name, buffers, paged, width, component, offset in self._mha_components:
+            buffer = buffers[layer_id]
+            if buffer is None:
+                continue
+            host = self.kv_buffer[
+                :, :, layer_id, component, :, :, offset : offset + width
+            ]
+            if load:
+                data = host.index_select(0, host_pages.to(host.device))
+                data = data.permute(0, 2, 1, 3, 4).reshape(
+                    -1, self.page_size, self.head_num, width
+                )
+                self._set_mha_component_pages(buffer, device_pages, name, paged, data)
+            else:
+                data = self._mha_component_pages(
+                    buffer, device_pages, name, paged, width
+                )
+                data = data.reshape(
+                    -1,
+                    self.page_size,
+                    self.head_group_num,
+                    self.heads_per_group,
+                    width,
+                ).permute(0, 2, 1, 3, 4)
+                host.index_copy_(0, host_pages.to(host.device), data.to(host.device))
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        self.backup_from_device_all_layer_physical(
+            device_pool,
+            *self.prepare_transfer_indices(host_indices, device_indices, io_backend),
+            io_backend,
+        )
+
+    def backup_from_device_all_layer_physical(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        for layer_id in range(self.layer_num):
+            self._copy_layer_pages(host_indices, device_indices, layer_id, load=False)
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft=False,
+    ):
+        self.load_to_device_per_layer_physical(
+            device_pool,
+            *self.prepare_transfer_indices(host_indices, device_indices, io_backend),
+            layer_id,
+            io_backend,
+            is_draft=is_draft,
+        )
+
+    def load_to_device_per_layer_physical(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft=False,
+    ):
+        if not is_draft and not 0 <= layer_id < self.target_layer_num:
+            return
+        self._copy_layer_pages(host_indices, device_indices, layer_id, load=True)
+
+    def get_data_page(self, index, flat=True):
+        page = self.kv_buffer[self._storage_page_index(index) // self.page_size]
+        return page.flatten() if flat else page
+
+    def get_dummy_flat_data_page(self):
+        return torch.zeros(
+            self.page_bytes,
+            dtype=torch.uint8,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+
+    def set_from_flat_data_page(self, index, data_page):
+        self.kv_buffer[self._storage_page_index(index) // self.page_size].copy_(
+            data_page.reshape_as(self.kv_buffer[0])
+        )
+
+    def get_page_buffer_meta(self, indices):
+        if len(indices) % self.page_size:
+            raise ValueError("Native MHA page metadata requires full pages.")
+        pages = indices[:: self.page_size].tolist()
+        return (
+            [
+                self.kv_buffer.data_ptr()
+                + self._storage_page_index(index) // self.page_size * self.page_bytes
+                for index in pages
+            ],
+            [self.page_bytes] * len(pages),
+        )
+
+    def is_stride_page_aligned(self, page_size_bytes=4096):
+        return (
+            self.kv_buffer.data_ptr() % page_size_bytes == 0
+            and self.page_bytes % page_size_bytes == 0
+        )
+
+
+def get_mha_host_pool_cls(
+    buffer_info: MHABufferInfo, *, layout: str | None = None
+) -> type:
+    if layout == "page_unified" and needs_native_page_unified(buffer_info):
+        return NativePageUnifiedMHATokenToKVPoolHost
     is_mxfp8 = (
         buffer_info.scales is not None
         and buffer_info.scales.layout == KVScaleLayout.MXFP8_INTERLEAVED

@@ -71,7 +71,10 @@ def _cpu_staging_environment(*, dcp_size=1, **memory_overrides):
     )
 
     def allocate_host(dims, *, dtype, device, **kwargs):
-        return torch.zeros(dims, dtype=dtype, device=device)
+        buffer = torch.zeros(dims, dtype=dtype, device=device)
+        # The CPU fixture never registered this allocation with CUDA.
+        buffer._sglang_cuda_host_registered_ranges = []
+        return buffer
 
     with ExitStack() as stack:
         for module in (runtime_context, kv_cache_builder, hybrid_pool_assembler):
@@ -345,6 +348,39 @@ class TestPageUnifiedStaging(CustomTestCase):
                     self.assertEqual(
                         host.staging_buffer.data_ptr(), prepared.data_ptr()
                     )
+
+    def test_native_layout_skips_jit_staging_and_keeps_head_partition(self):
+        with _cpu_staging_environment():
+            pool = MHATokenToKVPool(
+                size=PAGE_SIZE * 8,
+                page_size=PAGE_SIZE,
+                dtype=torch.float16,
+                head_num=4,
+                head_dim=16,
+                v_head_dim=8,
+                layer_num=3,
+                device="cpu",
+                enable_memory_saver=False,
+                enable_alt_stream=False,
+            )
+            with mock.patch.object(
+                kv_cache_builder, "prepare_page_unified_write_back_staging"
+            ) as prepare:
+                kv_cache_builder.prepare_hicache_staging(tp_worker=_worker(pool))
+                prepare.assert_not_called()
+            host = hybrid_pool_assembler.build_kv_host_pool(
+                kv_pool=pool, page_size=PAGE_SIZE
+            )
+            try:
+                self.assertIsInstance(host, mha.NativePageUnifiedMHATokenToKVPoolHost)
+                self.assertEqual(host.head_group_num, 2)
+                self.assertEqual(
+                    host.kv_buffer.nbytes,
+                    host.page_num * host.page_unified_layout.bytes_per_page,
+                )
+                self.assertFalse(host.can_use_write_back_jit)
+            finally:
+                host.destroy()
 
     def test_disabled_hicache_or_other_layout_does_not_allocate(self):
         for is_mla in (False, True):

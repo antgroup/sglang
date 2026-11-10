@@ -42,7 +42,10 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import (
+    MLATokenToKVPoolHost,
+    get_mla_host_pool_cls,
+)
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
 )
@@ -126,9 +129,9 @@ def _device_capacity_tokens(pool) -> int:
     return pool.host_capacity_tokens
 
 
-def _mha_host_inputs(pool, info, drafts=()):
+def _mha_host_inputs(pool, info, drafts=(), *, layout=None):
     return (
-        get_mha_host_pool_cls(info),
+        get_mha_host_pool_cls(info, layout=layout),
         dict(
             device_capacity_tokens=_device_capacity_tokens(pool),
             start_layer=pool.start_layer,
@@ -152,13 +155,19 @@ def build_kv_host_pool(
     host_input = kv_pool.get_device_pool_infos()[0].buffer_info
     use_mla = isinstance(host_input, MLABufferInfo)
     if use_mla:
-        kv_host_pool_cls, mha_kwargs = MLATokenToKVPoolHost, {}
+        kv_host_pool_cls, mha_kwargs = (
+            get_mla_host_pool_cls(host_input, layout=get_memory().hicache_mem_layout),
+            {},
+        )
         # An fp8 DSA store is wider than kv_lora_rank + qk_rope_head_dim. NPU bf16
         # pools report kv_lora_rank here and keep rope rows in a separate buffer.
         override_kv_cache_dim = kv_pool.kv_cache_dim
     else:
         kv_host_pool_cls, mha_kwargs = _mha_host_inputs(
-            kv_pool, host_input, mtp_draft_device_pools
+            kv_pool,
+            host_input,
+            mtp_draft_device_pools,
+            layout=get_memory().hicache_mem_layout,
         )
         override_kv_cache_dim = None
     parallel = get_parallel()
@@ -179,6 +188,8 @@ def build_kv_host_pool(
         kwargs["page_unified_layout"] = geometry.page_unified_layout
         if not use_mla:
             kwargs["head_group_num"] = geometry.page_unified_layout.head_group_num
+    elif not use_mla and get_memory().hicache_mem_layout == "page_unified":
+        kwargs["head_group_num"] = resolve_head_group_num(host_input.head_num)
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla:

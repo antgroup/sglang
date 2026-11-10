@@ -175,6 +175,30 @@ class KVHostGeometry(NamedTuple):
     page_unified_layout: PageUnifiedLayout | None
 
 
+def needs_native_page_unified(info: Any) -> bool:
+    """The standard copy kernels handle one equal-width tensor per component."""
+    from sglang.srt.mem_cache.device_pool_info import (
+        KVBufferLayout,
+        MHABufferInfo,
+        MLABufferInfo,
+        MLASplitBuffers,
+    )
+
+    if isinstance(info, MHABufferInfo):
+        if info.has_native_scale_buffers:
+            raise NotImplementedError(
+                "page_unified does not support the swizzled native NVFP4 scale buffers."
+            )
+        return (
+            info.scales is not None
+            or info.head_dim != info.v_head_dim
+            or info.buffers.layout != KVBufferLayout.NHD
+        )
+    return isinstance(info, MLABufferInfo) and (
+        info.scales is not None or isinstance(info.buffers, MLASplitBuffers)
+    )
+
+
 def resolve_kv_host_geometry(
     kv_pool: Any,
     *,
@@ -200,6 +224,9 @@ def resolve_kv_host_geometry(
     from sglang.srt.mem_cache.hicache_key_scheme import resolve_head_group_num
 
     info = kv_pool.get_device_pool_infos()[0].buffer_info
+    if needs_native_page_unified(info):
+        # Native codecs size their own token records and do not use JIT scratch.
+        return KVHostGeometry(target_layer_num, None)
     return KVHostGeometry(
         target_layer_num,
         PageUnifiedLayout(

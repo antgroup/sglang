@@ -40,6 +40,10 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+from sglang.srt.mem_cache.pool_host.mha import (
+    NativePageUnifiedMHATokenToKVPoolHost,
+    _native_transfer_device,
+)
 from sglang.srt.mem_cache.pool_host.npu_memfabric import (
     alloc_with_memfabric,
     ascendc_io_enabled,
@@ -1421,3 +1425,284 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
         return base_aligned and stride % page_size_bytes == 0
+
+
+class NativePageUnifiedMLATokenToKVPoolHost(NativePageUnifiedMHATokenToKVPoolHost):
+    """TP-replicated token records with payload, RoPE and scale fields."""
+
+    def __init__(
+        self,
+        buffer_info: MLABufferInfo,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+        override_kv_cache_dim: Optional[int] = None,
+        draft_buffer_infos: Sequence[MLABufferInfo] = (),
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
+        *,
+        device_capacity_tokens: int,
+        start_layer: int,
+        end_layer: int,
+        target_layer_num: int,
+        layer_shard_enabled: bool = False,
+        pool_label: str = "kv",
+        write_back_staging=None,
+        page_unified_layout: PageUnifiedLayout | None = None,
+        host_token_capacity: int | None = None,
+    ):
+        if layout != "page_unified":
+            raise ValueError("Native MLA host pages require layout='page_unified'.")
+        if dcp_size != 1 or layer_shard_enabled:
+            raise NotImplementedError(
+                "Native MLA page_unified requires full pages and contiguous local layers."
+            )
+        physical_page_size = page_size
+        infos = (buffer_info, *draft_buffer_infos)
+        for index, info in enumerate(infos):
+            info.validate()
+            if type(info.buffers) is not type(buffer_info.buffers):
+                raise ValueError(
+                    "Native MLA layers must share a buffer representation."
+                )
+            if index and len(info.layer_indices) != 1:
+                raise ValueError(
+                    "Each packed MLA draft must contain exactly one layer."
+                )
+            if (
+                isinstance(info.buffers, tuple)
+                and info.scales is not None
+                and len(info.scales) != len(info.buffers)
+            ):
+                raise ValueError("Every native MLA payload layer requires its scales.")
+        target_layer_num = len(buffer_info.layer_indices)
+        if not target_layer_num or buffer_info.layer_indices != tuple(
+            range(target_layer_num)
+        ):
+            raise NotImplementedError(
+                "Native MLA page_unified requires contiguous local model layers."
+            )
+        self.target_layer_num = target_layer_num
+        self.layer_num = target_layer_num + len(draft_buffer_infos)
+        self._mla_nz_by_layer = (buffer_info.is_fia_nz,) * target_layer_num + tuple(
+            info.is_fia_nz for info in draft_buffer_infos
+        )
+        self._target_layer_indices = buffer_info.layer_indices
+        self._host_layer_by_controller = {
+            layer: index for index, layer in enumerate(buffer_info.layer_indices)
+        }
+        self._host_layer_by_controller.update(
+            {
+                buffer_info.device_layer_num + index: target_layer_num + index
+                for index in range(len(draft_buffer_infos))
+            }
+        )
+
+        def component_rows(info, name):
+            if isinstance(info.buffers, tuple):
+                rows = info.buffers if name == "latent" else info.scales
+                return (
+                    list(rows) if rows is not None else [None] * len(info.layer_indices)
+                )
+            native = info.buffers
+            tensor = getattr(native, name)
+            if tensor is None or not tensor.numel():
+                return [None] * len(info.layer_indices)
+            slots = (
+                native.index_layer_indices
+                if name.startswith("index_")
+                else info.layer_indices
+            )
+            by_layer = dict(zip(slots, tensor))
+            rows = [by_layer.get(layer) for layer in info.layer_indices]
+            if any(
+                row is not None and row.shape[1] != physical_page_size for row in rows
+            ):
+                raise ValueError(
+                    "Native MLA split components must share the host page coverage."
+                )
+            return rows
+
+        split = isinstance(buffer_info.buffers, MLASplitBuffers)
+        if split and any(
+            tensor is not None and tensor.numel()
+            for info in infos
+            for tensor in (info.buffers.index_k, info.buffers.index_scales)
+        ):
+            raise NotImplementedError(
+                "Native MLA page_unified does not support sparse index side buffers."
+            )
+        names = ("k", "v") if split else ("latent", "scales")
+        components = []
+        for name in names:
+            rows = component_rows(buffer_info, name)
+            for draft in draft_buffer_infos:
+                rows.extend(component_rows(draft, name))
+            components.append((name, tuple(rows), split))
+        self._transfer_device = _native_transfer_device(infos, components)
+        self._configure_native_components(components, physical_page_size)
+        self.page_unified_layout = PageUnifiedLayout(
+            page_size=physical_page_size,
+            layer_num=self.layer_num,
+            head_num=1,
+            head_group_num=1,
+            head_dim=self.record_bytes,
+            itemsize=1,
+            is_mla=True,
+        )
+        self.storage_format_tag = (
+            f"page-unified-mla-record-v3:{buffer_info.dtype}:"
+            f"{buffer_info.kv_lora_rank}:{buffer_info.qk_rope_head_dim}:"
+            f"{buffer_info.kv_cache_dim}:{int(buffer_info.packed_fp8)}:{self._record_schema}"
+        )
+        HostKVCache.__init__(
+            self,
+            dtype=torch.uint8,
+            device_capacity_tokens=device_capacity_tokens,
+            size_per_token=(self.page_bytes + physical_page_size - 1)
+            // physical_page_size,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=page_size,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator_type=allocator_type,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            pool_label=pool_label,
+            host_token_capacity=host_token_capacity,
+        )
+        self.can_use_jit = False
+
+    def _configure_native_components(self, component_sets, page_size):
+        """Normalize every local layer to the same payload/scale token record."""
+        self._mla_fields = []
+        capacities = []
+        for layer in range(self.layer_num):
+            fields, schema, width = [], [], 0
+            for name, buffers, paged in component_sets:
+                buffer = buffers[layer]
+                if buffer is None:
+                    continue
+                raw = buffer.view(torch.uint8)
+                item_bytes, remainder = divmod(
+                    raw[0].numel(), page_size if paged else 1
+                )
+                if remainder or buffer.stride(-1) != 1:
+                    raise ValueError(
+                        "Native MLA components require complete token rows."
+                    )
+                is_nz = name in ("k", "v") and self._mla_nz_by_layer[layer]
+                if is_nz and item_bytes % (16 * buffer.element_size()):
+                    raise ValueError("FIA NZ requires complete 16-element tiles.")
+                fields.append((buffer, paged, width, item_bytes, is_nz))
+                schema.append((name, str(buffer.dtype), item_bytes))
+                width += item_bytes
+                capacities.append(buffer.shape[0] * (page_size if paged else 1))
+            if not fields:
+                raise ValueError(
+                    "Native MLA pages require physical components in every layer."
+                )
+            if layer == 0:
+                self._record_schema = schema
+                self.record_bytes = ((width + 15) // 16) * 16
+            elif schema != self._record_schema:
+                raise ValueError("Native MLA layers must share a token record schema.")
+            self._mla_fields.append(fields)
+        self.device_slots = min(capacities)
+        self._mla_page_bytes = self.layer_num * page_size * self.record_bytes
+        self._page_shape = (self.layer_num, page_size, self.record_bytes)
+
+    @property
+    def page_bytes(self):
+        return self._mla_page_bytes
+
+    def _copy_layer_pages(self, host_pages, device_pages, layer_id, *, load):
+        if not 0 <= layer_id < self.layer_num:
+            return
+        size = self.page_size
+        host = self.kv_buffer[:, layer_id]
+        if not load:
+            host.index_fill_(0, host_pages.to(host.device), 0)
+        for buffer, paged, field_offset, item_bytes, is_nz in self._mla_fields[
+            layer_id
+        ]:
+            raw = buffer.view(torch.uint8)
+            rows = (
+                device_pages
+                if paged
+                else (device_pages[:, None] * size + torch.arange(size)).flatten()
+            )
+            field = host[:, :, field_offset : field_offset + item_bytes]
+            if load:
+                data = field.index_select(0, host_pages.to(field.device))
+                if is_nz:
+                    data = data.reshape(
+                        -1,
+                        size,
+                        item_bytes // (16 * buffer.element_size()),
+                        16 * buffer.element_size(),
+                    ).transpose(1, 2)
+                raw.index_copy_(
+                    0,
+                    rows.to(raw.device),
+                    data.reshape(-1, *raw.shape[1:]).to(raw.device),
+                )
+            else:
+                data = raw.index_select(0, rows.to(raw.device))
+                if is_nz:
+                    data = data.reshape(
+                        -1,
+                        item_bytes // (16 * buffer.element_size()),
+                        size,
+                        16 * buffer.element_size(),
+                    ).transpose(1, 2)
+                field.index_copy_(
+                    0,
+                    host_pages.to(field.device),
+                    data.reshape(-1, size, item_bytes).to(field.device),
+                )
+
+    def get_ksize_per_token(self):
+        return self.get_size_per_token()
+
+    def prepare_transfer_indices(self, host_indices, device_indices, io_backend):
+        return super().prepare_transfer_indices(
+            maybe_dcp_kernel_indices(host_indices, self.dcp_size, self.dcp_rank),
+            maybe_dcp_kernel_indices(device_indices, self.dcp_size, self.dcp_rank),
+            io_backend,
+        )
+
+    def load_to_device_per_layer_physical(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft=False,
+    ):
+        if not is_draft and layer_id not in self._target_layer_indices:
+            return
+        host_layer = self._host_layer_by_controller.get(layer_id)
+        if host_layer is not None:
+            self._copy_layer_pages(host_indices, device_indices, host_layer, load=True)
+
+
+def get_mla_host_pool_cls(
+    buffer_info: MLABufferInfo, *, layout: str | None = None
+) -> type:
+    if layout == "page_unified" and (
+        buffer_info.scales is not None
+        or isinstance(buffer_info.buffers, MLASplitBuffers)
+    ):
+        return NativePageUnifiedMLATokenToKVPoolHost
+    return MLATokenToKVPoolHost

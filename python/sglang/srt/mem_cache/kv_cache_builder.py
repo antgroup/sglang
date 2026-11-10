@@ -124,7 +124,9 @@ def prepare_hicache_staging(
                     use_mla=is_mla,
                     draft_layer_num=len(packed_drafts),
                 ).page_unified_layout
-                assert geometry is not None
+                if geometry is None:
+                    # Native codecs transfer payload/scale records without JIT scratch.
+                    return
                 layer_num = geometry.layer_num
                 staging = prepare_page_unified_write_back_staging(
                     geometry,
