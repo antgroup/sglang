@@ -258,6 +258,8 @@ class MHABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     dtype: torch.dtype
     device: torch.device
     scales: KVScaleBuffers | None = None
+    quantization: str | None = None
+    has_native_scale_buffers: bool = False
     page_envelope: PageEnvelopeBufferInfo | None = None
     # Resolve current contiguous backing at transfer time for relocatable pools.
     transfer_buffers: Callable[[], tuple[torch.Tensor, torch.Tensor]] | None = None
@@ -326,6 +328,7 @@ class MLABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     packed_fp8: bool = False
     scales: tuple[torch.Tensor, ...] | None = None
     native_buffers: Callable[[], MLASplitBuffers] | None = None
+    is_fia_nz: bool = False
 
     def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
         if layer_ids is not None and len(layer_ids) != len(self.layer_indices):

@@ -416,6 +416,9 @@ class TestControllerUnifiedKeys(CustomTestCase):
                     ),
                 ):
                     config = controller._generate_storage_config("org/model")
+                    host_pool.storage_format_tag = "native-record-test"
+                    with self.assertRaisesRegex(ValueError, "nonempty model ID"):
+                        controller._generate_storage_config(None)
 
                 namespace = derive_namespace(
                     model_id="org/model",

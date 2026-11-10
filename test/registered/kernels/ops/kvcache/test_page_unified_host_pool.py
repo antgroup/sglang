@@ -283,3 +283,230 @@ def test_mla_page_unified(kv_lora_rank, qk_rope_head_dim, dtype, preallocate):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
+
+
+@pytest.mark.parametrize(
+    "native_format",
+    [
+        "asymmetric",
+        "fp4",
+        "mxfp8",
+        "hnd",
+        "paged",
+        "vectorized",
+        "mla_fp4",
+        "mla_split",
+    ],
+)
+@pytest.mark.parametrize("backend", ["kernel", "direct"])
+def test_native_page_unified_payload_and_scales(native_format, backend):
+    """The real device copies preserve each payload/scale field at new slots."""
+    from unittest.mock import patch
+
+    from sglang.srt.mem_cache.device_pool_info import (
+        KVBufferLayout,
+        KVBuffers,
+        KVScaleBuffers,
+        KVScaleLayout,
+        MHABufferInfo,
+        MLABufferInfo,
+        MLASplitBuffers,
+    )
+    from sglang.srt.mem_cache.pool_host.common import (
+        ALLOC_MEMORY_FUNCS,
+        alloc_with_pin_memory,
+    )
+    from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
+    from sglang.srt.mem_cache.pool_host.mla import get_mla_host_pool_cls
+
+    pages, layers, heads = 6, 2, 2
+    originals = []
+
+    def buffers(width, *, paged=False, scale=False):
+        if native_format == "mxfp8" and scale:
+            shape = (pages, heads, 2, PAGE_SIZE // 2, width)
+        elif native_format == "hnd":
+            shape = (pages, heads, PAGE_SIZE, width)
+        elif native_format == "vectorized":
+            shape = (pages, heads, width // 2, PAGE_SIZE, 2)
+        elif paged:
+            shape = (pages, PAGE_SIZE, heads, width)
+        else:
+            shape = (pages * PAGE_SIZE, heads, width)
+        result = tuple(
+            torch.empty(shape, dtype=torch.uint8, device=DEVICE) for _ in range(layers)
+        )
+        originals.append(
+            (
+                result,
+                paged
+                or native_format in ("hnd", "vectorized")
+                or (native_format == "mxfp8" and scale),
+            )
+        )
+        return result
+
+    if native_format.startswith("mla"):
+        payload = tuple(
+            torch.empty(pages * PAGE_SIZE, 1, 32, dtype=torch.uint8, device=DEVICE)
+            for _ in range(layers)
+        )
+        scales = tuple(
+            torch.empty(pages * PAGE_SIZE, 2, dtype=torch.uint8, device=DEVICE)
+            for _ in range(layers)
+        )
+        if native_format == "mla_split":
+            k = torch.empty(
+                layers, pages, PAGE_SIZE, 1, 32, dtype=torch.uint8, device=DEVICE
+            )
+            v = torch.empty(
+                layers, pages, PAGE_SIZE, 1, 16, dtype=torch.uint8, device=DEVICE
+            )
+            native = MLASplitBuffers(
+                k=k,
+                v=v,
+                index_k=None,
+                index_scales=None,
+                index_layer_indices=(),
+                k_width=32,
+                v_width=16,
+                index_width=0,
+            )
+            originals = [(tuple(k), True), (tuple(v), True)]
+            scales = None
+        else:
+            native = payload
+            originals = [(payload, False), (scales, False)]
+        info = MLABufferInfo(
+            buffers=native,
+            scales=scales,
+            data_ptrs=None,
+            layer_indices=tuple(range(layers)),
+            device_layer_num=layers,
+            page_size=PAGE_SIZE,
+            kv_lora_rank=32,
+            qk_rope_head_dim=32,
+            kv_cache_dim=64,
+            dtype=torch.uint8,
+            device=torch.device(DEVICE, torch.cuda.current_device()),
+        )
+        host_cls = get_mla_host_pool_cls(info, layout="page_unified")
+        kwargs = {"target_layer_num": layers}
+    else:
+        layout = {
+            "hnd": KVBufferLayout.HND,
+            "paged": KVBufferLayout.PAGED_NHD,
+            "vectorized": KVBufferLayout.VECTORIZED_5D,
+        }.get(native_format, KVBufferLayout.NHD)
+        k = buffers(32, paged=native_format == "paged")
+        v = buffers(48, paged=native_format == "paged")
+        scales = None
+        if native_format in ("fp4", "mxfp8"):
+            scales = KVScaleBuffers(
+                k=buffers(2, scale=True),
+                v=buffers(3, scale=True),
+                layout=KVScaleLayout.MXFP8_INTERLEAVED
+                if native_format == "mxfp8"
+                else KVScaleLayout.TOKEN,
+            )
+        info = MHABufferInfo(
+            buffers=KVBuffers(
+                k=k, v=v, k_data_ptrs=None, v_data_ptrs=None, layout=layout
+            ),
+            scales=scales,
+            page_size=PAGE_SIZE,
+            head_num=heads,
+            head_dim=64,
+            v_head_dim=96,
+            dtype=torch.uint8,
+            device=torch.device(DEVICE, torch.cuda.current_device()),
+        )
+        host_cls = get_mha_host_pool_cls(info, layout="page_unified")
+        kwargs = {"head_group_num": heads}
+
+    def allocate_pinned(*args, **kwargs):
+        buffer = alloc_with_pin_memory(*args, **kwargs)
+        # Torch owns the pin; this buffer did not use cudaHostRegister.
+        buffer._sglang_cuda_host_registered_ranges = []
+        return buffer
+
+    with patch.dict(ALLOC_MEMORY_FUNCS, {DEVICE: allocate_pinned}):
+        host = host_cls(
+            info,
+            2,
+            0,
+            PAGE_SIZE,
+            "page_unified",
+            pin_memory=True,
+            device_capacity_tokens=pages * PAGE_SIZE,
+            start_layer=0,
+            end_layer=layers,
+            **kwargs,
+        )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    try:
+        # The controller runs HiCache copies on dedicated transfer streams.
+        with torch.cuda.stream(stream):
+            for ordinal, (component, _) in enumerate(originals):
+                for layer, buffer in enumerate(component):
+                    buffer.copy_(
+                        (
+                            (
+                                torch.arange(buffer.numel(), device=DEVICE)
+                                + ordinal * 37
+                                + layer * 11
+                            )
+                            % 251
+                        )
+                        .reshape_as(buffer)
+                        .to(buffer.dtype)
+                    )
+            saved = [
+                [buffer.clone() for buffer in component] for component, _ in originals
+            ]
+            source, target = [3, 1], [5, 2]
+            host_indices = _page_indices([0, 4], PAGE_SIZE)
+            host.backup_from_device_all_layer(
+                None, host_indices, _page_indices(source, PAGE_SIZE).to(DEVICE), backend
+            )
+            torch.cuda.synchronize()
+            for component, _ in originals:
+                for buffer in component:
+                    buffer.fill_(173)
+            for layer in range(layers):
+                host.load_to_device_per_layer(
+                    None,
+                    host_indices.to(DEVICE) if backend == "kernel" else host_indices,
+                    _page_indices(target, PAGE_SIZE).to(DEVICE),
+                    layer,
+                    backend,
+                )
+            torch.cuda.synchronize()
+            for (component, paged), previous in zip(originals, saved):
+                src = (
+                    torch.tensor(source, device=DEVICE)
+                    if paged
+                    else _page_indices(source, PAGE_SIZE).to(DEVICE)
+                )
+                dst = (
+                    torch.tensor(target, device=DEVICE)
+                    if paged
+                    else _page_indices(target, PAGE_SIZE).to(DEVICE)
+                )
+                for actual, expected in zip(component, previous):
+                    assert torch.equal(
+                        actual.index_select(0, dst), expected.index_select(0, src)
+                    )
+                    untouched = torch.ones(
+                        actual.shape[0], dtype=torch.bool, device=DEVICE
+                    )
+                    untouched[dst] = False
+                    assert torch.all(actual[untouched] == 173)
+            assert host.kv_buffer.is_pinned()
+            assert (
+                host.get_data_page(0).nbytes == host.page_unified_layout.bytes_per_page
+            )
+    finally:
+        stream.synchronize()
+        host.destroy()

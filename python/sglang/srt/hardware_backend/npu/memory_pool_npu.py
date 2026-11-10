@@ -910,6 +910,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 if buffer is not None
             ),
             packed_fp8=self.dsa_kv_cache_store_fp8,
+            is_fia_nz=self.use_fia_nz and not self.use_combined_kv_buffer,
         )
 
     def _mla_native_buffers(self):

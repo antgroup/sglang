@@ -853,6 +853,8 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         dcp_size = get_parallel().attn_dcp_size
+        if not model_name and get_memory().hicache_storage_key_scheme == "unified":
+            raise ValueError("The unified key scheme requires a nonempty model ID.")
         model_name = storage_model_name(model_name, self.storage_host_pool)
         unified_plan = self._build_unified_plan(model_name, attn_cp_size)
         unified_chunk_spans = None

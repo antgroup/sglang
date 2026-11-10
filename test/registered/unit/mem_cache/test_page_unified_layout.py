@@ -6,14 +6,26 @@ coordinate. They share a file because they have to agree on the grid.
 """
 
 import unittest
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+from sglang.srt.managers.cache_controller import storage_model_name
+from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
 from sglang.srt.mem_cache.hicache_key_scheme import (
     derive_namespace,
     namespace_digest,
     normalize_dtype,
     plan_unified_kv,
+)
+from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
+from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
+from sglang.srt.mem_cache.pool_host.mla import (
+    NativePageUnifiedMLATokenToKVPoolHost,
+    get_mla_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -94,6 +106,229 @@ class TestPageUnifiedLayout(CustomTestCase):
             layout.chunk_span((3, 3))
         with self.assertRaisesRegex(ValueError, "head group"):
             layout.chunk_span((0, 1), layout.head_group_num)
+
+
+class TestNativePageUnifiedMLATransfer(CustomTestCase):
+    @mock.patch.dict(
+        ALLOC_MEMORY_FUNCS,
+        {"cpu": lambda dims, **kw: torch.empty(dims, dtype=kw["dtype"])},
+    )
+    def test_npu_fia_nz_and_token_layout_share_canonical_records(self):
+        """Dim-tiled NPU pages normalize to the same token records and restore."""
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+
+        hosts, infos, originals = [], [], []
+        try:
+            for nz in (False, True):
+                with (
+                    mock.patch.dict("os.environ", {"SGLANG_USE_FIA_NZ": str(nz)}),
+                    mock.patch(
+                        "sglang.srt.hardware_backend.npu.memory_pool_npu.get_parallel",
+                        return_value=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
+                    ),
+                ):
+                    pool = NPUMLATokenToKVPool(
+                        size=12,
+                        page_size=4,
+                        dtype=torch.float16,
+                        kv_lora_rank=32,
+                        qk_rope_head_dim=16,
+                        layer_num=2,
+                        device="cpu",
+                        enable_memory_saver=False,
+                    )
+                info = pool.get_device_pool_infos()[0].buffer_info
+                self.assertEqual(info.is_fia_nz, nz)
+                infos.append(info)
+                saved = []
+                for component, buffer in enumerate((info.buffers.k, info.buffers.v)):
+                    logical = (
+                        torch.arange(buffer.numel()).reshape_as(buffer) + component * 59
+                    ).to(buffer.dtype)
+                    if nz:
+                        physical = (
+                            logical.reshape(2, 4, 4, -1, 16)
+                            .transpose(2, 3)
+                            .contiguous()
+                            .reshape_as(buffer)
+                        )
+                    else:
+                        physical = logical
+                    buffer.copy_(physical)
+                    saved.append(physical.clone())
+                originals.append(saved)
+                with host_memory_budget_scope(1 << 20):
+                    host = NativePageUnifiedMLATokenToKVPoolHost(
+                        info,
+                        2,
+                        0,
+                        4,
+                        "page_unified",
+                        pin_memory=False,
+                        device_capacity_tokens=12,
+                        start_layer=0,
+                        end_layer=2,
+                        target_layer_num=2,
+                    )
+                hosts.append(host)
+                host.backup_from_device_all_layer(
+                    None, torch.arange(4), torch.arange(4, 8), "kernel"
+                )
+            self.assertEqual(hosts[0].storage_format_tag, hosts[1].storage_format_tag)
+            pages = [host.get_data_page(0).clone() for host in hosts]
+            self.assertTrue(torch.equal(*pages))
+            for index, host in enumerate(hosts):
+                host.set_from_flat_data_page(0, pages[1 - index])
+                for buffer in (infos[index].buffers.k, infos[index].buffers.v):
+                    buffer.view(torch.uint8).fill_(173)
+                for layer in range(2):
+                    host.load_to_device_per_layer(
+                        None, torch.arange(4), torch.arange(8, 12), layer, "kernel"
+                    )
+                for buffer, saved in zip(
+                    (infos[index].buffers.k, infos[index].buffers.v), originals[index]
+                ):
+                    self.assertTrue(
+                        torch.equal(
+                            buffer[:, 2].view(torch.uint8),
+                            saved[:, 1].view(torch.uint8),
+                        )
+                    )
+                    self.assertTrue(
+                        torch.all(buffer[:, [0, 1, 3]].view(torch.uint8) == 173)
+                    )
+        finally:
+            for host in hosts:
+                host.destroy()
+
+    @mock.patch.dict(
+        ALLOC_MEMORY_FUNCS,
+        {"cpu": lambda dims, **kw: torch.empty(dims, dtype=kw["dtype"])},
+    )
+    def test_fp4_mla_file_objects_restore_after_pp_and_tp_changes(self):
+        originals = [
+            ((torch.arange(3 * 12 * width) + offset) % 251)
+            .reshape(3, 12, 1, width)
+            .to(torch.uint8)
+            for width, offset in ((16, 13), (2, 47))
+        ]
+        hosts = []
+
+        def host(start, end):
+            payload = tuple(originals[0][start:end].clone())
+            scales = tuple(originals[1][start:end, :, 0].clone())
+            info = MLABufferInfo(
+                buffers=payload,
+                scales=scales,
+                data_ptrs=None,
+                layer_indices=tuple(range(end - start)),
+                device_layer_num=end - start,
+                page_size=2,
+                kv_lora_rank=16,
+                qk_rope_head_dim=16,
+                kv_cache_dim=32,
+                dtype=torch.uint8,
+                device=torch.device("cpu"),
+            )
+            self.assertIs(
+                get_mla_host_pool_cls(info, layout="page_unified"),
+                NativePageUnifiedMLATokenToKVPoolHost,
+            )
+            with host_memory_budget_scope(1 << 20):
+                result = NativePageUnifiedMLATokenToKVPoolHost(
+                    info,
+                    2,
+                    0,
+                    2,
+                    "page_unified",
+                    pin_memory=False,
+                    device_capacity_tokens=10,
+                    start_layer=start,
+                    end_layer=end,
+                    target_layer_num=end - start,
+                )
+            hosts.append(result)
+            return result, (payload, scales)
+
+        def backend(pool, directory, tp_size):
+            plan = plan_unified_kv(
+                model_id=storage_model_name("org/model", pool),
+                dtype="fp4",
+                page_size=2,
+                rank_replicated=True,
+                local_kv_heads=0,
+                attn_tp_rank=0,
+                attn_tp_size=tp_size,
+                attn_cp_size=1,
+                start_layer=pool.start_layer,
+                end_layer=pool.end_layer,
+                is_final_stage=pool.end_layer == 3,
+                layer_partition=1,
+            )
+            return HiCacheFile(
+                HiCacheStorageConfig(
+                    tp_rank=0,
+                    tp_size=tp_size,
+                    pp_rank=0,
+                    pp_size=1,
+                    attn_cp_rank=0,
+                    attn_cp_size=1,
+                    is_mla_model=True,
+                    enable_storage_metrics=False,
+                    is_page_first_layout=False,
+                    model_name="org/model",
+                    unified_suffixes=plan.suffixes,
+                    unified_chunk_spans=[
+                        pool.page_unified_layout.chunk_span(window)
+                        for window in plan.layer_ranges
+                    ],
+                    extra_config={"max_size": 0, "min_free_space": 0},
+                ),
+                file_path=directory,
+            )
+
+        try:
+            with TemporaryDirectory() as directory:
+                writer, _ = host(0, 3)
+                writer.backup_from_device_all_layer(
+                    None, torch.arange(2), torch.arange(2, 4), "direct"
+                )
+                self.assertTrue(
+                    backend(writer, directory, 1).set("prefix", writer.get_data_page(0))
+                )
+                for start, end in ((0, 1), (1, 3)):
+                    reader, components = host(start, end)
+                    self.assertEqual(
+                        writer.storage_format_tag, reader.storage_format_tag
+                    )
+                    data = reader.get_dummy_flat_data_page()
+                    self.assertIsNotNone(
+                        backend(reader, directory, 4).get("prefix", data)
+                    )
+                    reader.set_from_flat_data_page(2, data)
+                    for buffers in components:
+                        for buffer in buffers:
+                            buffer.fill_(173)
+                    for layer in range(end - start):
+                        reader.load_to_device_per_layer(
+                            None,
+                            torch.arange(2, 4),
+                            torch.arange(6, 8),
+                            layer,
+                            "kernel",
+                        )
+                    for buffers, saved in zip(components, originals):
+                        for local, layer in enumerate(range(start, end)):
+                            self.assertTrue(
+                                torch.equal(
+                                    buffers[local][6:8].reshape(2, -1),
+                                    saved[layer, 2:4].reshape(2, -1),
+                                )
+                            )
+                            self.assertTrue(torch.all(buffers[local][:6] == 173))
+        finally:
+            for pool in hosts:
+                pool.destroy()
 
 
 # GQA-70B shape: 8 kv heads, 80 layers.

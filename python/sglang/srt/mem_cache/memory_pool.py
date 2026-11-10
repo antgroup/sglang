@@ -2435,6 +2435,9 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             dtype=self.store_dtype,
             device=buffers.k[0].device if len(buffers.k) else torch.device(self.device),
             scales=self._mha_scale_buffers(),
+            quantization=getattr(getattr(self, "quant_method", None), "name", None),
+            has_native_scale_buffers=getattr(self, "native_k_scale_buffer", None)
+            is not None,
         )
 
     def _init_kv_copy_and_warmup(self):
