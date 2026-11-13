@@ -448,6 +448,7 @@ def _spec_for(
         temporal_state_shape=geometry.temporal_state_shape,
         temporal_dtype=geometry.temporal_dtype,
         conv_slice_axis=geometry.conv_slice_axis,
+        conv_shard_groups=geometry.conv_shard_groups,
         extra_parts=geometry.extra_parts,
         replay=geometry.replay,
         grow_direction=grow_direction,

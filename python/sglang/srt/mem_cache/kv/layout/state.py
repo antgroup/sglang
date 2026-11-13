@@ -71,6 +71,7 @@ class MambaSubPoolSpec(SubPoolSpec):
     temporal_state_shape: Tuple[int, ...]
     temporal_dtype: torch.dtype
     conv_slice_axis: int = 0
+    conv_shard_groups: Tuple[int, ...] = ()
     extra_parts: Tuple[TensorPartDecl, ...] = ()
     replay: Optional[StateReplay] = None
 
@@ -201,6 +202,8 @@ class StateView:
     custom_mem_pool = None
     debug_memory_pool = False
     conv_shard_groups = None
+    # Host checkpoints only; PD keeps whole entries and never reslices them.
+    _conv_shard_groups: Tuple[int, ...] = ()
     # GDN/KDA ReplaySSM is not supported in the arena: its rings are not per
     # slot entry. Readers test these for None.
     enable_linear_replayssm = False
@@ -234,6 +237,7 @@ class StateView:
         self.mamba_layer_ids = list(mamba_layer_ids)
         self.num_mamba_layers = spec.layer_num
         self.conv_slice_axis = spec.conv_slice_axis
+        self._conv_shard_groups = spec.conv_shard_groups
         self.device = arena.device
         max_slots = arena.extent_entries(spec.name)
         self.size = max_slots - 1  # slot 0 is reserved
@@ -422,6 +426,8 @@ class StateView:
                     temporal=self.mamba_cache.temporal,
                     conv=tuple(self.mamba_cache.conv),
                     extra_checkpoint_buffers=self._checkpoint_extra_buffers,
+                    conv_shard_groups=self._conv_shard_groups,
+                    conv_slice_axis=self.conv_slice_axis,
                 ),
             ),
         )

@@ -96,6 +96,8 @@ class StateGeometry(msgspec.Struct, frozen=True, kw_only=True):
     temporal_state_shape: Tuple[int, ...]
     temporal_dtype: torch.dtype
     conv_slice_axis: int = 0
+    # Full conv sub-block widths, each TP-sharded independently.
+    conv_shard_groups: Tuple[int, ...] = ()
     extra_parts: Tuple["TensorPartDecl", ...] = ()
     request_parts: Tuple["TensorPartDecl", ...] = ()
     scratch_parts: Tuple["TensorPartDecl", ...] = ()
@@ -112,6 +114,9 @@ class StateGeometry(msgspec.Struct, frozen=True, kw_only=True):
             temporal_dtype=cache_params.dtype.temporal,
             # Only some state shapes carry a slice axis; the rest slice axis 0.
             conv_slice_axis=getattr(shape, "conv_slice_axis", 0),
+            conv_shard_groups=tuple(
+                int(x) for x in getattr(shape, "conv_shard_groups", None) or ()
+            ),
         )
 
 
