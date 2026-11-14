@@ -1,0 +1,19 @@
+python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion/worker_patches/h3.py
+  s_0808578dc42784::t_09dde2836d99bc 18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "531ce4692451e714f1d99c318e13830bec49a283",
+  "prompts": {},
+  "sessions": {
+    "s_0808578dc42784": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1d405-cd26-7600-9474-d21c79496004",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thomas <thomas@U-PJGH9VKC-0301.local>"
+    }
+  }
+}
