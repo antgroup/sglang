@@ -1,0 +1,23 @@
+python/sglang/multimodal_gen/runtime/layers/attention/layer.py
+  s_8ec309057deaf6::t_10b4cc97a151d7 110-120,1697
+python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py
+  s_8ec309057deaf6::t_2299863c77f753 86,885
+python/sglang/multimodal_gen/test/unit/test_minimax_h3_subblock_pipeline.py
+  s_8ec309057deaf6::t_6c4be0fb3689bb 11,18-24,26-33,36,41-46,52,96-97,124-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "41d0d845d5c759684e94ed99abfebf0c2d65a078",
+  "prompts": {},
+  "sessions": {
+    "s_8ec309057deaf6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c996-2c50-75a0-857d-c66fa0f7cc9e",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thomas <thomas@U-PJGH9VKC-0301.local>"
+    }
+  }
+}

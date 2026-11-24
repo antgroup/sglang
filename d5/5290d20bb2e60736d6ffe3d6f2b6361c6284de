@@ -1,0 +1,26 @@
+python/sglang/multimodal_gen/runtime/layers/attention/backends/subblock_sparse_attn.py
+  h_1f61144e1009b2 128-130,136-147
+python/sglang/multimodal_gen/test/unit/test_subblock_sparse_attention.py
+  h_1f61144e1009b2 31-32,231-260
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d55290d20bb2e60736d6ffe3d6f2b6361c6284de",
+  "prompts": {},
+  "humans": {
+    "h_1f61144e1009b2": {
+      "author": "thomas <thomas@U-PJGH9VKC-0301.local>"
+    }
+  },
+  "sessions": {
+    "s_0808578dc42784": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1d405-cd26-7600-9474-d21c79496004",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "thomas <thomas@U-PJGH9VKC-0301.local>"
+    }
+  }
+}

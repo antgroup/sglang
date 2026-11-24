@@ -1,0 +1,29 @@
+docs/docs/sglang-diffusion/attention_backends.mdx
+  s_93ee6c37b8258e::t_539d5f51cd8d88 108
+python/sglang/multimodal_gen/runtime/layers/attention/backends/subblock_sparse_attn.py
+  s_93ee6c37b8258e::t_f0ad80a7d2fac6 299
+  s_93ee6c37b8258e::t_7bdc31d336df40 24
+  s_93ee6c37b8258e::t_349d78542c2223 288,298
+  s_93ee6c37b8258e::t_539d5f51cd8d88 269
+test/manual/attention/test_subblock_sage_fp8_sm120.py
+  s_93ee6c37b8258e::t_f0ad80a7d2fac6 4
+python/sglang/multimodal_gen/runtime/layers/attention/backends/subblock_sparse/README.md
+  s_93ee6c37b8258e::t_7bdc31d336df40 7
+  s_93ee6c37b8258e::t_539d5f51cd8d88 109-110
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2d45da143893db3dc117950bb8bdd167904fdcf2",
+  "prompts": {},
+  "sessions": {
+    "s_93ee6c37b8258e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20224-0f91-7052-9183-c43f1b6bdeba",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "林率 <zs565838@antgroup.com>"
+    }
+  }
+}
